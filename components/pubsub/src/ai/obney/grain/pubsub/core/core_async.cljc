@@ -4,7 +4,7 @@
 
 (defn start
   [{{:keys [topic-fn]} :config}]
-  (let [chan (async/chan)
+  (let [chan (async/chan 1024)
         pub (async/pub chan topic-fn)]
     {:chan chan
      :pub pub}))
