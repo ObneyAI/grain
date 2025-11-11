@@ -42,7 +42,7 @@
    ::context {}
    ::execution-fn {:context (ig/ref ::context)
                    :handler-fn (ig/ref ::handler-fn)}
-   ::in-chan {:size 10}
+   ::in-chan {:size 1024}
    ::thread-pool {:thread-count 1
                   :error-fn (fn [e] (u/log ::error ::error e))
                   :in-chan (ig/ref ::in-chan)
