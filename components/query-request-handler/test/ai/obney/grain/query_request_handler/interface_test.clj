@@ -7,6 +7,7 @@
             [cognitect.anomalies :as anom]
             [cognitect.transit :as transit]
             [io.pedestal.http :as http]
+            [io.pedestal.http.body-params :as body-params]
             [io.pedestal.test :refer [response-for]]
             [clj-uuid :as uuid])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
@@ -84,7 +85,9 @@
   [context]
   {:query/result {:context-keys (keys context)
                   :has-query-registry (contains? context :query-registry)
-                  :has-query (contains? context :query)}})
+                  :has-query (contains? context :query)
+                  :user-id (:user-id context)
+                  :request-id (:request-id context)}})
 
 (defn throwing-handler
   "Throws an uncaught exception to test error handling"
@@ -328,6 +331,39 @@
       (is (true? (:has-query body)))
       (is (contains? (set (:context-keys body)) :query-registry))
       (is (contains? (set (:context-keys body)) :query)))))
+
+(deftest test-additional-context-merging
+  (testing "Query handler receives merged grain/additional-context from interceptors"
+    (let [;; Create an interceptor that adds additional context
+          additional-context-interceptor
+          {:name ::add-additional-context
+           :enter (fn [context]
+                    (assoc context :grain/additional-context
+                           {:user-id "test-user-789"
+                            :request-id "req-abc"}))}
+
+          ;; Create a service with the additional context interceptor
+          config {:query-registry test-query-registry}
+          service-map {::http/routes
+                      #{["/query" :post
+                         [(body-params/body-params)
+                          additional-context-interceptor
+                          (core/interceptor config)]
+                         :route-name :query]}
+                      ::http/type :jetty
+                      ::http/join? false}
+          test-service (::http/service-fn (http/create-servlet service-map))
+
+          query {:query/name :test/echo-context}
+          response (response-for test-service :post "/query"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:query query}))
+          body (transit-read (:body response))]
+      (is (= 200 (:status response)))
+      (is (= "test-user-789" (:user-id body))
+          "Additional context :user-id should be accessible to handler")
+      (is (= "req-abc" (:request-id body))
+          "Additional context :request-id should be accessible to handler"))))
 
 ;; Exception Handling Tests
 

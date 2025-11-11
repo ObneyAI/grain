@@ -8,6 +8,7 @@
             [cognitect.anomalies :as anom]
             [cognitect.transit :as transit]
             [io.pedestal.http :as http]
+            [io.pedestal.http.body-params :as body-params]
             [io.pedestal.test :refer [response-for]]
             [clj-uuid :as uuid])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
@@ -361,6 +362,40 @@
       (is (contains? context-keys :command-registry))
       (is (contains? context-keys :event-store))
       (is (contains? context-keys :command)))))
+
+(deftest test-additional-context-merging
+  (testing "Command handler receives merged grain/additional-context from interceptors"
+    (let [;; Create an interceptor that adds additional context
+          additional-context-interceptor
+          {:name ::add-additional-context
+           :enter (fn [context]
+                    (assoc context :grain/additional-context
+                           {:user-id "test-user-123"
+                            :request-id "req-456"}))}
+
+          ;; Create a service with the additional context interceptor
+          grain-context {:command-registry test-command-registry
+                        :event-store *event-store*}
+          service-map {::http/routes
+                      #{["/command" :post
+                         [(body-params/body-params)
+                          additional-context-interceptor
+                          (core/interceptor grain-context)]
+                         :route-name :command]}
+                      ::http/type :jetty
+                      ::http/join? false}
+          test-service (::http/service-fn (http/create-servlet service-map))
+
+          command {:command/name :test/echo-context}
+          response (response-for test-service :post "/command"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:command command}))
+          body (transit-read (:body response))]
+      (is (= 200 (:status response)))
+      (is (= "test-user-123" (:user-id body))
+          "Additional context :user-id should be accessible to handler")
+      (is (= "req-456" (:request-id body))
+          "Additional context :request-id should be accessible to handler"))))
 
 ;; Exception Handling Tests
 

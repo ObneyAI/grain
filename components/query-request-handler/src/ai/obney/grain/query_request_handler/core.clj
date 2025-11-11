@@ -77,7 +77,9 @@
                     {::anom/category ::anom/incorrect
                      ::anom/message "Invalid Query"
                      :error/explain error})))
-           (let [result (async/<! (async/thread (qp/process-query (assoc config :query query))))]
+           (let [result (async/<! (async/thread (qp/process-query (assoc (merge config
+                                                                                  (:grain/additional-context context))
+                                                                           :query query))))]
              (when (anomaly? result)
                (u/log ::anomaly ::anom/anomaly result))
              (assoc context :response (prep-response (process-query-result result))))))
