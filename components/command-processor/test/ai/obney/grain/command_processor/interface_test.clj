@@ -269,13 +269,15 @@
       (is (= command (get-in result [:command/result :received-command]))))))
 
 (deftest test-handler-throwing-exception
-  (testing "Handler throwing uncaught exception propagates up"
+  (testing "Handler throwing exception returns ::anom/fault anomaly"
     (let [command (make-command :test/throwing-handler)
           registry (make-registry {:test/throwing-handler handler-throwing-exception})
-          context (make-context command registry)]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"Unexpected error in handler"
-                            (cp/process-command context))))))
+          context (make-context command registry)
+          result (cp/process-command context)]
+      (is (= ::anom/fault (::anom/category result)))
+      (is (string? (::anom/message result)))
+      (is (re-find #"Error executing command handler" (::anom/message result)))
+      (is (re-find #"Unexpected error in handler" (::anom/message result))))))
 
 ;; 5. Event Store Integration Tests
 

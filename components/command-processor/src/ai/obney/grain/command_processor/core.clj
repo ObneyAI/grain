@@ -10,10 +10,17 @@
 
 (defn execute-command
   [handler {:keys [event-store] :as context}]
-  (let [result (or (handler context)
+  (let [result (try
+                 (or (handler context)
+                     {::anom/category ::anom/fault
+                      ::anom/message (format "Command handler returned nil: %s"
+                                             (get-in context [:command :command/name]))})
+                 (catch Exception e
+                   (u/log ::command-handler-exception
+                          :error e
+                          :command (get-in context [:command :command/name]))
                    {::anom/category ::anom/fault
-                    ::anom/message (format "Command handler returned nil: %s"
-                                           (get-in context [:command :command/name]))})]
+                    ::anom/message (format "Error executing command handler: %s" (.getMessage e))}))]
     (when (anomaly? result)
       (u/log ::error-executing-command ::anomaly result))
     (if-let [events (:command-result/events result)]

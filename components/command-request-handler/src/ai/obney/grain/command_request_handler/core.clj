@@ -77,8 +77,8 @@
                     {::anom/category ::anom/incorrect
                      ::anom/message "Invalid Command"
                      :error/explain error})))
-           (let [result (async/<! (async/thread (cp/process-command (assoc (merge grain-context 
-                                                                                  (:grain/additional-context http-context)) 
+           (let [result (async/<! (async/thread (cp/process-command (assoc (merge grain-context
+                                                                                  (:grain/additional-context http-context))
                                                                            :command command))))]
              (when (anomaly? result)
                (u/log ::anomaly ::anom/anomaly result))
