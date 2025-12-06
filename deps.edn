@@ -3,7 +3,7 @@
                   :extra-deps {org.clojure/clojure {:mvn/version "1.12.0"}
                                clj-http/clj-http {:mvn/version "3.13.0"}
                                clj-python/libpython-clj {:mvn/version "2.025"}
-                               
+
                                ;; Components
                                poly/command-processor {:local/root "components/command-processor"}
                                poly/command-request-handler {:local/root "components/command-request-handler"}
@@ -25,10 +25,16 @@
                                poly/behavior-tree-v2 {:local/root "components/behavior-tree-v2"}
                                poly/behavior-tree-v2-dspy-extensions {:local/root "components/behavior-tree-v2-dspy-extensions"}
                                poly/clj-dspy {:local/root "components/clj-dspy"}
+                               poly/read-model-processor {:local/root "components/read-model-processor"}
+                               poly/file-store {:local/root "components/file-store"}
+                               poly/kv-store {:local/root "components/kv-store"}
+                               poly/kv-store-lmdb {:local/root "components/kv-store-lmdb"}
 
                                ;; Examples
                                poly/example-base {:local/root "bases/example-base"}
-                               poly/example-service {:local/root "components/example-service"}}}
+                               poly/example-service {:local/root "components/example-service"}}
+                  :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}
 
             :test {:extra-paths []}
 

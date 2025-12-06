@@ -13,7 +13,11 @@
         poly/pubsub {:local/root "../../components/pubsub"}
         poly/todo-processor {:local/root "../../components/todo-processor"}
         poly/periodic-task {:local/root "../../components/periodic-task"}
-        poly/behavior-tree-v2 {:local/root "../../components/behavior-tree-v2"}}
+        poly/behavior-tree-v2 {:local/root "../../components/behavior-tree-v2"}
+        poly/read-model-processor {:local/root "../../components/read-model-processor"}
+        #_#_poly/file-store {:local/root "../../components/file-store"}
+        poly/kv-store {:local/root "../../components/kv-store"}
+        poly/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}}
 
  :aliases {:test {:extra-paths []
                   :extra-deps  {}}}}
