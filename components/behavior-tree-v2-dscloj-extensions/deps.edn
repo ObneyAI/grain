@@ -1,0 +1,6 @@
+{:paths ["src" "resources"]
+ :deps {tech.unravel/dscloj {:git/url "https://github.com/unravel-team/DSCloj.git" 
+                             :sha "06fdfd508652b7c2798c058cf430a36b8b8ca485"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {}}}}
+

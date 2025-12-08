@@ -1,0 +1,12 @@
+{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        gdce/anomalies {:local/root "../../components/anomalies"}
+        gdce/time {:local/root "../../components/time"}
+        gdce/schema-util {:local/root "../../components/schema-util"}
+        gdce/pubsub {:local/root "../../components/pubsub"}
+        gdce/event-store-v2 {:local/root "../../components/event-store-v2"}
+        gdce/behavior-tree-v2 {:local/root "../../components/behavior-tree-v2"}
+        gdce/behavior-tree-v2-dscloj-extensions {:local/root "../../components/behavior-tree-v2-dscloj-extensions"}}
+
+ :aliases {:test {:extra-paths []
+                  :extra-deps  {}}}}
+

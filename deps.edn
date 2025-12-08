@@ -25,6 +25,7 @@
                                poly/behavior-tree-v2 {:local/root "components/behavior-tree-v2"}
                                poly/behavior-tree-v2-dspy-extensions {:local/root "components/behavior-tree-v2-dspy-extensions"}
                                poly/clj-dspy {:local/root "components/clj-dspy"}
+                               poly/behavior-tree-v2-dscloj-extensions {:local/root "components/behavior-tree-v2-dscloj-extensions"}
 
                                ;; Examples
                                poly/example-base {:local/root "bases/example-base"}
