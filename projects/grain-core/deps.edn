@@ -1,4 +1,5 @@
-{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+{:paths ["resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         poly/command-processor {:local/root "../../components/command-processor"}
         poly/command-request-handler {:local/root "../../components/command-request-handler"}
         poly/anomalies {:local/root "../../components/anomalies"}

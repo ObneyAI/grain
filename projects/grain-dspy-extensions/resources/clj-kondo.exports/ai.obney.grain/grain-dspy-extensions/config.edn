@@ -1,0 +1,5 @@
+{:hooks {:analyze-call {ai.obney.grain.clj-dspy.interface/defsignature hooks.dspy/defsignature
+                        ai.obney.grain.clj-dspy.core/defsignature hooks.dspy/defsignature-core}}
+ :linters {:clojure-lsp/unused-public-var
+           {:exclude-when-defined-by [ai.obney.grain.clj-dspy.interface/defsignature
+                                      ai.obney.grain.clj-dspy.core/defsignature]}}}

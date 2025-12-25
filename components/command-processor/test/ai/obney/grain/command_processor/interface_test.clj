@@ -376,3 +376,88 @@
       (is (= "Resource already exists" (::anom/message result)))
       (is (= 123 (:resource-id result)))
       (is (= "Additional context" (:extra-info result))))))
+
+;; 7. Global Registry and defcommand Macro Tests
+
+(defschemas global-registry-test-commands
+  {:test/global-registry-command [:map]
+   :test/global-fallback [:map]
+   :test/precedence-test [:map]
+   :test/with-opts [:map]})
+
+(deftest test-register-command-adds-to-global-registry
+  (testing "register-command! adds handler to global registry"
+    (let [initial-registry @cp/command-registry*]
+      (reset! cp/command-registry* {})
+      (try
+        (cp/register-command! :test/global-registry-command
+                              (fn [_] {:command/result {:success true}})
+                              {})
+        (is (contains? @cp/command-registry* :test/global-registry-command))
+        (is (fn? (get-in @cp/command-registry* [:test/global-registry-command :handler-fn])))
+        (finally
+          (reset! cp/command-registry* initial-registry))))))
+
+(deftest test-register-command-merges-opts
+  (testing "register-command! merges opts into registry entry"
+    (let [initial-registry @cp/command-registry*]
+      (reset! cp/command-registry* {})
+      (try
+        (cp/register-command! :test/with-opts
+                              (fn [_] {:command/result {:success true}})
+                              {:auth :admin-required :rate-limit 10})
+        (let [entry (get @cp/command-registry* :test/with-opts)]
+          (is (fn? (:handler-fn entry)))
+          (is (= :admin-required (:auth entry)))
+          (is (= 10 (:rate-limit entry))))
+        (finally
+          (reset! cp/command-registry* initial-registry))))))
+
+(deftest test-process-command-uses-global-registry-as-fallback
+  (testing "process-command uses global registry when no context registry"
+    (let [initial-registry @cp/command-registry*]
+      (reset! cp/command-registry* {})
+      (try
+        (cp/register-command! :test/global-fallback
+                              (fn [_] {:command/result {:source :global}})
+                              {})
+        (let [command (make-command :test/global-fallback)
+              ;; Context WITHOUT command-registry
+              context {:command command
+                       :event-store *event-store*}
+              result (cp/process-command context)]
+          (is (not (contains? result ::anom/category)))
+          (is (= {:source :global} (:command/result result))))
+        (finally
+          (reset! cp/command-registry* initial-registry))))))
+
+(deftest test-context-registry-takes-precedence-over-global
+  (testing "context command-registry takes precedence over global"
+    (let [initial-registry @cp/command-registry*]
+      (reset! cp/command-registry* {})
+      (try
+        ;; Register in global with one behavior
+        (cp/register-command! :test/precedence-test
+                              (fn [_] {:command/result {:source :global}})
+                              {})
+        ;; Use context registry with different behavior
+        (let [command (make-command :test/precedence-test)
+              context-handler (fn [_] {:command/result {:source :context}})
+              context {:command command
+                       :command-registry {:test/precedence-test {:handler-fn context-handler}}
+                       :event-store *event-store*}
+              result (cp/process-command context)]
+          (is (= {:source :context} (:command/result result))))
+        (finally
+          (reset! cp/command-registry* initial-registry))))))
+
+(deftest test-global-command-registry-returns-current-registry
+  (testing "global-command-registry returns the current state of the registry"
+    (let [initial-registry @cp/command-registry*]
+      (reset! cp/command-registry* {})
+      (try
+        (is (= {} (cp/global-command-registry)))
+        (cp/register-command! :test/some-command (fn [_] {}) {})
+        (is (contains? (cp/global-command-registry) :test/some-command))
+        (finally
+          (reset! cp/command-registry* initial-registry))))))
