@@ -18,16 +18,37 @@
   @query-registry*)
 
 (defmacro defquery
-  "Defines a query handler and registers it in the global registry.
+  "Defines a query handler for the read-side of CQRS.
 
-   Usage:
+   Queries read from projections/read-models and return data. They never
+   generate events or cause state changes.
+
+   Syntax:
+     (defquery :ns name opts? docstring? [context] body...)
+
+   Creates:
+   - Function `ns-name` in current namespace
+   - Registry entry `:ns/name`
+
+   The context map contains :query (with :query/name, :query/id, :query/timestamp,
+   plus any query parameters), :event-store, and application-specific keys.
+
+   Return {:query/result ...} on success, or a Cognitect anomaly on failure.
+
+   Example:
      (defquery :example counters
-       {:auth :admin-required}  ; optional data map
-       \"Optional docstring\"
+       \"Returns all counters.\"
        [context]
-       ...body...)
+       {:query/result (read-models/counters context)})
 
-   Defines a function named `example-counters` and registers it as :example/counters."
+     (defquery :example counter-by-id
+       [context]
+       (let [id (get-in context [:query :counter-id])]
+         (if-let [counter (find-counter context id)]
+           {:query/result counter}
+           {::anom/category ::anom/not-found})))
+
+   See also: defcommand, defschemas, process-query"
   {:arglists '([ns-kw name opts? docstring? [context] & body])}
   [ns-kw fn-name & args]
   (let [[opts args] (if (map? (first args))
