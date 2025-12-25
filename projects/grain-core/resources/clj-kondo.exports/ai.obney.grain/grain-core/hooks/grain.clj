@@ -3,15 +3,23 @@
 
 (defn- def-handler-macro
   "Common hook logic for defcommand/defquery macros.
-   Transforms (defcommand :ns/name opts? docstring? [args] body)
-   into (defn ^:clj-kondo/ignore name docstring? [args] body) for linting purposes."
+   Transforms (defcommand :ns name opts? docstring? [args] body)
+   into (defn ns-name docstring? [args] body) for linting purposes."
   [{:keys [node]} defined-by]
   (let [args (rest (:children node))
-        ;; First arg is the keyword name
-        kw-node (first args)
-        kw-name (when (api/keyword-node? kw-node)
-                  (-> kw-node api/sexpr name symbol))
+        ;; First arg is the namespace keyword
+        ns-kw-node (first args)
+        ns-name (when (api/keyword-node? ns-kw-node)
+                  (name (api/sexpr ns-kw-node)))
         args (next args)
+        ;; Second arg is the function name symbol
+        fn-name-node (first args)
+        fn-name (when (api/token-node? fn-name-node)
+                  (name (api/sexpr fn-name-node)))
+        args (next args)
+        ;; Build prefixed var name
+        var-name (when (and ns-name fn-name)
+                   (symbol (str ns-name "-" fn-name)))
         ;; Optional opts map
         ?opts (when (and (first args) (api/map-node? (first args)))
                 (first args))
@@ -23,11 +31,11 @@
         ;; Args vector and body
         args-node (first args)
         body (next args)]
-    (when kw-name
+    (when var-name
       (let [new-node (api/list-node
                        (list*
                          (api/token-node 'defn)
-                         (api/token-node kw-name)
+                         (api/token-node var-name)
                          (concat
                            (when ?docstring [?docstring])
                            [args-node]
@@ -53,3 +61,4 @@
                  name-node
                  schema-map-node))
        :defined-by 'ai.obney.grain.schema-util.interface/defschemas})))
+

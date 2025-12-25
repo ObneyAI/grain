@@ -21,27 +21,30 @@
   "Defines a command handler and registers it in the global registry.
 
    Usage:
-     (defcommand :example/create-counter
+     (defcommand :example create-counter
        {:auth :admin-required}  ; optional data map
        \"Optional docstring\"
        [context]
-       ...body...)"
-  {:arglists '([command-name opts? docstring? [context] & body])}
-  [command-name & args]
+       ...body...)
+
+   Defines a function named `example-create-counter` and registers it as :example/create-counter."
+  {:arglists '([ns-kw name opts? docstring? [context] & body])}
+  [ns-kw fn-name & args]
   (let [[opts args] (if (map? (first args))
                       [(first args) (rest args)]
                       [{} args])
         [docstring args body] (if (string? (first args))
                                 [(first args) (second args) (drop 2 args)]
                                 [nil (first args) (rest args)])
-        fn-name (symbol (name command-name))]
+        command-name (keyword (name ns-kw) (name fn-name))
+        var-name (symbol (str (name ns-kw) "-" (name fn-name)))]
     `(do
-       (defn ~fn-name
+       (defn ~var-name
          ~@(when docstring [docstring])
          ~args
          ~@body)
-       (register-command! ~command-name (var ~fn-name) ~opts)
-       (var ~fn-name))))
+       (register-command! ~command-name (var ~var-name) ~opts)
+       (var ~var-name))))
 
 (defn process-command
   "Processes a command using the registry in context, falling back to global registry."

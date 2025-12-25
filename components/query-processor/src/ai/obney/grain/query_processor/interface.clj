@@ -21,27 +21,30 @@
   "Defines a query handler and registers it in the global registry.
 
    Usage:
-     (defquery :example/counters
+     (defquery :example counters
        {:auth :admin-required}  ; optional data map
        \"Optional docstring\"
        [context]
-       ...body...)"
-  {:arglists '([query-name opts? docstring? [context] & body])}
-  [query-name & args]
+       ...body...)
+
+   Defines a function named `example-counters` and registers it as :example/counters."
+  {:arglists '([ns-kw name opts? docstring? [context] & body])}
+  [ns-kw fn-name & args]
   (let [[opts args] (if (map? (first args))
                       [(first args) (rest args)]
                       [{} args])
         [docstring args body] (if (string? (first args))
                                 [(first args) (second args) (drop 2 args)]
                                 [nil (first args) (rest args)])
-        fn-name (symbol (name query-name))]
+        query-name (keyword (name ns-kw) (name fn-name))
+        var-name (symbol (str (name ns-kw) "-" (name fn-name)))]
     `(do
-       (defn ~fn-name
+       (defn ~var-name
          ~@(when docstring [docstring])
          ~args
          ~@body)
-       (register-query! ~query-name (var ~fn-name) ~opts)
-       (var ~fn-name))))
+       (register-query! ~query-name (var ~var-name) ~opts)
+       (var ~var-name))))
 
 (defn process-query
   "Processes a query using the registry in context, falling back to global registry."
