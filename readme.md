@@ -34,7 +34,7 @@ Yes, you can use it. Grain is MIT licensed software. We use Grain in production 
 
 Using Grain feels like snapping Lego bricks together, each component is independent but plays nicely with the rest. Start with an in-memory event store for quick iteration, then swap in Postgres with a single line change when you’re ready.
 
-One promise we can make is that we will never break your software, we enhance existing components routinely, but we avoid making breaking changes that violate existing contracts between components. If a change we want to make is revolutionary enough, we will introduce a new version of a component, that way consumers of existing versions aren't negatively impacted.
+We enhance existing components routinely, but we try to avoid making breaking changes that violate existing contracts between components. If a change we want to make is revolutionary enough, we will introduce a new version of a component, that way consumers of existing versions aren't negatively impacted. We are actively evolving the system though, so you may experience breaking changes!
 
 Our choice to deliver Grain as a simple system of cooperating components using [Polylith](https://polylith.gitbook.io/polylith) allows us this flexibility in addition to the ability to mix and match components in new and interesting ways to publish standalone tools as independent Polylith Projects from a single repository.
 
@@ -80,7 +80,7 @@ This is the core set of utilities that can power what you see in the example app
 ```clojure
 obneyai/grain-core
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "2d065bd2bc68922254f8cc0a085bdae46a60f5f7"
+ :sha "5715dee80c2cc8ce49e24aed1e4b9e399100bfca"
  :deps/root "projects/grain-core"}
 ```
 
@@ -91,7 +91,7 @@ This is a Postgres backend for the Event Store component, pull it in and require
 ```clojure
 obneyai/grain-event-store-postgres-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "2d065bd2bc68922254f8cc0a085bdae46a60f5f7"
+ :sha "5715dee80c2cc8ce49e24aed1e4b9e399100bfca"
  :deps/root "projects/grain-event-store-postgres-v2"}
 ```
 
@@ -104,7 +104,7 @@ We think the dependency on Python is pretty neat! Python is really in the spotli
 ```clojure
 obneyai/grain-dspy-extensions
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "2d065bd2bc68922254f8cc0a085bdae46a60f5f7"
+ :sha "5715dee80c2cc8ce49e24aed1e4b9e399100bfca"
  :deps/root "projects/grain-dspy-extensions"}
 ```
 
@@ -115,7 +115,7 @@ Grain uses [mulog](https://github.com/BrunoBonacci/mulog) for logging and tracin
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "2d065bd2bc68922254f8cc0a085bdae46a60f5f7"
+ :sha "5715dee80c2cc8ce49e24aed1e4b9e399100bfca"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
