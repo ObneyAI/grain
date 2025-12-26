@@ -1,131 +1,195 @@
 # Grain
 
-## What is this?
+An Event-Sourced framework for building AI-native systems in Clojure.
 
-Grain is an “AI-native” framework for building Event-Sourced systems where Agentic Workflows are part of the domain model and not an afterthought.
-If you’ve ever struggled to bolt an agent framework onto an existing system, Grain gives you a coherent architecture where agents and events share the same backbone.
+## What is Grain?
 
+Grain is a framework for building Event-Sourced systems using CQRS (Command Query Responsibility Segregation). It provides composable components that snap together like Lego bricks—start with an in-memory event store for quick iteration, then swap in Postgres with a single line change when you're ready.
 
-## Why did you make it?
+Grain is also AI-native: agents and events share the same backbone, giving you a coherent architecture where agentic workflows are part of the domain model rather than bolted on as an afterthought.
 
-At ObneyAI, we use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and-eventsourcing) to design [Simple](https://www.youtube.com/watch?v=SxdOUGdseq4) information systems and applications for our customers. We believe in investing in our tooling, because we always want to deliver the next project faster, but with a high degree of confidence in the platforms we deliver. Being in the emerging AI space, it's our job to wade through all the uncertainty and attempt to skate to where we think the puck is heading. Grain combines proven ideas from conventional software architecture with modern agent workflows, giving us (and you) a single, composable toolkit for building the next generation of AI-driven applications.
+## Architecture
 
-## Does it have an Agent Framework?
+```
+                            ┌────────────────────────────────────────────────────────┐
+                            │                      Write Side                        │
+                            │                                                        │
+  POST /command ───────────▶│  Command Processor ──▶ Validate ──▶ Handler ──▶ Events │
+                            │         ▲                  ▲                      │    │
+                            └─────────│──────────────────│──────────────────────┼────┘
+                                      │                  │                      │
+                                      │                  │ read                 │ append
+                                      │        ┌─────────┴─────────┐            │
+                                      │        │                   │            ▼
+            Todo Processors ──────────┘        │    Read Model     │◀───┬───────────┐
+                   ▲                           │                   │    │   Event   │
+                   │                           └───────────────────┘    │   Store   │
+                   │                                     ▲         proj └───────────┘
+                   │        ┌────────────────────────────│─────────────┐      │
+                   │        │              Read Side     │             │      │ publish
+                   │        │                            │             │      ▼
+                   │        │  Query Processor ──────────┘             │ ┌─────────┐
+  POST /query ─────────────▶│                                          │ │ Pub/Sub │
+                   │        └──────────────────────────────────────────┘ └─────────┘
+                   │                                                          │
+                   └──────────────────────────────────────────────────────────┘
+                                                (async)
+```
 
-We have taken a look at the landscape of Agent Frameworks and determined two things:
+**Commands** are the only path to state change—they validate business rules and emit events. **Events** are immutable facts stored in the event store. **Queries** read from projections (read models) built from events. **Todo Processors** react to events asynchronously, enabling event-driven workflows.
 
-1. There are better ways to go about it than what most existing Agent Frameworks are doing.
-2. Agent Frameworks are not rocket science, they are largely just orchestration engines, so it's ok to make your own if you have a good reason.
+## Core Concepts
 
-Grain’s Agent Framework integrates directly with your Event-Sourced domain. Grain Agents are built with:
+### Commands (Write Side)
 
-- [Fully declarative Behavior Trees](https://arxiv.org/abs/2404.07439)
-- High leverage integration with [DSPY](https://dspy.ai/)
-- Short-term program memory
-- Long-term, event-sourced memory e.g. projections over your domain events.
+Commands change state by generating events:
 
-This means your agents can reason over the same source of truth as the rest of your system.
+```clojure
+(defcommand :example create-counter
+  "Creates a new counter."
+  [context]
+  (let [id (random-uuid)
+        name (get-in context [:command :name])]
+    {:command-result/events
+     [(->event {:type :example/counter-created
+                :body {:counter-id id :name name}})]
+     :command/result {:counter-id id}}))
+```
 
-A few demos are available [here](https://github.com/ObneyAI/macroexpand-2-demo)
+### Events
 
-## Can I use it?
+Events are immutable facts about what happened:
 
-Yes, you can use it. Grain is MIT licensed software. We use Grain in production for our clients, but that doesn't mean it's perfect or ready in every way. Large portions of Grain are relatively stable at this point, such as the core CQRS / Event Sourcing components, but other aspects may change rapidly, such as the components that make up the Agent Framework.
+```clojure
+{:event/type :example/counter-created
+ :event/id #uuid "..."           ; UUID v7
+ :event/timestamp #inst "..."
+ :event/body {:counter-id #uuid "..." :name "My Counter"}
+ :event/tags #{[:counter #uuid "..."]}}  ; for efficient querying
+```
 
-Using Grain feels like snapping Lego bricks together, each component is independent but plays nicely with the rest. Start with an in-memory event store for quick iteration, then swap in Postgres with a single line change when you’re ready.
+### Queries (Read Side)
 
-We enhance existing components routinely, but we try to avoid making breaking changes that violate existing contracts between components. If a change we want to make is revolutionary enough, we will introduce a new version of a component, that way consumers of existing versions aren't negatively impacted. We are actively evolving the system though, so you may experience breaking changes!
+Queries read from projections without causing state changes:
 
-Our choice to deliver Grain as a simple system of cooperating components using [Polylith](https://polylith.gitbook.io/polylith) allows us this flexibility in addition to the ability to mix and match components in new and interesting ways to publish standalone tools as independent Polylith Projects from a single repository.
+```clojure
+(defquery :example counters
+  "Returns all counters."
+  [context]
+  {:query/result (read-models/counters context)})
+```
 
-## How do I use it?
+### Read Models / Projections
 
-It may be a while before we have extensive documentation.
+Read models are built by reducing over events:
 
-There are 2 main ways you can use Grain:
+```clojure
+(defn apply-events [events]
+  (reduce
+    (fn [state {:event/keys [type body]}]
+      (case type
+        :example/counter-created
+        (assoc state (:counter-id body) {:id (:counter-id body)
+                                          :name (:name body)
+                                          :value 0})
+        :example/counter-incremented
+        (update-in state [(:counter-id body) :value] inc)
+        state))
+    {}
+    events))
+```
 
-1. You can use Grain as a library if you don't foresee yourself needing to adjust any aspects of the components and framework to what you intend to build.
+## Getting Started
 
-2. You could clone this repository and build your application directly within the framework, all of the pieces and parts would then be available for you to tweak and refine. The downside, of course, is that you would make it harder to take advantage of updates to Grain, but sometimes this level of control is a necessity.
-
-We've tried to give a decent demonstration of how to build an application with Grain in the base in `bases/example-base` and the component in `components/example-service`. Additionally, see `development/src/example_app_demo.clj` for a demo of how to start and interact with the example system.
-
-### Authentication / Authorization
-
-At this time we leave these two aspects to the user, but this shouldn't be much of an issue, as the user has the option of composing their own routes together when using the webserver component or even using their own preferred webserver.
-
-### Can I just use the Agent Framework?
-
-Sure you can. Grain really shines when you drink the Event Sourcing koolaid and model your entire domain as an Event Sourced system, but it's totally possible to just use Grain's Event Sourced, Behavior-Tree Agent Framework on its own and integrate it into your more conventional application systems.
-
-## Available Packages
-
-Polylith projects are how we publish various aspects of Grain such that you can include them in your deps.edn file and pull them in as dependencies. 
-
-Here is what we currently offer:
-
-| Package | Summary |
-| --- | --- |
-| **grain-core** | CQRS/Event Sourcing utilities with in-memory backend + Behavior Tree engine. |
-| **grain-event-store-postgres-v2** | Protocol-driven Postgres backend — swap in/out with a config change. |
-| **grain-dspy-extensions** | DSPy integration + re-usable BT node for LLM workflows. |
-| **grain-mulog-aws-cloudwatch-emf-publisher** | Mulog publisher for AWS CloudWatch metrics & dashboards. |
-
-
-
-### grain-core
-
-This is the core set of utilities that can power what you see in the example application in this repo. It's everything you need to build an application that follows CQRS / Event Sourcing principles. It comes with an in-memory backend for the Event Store component for getting started quickly. The Event Sourced Behavior Tree Engine is included in this package.
+Add to your `deps.edn`:
 
 ```clojure
 obneyai/grain-core
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "5715dee80c2cc8ce49e24aed1e4b9e399100bfca"
+ :sha "7eb0038c2c79809c1cba5a5f06bb9cf1c38f40c3"
+ :deps/root "projects/grain-core"}
+```
+
+See `bases/example-base` and `components/example-service` for a complete example application. Run `development/src/example_app_demo.clj` to start and interact with the example system.
+
+## Available Packages
+
+| Package | Summary |
+| --- | --- |
+| **grain-core** | CQRS/Event Sourcing + in-memory event store + Behavior Tree engine |
+| **grain-event-store-postgres-v2** | Protocol-driven Postgres backend—swap with a config change |
+| **grain-dspy-extensions** | DSPy integration for LLM workflows |
+| **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
+
+<details>
+<summary>Package Details</summary>
+
+### grain-core
+
+Everything you need for CQRS/Event Sourcing with an in-memory event store:
+
+```clojure
+obneyai/grain-core
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "7eb0038c2c79809c1cba5a5f06bb9cf1c38f40c3"
  :deps/root "projects/grain-core"}
 ```
 
 ### grain-event-store-postgres-v2
 
-This is a Postgres backend for the Event Store component, pull it in and require the `ai.obney.grain.event-store-postgres-v2.interface` namespace to load its multimethod implementation. This will allow you to simply switch between `:in-memory` and `:postgres` with a one line change with no other code changes required. Our event-store-v2 component is protocol-driven and presents a consistent API to callers, backends are expected to implement the spec. You can even implement your own backend!
+Postgres backend—require `ai.obney.grain.event-store-postgres-v2.interface` and switch from `:in-memory` to `:postgres`:
 
 ```clojure
 obneyai/grain-event-store-postgres-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "5715dee80c2cc8ce49e24aed1e4b9e399100bfca"
+ :sha "7eb0038c2c79809c1cba5a5f06bb9cf1c38f40c3"
  :deps/root "projects/grain-event-store-postgres-v2"}
 ```
 
 ### grain-dspy-extensions
 
-This is where the magic of Grain's Agent Framework happens. [DSPY](https://dspy.ai/) is a best in class Python library from Stanford for working with LLMs in sophisticated ways. This package includes our `clj-dspy` component and a re-useable `dspy` Behavior Tree action node for orchestrating reliable Agentic Workflows. You'll just have to see some examples to experience the magic, it's difficult to explain how cool it is. However, you do take a dependency on Python when you use these tools, so you will want to set up a `python.edn` file in the root of your project directory with the following content: `{:python-executable ".venv/bin/python"}`. Then you will need to create a python virtual environment called `.venv` in the root of your directory using a tool of your choice. We like [uv](https://docs.astral.sh/uv/). You'll need to install at least Python `3.12`.
-
-We think the dependency on Python is pretty neat! Python is really in the spotlight these days thanks to a lot of applied AI tooling being heavily Python based. It's fantastic that a Clojure application can combine the best of both the JVM and Python in order to create an innovative product that is more than the sum of its parts.
+[DSPy](https://dspy.ai/) integration for sophisticated LLM workflows. Requires Python 3.12+ (we recommend [uv](https://docs.astral.sh/uv/) for environment management):
 
 ```clojure
 obneyai/grain-dspy-extensions
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "5715dee80c2cc8ce49e24aed1e4b9e399100bfca"
+ :sha "7eb0038c2c79809c1cba5a5f06bb9cf1c38f40c3"
  :deps/root "projects/grain-dspy-extensions"}
 ```
 
 ### grain-mulog-aws-cloudwatch-emf-publisher
 
-Grain uses [mulog](https://github.com/BrunoBonacci/mulog) for logging and tracing. This is good for you, because it means if you have a preferred logging solution, all you have to do is implement a custom mulog publisher, intercept Grain's logs, and translate them into your own logging solution. This package is a custom publisher that we use to enable automatic creation of CloudWatch metrics in AWS for Dashboards, Alerting, and other observability use-cases.
+[mulog](https://github.com/BrunoBonacci/mulog) publisher for CloudWatch metrics:
 
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "5715dee80c2cc8ce49e24aed1e4b9e399100bfca"
+ :sha "7eb0038c2c79809c1cba5a5f06bb9cf1c38f40c3"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
-## What's next?
+</details>
 
-- Comprehensive Documentation
-- More examples
+## Agent Framework
 
-## Contact Us
+Grain includes a behavior tree engine with DSPy integration for building agentic workflows. Agents can reason over the same event-sourced domain as the rest of your system—with short-term program memory and long-term event-sourced memory.
 
-If you have questions or want help getting started, then feel free to come find us in the Clojurian Slack in the [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) channel.
+See demos at [macroexpand-2-demo](https://github.com/ObneyAI/macroexpand-2-demo).
 
-If you have feedback or find bugs or problems, feel free to create a github issue.
+You can use the agent framework standalone or skip it entirely if you just want Event Sourcing.
+
+## Why Grain?
+
+We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and-eventsourcing) to design [Simple](https://www.youtube.com/watch?v=SxdOUGdseq4) systems. Grain combines proven ideas from conventional software architecture with modern agent workflows, giving us a single, composable toolkit for building AI-driven applications.
+
+[Polylith](https://polylith.gitbook.io/polylith) enables us to evolve components independently and publish standalone tools from a single repository.
+
+## Status
+
+Grain is MIT licensed. We use it in production, but it's actively evolving. The core CQRS/Event Sourcing components are stable; agent-related components may change more rapidly.
+
+## More Information
+
+- **Examples**: `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
+- **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians
+- **Issues**: [GitHub Issues](https://github.com/ObneyAI/grain/issues)
