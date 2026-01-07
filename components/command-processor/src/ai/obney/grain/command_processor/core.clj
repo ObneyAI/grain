@@ -24,13 +24,15 @@
     (when (anomaly? result)
       (u/log ::error-executing-command ::anomaly result))
     (if-let [events (:command-result/events result)]
-      (let [event-store-result (event-store/append event-store {:events events})]
-        (if-not (anomaly? event-store-result)
-          result
-          (do
-            (u/log ::error-storing-events)
-            {::anom/category ::anom/fault
-             ::anom/message "Error storing events."})))
+      (if (:command-processor/skip-event-storage context)
+        result
+        (let [event-store-result (event-store/append event-store {:events events})]
+          (if-not (anomaly? event-store-result)
+            result
+            (do
+              (u/log ::error-storing-events)
+              {::anom/category ::anom/fault
+               ::anom/message "Error storing events."}))))
       result)))
 
 (defn process-command [{:keys [command command-registry] :as context}]

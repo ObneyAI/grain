@@ -22,7 +22,9 @@
    :test/filtered-events [:map]
    :test/anomaly-handler [:map]
    :test/context-anomaly [:map]
-   :test/throwing-handler [:map]})
+   :test/throwing-handler [:map]
+   :test/skip-storage [:map]
+   :test/skip-storage-child [:map]})
 
 ;; Register test event schemas
 (defschemas test-events
@@ -461,3 +463,73 @@
         (is (contains? (cp/global-command-registry) :test/some-command))
         (finally
           (reset! cp/command-registry* initial-registry))))))
+
+;; 8. Skip Event Storage Tests
+
+(deftest test-skip-event-storage
+  (testing "Events are returned but not stored when :command-processor/skip-event-storage is true"
+    (let [handler (fn [_context]
+                    {:command-result/events
+                     [(es/->event {:type :test/event-created
+                                   :tags #{[:test (uuid/v4)]}
+                                   :body {:event-id (uuid/v4)
+                                          :description "Should not be stored"}})]
+                     :command/result {:status "ok"}})
+          command (make-command :test/skip-storage)
+          registry (make-registry {:test/skip-storage handler})
+          context (assoc (make-context command registry)
+                         :command-processor/skip-event-storage true)
+          result (cp/process-command context)]
+      ;; Result should contain events
+      (is (= 1 (count (:command-result/events result))))
+      (is (= {:status "ok"} (:command/result result)))
+
+      ;; But no events should be stored (filter out :grain/tx events)
+      (let [events (->> (es/read *event-store* {})
+                        (into [])
+                        (filter #(not= :grain/tx (:event/type %))))]
+        (is (empty? events))))))
+
+(deftest test-command-composition-with-skip-storage
+  (testing "Parent handler can aggregate events from child commands"
+    (let [child-handler (fn [_context]
+                          {:command-result/events
+                           [(es/->event {:type :test/event-created
+                                         :tags #{[:test (uuid/v4)]}
+                                         :body {:event-id (uuid/v4)
+                                                :description "Child event"}})]})
+          parent-handler (fn [context]
+                           (let [child-ctx (assoc context :command-processor/skip-event-storage true)
+                                 child-result (cp/process-command
+                                                (assoc child-ctx
+                                                       :command (make-command :test/skip-storage-child)))]
+                             {:command-result/events (:command-result/events child-result)
+                              :command/result {:aggregated true}}))
+          command (make-command :test/skip-storage)
+          registry (make-registry {:test/skip-storage parent-handler
+                                   :test/skip-storage-child child-handler})
+          context (make-context command registry)
+          result (cp/process-command context)]
+      ;; Parent should store the aggregated events
+      (is (= 1 (count (:command-result/events result))))
+      (is (= {:aggregated true} (:command/result result)))
+
+      ;; Events should be stored (only once, by parent)
+      (let [events (->> (es/read *event-store* {})
+                        (into [])
+                        (filter #(not= :grain/tx (:event/type %))))]
+        (is (= 1 (count events)))))))
+
+(deftest test-default-behavior-stores-events
+  (testing "Events are stored when :command-processor/skip-event-storage is not set"
+    (let [command (make-command :test/create-with-events)
+          registry (make-registry {:test/create-with-events handler-with-events})
+          context (make-context command registry)
+          result (cp/process-command context)]
+      (is (seq (:command-result/events result)))
+
+      ;; Events should be stored
+      (let [events (->> (es/read *event-store* {})
+                        (into [])
+                        (filter #(not= :grain/tx (:event/type %))))]
+        (is (= 1 (count events)))))))
