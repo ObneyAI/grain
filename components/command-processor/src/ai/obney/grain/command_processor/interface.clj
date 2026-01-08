@@ -39,6 +39,7 @@
 
    Example:
      (defcommand :example create-counter
+       {:authorized? (constantly true)}
        \"Creates a new counter.\"
        [context]
        (let [id (random-uuid)
@@ -49,6 +50,7 @@
           :command/result {:counter-id id}}))
 
      (defcommand :example increment-counter
+       {:authorized? (constantly true)}
        [context]
        (let [id (get-in context [:command :counter-id])]
          (if (find-counter context id)

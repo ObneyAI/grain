@@ -46,6 +46,7 @@ Commands change state by generating events:
 
 ```clojure
 (defcommand :example create-counter
+  {:authorized? (constantly true)}
   "Creates a new counter."
   [context]
   (let [id (random-uuid)
@@ -74,6 +75,7 @@ Queries read from projections without causing state changes:
 
 ```clojure
 (defquery :example counters
+  {:authorized? (constantly true)}
   "Returns all counters."
   [context]
   {:query/result (read-models/counters context)})

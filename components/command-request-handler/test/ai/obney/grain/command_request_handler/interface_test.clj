@@ -24,7 +24,11 @@
    :test/conflict [:map]
    :test/server-error [:map]
    :test/echo-context [:map]
-   :test/throwing-handler [:map]})
+   :test/throwing-handler [:map]
+   :test/no-auth [:map [:name :string]]
+   :test/auth-false [:map]
+   :test/auth-true [:map]
+   :test/auth-context [:map]})
 
 ;; Register test event schemas
 (defschemas test-events
@@ -115,16 +119,43 @@
   [_context]
   (throw (ex-info "Database connection failed" {:error-type :database-error})))
 
+(defn auth-true-handler
+  [_context]
+  {:command/result {:status "authorized"}})
+
+(defn auth-context-handler
+  [context]
+  {:command/result {:has-command (contains? context :command)
+                    :has-event-store (contains? context :event-store)}})
+
 (def test-command-registry
-  {:test/create-resource {:handler-fn create-resource-handler}
-   :test/return-result {:handler-fn return-result-handler}
-   :test/with-events {:handler-fn handler-with-events}
-   :test/forbidden {:handler-fn forbidden-handler}
-   :test/not-found {:handler-fn not-found-handler}
-   :test/conflict {:handler-fn conflict-handler}
-   :test/server-error {:handler-fn server-error-handler}
-   :test/echo-context {:handler-fn echo-context-handler}
-   :test/throwing-handler {:handler-fn throwing-handler}})
+  {:test/create-resource {:handler-fn create-resource-handler
+                          :authorized? (constantly true)}
+   :test/return-result {:handler-fn return-result-handler
+                        :authorized? (constantly true)}
+   :test/with-events {:handler-fn handler-with-events
+                      :authorized? (constantly true)}
+   :test/forbidden {:handler-fn forbidden-handler
+                    :authorized? (constantly true)}
+   :test/not-found {:handler-fn not-found-handler
+                    :authorized? (constantly true)}
+   :test/conflict {:handler-fn conflict-handler
+                   :authorized? (constantly true)}
+   :test/server-error {:handler-fn server-error-handler
+                       :authorized? (constantly true)}
+   :test/echo-context {:handler-fn echo-context-handler
+                       :authorized? (constantly true)}
+   :test/throwing-handler {:handler-fn throwing-handler
+                           :authorized? (constantly true)}
+   ;; Authorization tests
+   :test/no-auth {:handler-fn create-resource-handler}
+   :test/auth-false {:handler-fn auth-true-handler
+                     :authorized? (constantly false)}
+   :test/auth-true {:handler-fn auth-true-handler
+                    :authorized? (constantly true)}
+   :test/auth-context {:handler-fn auth-context-handler
+                       :authorized? (fn [ctx] (and (contains? ctx :command)
+                                                    (contains? ctx :event-store)))}})
 
 (defn service-fixture [f]
   (binding [*event-store* (es/start {:conn {:type :in-memory}})]
@@ -410,3 +441,46 @@
       (is (string? (:message body)))
       (is (re-find #"Error executing command" (:message body)))
       (is (re-find #"Database connection failed" (:message body))))))
+
+;; Authorization Tests
+
+(deftest test-e2e-unauthorized-when-authorized-missing
+  (testing "Command without :authorized? returns 403"
+    (let [command {:command/name :test/no-auth :name "Test"}
+          response (response-for *service* :post "/command"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:command command}))
+          body (transit-read (:body response))]
+      (is (= 403 (:status response)))
+      (is (= "Unauthorized" (:message body))))))
+
+(deftest test-e2e-unauthorized-when-predicate-returns-false
+  (testing "Command with :authorized? returning false returns 403"
+    (let [command {:command/name :test/auth-false}
+          response (response-for *service* :post "/command"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:command command}))
+          body (transit-read (:body response))]
+      (is (= 403 (:status response)))
+      (is (= "Unauthorized" (:message body))))))
+
+(deftest test-e2e-authorized-when-predicate-returns-true
+  (testing "Command with :authorized? returning true proceeds"
+    (let [command {:command/name :test/auth-true}
+          response (response-for *service* :post "/command"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:command command}))
+          body (transit-read (:body response))]
+      (is (= 200 (:status response)))
+      (is (= "authorized" (:status body))))))
+
+(deftest test-e2e-authorized-predicate-receives-context
+  (testing "Authorization predicate receives full context"
+    (let [command {:command/name :test/auth-context}
+          response (response-for *service* :post "/command"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:command command}))
+          body (transit-read (:body response))]
+      (is (= 200 (:status response)))
+      (is (true? (:has-command body)))
+      (is (true? (:has-event-store body))))))

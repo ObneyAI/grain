@@ -23,7 +23,11 @@
    :test/conflict [:map]
    :test/server-error [:map]
    :test/echo-context [:map]
-   :test/throwing-handler [:map]})
+   :test/throwing-handler [:map]
+   :test/no-auth [:map]
+   :test/auth-false [:map]
+   :test/auth-true [:map]
+   :test/auth-context [:map]})
 
 ;; Test Fixtures
 
@@ -94,16 +98,43 @@
   [_context]
   (throw (ex-info "Database query failed" {:error-type :database-error})))
 
+(defn auth-true-handler
+  [_context]
+  {:query/result {:status "authorized"}})
+
+(defn auth-context-handler
+  [context]
+  {:query/result {:has-query (contains? context :query)
+                  :has-query-registry (contains? context :query-registry)}})
+
 (def test-query-registry
-  {:test/simple-query {:handler-fn simple-query-handler}
-   :test/query-with-param {:handler-fn query-with-param-handler}
-   :test/return-result {:handler-fn return-result-handler}
-   :test/forbidden {:handler-fn forbidden-handler}
-   :test/not-found {:handler-fn not-found-handler}
-   :test/conflict {:handler-fn conflict-handler}
-   :test/server-error {:handler-fn server-error-handler}
-   :test/echo-context {:handler-fn echo-context-handler}
-   :test/throwing-handler {:handler-fn throwing-handler}})
+  {:test/simple-query {:handler-fn simple-query-handler
+                       :authorized? (constantly true)}
+   :test/query-with-param {:handler-fn query-with-param-handler
+                           :authorized? (constantly true)}
+   :test/return-result {:handler-fn return-result-handler
+                        :authorized? (constantly true)}
+   :test/forbidden {:handler-fn forbidden-handler
+                    :authorized? (constantly true)}
+   :test/not-found {:handler-fn not-found-handler
+                    :authorized? (constantly true)}
+   :test/conflict {:handler-fn conflict-handler
+                   :authorized? (constantly true)}
+   :test/server-error {:handler-fn server-error-handler
+                       :authorized? (constantly true)}
+   :test/echo-context {:handler-fn echo-context-handler
+                       :authorized? (constantly true)}
+   :test/throwing-handler {:handler-fn throwing-handler
+                           :authorized? (constantly true)}
+   ;; Authorization tests
+   :test/no-auth {:handler-fn simple-query-handler}
+   :test/auth-false {:handler-fn auth-true-handler
+                     :authorized? (constantly false)}
+   :test/auth-true {:handler-fn auth-true-handler
+                    :authorized? (constantly true)}
+   :test/auth-context {:handler-fn auth-context-handler
+                       :authorized? (fn [ctx] (and (contains? ctx :query)
+                                                    (contains? ctx :query-registry)))}})
 
 (defn service-fixture [f]
   (let [config {:query-registry test-query-registry}
@@ -378,3 +409,46 @@
       (is (string? (:message body)))
       (is (re-find #"Error executing query handler" (:message body)))
       (is (re-find #"Database query failed" (:message body))))))
+
+;; Authorization Tests
+
+(deftest test-e2e-unauthorized-when-authorized-missing
+  (testing "Query without :authorized? returns 403"
+    (let [query {:query/name :test/no-auth}
+          response (response-for *service* :post "/query"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:query query}))
+          body (transit-read (:body response))]
+      (is (= 403 (:status response)))
+      (is (= "Unauthorized" (:message body))))))
+
+(deftest test-e2e-unauthorized-when-predicate-returns-false
+  (testing "Query with :authorized? returning false returns 403"
+    (let [query {:query/name :test/auth-false}
+          response (response-for *service* :post "/query"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:query query}))
+          body (transit-read (:body response))]
+      (is (= 403 (:status response)))
+      (is (= "Unauthorized" (:message body))))))
+
+(deftest test-e2e-authorized-when-predicate-returns-true
+  (testing "Query with :authorized? returning true proceeds"
+    (let [query {:query/name :test/auth-true}
+          response (response-for *service* :post "/query"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:query query}))
+          body (transit-read (:body response))]
+      (is (= 200 (:status response)))
+      (is (= "authorized" (:status body))))))
+
+(deftest test-e2e-authorized-predicate-receives-context
+  (testing "Authorization predicate receives full context"
+    (let [query {:query/name :test/auth-context}
+          response (response-for *service* :post "/query"
+                                :headers {"Content-Type" "application/transit+json"}
+                                :body (transit-write {:query query}))
+          body (transit-read (:body response))]
+      (is (= 200 (:status response)))
+      (is (true? (:has-query body)))
+      (is (true? (:has-query-registry body))))))

@@ -37,11 +37,13 @@
 
    Example:
      (defquery :example counters
+       {:authorized? (constantly true)}
        \"Returns all counters.\"
        [context]
        {:query/result (read-models/counters context)})
 
      (defquery :example counter-by-id
+       {:authorized? (constantly true)}
        [context]
        (let [id (get-in context [:query :counter-id])]
          (if-let [counter (find-counter context id)]

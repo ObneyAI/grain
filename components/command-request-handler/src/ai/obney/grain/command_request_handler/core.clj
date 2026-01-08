@@ -77,15 +77,25 @@
                     {::anom/category ::anom/incorrect
                      ::anom/message "Invalid Command"
                      :error/explain error})))
-           (let [result (async/<! (async/thread (cp/process-command (assoc (merge grain-context
-                                                                                  (:grain/additional-context http-context))
-                                                                           :command command))))]
-             (when (anomaly? result)
-               (u/log ::anomaly ::anom/anomaly result))
-             (assoc http-context
-                    :response (-> result process-command-result prep-response)
-                    :grain/command command
-                    :grain/command-result result))))
+           (let [context (assoc (merge grain-context
+                                       (:grain/additional-context http-context))
+                                :command command)
+                 command-registry (or (:command-registry context)
+                                      @cp/command-registry*)
+                 authorized? (get-in command-registry [(:command/name command) :authorized?])]
+             (if (and authorized? (true? (authorized? context)))
+               (let [result (async/<! (async/thread (cp/process-command context)))]
+                 (when (anomaly? result)
+                   (u/log ::anomaly ::anom/anomaly result))
+                 (assoc http-context
+                        :response (-> result process-command-result prep-response)
+                        :grain/command command
+                        :grain/command-result result))
+               (assoc http-context :response
+                      (prep-response
+                       (process-command-result
+                        {::anom/category ::anom/forbidden
+                         ::anom/message "Unauthorized"})))))))
        (catch Exception e (u/log ::error :error e))))))
 
 (defn interceptor
