@@ -1,4 +1,5 @@
-{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+{:paths ["resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         gde/anomalies {:local/root "../../components/anomalies"}
         gde/time {:local/root "../../components/time"}
         gde/clj-dspy {:local/root "../../components/clj-dspy"}

@@ -288,3 +288,86 @@
       (is (= "Resource already exists" (::anom/message result)))
       (is (= 123 (:resource-id result)))
       (is (= "Additional context" (:extra-info result))))))
+
+;; 6. Global Registry and defquery Macro Tests
+
+(defschemas global-registry-test-queries
+  {:test/global-registry-query [:map]
+   :test/global-fallback [:map]
+   :test/precedence-test [:map]
+   :test/with-opts [:map]})
+
+(deftest test-register-query-adds-to-global-registry
+  (testing "register-query! adds handler to global registry"
+    (let [initial-registry @qp/query-registry*]
+      (reset! qp/query-registry* {})
+      (try
+        (qp/register-query! :test/global-registry-query
+                            (fn [_] {:query/result {:success true}})
+                            {})
+        (is (contains? @qp/query-registry* :test/global-registry-query))
+        (is (fn? (get-in @qp/query-registry* [:test/global-registry-query :handler-fn])))
+        (finally
+          (reset! qp/query-registry* initial-registry))))))
+
+(deftest test-register-query-merges-opts
+  (testing "register-query! merges opts into registry entry"
+    (let [initial-registry @qp/query-registry*]
+      (reset! qp/query-registry* {})
+      (try
+        (qp/register-query! :test/with-opts
+                            (fn [_] {:query/result {:success true}})
+                            {:auth :admin-required :cache-ttl 60})
+        (let [entry (get @qp/query-registry* :test/with-opts)]
+          (is (fn? (:handler-fn entry)))
+          (is (= :admin-required (:auth entry)))
+          (is (= 60 (:cache-ttl entry))))
+        (finally
+          (reset! qp/query-registry* initial-registry))))))
+
+(deftest test-process-query-uses-global-registry-as-fallback
+  (testing "process-query uses global registry when no context registry"
+    (let [initial-registry @qp/query-registry*]
+      (reset! qp/query-registry* {})
+      (try
+        (qp/register-query! :test/global-fallback
+                            (fn [_] {:query/result {:source :global}})
+                            {})
+        (let [query (make-query :test/global-fallback)
+              ;; Context WITHOUT query-registry
+              context {:query query}
+              result (qp/process-query context)]
+          (is (not (contains? result ::anom/category)))
+          (is (= {:source :global} (:query/result result))))
+        (finally
+          (reset! qp/query-registry* initial-registry))))))
+
+(deftest test-context-registry-takes-precedence-over-global
+  (testing "context query-registry takes precedence over global"
+    (let [initial-registry @qp/query-registry*]
+      (reset! qp/query-registry* {})
+      (try
+        ;; Register in global with one behavior
+        (qp/register-query! :test/precedence-test
+                            (fn [_] {:query/result {:source :global}})
+                            {})
+        ;; Use context registry with different behavior
+        (let [query (make-query :test/precedence-test)
+              context-handler (fn [_] {:query/result {:source :context}})
+              context {:query query
+                       :query-registry {:test/precedence-test {:handler-fn context-handler}}}
+              result (qp/process-query context)]
+          (is (= {:source :context} (:query/result result))))
+        (finally
+          (reset! qp/query-registry* initial-registry))))))
+
+(deftest test-global-query-registry-returns-current-registry
+  (testing "global-query-registry returns the current state of the registry"
+    (let [initial-registry @qp/query-registry*]
+      (reset! qp/query-registry* {})
+      (try
+        (is (= {} (qp/global-query-registry)))
+        (qp/register-query! :test/some-query (fn [_] {}) {})
+        (is (contains? (qp/global-query-registry) :test/some-query))
+        (finally
+          (reset! qp/query-registry* initial-registry))))))

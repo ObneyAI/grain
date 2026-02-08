@@ -77,12 +77,22 @@
                     {::anom/category ::anom/incorrect
                      ::anom/message "Invalid Query"
                      :error/explain error})))
-           (let [result (async/<! (async/thread (qp/process-query (assoc (merge config
-                                                                                  (:grain/additional-context context))
-                                                                           :query query))))]
-             (when (anomaly? result)
-               (u/log ::anomaly ::anom/anomaly result))
-             (assoc context :response (prep-response (process-query-result result))))))
+           (let [query-context (assoc (merge config
+                                             (:grain/additional-context context))
+                                      :query query)
+                 query-registry (or (:query-registry query-context)
+                                    @qp/query-registry*)
+                 authorized? (get-in query-registry [(:query/name query) :authorized?])]
+             (if (and authorized? (true? (authorized? query-context)))
+               (let [result (async/<! (async/thread (qp/process-query query-context)))]
+                 (when (anomaly? result)
+                   (u/log ::anomaly ::anom/anomaly result))
+                 (assoc context :response (prep-response (process-query-result result))))
+               (assoc context :response
+                      (prep-response
+                       (process-query-result
+                        {::anom/category ::anom/forbidden
+                         ::anom/message "Unauthorized"})))))))
        (catch Exception e (u/log ::error :error e))))))
 
 (defn interceptor
