@@ -34,7 +34,7 @@
    ::as-of-or-after
    [:fn {:error/message "Cannot supply both :as-of and :after"} as-of-or-after]
 
-   ::read-args
+   ::single-read-args
    [:and
     ::as-of-or-after
     [:map
@@ -42,6 +42,9 @@
      [:types {:optional true} ::types]
      [:as-of {:optional true}  ::id]
      [:after {:optional true} ::id]]]
+
+   ::read-args
+   [:or ::single-read-args [:vector {:min 1} ::single-read-args]]
 
    ::cas
    [:and

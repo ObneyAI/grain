@@ -119,8 +119,10 @@
       (throw e))))
 
 
-(defn read
-  [event-store {:keys [tags types after as-of]}]
+(defn- build-single-query-sql
+  "Build WHERE clause and params for a single read query.
+   Returns {:where-sql \"WHERE ...\" :params [...]}"
+  [{:keys [tags types after as-of]}]
   (let [tag-clauses (when tags
                       [["tags @> ?::text[]"
                         (into-array String
@@ -130,44 +132,76 @@
                                  ["type = ANY(?)"
                                   (into-array String (mapv #(str ":" (key-fn %)) types))])
                                (when after ["id > ?" after])
-                               (when as-of  ["id >= ?" as-of])])
+                               (when as-of  ["id <= ?" as-of])])
                       (remove nil?))
         where-sql (if (seq clauses)
-                    (str "WHERE " (clojure.string/join " AND " (map first clauses)))
-                    "")
-        params   (map second clauses)
-        sql      (str
-                  "SELECT id, time, type, tags, edn "
-                  "FROM grain.events "
-                  where-sql
-                  " ORDER BY id")
-        plan     (jdbc/plan
-                  (get-in event-store [:state ::connection-pool])
-                  (into [sql] params)
-                  {:fetch-size 500})]
-    (reify
-      ;; Wrap JDBC plan to pre-process rows into proper event format while retaining the plan's lazy nature.
-      clojure.lang.IReduceInit
-      (reduce [_ f init]
-        (reduce
-         (fn [acc row]
-           (f acc (transform-row row)))
-         init
-         plan))
-      ;; Make compatible with transducers while retaining lazy evaluation.
-      clojure.lang.IReduce
-      (reduce [_ f]
-        (let [reduced-result
-              (reduce
-               (fn [acc row]
-                 (if (= acc ::none)
-                   (transform-row row)
-                   (f acc (transform-row row))))
-               ::none
-               plan)]
-          (if (= reduced-result ::none)
-            (f)
-            reduced-result))))))
+                    (str "WHERE " (string/join " AND " (map first clauses)))
+                    "")]
+    {:where-sql where-sql
+     :params    (mapv second clauses)}))
+
+(defn- make-reducible
+  "Create a reducible that transforms rows via transform-row over a JDBC plan."
+  [plan]
+  (reify
+    clojure.lang.IReduceInit
+    (reduce [_ f init]
+      (reduce
+       (fn [acc row]
+         (f acc (transform-row row)))
+       init
+       plan))
+    clojure.lang.IReduce
+    (reduce [_ f]
+      (let [reduced-result
+            (reduce
+             (fn [acc row]
+               (if (= acc ::none)
+                 (transform-row row)
+                 (f acc (transform-row row))))
+             ::none
+             plan)]
+        (if (= reduced-result ::none)
+          (f)
+          reduced-result)))))
+
+(defn- read-single
+  [event-store query]
+  (let [{:keys [where-sql params]} (build-single-query-sql query)
+        sql  (str "SELECT id, time, type, tags, edn FROM grain.events "
+                  where-sql " ORDER BY id")
+        plan (jdbc/plan
+              (get-in event-store [:state ::connection-pool])
+              (into [sql] params)
+              {:fetch-size 500})]
+    (make-reducible plan)))
+
+(defn- read-batch
+  [event-store queries]
+  (let [sub-queries (map-indexed
+                     (fn [i query]
+                       (let [{:keys [where-sql params]} (build-single-query-sql query)]
+                         {:sql    (str "(SELECT id, time, type, tags, edn FROM grain.events "
+                                       where-sql ")")
+                          :params params}))
+                     queries)
+        union-sql   (str "SELECT DISTINCT ON (id) id, time, type, tags, edn FROM ("
+                         (string/join " UNION ALL " (map :sql sub-queries))
+                         ") AS combined ORDER BY id")
+        all-params  (into [] (mapcat :params) sub-queries)
+        plan        (jdbc/plan
+                     (get-in event-store [:state ::connection-pool])
+                     (into [union-sql] all-params)
+                     {:fetch-size 500})]
+    (make-reducible plan)))
+
+(defn read
+  [event-store args]
+  (if (vector? args)
+    (if (= 1 (count args))
+      (read-single event-store (first args))
+      (read-batch event-store args))
+    (read-single event-store args)))
 
 (defn insert-events
   [conn events]
