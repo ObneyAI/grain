@@ -18,7 +18,7 @@
   #?(:clj (dosync (ref-set state nil))
      :cljs (reset! state nil)))
 
-#?(:clj (defn read
+#?(:clj (defn- read-single
           [event-store {:keys [tags types as-of after] :as args}]
           (u/trace
            ::read
@@ -42,7 +42,7 @@
                clojure.lang.IReduceInit
                (reduce [_ f init]
                  (reduce f init filtered-events))
-               ;; Support streaming reduction without init value  
+               ;; Support streaming reduction without init value
                clojure.lang.IReduce
                (reduce [_ f]
                  (let [reduced-result
@@ -57,7 +57,7 @@
                      (f)  ; Empty collection case
                      reduced-result)))))))
 
-   :cljs (defn read
+   :cljs (defn- read-single
            [event-store {:keys [tags types as-of after] :as _args}]
            (let [filtered-events (->> (-> event-store :state deref :events)
                                       (filter
@@ -88,6 +88,63 @@
                      reduced-result)))
                (-reduce [_ f init]
                  (reduce f init filtered-events))))))
+
+(defn- read-batch
+  [event-store queries]
+  (let [merged (->> queries
+                    (mapcat #(into [] (read-single event-store %)))
+                    (reduce (fn [acc event]
+                              (if (contains? (::seen acc) (:event/id event))
+                                acc
+                                (-> acc
+                                    (update ::seen conj (:event/id event))
+                                    (update ::events conj event))))
+                            {::seen #{} ::events []})
+                    ::events
+                    (sort-by :event/id #?(:clj (fn [a b]
+                                                (cond (uuid/< a b) -1
+                                                      (uuid/= a b) 0
+                                                      :else 1))
+                                          :cljs compare)))]
+    #?(:clj (reify
+              clojure.lang.IReduceInit
+              (reduce [_ f init]
+                (reduce f init merged))
+              clojure.lang.IReduce
+              (reduce [_ f]
+                (let [reduced-result
+                      (reduce
+                       (fn [acc event]
+                         (if (= acc ::none)
+                           event
+                           (f acc event)))
+                       ::none
+                       merged)]
+                  (if (= reduced-result ::none)
+                    (f)
+                    reduced-result))))
+       :cljs (reify
+               cljs.core/IReduce
+               (-reduce [_ f]
+                 (let [reduced-result
+                       (reduce
+                        (fn [acc event]
+                          (if (= acc ::none)
+                            event
+                            (f acc event)))
+                        ::none
+                        merged)]
+                   (if (= reduced-result ::none)
+                     (f)
+                     reduced-result)))
+               (-reduce [_ f init]
+                 (reduce f init merged))))))
+
+(defn read
+  [event-store args]
+  (if (vector? args)
+    (read-batch event-store args)
+    (read-single event-store args)))
 
 #?(:clj (defn append
           [event-store {{:keys [predicate-fn] :as cas} :cas
