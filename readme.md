@@ -108,7 +108,7 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "9ee03f197532f9d1d1bf17957708f14e7b606045"
+ :sha "9109383f1927f8d7a3012438def80435caebfa17"
  :deps/root "projects/grain-core"}
 ```
 
@@ -133,7 +133,7 @@ Everything you need for CQRS/Event Sourcing with an in-memory event store:
 ```clojure
 obneyai/grain-core
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "9ee03f197532f9d1d1bf17957708f14e7b606045"
+ :sha "9109383f1927f8d7a3012438def80435caebfa17"
  :deps/root "projects/grain-core"}
 ```
 
@@ -144,7 +144,7 @@ Postgres backend—require `ai.obney.grain.event-store-postgres-v2.interface` an
 ```clojure
 obneyai/grain-event-store-postgres-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "9ee03f197532f9d1d1bf17957708f14e7b606045"
+ :sha "9109383f1927f8d7a3012438def80435caebfa17"
  :deps/root "projects/grain-event-store-postgres-v2"}
 ```
 
@@ -155,7 +155,7 @@ obneyai/grain-event-store-postgres-v2
 ```clojure
 obneyai/grain-dspy-extensions
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "9ee03f197532f9d1d1bf17957708f14e7b606045"
+ :sha "9109383f1927f8d7a3012438def80435caebfa17"
  :deps/root "projects/grain-dspy-extensions"}
 ```
 
@@ -166,7 +166,7 @@ obneyai/grain-dspy-extensions
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "9ee03f197532f9d1d1bf17957708f14e7b606045"
+ :sha "9109383f1927f8d7a3012438def80435caebfa17"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
