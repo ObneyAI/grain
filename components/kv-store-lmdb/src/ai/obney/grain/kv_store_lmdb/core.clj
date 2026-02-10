@@ -3,8 +3,7 @@
   (:require [ai.obney.grain.kv-store.interface.protocol :as p])
   (:import [org.lmdbjava DbiFlags Env]
            [java.nio ByteBuffer]
-           [java.io File]
-           [java.nio.charset StandardCharsets]))
+           [java.io File]))
 
 (defn start
   [{{:keys [storage-dir db-name]} :config
@@ -30,7 +29,10 @@
           _ (.. k-buf (put k) flip)
           found (.get db txn k-buf)]
       (when found
-        (str (.decode StandardCharsets/UTF_8 (.val txn)))))))
+        (let [val-buf (.val txn)
+              arr (byte-array (.remaining val-buf))]
+          (.get val-buf arr)
+          arr)))))
 
 (defn put!
   [{:keys [env db] :as _cache} {:keys [k v]}]
