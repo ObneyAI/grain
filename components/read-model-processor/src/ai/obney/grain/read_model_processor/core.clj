@@ -1,6 +1,5 @@
 (ns ai.obney.grain.read-model-processor.core
-  (:require #_[ai.obney.grain.file-store.interface :as fs]
-            [ai.obney.grain.event-store-v2.interface :as es]
+  (:require [ai.obney.grain.event-store-v2.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
             [clojure.data.fressian :as fressian]
             [com.brunobonacci.mulog :as u])
@@ -32,7 +31,7 @@
    events))
 
 (defn p
-  [{:keys [event-store #__file-store cache]}
+  [{:keys [event-store cache]}
    {:keys [f query name version]}]
   (u/with-context {:read-model/query query
                    :read-model/name name

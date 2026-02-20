@@ -6,6 +6,6 @@
 
    The Read Model Processor transparently manages
    incremental snapshotting and caching."
-  [{:keys [_file-store _event-store] :as context}
+  [{:keys [_event-store] :as context}
    {:keys [_f _query _name _version] :as args}]
   (core/p context args))
