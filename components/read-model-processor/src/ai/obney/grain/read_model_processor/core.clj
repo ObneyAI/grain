@@ -18,6 +18,16 @@
   [n v]
   (.getBytes (format "%s-%s" n v)))
 
+(defn format-scoped-key [n v scope]
+  (if scope
+    (.getBytes (format "%s-%s-%s" n v (Integer/toHexString (hash scope))))
+    (format-key n v)))
+
+(defn- add-watermark [query watermark]
+  (if (vector? query)
+    (mapv #(assoc % :after watermark) query)
+    (assoc query :after watermark)))
+
 (defn process-events
   [state events f]
   (reduce
@@ -32,36 +42,37 @@
 
 (defn p
   [{:keys [event-store cache]}
-   {:keys [f query name version]}]
+   {:keys [f query name version scope]}]
   (u/with-context {:read-model/query query
                    :read-model/name name
                    :read-model/version version})
-  (u/trace
-   ::read-model-processed
-   [:metric/name "ReadModelProcessed" :metric/resolution :high]
-   (if-let [v (kv/get! cache {:k (format-key name version)})]
-     (u/trace
-      ::cache-hit
-      [:metric/name "ReadModelCacheHit" :metric/resolution :high]
-      (let [{:keys [data watermark]} (fressian-decode v)
-            events (es/read event-store (assoc query :after watermark))
-            {:keys [state event-count new-watermark]} (process-events data events f)
-            _ (when (>= event-count 10)
-                (kv/put! cache
-                         {:k (format-key name version)
+  (let [cache-key (format-scoped-key name version scope)]
+    (u/trace
+     ::read-model-processed
+     [:metric/name "ReadModelProcessed" :metric/resolution :high]
+     (if-let [v (kv/get! cache {:k cache-key})]
+       (u/trace
+        ::cache-hit
+        [:metric/name "ReadModelCacheHit" :metric/resolution :high]
+        (let [{:keys [data watermark]} (fressian-decode v)
+              events (es/read event-store (add-watermark query watermark))
+              {:keys [state event-count new-watermark]} (process-events data events f)
+              _ (when (>= event-count 10)
+                  (kv/put! cache
+                           {:k cache-key
+                            :v (fressian-encode {:data state
+                                                :watermark new-watermark})}))]
+          state))
+       (u/trace
+        ::cache-miss
+        [:metric/name "ReadModelCacheMiss" :metric/resolution :high]
+        (let [events (es/read event-store query)
+              {:keys [state _event-count new-watermark]} (process-events {} events f)
+              _ (kv/put! cache
+                         {:k cache-key
                           :v (fressian-encode {:data state
-                                              :watermark new-watermark})}))]
-        state))
-     (u/trace
-      ::cache-miss
-      [:metric/name "ReadModelCacheMiss" :metric/resolution :high]
-      (let [events (es/read event-store query)
-            {:keys [state _event-count new-watermark]} (process-events {} events f)
-            _ (kv/put! cache
-                       {:k (format-key name version)
-                        :v (fressian-encode {:data state
-                                            :watermark new-watermark})})]
-        state)))))
+                                              :watermark new-watermark})})]
+          state))))))
 
 
 (comment

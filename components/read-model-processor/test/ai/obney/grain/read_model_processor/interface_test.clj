@@ -73,6 +73,11 @@
                       (range n))]
      (es/append *event-store* {:events events}))))
 
+(defn append-tagged-events!
+  [n event-type tags]
+  (let [events (mapv (fn [_] (es/->event {:type event-type :tags tags})) (range n))]
+    (es/append *event-store* {:events events})))
+
 (defn read-cached [name version]
   (some-> (kv/get! *cache* {:k (core/format-key name version)})
           core/fressian-decode))
@@ -224,3 +229,173 @@
     (is (every? #(= :test/counter-incremented (:event/type %)) @captured))
     (is (every? :event/id @captured))
     (is (every? :event/timestamp @captured))))
+
+;; ---------------------------------------------------------------------------
+;; F. defreadmodel Macro & Registry
+;; ---------------------------------------------------------------------------
+
+;; Reset registry before each test via fixture — the test-fixture already runs per :each
+;; but we also reset explicitly to isolate macro tests from each other.
+
+(defn counter-reducer-multi [state event]
+  (case (:event/type event)
+    :test/counter-incremented (update state :count (fnil inc 0))
+    state))
+
+(deftest defreadmodel-creates-function-and-registers
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/defreadmodel :test counter-rm
+        {:events #{:test/counter-incremented}
+         :version 2}
+        [state event]
+        (counter-reducer-multi state event))
+
+      (testing "function is created and callable"
+        (is (fn? test-counter-rm))
+        (is (= {:count 1}
+               (test-counter-rm {} {:event/type :test/counter-incremented}))))
+
+      (testing "registry entry exists with correct keys"
+        (let [entry (get @rmp/read-model-registry* :test/counter-rm)]
+          (is (some? entry))
+          (is (ifn? (:reducer-fn entry)))
+          (is (= #{:test/counter-incremented} (:events entry)))
+          (is (= 2 (:version entry)))))
+
+      (testing "registry function matches the defn"
+        (let [entry (get @rmp/read-model-registry* :test/counter-rm)]
+          (is (= {:count 1}
+                 ((:reducer-fn entry) {} {:event/type :test/counter-incremented})))))
+
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
+(deftest defreadmodel-with-docstring
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/defreadmodel :test documented-rm
+        {:events #{:test/counter-incremented}
+         :version 1}
+        "A documented read model."
+        [state event]
+        (update state :count (fnil inc 0)))
+
+      (testing "docstring is attached to the var"
+        (is (= "A documented read model." (:doc (meta #'test-documented-rm)))))
+
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
+(deftest defreadmodel-without-opts
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/defreadmodel :test bare-rm
+        [state _event]
+        (update state :count (fnil inc 0)))
+
+      (testing "works without opts map"
+        (is (fn? test-bare-rm))
+        (is (= {:count 1} (test-bare-rm {} {}))))
+
+      (testing "registry entry exists with empty opts"
+        (let [entry (get @rmp/read-model-registry* :test/bare-rm)]
+          (is (some? entry))
+          (is (ifn? (:reducer-fn entry)))
+          (is (nil? (:events entry)))
+          (is (nil? (:version entry)))))
+
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
+(deftest global-read-model-registry-returns-snapshot
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/register-read-model! :test/dummy identity {:events #{:test/e1} :version 1})
+      (let [reg (rmp/global-read-model-registry)]
+        (is (map? reg))
+        (is (contains? reg :test/dummy)))
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
+;; ---------------------------------------------------------------------------
+;; G. Scoped Projections
+;; ---------------------------------------------------------------------------
+
+(deftest scoped-projection-with-tags
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/register-read-model! :test/counter counter-reducer
+                                {:events #{:test/counter-incremented} :version 1})
+      (let [org-a (random-uuid)
+            org-b (random-uuid)]
+        (append-tagged-events! 3 :test/counter-incremented #{[:org org-a]})
+        (append-tagged-events! 5 :test/counter-incremented #{[:org org-b]})
+        (let [result-a (rmp/project (make-context) :test/counter {:tags #{[:org org-a]}})
+              result-b (rmp/project (make-context) :test/counter {:tags #{[:org org-b]}})]
+          (is (= {:count 3} result-a))
+          (is (= {:count 5} result-b))))
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
+(deftest cache-isolation-between-scopes
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/register-read-model! :test/counter counter-reducer
+                                {:events #{:test/counter-incremented} :version 1})
+      (let [org-a (random-uuid)
+            org-b (random-uuid)]
+        ;; Append 4 unscoped, 3 for org-a, 5 for org-b
+        (append-test-events! 4)
+        (append-tagged-events! 3 :test/counter-incremented #{[:org org-a]})
+        (append-tagged-events! 5 :test/counter-incremented #{[:org org-b]})
+        (let [unscoped (rmp/project (make-context) :test/counter)
+              scoped-a (rmp/project (make-context) :test/counter {:tags #{[:org org-a]}})
+              scoped-b (rmp/project (make-context) :test/counter {:tags #{[:org org-b]}})]
+          ;; Unscoped sees all 12 events (no tag filter)
+          (is (= {:count 12} unscoped))
+          ;; Scoped see only their tagged events
+          (is (= {:count 3} scoped-a))
+          (is (= {:count 5} scoped-b))))
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
+(deftest scoped-projection-with-custom-queries
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/register-read-model! :test/counter counter-reducer
+                                {:events #{:test/counter-incremented} :version 1})
+      (let [org-a (random-uuid)
+            org-b (random-uuid)]
+        (append-tagged-events! 3 :test/counter-incremented #{[:org org-a]})
+        (append-tagged-events! 5 :test/counter-incremented #{[:org org-b]})
+        ;; Use :queries to override — batch query for both orgs
+        (let [result (rmp/project (make-context) :test/counter
+                                  {:queries [{:types #{:test/counter-incremented}
+                                              :tags #{[:org org-a]}}
+                                             {:types #{:test/counter-incremented}
+                                              :tags #{[:org org-b]}}]})]
+          (is (= {:count 8} result))))
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
+(deftest vector-query-cache-hit
+  (let [org-a (random-uuid)
+        org-b (random-uuid)
+        query [{:types #{:test/counter-incremented} :tags #{[:org org-a]}}
+               {:types #{:test/counter-incremented} :tags #{[:org org-b]}}]
+        scope {:queries query}
+        args  {:f       counter-reducer
+               :query   query
+               :name    "test-vector"
+               :version 1
+               :scope   scope}]
+    ;; Initial events
+    (append-tagged-events! 3 :test/counter-incremented #{[:org org-a]})
+    (append-tagged-events! 5 :test/counter-incremented #{[:org org-b]})
+    (let [first-result (rmp/p (make-context) args)]
+      (is (= {:count 8} first-result)))
+    ;; Append more and verify incremental processing (cache hit with vector query)
+    (append-tagged-events! 2 :test/counter-incremented #{[:org org-a]})
+    (let [second-result (rmp/p (make-context) args)]
+      (is (= {:count 10} second-result)))))
