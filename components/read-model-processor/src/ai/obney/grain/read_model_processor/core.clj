@@ -2,6 +2,7 @@
   (:require [ai.obney.grain.event-store-v2.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
             [clojure.data.fressian :as fressian]
+            [clojure.walk :as walk]
             [com.brunobonacci.mulog :as u])
   (:import [java.io ByteArrayInputStream]))
 
@@ -12,7 +13,9 @@
     arr))
 
 (defn fressian-decode [bytes]
-  (fressian/read (ByteArrayInputStream. bytes)))
+  (walk/postwalk
+   (fn [x] (if (instance? java.util.Set x) (set x) x))
+   (fressian/read (ByteArrayInputStream. bytes))))
 
 (defn format-key
   [n v]
@@ -24,9 +27,11 @@
     (format-key n v)))
 
 (defn- add-watermark [query watermark]
-  (if (vector? query)
-    (mapv #(assoc % :after watermark) query)
-    (assoc query :after watermark)))
+  (if watermark
+    (if (vector? query)
+      (mapv #(assoc % :after watermark) query)
+      (assoc query :after watermark))
+    query))
 
 (defn process-events
   [state events f]
