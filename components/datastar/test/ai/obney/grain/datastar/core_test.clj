@@ -27,6 +27,7 @@
   {:test/counters [:map]
    :test/auto-counters [:map]
    :test/event-counters [:map]
+   :test/tagged-counters [:map]
    :test/increment [:map [:counter-id :uuid]]
    :test/no-signals [:map]})
 
@@ -95,6 +96,34 @@
    :datastar/path "/event-counters"
    :datastar/title "Event Counters"
    :datastar/debounce-ms 50}
+  [context]
+  (let [state @(:test-state context)
+        counters (:counters state)]
+    {:query/result counters
+     :datastar/hiccup
+     [:div#app
+      (for [c counters]
+        [:div {:id (str (:id c))}
+         (:name c) ": " (:value c)])]}))
+
+;; ------------------------------------------ ;;
+;; Event-Tagged Test Read Model & Query        ;;
+;; ------------------------------------------ ;;
+
+#_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
+(rmp/defreadmodel :test tagged-counters-rm
+  {:events #{:test/counter-incremented}
+   :version 1}
+  [state event]
+  (update state :count (fnil inc 0)))
+
+(defquery :test tagged-counters
+  {:authorized? (constantly true)
+   :grain/read-models {:test/tagged-counters-rm 1}
+   :datastar/path "/tagged-counters/:counter-id"
+   :datastar/title "Tagged Counters"
+   :datastar/debounce-ms 50
+   :datastar/event-tags {:counter :counter-id}}
   [context]
   (let [state @(:test-state context)
         counters (:counters state)]
@@ -648,3 +677,93 @@
     (is (= 200 (.statusCode response)))
     (is (str/includes? body "Event Counters"))
     (is (str/includes? body "@get(&apos;/event-counters/stream&apos;)"))))
+
+;; ====================================== ;;
+;; resolve-event-tags Unit Tests           ;;
+;; ====================================== ;;
+
+(deftest resolve-event-tags-test
+  (let [context {:query {:counter-id "abc-123" :org-id "org-456"}
+                 :auth-claims {:tenant-id "tenant-789"}}]
+
+    (testing "bare keyword resolves from [:query k]"
+      (let [pred (#'ds/resolve-event-tags {:counter :counter-id} context)]
+        (is (true? (pred {:event/tags #{[:counter "abc-123"]}})))
+        (is (false? (pred {:event/tags #{[:counter "other"]}})))))
+
+    (testing "vector path resolves via get-in"
+      (let [pred (#'ds/resolve-event-tags {:tenant [:auth-claims :tenant-id]} context)]
+        (is (true? (pred {:event/tags #{[:tenant "tenant-789"]}})))
+        (is (false? (pred {:event/tags #{[:tenant "wrong"]}})))))
+
+    (testing "multiple tags require ALL to match (subset)"
+      (let [pred (#'ds/resolve-event-tags {:counter :counter-id :org :org-id} context)]
+        (is (true? (pred {:event/tags #{[:counter "abc-123"] [:org "org-456"]}})))
+        (is (true? (pred {:event/tags #{[:counter "abc-123"] [:org "org-456"] [:extra "x"]}})))
+        (is (false? (pred {:event/tags #{[:counter "abc-123"]}})))
+        (is (false? (pred {:event/tags #{[:org "org-456"]}})))))))
+
+;; ====================================== ;;
+;; query->route-pair with event-tags       ;;
+;; ====================================== ;;
+
+(deftest query->route-pair-with-event-tags-test
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/register-read-model! :test/rm-tagged identity {:events #{:e/one} :version 1})
+      (let [entry {:handler-fn identity
+                   :authorized? (constantly true)
+                   :datastar/path "/tagged/:item-id"
+                   :grain/read-models {:test/rm-tagged 1}
+                   :datastar/event-tags {:item :item-id}}
+            [_ stream-route] (#'ds/query->route-pair {} :test/tagged entry)
+            stream-interceptor (last (nth stream-route 2))]
+        (testing "stream route is created"
+          (is (some? stream-route)))
+        (testing "stream interceptor has :enter fn (event-driven mode)"
+          (is (fn? (:enter stream-interceptor)))))
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
+;; ====================================== ;;
+;; E2E Event-Tags Streaming Tests          ;;
+;; ====================================== ;;
+
+(deftest e2e-event-tags-matching-test
+  (let [client (HttpClient/newHttpClient)
+        counter-id "00000000-0000-0000-0000-000000000001"
+        stream-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/tagged-counters/" counter-id "/stream")))
+                           (.GET)
+                           .build)
+        stream-response (.send client stream-request (HttpResponse$BodyHandlers/ofInputStream))
+        stream-events-future (future (parse-sse-events (.body stream-response) 2 10000))
+        _ (Thread/sleep 500)
+        _ (swap! *e2e-state* assoc-in [:counters 0 :value] 77)
+        _ (pubsub/pub *event-pubsub*
+            {:message {:event/type :test/counter-incremented
+                       :event/tags #{[:counter counter-id]}}})
+        stream-events @stream-events-future]
+    (is (= 2 (count stream-events)))
+    (is (str/includes? (:data (second stream-events)) "77"))))
+
+(deftest e2e-event-tags-non-matching-test
+  (let [client (HttpClient/newHttpClient)
+        counter-id "00000000-0000-0000-0000-000000000001"
+        stream-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/tagged-counters/" counter-id "/stream")))
+                           (.GET)
+                           .build)
+        stream-response (.send client stream-request (HttpResponse$BodyHandlers/ofInputStream))
+        stream-events-future (future (parse-sse-events (.body stream-response) 2 5000))
+        _ (Thread/sleep 500)
+        _ (swap! *e2e-state* assoc-in [:counters 0 :value] 999)
+        _ (pubsub/pub *event-pubsub*
+            {:message {:event/type :test/counter-incremented
+                       :event/tags #{[:counter "wrong-id"]}}})
+        stream-events @stream-events-future]
+    ;; Only initial render — event was filtered out by transducer
+    (is (= 1 (count stream-events)))
+    (is (not (str/includes? (:data (first stream-events)) "999")))))

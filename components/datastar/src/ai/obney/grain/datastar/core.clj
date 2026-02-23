@@ -1,6 +1,7 @@
 (ns ai.obney.grain.datastar.core
   (:require [hiccup2.core :as h]
             [clojure.data.json :as json]
+            [clojure.set :as set]
             [clojure.core.async :as async]
             [clojure.core.async.impl.protocols :as async-protocols]
             [clojure.string :as string]
@@ -185,11 +186,29 @@
                     (:events (get registry rm-name))))
           read-models)))
 
+(defn- resolve-event-tags
+  "Resolves a {:tag-key :query-key-or-path} map against query-context into
+   a predicate (fn [event] -> boolean) suitable for a channel transducer.
+   Bare keyword values resolve from [:query k]; vectors are full get-in paths."
+  [event-tags query-context]
+  (let [resolved (into #{}
+                       (map (fn [[tag-key path]]
+                              [tag-key (if (vector? path)
+                                         (get-in query-context path)
+                                         (get-in query-context [:query path]))]))
+                       event-tags)]
+    (fn [event]
+      (set/subset? resolved (:event/tags event)))))
+
 (defn- subscribe-to-events
   "Creates a sliding-buffer channel and subscribes it to each event type via pubsub.
+   When event-filter-fn is provided, applies it as a transducer on the channel.
    Returns the subscription channel."
-  [event-pubsub event-types]
-  (let [sub-chan (async/chan (async/sliding-buffer 64))]
+  [event-pubsub event-types event-filter-fn]
+  (let [buf (async/sliding-buffer 64)
+        sub-chan (if event-filter-fn
+                  (async/chan buf (filter event-filter-fn))
+                  (async/chan buf))]
     (doseq [event-type event-types]
       (pubsub/sub event-pubsub {:topic event-type :sub-chan sub-chan}))
     sub-chan))
@@ -205,14 +224,16 @@
 (defn- stream-view-loop-events
   "Event-driven loop for stream-view. Subscribes to event types, re-renders on events.
    Sub-chan is created BEFORE initial render to avoid missing events."
-  [event-ch sse-ctx context query-name event-pubsub event-types debounce-ms additional-context]
+  [event-ch sse-ctx context query-name event-pubsub event-types debounce-ms additional-context event-tags]
   (let [request (:request sse-ctx)
         raw-query (merge {:query/name query-name}
                          (:query-params request)
                          (:path-params request))
         decoded-query (decode-json-query raw-query)
         query-context (merge context additional-context {:query decoded-query})
-        sub-chan (subscribe-to-events event-pubsub event-types)]
+        event-filter-fn (when event-tags
+                          (resolve-event-tags event-tags query-context))
+        sub-chan (subscribe-to-events event-pubsub event-types event-filter-fn)]
     (try
       ;; Initial render
       (let [initial (poll-and-render query-context nil)]
@@ -263,12 +284,12 @@
 
 (defn- stream-view-enter-events
   "Enter fn for stream-view interceptor (event-driven mode)."
-  [context query-name event-pubsub event-types debounce-ms heartbeat-delay pedestal-context]
+  [context query-name event-pubsub event-types debounce-ms heartbeat-delay event-tags pedestal-context]
   (let [additional-context (:grain/additional-context pedestal-context)]
     (sse/start-stream
       (fn [event-ch sse-ctx]
         (stream-view-loop-events event-ch sse-ctx context query-name
-                                 event-pubsub event-types debounce-ms additional-context))
+                                 event-pubsub event-types debounce-ms additional-context event-tags))
       pedestal-context
       heartbeat-delay)))
 
@@ -281,14 +302,14 @@
    - Polling: when :fps is positive, polls at the given FPS.
    - One-shot: when :fps is 0 or nil, renders once and closes."
   [context query-name opts]
-  (let [{:keys [fps heartbeat-delay event-types debounce-ms]
+  (let [{:keys [fps heartbeat-delay event-types debounce-ms event-tags]
          :or {fps 30 heartbeat-delay 10 debounce-ms 50}} opts
         event-pubsub (:event-pubsub context)]
     (if (and (seq event-types) event-pubsub)
       ;; Event-driven mode
       {:name (keyword "ai.obney.grain.datastar.core" (str "stream-" (name query-name)))
        :enter #(stream-view-enter-events context query-name event-pubsub event-types
-                                         debounce-ms heartbeat-delay %)}
+                                         debounce-ms heartbeat-delay event-tags %)}
       ;; Polling / one-shot mode (unchanged)
       (let [interval-ms (when (and fps (pos? fps))
                           (long (/ 1000.0 fps)))]
@@ -413,9 +434,11 @@
           read-models (:grain/read-models entry)
           event-types (when (seq read-models) (resolve-events read-models))
           debounce-ms (:datastar/debounce-ms entry 50)
+          event-tags (:datastar/event-tags entry)
           stream-opts (cond-> {:fps fps}
                         (seq event-types) (assoc :event-types event-types
-                                                 :debounce-ms debounce-ms))]
+                                                 :debounce-ms debounce-ms)
+                        event-tags (assoc :event-tags event-tags))]
       [;; Shim page route
        [path :get (into interceptors [(shim-page shim-opts)])
         :route-name (keyword (namespace route-base)
