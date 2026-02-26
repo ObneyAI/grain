@@ -206,7 +206,21 @@
     (is (uuid? (:counter-id decoded)))
     (is (= id (:counter-id decoded)))
     (is (uuid? (:command/id decoded)))
-    (is (some? (:command/timestamp decoded)))))
+    (is (some? (:command/timestamp decoded))))
+
+  (testing "strips extra keys not in schema"
+    (let [id (random-uuid)
+          raw {:command/name ":test/increment"
+               :counter-id (str id)
+               :showModal true
+               :extra-field "noise"
+               :some-prefix-name ""}
+          decoded (#'ds/decode-json-command raw)]
+      (is (= :test/increment (:command/name decoded)))
+      (is (= id (:counter-id decoded)))
+      (is (nil? (:showModal decoded)))
+      (is (nil? (:extra-field decoded)))
+      (is (nil? (:some-prefix-name decoded))))))
 
 (deftest decode-json-query-test
   (let [raw {:query/name :test/counters}

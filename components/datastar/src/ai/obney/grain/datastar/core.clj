@@ -86,7 +86,9 @@
         command-schema (try (when command-name (mc/schema command-name))
                             (catch Exception _ nil))
         decoded (if command-schema
-                  (mc/decode command-schema raw-command (mt/json-transformer))
+                  (mc/decode command-schema raw-command
+                            (mt/transformer (mt/json-transformer)
+                                            (mt/strip-extra-keys-transformer)))
                   raw-command)]
     (assoc decoded
            :command/name command-name
@@ -326,7 +328,7 @@
 (defn- shim-page-enter
   "Enter fn for shim-page interceptor."
   [opts context]
-  (let [{:keys [title stream-path body head datastar-url]
+  (let [{:keys [title stream-path body head datastar-url html-attrs]
          :or {title "Grain App" datastar-url default-datastar-url}} opts
         query-string (get-in context [:request :query-string])
         effective-stream-path (when stream-path
@@ -335,18 +337,18 @@
                                   stream-path))
         page-html (str "<!DOCTYPE html>"
                        (h/html
-                         [:html
+                         [:html (or html-attrs {})
                           [:head
                            [:meta {:charset "UTF-8"}]
                            [:meta {:name "viewport" :content "width=device-width, initial-scale=1.0"}]
                            [:title title]
                            [:script {:type "module" :src datastar-url}]
                            (when head head)]
-                          [:body
+                          [:body (when effective-stream-path
+                                  {:data-init (str "@get('" effective-stream-path "')")})
                            (when body body)
                            (when effective-stream-path
-                             [:div {:id "app"
-                                    :data-init (str "@get('" effective-stream-path "')")}])]]))]
+                             [:div {:id "app"}])]]))]
     (assoc context :response
            {:status 200
             :headers {"Content-Type" "text/html; charset=UTF-8"}
@@ -378,7 +380,10 @@
       (let [result (cp/process-command command-context)]
         (cond
           (anomaly? result)
-          (patch-signals {:error (::anom/message result)} {})
+          (patch-signals (cond-> {:error (::anom/message result)}
+                           (:error/explain result)
+                           (assoc :fieldErrors (:error/explain result)))
+                         {})
 
           (:datastar/signals result)
           (patch-signals (:datastar/signals result) {})
