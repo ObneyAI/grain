@@ -65,8 +65,9 @@ Events are immutable facts about what happened:
 {:event/type :example/counter-created
  :event/id #uuid "..."           ; UUID v7
  :event/timestamp #inst "..."
- :event/body {:counter-id #uuid "..." :name "My Counter"}
- :event/tags #{[:counter #uuid "..."]}}  ; for efficient querying
+ :event/tags #{[:counter #uuid "..."]}  ; for efficient querying
+ :counter-id #uuid "..."               ; body fields are merged
+ :name "My Counter"}                    ; directly into the event
 ```
 
 ### Queries (Read Side)
@@ -81,6 +82,20 @@ Queries read from projections without causing state changes:
   {:query/result (read-models/counters context)})
 ```
 
+### Authorization
+
+Commands and queries support an `:authorized?` predicate in their registry opts. This function receives the full context (including the `:command` or `:query` map, `:event-store`, and any application-specific keys) and must return `true` to allow execution.
+
+```clojure
+(defcommand :example create-counter
+  {:authorized? (fn [context]
+                  (some? (get-in context [:command :user-id])))}
+  [context]
+  ...)
+```
+
+Authorization is enforced at the adapter level (request handlers, Datastar) before the command or query processor runs. The behavior is **deny by default**: if `:authorized?` is missing or returns a non-`true` value, the request is rejected. Every command and query must have an `:authorized?` predicate to be executable via an adapter.
+
 ### Read Models / Projections
 
 Read models are built by reducing over events:
@@ -88,17 +103,92 @@ Read models are built by reducing over events:
 ```clojure
 (defn apply-events [events]
   (reduce
-    (fn [state {:event/keys [type body]}]
+    (fn [state {:event/keys [type] :keys [counter-id name]}]
       (case type
         :example/counter-created
-        (assoc state (:counter-id body) {:id (:counter-id body)
-                                          :name (:name body)
-                                          :value 0})
+        (assoc state counter-id {:id counter-id
+                                  :name name
+                                  :value 0})
         :example/counter-incremented
-        (update-in state [(:counter-id body) :value] inc)
+        (update-in state [counter-id :value] inc)
         state))
     {}
     events))
+```
+
+### Read Model Registry
+
+The `defreadmodel` macro defines and registers read model reducers, following the same pattern as `defcommand` and `defquery`:
+
+```clojure
+(defreadmodel :example counters
+  {:events #{:example/counter-created :example/counter-incremented}
+   :version 1}
+  "Reducer for counter read model."
+  [state event]
+  (let [{:event/keys [type] :keys [counter-id name]} event]
+    (case type
+      :example/counter-created
+      (assoc state counter-id {:id counter-id :name name :value 0})
+      :example/counter-incremented
+      (update-in state [counter-id :value] inc)
+      state)))
+```
+
+Project it by name anywhere you have a context:
+
+```clojure
+(rmp/project context :example/counters)
+```
+
+### Datastar (Reactive UI)
+
+Grain integrates with [Datastar](https://data-star.dev/) for building reactive server-rendered UIs. Queries that return `:datastar/hiccup` are streamed to the browser over SSE — the server re-renders when domain events fire and Datastar patches the DOM.
+
+```clojure
+(defquery :example counter-view
+  {:authorized?       (constantly true)
+   :datastar/path     "/counters"
+   :datastar/title    "Counters"
+   :grain/read-models {:example/counters 1}}
+  [context]
+  (let [counters (rmp/project context :example/counters)]
+    {:query/result counters
+     :datastar/hiccup [:div#app
+                        (for [[id c] counters]
+                          [:p (str (:name c) ": " (:value c))])]}))
+```
+
+The Datastar component provides three Pedestal interceptor factories:
+
+- **`stream-view`** — Streams `:datastar/hiccup` from a query via SSE. Supports three modes: event-driven (re-renders on domain events), polling (fixed FPS), or one-shot (render once and close).
+- **`shim-page`** — Serves an HTML shell that loads the Datastar JS client and connects to a stream endpoint.
+- **`action-handler`** — Receives commands from Datastar signals (browser actions), executes them through the command processor, and streams back results or errors.
+
+Auto-generate Pedestal routes from query registry metadata:
+
+```clojure
+(require '[ai.obney.grain.datastar.interface :as ds])
+
+(ds/routes context) ;; scans for queries with :datastar/path
+```
+
+This creates paired routes for each annotated query — an HTML page route and an SSE stream route — so there's no manual route wiring.
+
+#### Datastar UI Flow
+
+```
+                    ┌───────────────────────────────────────────┐
+  Browser ◀── SSE ──┤  stream-view ──▶ Query Processor          │
+  (Datastar)        │       ▲              │                    │
+                    │       │          projections               │
+                    │   domain events      │                    │
+                    │   (pub/sub)     Read Model Processor       │
+                    │                      │                    │
+                    │                  Event Store               │
+                    │                      ▲                    │
+  Browser ── POST ──┤  action-handler ──▶ Command Processor     │
+  (signals)         └───────────────────────────────────────────┘
 ```
 
 ## Getting Started
@@ -119,6 +209,7 @@ See `bases/example-base` and `components/example-service` for a complete example
 | Package | Summary |
 | --- | --- |
 | **grain-core** | CQRS/Event Sourcing + in-memory event store + Behavior Tree engine |
+| **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE |
 | **grain-event-store-postgres-v2** | Protocol-driven Postgres backend—swap with a config change |
 | **grain-dspy-extensions** | DSPy integration for LLM workflows |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
@@ -136,6 +227,19 @@ obneyai/grain-core
  :sha "ed55e97b012c4a205a65a4ae7863ca40220476fc"
  :deps/root "projects/grain-core"}
 ```
+
+### grain-datastar
+
+Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hiccup-rendered HTML over SSE, with event-driven re-rendering, Malli-based JSON coercion, and automatic Pedestal route generation:
+
+```clojure
+obneyai/grain-datastar
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "..."
+ :deps/root "projects/grain-datastar"}
+```
+
+Includes the core CQRS components (command/query/read-model processors, event store, pub/sub). See `components/datastar` for the full source.
 
 ### grain-event-store-postgres-v2
 
