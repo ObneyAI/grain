@@ -105,16 +105,16 @@
   (let [query-registry (or (:query-registry query-context) @qp/query-registry*)
         query-name (get-in query-context [:query :query/name])
         authorized? (get-in query-registry [query-name :authorized?])]
-    (if (and authorized? (not (true? (authorized? query-context))))
-      {:event (patch-signals {:error "Unauthorized"} {})
-       :result prev-result
-       :stop? true}
+    (if (and authorized? (true? (authorized? query-context)))
       (let [result (qp/process-query query-context)
             query-data (when-not (anomaly? result) (:query/result result))]
         (when (not= query-data prev-result)
           (when-let [hiccup (:datastar/hiccup result)]
             {:event (patch-elements (render-html hiccup) {})
-             :result query-data}))))))
+             :result query-data})))
+      {:event (patch-signals {:error "Unauthorized"} {})
+       :result prev-result
+       :stop? true})))
 
 ;; ------------------------ ;;
 ;; Interceptor Factories    ;;
@@ -375,8 +375,7 @@
                              @cp/command-registry*)
         authorized? (get-in command-registry
                            [(:command/name command) :authorized?])]
-    (if (and authorized? (not (true? (authorized? command-context))))
-      (patch-signals {:error "Unauthorized"} {})
+    (if (and authorized? (true? (authorized? command-context)))
       (let [result (cp/process-command command-context)]
         (cond
           (anomaly? result)
@@ -389,7 +388,8 @@
           (patch-signals (:datastar/signals result) {})
 
           (:command/result result)
-          (patch-signals (:command/result result) {}))))))
+          (patch-signals (:command/result result) {})))
+      (patch-signals {:error "Unauthorized"} {}))))
 
 (defn- action-handler-enter
   "Enter fn for action-handler interceptor."
