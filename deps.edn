@@ -29,6 +29,7 @@
                                poly/clj-dspy {:local/root "components/clj-dspy"}
                                poly/read-model-processor {:local/root "components/read-model-processor"}
                                poly/command-processor-v2 {:local/root "components/command-processor-v2"}
+                               poly/command-request-handler-v2 {:local/root "components/command-request-handler-v2"}
                                poly/read-model-processor-v2 {:local/root "components/read-model-processor-v2"}
                                poly/todo-processor-v2 {:local/root "components/todo-processor-v2"}
                                poly/datastar {:local/root "components/datastar"}

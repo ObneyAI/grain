@@ -7,6 +7,6 @@
         metosin/malli {:mvn/version "0.17.0"}
         com.cognitect/anomalies {:mvn/version "0.1.12"}
         ai.obney/grain-pubsub {:local/root "../pubsub"}
-        ai.obney/grain-read-model-processor {:local/root "../read-model-processor"}}
+        ai.obney/grain-read-model-processor-v2 {:local/root "../read-model-processor-v2"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {ai.obney/grain-webserver {:local/root "../webserver"}}}}}

@@ -1,4 +1,5 @@
-(ns ai.obney.grain.event-store-v2.interface
+(ns ^:deprecated ai.obney.grain.event-store-v2.interface
+  "DEPRECATED: Use ai.obney.grain.event-store-v3.interface instead."
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v2.interface.schemas]
             [ai.obney.grain.event-store-v2.core :as core]

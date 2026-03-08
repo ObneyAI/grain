@@ -1,4 +1,5 @@
-(ns ai.obney.grain.todo-processor.interface
+(ns ^:deprecated ai.obney.grain.todo-processor.interface
+  "DEPRECATED: Use ai.obney.grain.todo-processor-v2.interface instead."
   (:require [ai.obney.grain.todo-processor.core :as core]))
 
 (defn start

@@ -1,4 +1,5 @@
-(ns ai.obney.grain.read-model-processor.interface
+(ns ^:deprecated ai.obney.grain.read-model-processor.interface
+  "DEPRECATED: Use ai.obney.grain.read-model-processor-v2.interface instead."
   (:require [ai.obney.grain.read-model-processor.core :as core]))
 
 (defn p

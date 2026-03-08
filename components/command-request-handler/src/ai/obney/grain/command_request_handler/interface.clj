@@ -1,4 +1,5 @@
-(ns ai.obney.grain.command-request-handler.interface
+(ns ^:deprecated ai.obney.grain.command-request-handler.interface
+  "DEPRECATED: Use ai.obney.grain.command-request-handler-v2.interface instead."
   (:require [ai.obney.grain.command-request-handler.core :as core]))
 
 (defn routes

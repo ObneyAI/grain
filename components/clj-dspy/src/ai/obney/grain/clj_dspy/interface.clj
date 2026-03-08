@@ -1,4 +1,5 @@
-(ns ai.obney.grain.clj-dspy.interface
+(ns ^:deprecated ai.obney.grain.clj-dspy.interface
+  "DEPRECATED: This component is no longer maintained."
   (:require [ai.obney.grain.clj-dspy.core :as core]))
 
 (defmacro defsignature

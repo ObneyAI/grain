@@ -1,10 +1,10 @@
 {:deps {org.clojure/clojure {:mvn/version "1.12.0"}
         ds/datastar {:local/root "../../components/datastar"}
-        ds/command-processor {:local/root "../../components/command-processor"}
+        ds/command-processor-v2 {:local/root "../../components/command-processor-v2"}
         ds/query-processor {:local/root "../../components/query-processor"}
-        ds/read-model-processor {:local/root "../../components/read-model-processor"}
+        ds/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
         ds/pubsub {:local/root "../../components/pubsub"}
-        ds/event-store-v2 {:local/root "../../components/event-store-v2"}
+        ds/event-store-v3 {:local/root "../../components/event-store-v3"}
         ds/anomalies {:local/root "../../components/anomalies"}
         ds/schema-util {:local/root "../../components/schema-util"}
         ds/time {:local/root "../../components/time"}

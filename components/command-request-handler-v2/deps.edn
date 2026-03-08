@@ -1,0 +1,8 @@
+{:paths ["src" "resources"]
+ :deps {com.brunobonacci/mulog {:mvn/version "0.9.0"}
+        com.cognitect/anomalies {:mvn/version "0.1.12"}
+        org.clojure/core.async {:mvn/version "1.7.701"}
+        io.pedestal/pedestal.service {:mvn/version "0.7.2"}
+        com.cognitect/transit-clj {:mvn/version "1.0.333"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {}}}}

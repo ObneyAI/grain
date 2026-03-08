@@ -1,4 +1,5 @@
-(ns ai.obney.grain.behavior-tree-v2.interface
+(ns ^:deprecated ai.obney.grain.behavior-tree-v2.interface
+  "DEPRECATED: This component is no longer maintained."
   (:require [ai.obney.grain.behavior-tree-v2.core.engine :as core]
             [ai.obney.grain.behavior-tree-v2.interface.protocol :as p]))
 

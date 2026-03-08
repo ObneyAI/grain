@@ -1,4 +1,5 @@
-(ns ai.obney.grain.command-processor.interface
+(ns ^:deprecated ai.obney.grain.command-processor.interface
+  "DEPRECATED: Use ai.obney.grain.command-processor-v2.interface instead."
   (:require [ai.obney.grain.command-processor.core :as core]))
 
 ;; Global command registry atom
