@@ -198,7 +198,7 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "218dfae51e4cb77fa953bf1219bd20c1b2a28b28"
+ :sha "688152c01a01b1639171d56db4522dd6429905fd"
  :deps/root "projects/grain-core"}
 ```
 
@@ -211,6 +211,7 @@ See `bases/example-base` and `components/example-service` for a complete example
 | **grain-core** | CQRS/Event Sourcing + in-memory event store + Behavior Tree engine |
 | **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE |
 | **grain-event-store-postgres-v2** | Protocol-driven Postgres backend—swap with a config change |
+| **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
 | **grain-dspy-extensions** | DSPy integration for LLM workflows |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
 
@@ -224,7 +225,7 @@ Everything you need for CQRS/Event Sourcing with an in-memory event store:
 ```clojure
 obneyai/grain-core
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "218dfae51e4cb77fa953bf1219bd20c1b2a28b28"
+ :sha "688152c01a01b1639171d56db4522dd6429905fd"
  :deps/root "projects/grain-core"}
 ```
 
@@ -235,7 +236,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "218dfae51e4cb77fa953bf1219bd20c1b2a28b28"
+ :sha "688152c01a01b1639171d56db4522dd6429905fd"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -248,8 +249,19 @@ Postgres backend—require `ai.obney.grain.event-store-postgres-v2.interface` an
 ```clojure
 obneyai/grain-event-store-postgres-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "218dfae51e4cb77fa953bf1219bd20c1b2a28b28"
+ :sha "688152c01a01b1639171d56db4522dd6429905fd"
  :deps/root "projects/grain-event-store-postgres-v2"}
+```
+
+### grain-event-store-postgres-v3
+
+Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks, Fressian binary serialization, and tenant-scoped operations. All read and append operations require a tenant ID, ensuring structural data isolation:
+
+```clojure
+obneyai/grain-event-store-postgres-v3
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "688152c01a01b1639171d56db4522dd6429905fd"
+ :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
 ### grain-dspy-extensions
@@ -259,7 +271,7 @@ obneyai/grain-event-store-postgres-v2
 ```clojure
 obneyai/grain-dspy-extensions
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "218dfae51e4cb77fa953bf1219bd20c1b2a28b28"
+ :sha "688152c01a01b1639171d56db4522dd6429905fd"
  :deps/root "projects/grain-dspy-extensions"}
 ```
 
@@ -270,7 +282,7 @@ obneyai/grain-dspy-extensions
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "218dfae51e4cb77fa953bf1219bd20c1b2a28b28"
+ :sha "688152c01a01b1639171d56db4522dd6429905fd"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
