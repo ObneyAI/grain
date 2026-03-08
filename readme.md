@@ -1,12 +1,12 @@
 # Grain
 
-An Event-Sourced framework for building AI-native systems in Clojure.
+An Event-Sourced framework for building multi-tenant systems in Clojure.
 
 ## What is Grain?
 
 Grain is a framework for building Event-Sourced systems using CQRS (Command Query Responsibility Segregation). It provides composable components that snap together like Lego bricks—start with an in-memory event store for quick iteration, then swap in Postgres with a single line change when you're ready.
 
-Grain is also AI-native: agents and events share the same backbone, giving you a coherent architecture where agentic workflows are part of the domain model rather than bolted on as an afterthought.
+Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks.
 
 ## Architecture
 
@@ -39,6 +39,20 @@ Grain is also AI-native: agents and events share the same backbone, giving you a
 **Commands** are the only path to state change—they validate business rules and emit events. **Events** are immutable facts stored in the event store. **Queries** read from projections (read models) built from events. **Todo Processors** react to events asynchronously, enabling event-driven workflows.
 
 ## Core Concepts
+
+### Multi-Tenancy
+
+Every event-store operation requires a `:tenant-id`. The processors extract it from the context map and pass it through automatically:
+
+```clojure
+;; Tenant ID flows through context — Grain doesn't care where it comes from.
+;; Typically injected by middleware (e.g., from a JWT claim).
+(def context {:event-store event-store
+              :tenant-id  #uuid "..."
+              :command    command})
+```
+
+The Postgres backend (`grain-event-store-postgres-v3`) enforces tenant isolation at the database level with Row-Level Security policies and per-tenant advisory locks.
 
 ### Commands (Write Side)
 
@@ -196,10 +210,10 @@ This creates paired routes for each annotated query — an HTML page route and a
 Add to your `deps.edn`:
 
 ```clojure
-obneyai/grain-core
+obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "db3afa5704286f22ddc0a0153012eeb735261d7c"
- :deps/root "projects/grain-core"}
+ :sha "1c728c8d53d49da9dfb1476947377e465ae3317b"
+ :deps/root "projects/grain-core-v2"}
 ```
 
 See `bases/example-base` and `components/example-service` for a complete example application. Run `development/src/example_app_demo.clj` to start and interact with the example system.
@@ -208,25 +222,23 @@ See `bases/example-base` and `components/example-service` for a complete example
 
 | Package | Summary |
 | --- | --- |
-| **grain-core** | CQRS/Event Sourcing + in-memory event store + Behavior Tree engine |
+| **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store |
 | **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE |
-| **grain-event-store-postgres-v2** | Protocol-driven Postgres backend—swap with a config change |
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
-| **grain-dspy-extensions** | DSPy integration for LLM workflows |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
 
 <details>
 <summary>Package Details</summary>
 
-### grain-core
+### grain-core-v2
 
-Everything you need for CQRS/Event Sourcing with an in-memory event store:
+Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 processors (command, read-model, todo), v2 request handler, query processor, and pub/sub:
 
 ```clojure
-obneyai/grain-core
+obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "db3afa5704286f22ddc0a0153012eeb735261d7c"
- :deps/root "projects/grain-core"}
+ :sha "1c728c8d53d49da9dfb1476947377e465ae3317b"
+ :deps/root "projects/grain-core-v2"}
 ```
 
 ### grain-datastar
@@ -236,22 +248,11 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "db3afa5704286f22ddc0a0153012eeb735261d7c"
+ :sha "1c728c8d53d49da9dfb1476947377e465ae3317b"
  :deps/root "projects/grain-datastar"}
 ```
 
 Includes the core CQRS components (command/query/read-model processors, event store, pub/sub). See `components/datastar` for the full source.
-
-### grain-event-store-postgres-v2
-
-Postgres backend—require `ai.obney.grain.event-store-postgres-v2.interface` and switch from `:in-memory` to `:postgres`:
-
-```clojure
-obneyai/grain-event-store-postgres-v2
-{:git/url "https://github.com/ObneyAI/grain.git"
- :sha "db3afa5704286f22ddc0a0153012eeb735261d7c"
- :deps/root "projects/grain-event-store-postgres-v2"}
-```
 
 ### grain-event-store-postgres-v3
 
@@ -260,19 +261,8 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "db3afa5704286f22ddc0a0153012eeb735261d7c"
+ :sha "1c728c8d53d49da9dfb1476947377e465ae3317b"
  :deps/root "projects/grain-event-store-postgres-v3"}
-```
-
-### grain-dspy-extensions
-
-[DSPy](https://dspy.ai/) integration for sophisticated LLM workflows. Requires Python 3.12+ (we recommend [uv](https://docs.astral.sh/uv/) for environment management):
-
-```clojure
-obneyai/grain-dspy-extensions
-{:git/url "https://github.com/ObneyAI/grain.git"
- :sha "db3afa5704286f22ddc0a0153012eeb735261d7c"
- :deps/root "projects/grain-dspy-extensions"}
 ```
 
 ### grain-mulog-aws-cloudwatch-emf-publisher
@@ -282,29 +272,34 @@ obneyai/grain-dspy-extensions
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "db3afa5704286f22ddc0a0153012eeb735261d7c"
+ :sha "1c728c8d53d49da9dfb1476947377e465ae3317b"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
 </details>
 
-## Agent Framework
+<details>
+<summary>Deprecated Packages</summary>
 
-Grain includes a behavior tree engine with DSPy integration for building agentic workflows. Agents can reason over the same event-sourced domain as the rest of your system—with short-term program memory and long-term event-sourced memory.
+The following packages are deprecated and will be removed in a future release:
 
-See demos at [macroexpand-2-demo](https://github.com/ObneyAI/macroexpand-2-demo).
+| Package | Replacement |
+| --- | --- |
+| grain-core | grain-core-v2 |
+| grain-event-store-postgres-v2 | grain-event-store-postgres-v3 |
+| grain-dspy-extensions | None (deprecated) |
 
-You can use the agent framework standalone or skip it entirely if you just want Event Sourcing.
+</details>
 
 ## Why Grain?
 
-We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and-eventsourcing) to design [Simple](https://www.youtube.com/watch?v=SxdOUGdseq4) systems. Grain combines proven ideas from conventional software architecture with modern agent workflows, giving us a single, composable toolkit for building AI-driven applications.
+We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and-eventsourcing) to design [Simple](https://www.youtube.com/watch?v=SxdOUGdseq4) systems. Grain provides a single, composable toolkit for building multi-tenant, event-sourced applications in Clojure.
 
 [Polylith](https://polylith.gitbook.io/polylith) enables us to evolve components independently and publish standalone tools from a single repository.
 
 ## Status
 
-Grain is MIT licensed. We use it in production, but it's actively evolving. The core CQRS/Event Sourcing components are stable; agent-related components may change more rapidly.
+Grain is MIT licensed. We use it in production, but it's actively evolving. The core CQRS/Event Sourcing components are stable.
 
 ## More Information
 
