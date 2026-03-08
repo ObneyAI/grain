@@ -1,0 +1,10 @@
+{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        pgesv3/event-store-postgres-v3 {:local/root "../../components/event-store-postgres-v3"}
+        pgesv3/event-store-v3 {:local/root "../../components/event-store-v3"}
+        pgesv3/pubsub {:local/root "../../components/pubsub"}
+        pgesv3/anomalies {:local/root "../../components/anomalies"}
+        pgesv3/schema-util {:local/root "../../components/schema-util"}
+        pgesv3/time {:local/root "../../components/time"}}
+
+ :aliases {:test {:extra-paths []
+                  :extra-deps  {}}}}

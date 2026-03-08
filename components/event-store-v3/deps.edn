@@ -1,0 +1,4 @@
+{:paths ["src" "resources"]
+ :deps {danlentz/clj-uuid {:mvn/version "0.2.0"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {}}}}

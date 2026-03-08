@@ -11,4 +11,5 @@
             "grain-dspy-extensions" {:alias "gde"}
             "grain-event-store-postgres" {:alias "es-pg"}
             "grain-event-store-postgres-v2" {:alias "es-pg-v2"}
+            "grain-event-store-postgres-v3" {:alias "es-pg-v3"}
             "grain-mulog-aws-cloudwatch-emf-publisher" {:alias "mulog-aws-emf-pub"}}}

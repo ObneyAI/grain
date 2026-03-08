@@ -17,6 +17,8 @@
                                poly/query-schema {:local/root "components/query-schema"}
                                poly/event-store-v2 {:local/root "components/event-store-v2"}
                                poly/event-store-postgres-v2 {:local/root "components/event-store-postgres-v2"}
+                               poly/event-store-v3 {:local/root "components/event-store-v3"}
+                               poly/event-store-postgres-v3 {:local/root "components/event-store-postgres-v3"}
                                poly/pubsub {:local/root "components/pubsub"}
                                poly/todo-processor {:local/root "components/todo-processor"}
                                poly/periodic-task {:local/root "components/periodic-task"}
