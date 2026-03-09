@@ -24,11 +24,15 @@
        (if (anomaly? result)
          (u/log ::anomaly-in-todo-processor :anomaly result)
          (when-let [events (:result/events result)]
-           (let [event-store-result (event-store/append event-store {:tenant-id tenant-id :events events})]
+           (let [cas (:result/cas result)
+                 event-store-result (event-store/append event-store (cond-> {:tenant-id tenant-id :events events}
+                                                                     cas (assoc :cas cas)))]
              (when (anomaly? event-store-result)
-               (u/log ::error-storing-events)
-               {::anom/category ::anom/fault
-                ::anom/message "Error storing events."})))))
+               (u/log ::error-storing-events :anomaly event-store-result)
+               (if (= ::anom/conflict (::anom/category event-store-result))
+                 event-store-result
+                 {::anom/category ::anom/fault
+                  ::anom/message "Error storing events."}))))))
      (catch Throwable t
        (u/log ::uncaught-exception-in-todo-processor :exception t)))))
 

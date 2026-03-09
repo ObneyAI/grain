@@ -17,7 +17,8 @@
                           [:status :string]]
    :test/event-1 [:map [:num :int]]
    :test/event-2 [:map [:num :int]]
-   :test/event-3 [:map [:num :int]]})
+   :test/event-3 [:map [:num :int]]
+   :test/cas-event [:map [:n :int]]})
 
 ;; Test Fixtures
 
@@ -393,3 +394,40 @@
         (finally
           (tp/stop processor)
           (pubsub/stop ps))))))
+
+;; 7. CAS (Compare-And-Swap) Tests
+
+(deftest test-cas-success-then-conflict
+  (testing "CAS predicate controls whether events are stored via todo processor"
+    (let [handler (fn [_context]
+                    {:result/events
+                     [(es/->event {:type :test/cas-event
+                                   :tags #{}
+                                   :body {:n 1}})]
+                     :result/cas
+                     {:types #{:test/cas-event}
+                      :predicate-fn (fn [events] (empty? (into [] events)))}})
+          event1 (make-event :test/trigger-event)
+          event2 (make-event :test/trigger-event)]
+      ;; First call succeeds (no existing events, predicate returns true)
+      (let [result1 (core/process-event (make-context event1 handler))]
+        (is (nil? result1)))
+      ;; Second call fails (events exist, predicate returns false)
+      (let [result2 (core/process-event (make-context event2 handler))]
+        (is (= ::anom/conflict (::anom/category result2)))
+        (is (= "CAS failed" (::anom/message result2)))))))
+
+(deftest test-cas-conflict-not-wrapped-as-fault
+  (testing "CAS conflict anomaly is passed through, not wrapped as generic fault"
+    (let [handler (fn [_context]
+                    {:result/events
+                     [(es/->event {:type :test/cas-event
+                                   :tags #{}
+                                   :body {:n 1}})]
+                     :result/cas
+                     {:types #{:test/cas-event}
+                      :predicate-fn (constantly false)}})
+          event (make-event :test/trigger-event)
+          result (core/process-event (make-context event handler))]
+      (is (= ::anom/conflict (::anom/category result)))
+      (is (not= "Error storing events." (::anom/message result))))))

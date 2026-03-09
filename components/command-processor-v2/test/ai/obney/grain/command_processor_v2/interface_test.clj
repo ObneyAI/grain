@@ -26,7 +26,8 @@
    :test/context-anomaly [:map]
    :test/throwing-handler [:map]
    :test/skip-storage [:map]
-   :test/skip-storage-child [:map]})
+   :test/skip-storage-child [:map]
+   :test/cas-command [:map]})
 
 ;; Register test event schemas
 (defschemas test-events
@@ -37,7 +38,8 @@
    :test/event-2 [:map [:num :int]]
    :test/event-3 [:map [:num :int]]
    :test/type-a [:map [:category :string]]
-   :test/type-b [:map [:category :string]]})
+   :test/type-b [:map [:category :string]]
+   :test/cas-event [:map [:n :int]]})
 
 ;; Test Fixtures
 
@@ -538,3 +540,42 @@
                         (into [])
                         (filter #(not= :grain/tx (:event/type %))))]
         (is (= 1 (count events)))))))
+
+;; 9. CAS (Compare-And-Swap) Tests
+
+(deftest test-cas-success-then-conflict
+  (testing "CAS predicate controls whether events are stored"
+    (let [handler (fn [_context]
+                    {:command-result/events
+                     [(es/->event {:type :test/cas-event
+                                   :tags #{}
+                                   :body {:n 1}})]
+                     :command-result/cas
+                     {:types #{:test/cas-event}
+                      :predicate-fn (fn [events] (empty? (into [] events)))}})
+          command1 (make-command :test/cas-command)
+          command2 (make-command :test/cas-command)
+          registry (make-registry {:test/cas-command handler})]
+      ;; First call succeeds (no existing events, predicate returns true)
+      (let [result1 (cp/process-command (make-context command1 registry))]
+        (is (not (contains? result1 ::anom/category))))
+      ;; Second call fails (events exist, predicate returns false)
+      (let [result2 (cp/process-command (make-context command2 registry))]
+        (is (= ::anom/conflict (::anom/category result2)))
+        (is (= "CAS failed" (::anom/message result2)))))))
+
+(deftest test-cas-conflict-not-wrapped-as-fault
+  (testing "CAS conflict anomaly is passed through, not wrapped as generic fault"
+    (let [handler (fn [_context]
+                    {:command-result/events
+                     [(es/->event {:type :test/cas-event
+                                   :tags #{}
+                                   :body {:n 1}})]
+                     :command-result/cas
+                     {:types #{:test/cas-event}
+                      :predicate-fn (constantly false)}})
+          command (make-command :test/cas-command)
+          registry (make-registry {:test/cas-command handler})
+          result (cp/process-command (make-context command registry))]
+      (is (= ::anom/conflict (::anom/category result)))
+      (is (not= "Error storing events." (::anom/message result))))))

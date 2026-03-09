@@ -26,13 +26,17 @@
     (if-let [events (:command-result/events result)]
       (if (:command-processor/skip-event-storage context)
         result
-        (let [event-store-result (event-store/append event-store {:tenant-id tenant-id :events events})]
+        (let [cas (:command-result/cas result)
+              event-store-result (event-store/append event-store (cond-> {:tenant-id tenant-id :events events}
+                                                                   cas (assoc :cas cas)))]
           (if-not (anomaly? event-store-result)
             result
             (do
-              (u/log ::error-storing-events)
-              {::anom/category ::anom/fault
-               ::anom/message "Error storing events."}))))
+              (u/log ::error-storing-events :anomaly event-store-result)
+              (if (= ::anom/conflict (::anom/category event-store-result))
+                event-store-result
+                {::anom/category ::anom/fault
+                 ::anom/message "Error storing events."})))))
       result)))
 
 (defn process-command [{:keys [command command-registry] :as context}]
