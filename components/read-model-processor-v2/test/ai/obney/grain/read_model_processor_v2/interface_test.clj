@@ -81,9 +81,11 @@
   (let [events (mapv (fn [_] (es/->event {:type event-type :tags tags})) (range n))]
     (es/append *event-store* {:tenant-id test-tenant-id :events events})))
 
-(defn read-cached [name version]
-  (some-> (kv/get! *cache* {:k (core/format-key name version)})
-          core/fressian-decode))
+(defn read-cached
+  ([name version] (read-cached name version test-tenant-id))
+  ([name version tenant-id]
+   (some-> (kv/get! *cache* {:k (core/format-scoped-key name version tenant-id)})
+           core/fressian-decode)))
 
 ;; ---------------------------------------------------------------------------
 ;; A. Cache Miss
@@ -309,6 +311,55 @@
 ;; ---------------------------------------------------------------------------
 ;; G. Scoped Projections
 ;; ---------------------------------------------------------------------------
+
+(deftest cross-tenant-cache-isolation
+  (let [tenant-a (random-uuid)
+        tenant-b (random-uuid)
+        ctx-a    (assoc (make-context) :tenant-id tenant-a)
+        ctx-b    (assoc (make-context) :tenant-id tenant-b)]
+    ;; Append different event counts to each tenant
+    (es/append *event-store* {:tenant-id tenant-a
+                              :events (mapv (fn [_] (es/->event {:type :test/counter-incremented}))
+                                            (range 3))})
+    (es/append *event-store* {:tenant-id tenant-b
+                              :events (mapv (fn [_] (es/->event {:type :test/counter-incremented}))
+                                            (range 7))})
+    (let [result-a (rmp/p ctx-a (make-args))
+          result-b (rmp/p ctx-b (make-args))]
+      (is (= {:count 3} result-a))
+      (is (= {:count 7} result-b)))
+
+    ;; Verify cached values are also isolated
+    (let [cached-a (read-cached :test/counter 1 tenant-a)
+          cached-b (read-cached :test/counter 1 tenant-b)]
+      (is (= {:count 3} (:data cached-a)))
+      (is (= {:count 7} (:data cached-b))))))
+
+(deftest cross-tenant-scoped-cache-isolation
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/register-read-model! :test/counter counter-reducer
+                                {:events #{:test/counter-incremented} :version 1})
+      (let [tenant-a (random-uuid)
+            tenant-b (random-uuid)
+            org-id   (random-uuid)
+            ctx-a    (assoc (make-context) :tenant-id tenant-a)
+            ctx-b    (assoc (make-context) :tenant-id tenant-b)]
+        ;; Same org-id tag, different tenants
+        (es/append *event-store* {:tenant-id tenant-a
+                                  :events (mapv (fn [_] (es/->event {:type :test/counter-incremented
+                                                                     :tags #{[:org org-id]}}))
+                                                (range 2))})
+        (es/append *event-store* {:tenant-id tenant-b
+                                  :events (mapv (fn [_] (es/->event {:type :test/counter-incremented
+                                                                     :tags #{[:org org-id]}}))
+                                                (range 6))})
+        (let [result-a (rmp/project ctx-a :test/counter {:tags #{[:org org-id]}})
+              result-b (rmp/project ctx-b :test/counter {:tags #{[:org org-id]}})]
+          (is (= {:count 2} result-a))
+          (is (= {:count 6} result-b))))
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
 
 (deftest scoped-projection-with-tags
   (let [prev-registry @rmp/read-model-registry*]

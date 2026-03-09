@@ -56,7 +56,7 @@
   (u/with-context {:read-model/query query
                    :read-model/name name
                    :read-model/version version})
-  (let [cache-key (format-scoped-key name version scope)
+  (let [cache-key (format-scoped-key name version (if scope [tenant-id scope] tenant-id))
         query (inject-tenant-id query tenant-id)]
     (u/trace
      ::read-model-processed
