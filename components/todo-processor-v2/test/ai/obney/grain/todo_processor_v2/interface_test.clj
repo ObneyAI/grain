@@ -266,7 +266,89 @@
       (is (= ::anom/fault (::anom/category result)))
       (is (= "Error storing events." (::anom/message result))))))
 
-;; 5. Integration Tests - Backpressure and Concurrency
+;; 5. Tenant-ID Propagation Tests
+
+(deftest test-tenant-id-propagated-from-event
+  (testing "Todo processor extracts :grain/tenant-id from event and sets it on context"
+    (let [tenant-id (random-uuid)
+          received-tenant-id (atom nil)
+          handler (fn [context]
+                    (reset! received-tenant-id (:tenant-id context))
+                    {})
+          ps (pubsub/start {:type :core-async :topic-fn :event/type})
+          processor (tp/start {:event-pubsub ps
+                               :topics [:test/tenant-event]
+                               :handler-fn handler
+                               :context {:event-store *event-store*}})]
+      (try
+        (pubsub/pub ps {:message {:event/type :test/tenant-event
+                                  :event/id (uuid/v4)
+                                  :grain/tenant-id tenant-id}})
+        (Thread/sleep 200)
+        (is (= tenant-id @received-tenant-id))
+        (finally
+          (tp/stop processor)
+          (pubsub/stop ps))))))
+
+(deftest test-tenant-id-stripped-from-event-before-handler
+  (testing "Handler receives event without :grain/tenant-id key"
+    (let [received-event (atom nil)
+          handler (fn [context]
+                    (reset! received-event (:event context))
+                    {})
+          ps (pubsub/start {:type :core-async :topic-fn :event/type})
+          processor (tp/start {:event-pubsub ps
+                               :topics [:test/tenant-event]
+                               :handler-fn handler
+                               :context {:event-store *event-store*
+                                         :tenant-id test-tenant-id}})]
+      (try
+        (pubsub/pub ps {:message {:event/type :test/tenant-event
+                                  :event/id (uuid/v4)
+                                  :grain/tenant-id (random-uuid)
+                                  :data "test-data"}})
+        (Thread/sleep 200)
+        (is (some? @received-event))
+        (is (not (contains? @received-event :grain/tenant-id)))
+        (is (= "test-data" (:data @received-event)))
+        (finally
+          (tp/stop processor)
+          (pubsub/stop ps))))))
+
+(deftest test-tenant-id-used-for-event-storage
+  (testing "Events produced by handler are stored in the correct tenant partition"
+    (let [tenant-id (random-uuid)
+          other-tenant-id (random-uuid)
+          handler (fn [_context]
+                    {:result/events
+                     [(es/->event {:type :test/event-processed
+                                   :tags #{[:test (uuid/v4)]}
+                                   :body {:event-id (uuid/v4)
+                                          :status "done"}})]})
+          ps (pubsub/start {:type :core-async :topic-fn :event/type})
+          processor (tp/start {:event-pubsub ps
+                               :topics [:test/tenant-event]
+                               :handler-fn handler
+                               :context {:event-store *event-store*}})]
+      (try
+        (pubsub/pub ps {:message {:event/type :test/tenant-event
+                                  :event/id (uuid/v4)
+                                  :grain/tenant-id tenant-id}})
+        (Thread/sleep 200)
+        (let [events (->> (es/read *event-store* {:tenant-id tenant-id})
+                          (into [])
+                          (filter #(not= :grain/tx (:event/type %))))]
+          (is (= 1 (count events)))
+          (is (= :test/event-processed (:event/type (first events)))))
+        (let [other-events (->> (es/read *event-store* {:tenant-id other-tenant-id})
+                                (into [])
+                                (filter #(not= :grain/tx (:event/type %))))]
+          (is (empty? other-events)))
+        (finally
+          (tp/stop processor)
+          (pubsub/stop ps))))))
+
+;; 6. Integration Tests - Backpressure and Concurrency
 
 (deftest test-backpressure-with-slow-handler-and-many-events
   (testing "Todo-processor handles backpressure with 1000 events and slow handler (100ms each)"

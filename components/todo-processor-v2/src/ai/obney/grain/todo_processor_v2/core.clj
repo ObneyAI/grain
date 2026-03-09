@@ -63,7 +63,12 @@
   (u/log ::starting-execution-fn)
   (fn [event]
     (async/thread
-      (try (process-event (assoc context :event event :handler-fn handler-fn))
+      (try (let [tenant-id (:grain/tenant-id event)
+                 event (dissoc event :grain/tenant-id)]
+             (process-event (assoc context
+                              :event event
+                              :handler-fn handler-fn
+                              :tenant-id tenant-id)))
            (catch Throwable t
              {::anom/category ::anom/fault
               ::anom/message "Error processing message"

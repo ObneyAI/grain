@@ -61,8 +61,9 @@
       (let [result (p/append event-store args)]
         (if (anomaly? result)
           result
-          (when event-pubsub
-            (run! #(pubsub/pub event-pubsub {:message %}) events)))))))
+          (let [{:keys [tenant-id]} args]
+            (when event-pubsub
+              (run! #(pubsub/pub event-pubsub {:message (assoc % :grain/tenant-id tenant-id)}) events))))))))
 
 (defn read
   [event-store args]

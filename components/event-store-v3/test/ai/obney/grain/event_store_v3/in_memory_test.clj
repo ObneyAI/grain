@@ -1,8 +1,10 @@
 (ns ai.obney.grain.event-store-v3.in-memory-test
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
+            [clojure.core.async :as async]
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime]))
 
@@ -613,3 +615,44 @@
   (let [event (append-event! :test/alpha #{} {:n 1})
         read (first (non-tx-events (read-events {})))]
     (is (not (contains? read :grain/tenant-id)))))
+
+;; ============================================ ;;
+;; K. Pubsub Tenant-ID Propagation (2 tests)    ;;
+;; ============================================ ;;
+
+(deftest published-events-contain-tenant-id
+  (let [tenant-id (uuid/v4)
+        published (atom [])
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        sub-ch (async/chan 10)
+        store (es/start {:conn {:type :in-memory}
+                         :event-pubsub ps})]
+    (pubsub/sub ps {:topic :test/alpha :sub-chan sub-ch})
+    (async/go-loop []
+      (when-let [evt (async/<! sub-ch)]
+        (swap! published conj evt)
+        (recur)))
+    (try
+      (let [event (es/->event {:type :test/alpha :tags #{} :body {:n 1}})]
+        (es/append store {:tenant-id tenant-id :events [event]})
+        (Thread/sleep 100)
+        (is (= 1 (count @published)))
+        (is (= tenant-id (:grain/tenant-id (first @published)))))
+      (finally
+        (async/close! sub-ch)
+        (es/stop store)
+        (pubsub/stop ps)))))
+
+(deftest stored-events-do-not-contain-tenant-id-with-pubsub
+  (let [tenant-id (uuid/v4)
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        store (es/start {:conn {:type :in-memory}
+                         :event-pubsub ps})]
+    (try
+      (let [event (es/->event {:type :test/alpha :tags #{} :body {:n 1}})]
+        (es/append store {:tenant-id tenant-id :events [event]})
+        (let [read (into [] (es/read store {:tenant-id tenant-id :types #{:test/alpha}}))]
+          (is (not-any? :grain/tenant-id read))))
+      (finally
+        (es/stop store)
+        (pubsub/stop ps)))))
