@@ -343,7 +343,7 @@
                            [:meta {:name "viewport" :content "width=device-width, initial-scale=1.0"}]
                            [:title title]
                            [:script {:type "module" :src datastar-url}]
-                           (when head head)]
+                           (when head (if (fn? head) (head) head))]
                           [:body (when effective-stream-path
                                   {:data-init (str "@get('" effective-stream-path "')")})
                            (when body body)
