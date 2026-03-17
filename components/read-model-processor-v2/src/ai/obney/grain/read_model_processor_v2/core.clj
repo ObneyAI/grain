@@ -14,7 +14,11 @@
 
 (defn fressian-decode [bytes]
   (walk/postwalk
-   (fn [x] (if (instance? java.util.Set x) (set x) x))
+   (fn [x]
+     (cond
+       (instance? java.util.Set x) (set x)
+       (and (instance? java.util.List x) (not (vector? x))) (vec x)
+       :else x))
    (fressian/read (ByteArrayInputStream. bytes))))
 
 (defn format-key

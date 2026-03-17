@@ -73,6 +73,56 @@
       (when (seq body-str)
         (json/read-str body-str :key-fn keyword)))))
 
+(defn- stringify-signal-values
+  "Coerce signal values to strings to match GET query-param semantics.
+   Skips maps and collections (e.g. fieldErrors) — only primitives are stringified."
+  [signals]
+  (reduce-kv (fn [m k v]
+               (assoc m k (cond
+                            (string? v) v
+                            (nil? v) ""
+                            (or (map? v) (sequential? v)) v
+                            :else (str v))))
+             {} signals))
+
+(def parse-datastar-signals
+  "Interceptor that extracts Datastar signals from the `datastar` query param (GET)
+   or JSON body (POST) and merges them into the request's :query-params map.
+   Auto-included by `query->route-pair` on all generated routes.
+
+   POST body formats:
+   - Wrapped:  {\"datastar\": {\"key\": \"val\"}}  (older Datastar convention)
+   - Flat:     {\"key\": \"val\"}                   (Datastar RC.7+)
+
+   POST JSON values are stringified to match GET query-param behavior, since
+   query schemas expect string types (e.g. page, pageSize)."
+  {:name ::parse-datastar-signals
+   :enter
+   (fn [ctx]
+     (let [ds-param (or (get-in ctx [:request :query-params :datastar])
+                        (get-in ctx [:request :query-params "datastar"]))
+           ds-body (when (and (nil? ds-param)
+                              (= :post (get-in ctx [:request :request-method])))
+                     (try
+                       (when-let [body (get-in ctx [:request :body])]
+                         (let [body-str (if (string? body) body (slurp body))]
+                           (when (seq body-str)
+                             (let [parsed (json/read-str body-str :key-fn keyword)]
+                               ;; Unwrap {:datastar {...}} if present, otherwise use flat signals
+                               (stringify-signal-values (or (:datastar parsed) parsed))))))
+                       (catch Exception _ nil)))]
+       (cond
+         ds-param
+         (try
+           (let [signals (json/read-str ds-param :key-fn keyword)]
+             (update-in ctx [:request :query-params] merge signals))
+           (catch Exception _ ctx))
+
+         ds-body
+         (update-in ctx [:request :query-params] merge ds-body)
+
+         :else ctx)))})
+
 (defn- decode-json-command
   "Coerces a raw JSON-parsed command map into proper EDN types using
    the command's registered Malli schema + json-transformer."
@@ -94,6 +144,15 @@
            :command/name command-name
            :command/id (random-uuid)
            :command/timestamp (time/now))))
+
+;; -------------------------------- ;;
+;; Active Stream Context Registry   ;;
+;; -------------------------------- ;;
+
+;; Registry of active event-driven SSE connections.
+;; Maps [user-id query-name] -> {:context-atom atom :signal-ch channel}.
+;; Used by @post to update signals on an existing SSE without reconnecting.
+(def ^:private active-stream-contexts (atom {}))
 
 ;; --------------- ;;
 ;; Query Polling   ;;
@@ -120,14 +179,21 @@
 ;; Interceptor Factories    ;;
 ;; ------------------------ ;;
 
+(defn- extract-query-from-request
+  "Builds the raw query map from a request.
+   Reads :query-params (populated by interceptors for both GET and POST)
+   and :path-params."
+  [request query-name]
+  (merge {:query/name query-name}
+         (:query-params request)
+         (:path-params request)))
+
 (defn- stream-view-loop
   "Polling loop for stream-view. Runs on SSE thread.
    When interval-ms is nil (fps 0), renders once and closes."
   [event-ch sse-ctx context query-name interval-ms additional-context]
   (let [request (:request sse-ctx)
-        raw-query (merge {:query/name query-name}
-                         (:query-params request)
-                         (:path-params request))
+        raw-query (extract-query-from-request request query-name)
         decoded-query (decode-json-query raw-query)
         query-context (merge context additional-context {:query decoded-query})]
     (try
@@ -225,30 +291,36 @@
 
 (defn- stream-view-loop-events
   "Event-driven loop for stream-view. Subscribes to event types, re-renders on events.
-   Sub-chan is created BEFORE initial render to avoid missing events."
+   Sub-chan is created BEFORE initial render to avoid missing events.
+   Query context is stored in an atom so @post can update signals mid-stream."
   [event-ch sse-ctx context query-name event-pubsub event-types debounce-ms additional-context event-tags]
   (let [request (:request sse-ctx)
-        raw-query (merge {:query/name query-name}
-                         (:query-params request)
-                         (:path-params request))
+        raw-query (extract-query-from-request request query-name)
         decoded-query (decode-json-query raw-query)
-        query-context (merge context additional-context {:query decoded-query})
+        initial-context (merge context additional-context {:query decoded-query})
+        context-atom (atom initial-context)
+        signal-ch (async/chan (async/sliding-buffer 1))
+        user-id (get-in additional-context [:auth-claims :user-id])
+        session-key [user-id query-name]
+        _ (swap! active-stream-contexts assoc session-key
+                 {:context-atom context-atom :signal-ch signal-ch})
         event-filter-fn (when event-tags
-                          (resolve-event-tags event-tags query-context))
+                          (resolve-event-tags event-tags @context-atom))
         sub-chan (subscribe-to-events event-pubsub event-types event-filter-fn)]
     (try
       ;; Initial render
-      (let [initial (poll-and-render query-context nil)]
+      (let [initial (poll-and-render @context-atom nil)]
         (when initial
           (async/>!! event-ch (:event initial)))
         (when (:stop? initial)
           (throw (ex-info "stop" {:stop true})))
-        ;; Event loop
+        ;; Event loop — listens to domain events AND signal updates
         (loop [prev-result (:result initial)]
-          (let [[val _port] (async/alts!! [sub-chan (async/timeout 30000)])]
+          (let [[val _port] (async/alts!! [sub-chan signal-ch (async/timeout 30000)])]
             (cond
-              ;; sub-chan closed (pubsub shutting down)
-              (and (nil? val) (async-protocols/closed? sub-chan))
+              ;; Channel closed (pubsub shutting down or signal-ch closed)
+              (and (nil? val) (or (async-protocols/closed? sub-chan)
+                                  (async-protocols/closed? signal-ch)))
               nil
 
               ;; Timeout — liveness check
@@ -257,12 +329,13 @@
                 nil
                 (recur prev-result))
 
-              ;; Event received — debounce, drain, re-render
+              ;; Event or signal update — debounce, drain, re-render with current context
               :else
               (do
                 (when (pos? debounce-ms) (Thread/sleep (long debounce-ms)))
                 (drain-channel sub-chan)
-                (let [poll-result (poll-and-render query-context prev-result)]
+                (drain-channel signal-ch)
+                (let [poll-result (poll-and-render @context-atom prev-result)]
                   (cond
                     (:stop? poll-result)
                     (async/>!! event-ch (:event poll-result))
@@ -281,6 +354,8 @@
         (when-not (= "stop" (.getMessage e))
           (u/log ::stream-view-events-error :error e)))
       (finally
+        (swap! active-stream-contexts dissoc session-key)
+        (async/close! signal-ch)
         (async/close! sub-chan)
         (async/close! event-ch)))))
 
@@ -295,12 +370,43 @@
       pedestal-context
       heartbeat-delay)))
 
+(defn- update-or-start-stream-events
+  "For POST requests: if an active event-driven SSE exists for this user+query,
+   update its context atom with new signals and trigger a re-render via signal-ch.
+   Otherwise start a new SSE. This allows @post to update filters/search on an
+   existing SSE without dropping the persistent connection."
+  [context query-name event-pubsub event-types debounce-ms heartbeat-delay event-tags pedestal-context]
+  (let [additional-context (:grain/additional-context pedestal-context)
+        user-id (get-in additional-context [:auth-claims :user-id])
+        session-key [user-id query-name]
+        existing (get @active-stream-contexts session-key)
+        ;; Only use existing if signal-ch is still open (not stale from a previous session)
+        existing (when (and existing
+                            (not (async-protocols/closed? (:signal-ch existing))))
+                   existing)]
+    (if existing
+      ;; Update existing SSE's context with new signals (from :query-params, already parsed by interceptor)
+      (let [request (:request pedestal-context)
+            new-query (extract-query-from-request request query-name)
+            new-decoded (decode-json-query new-query)
+            {:keys [context-atom signal-ch]} existing]
+        (swap! context-atom assoc :query new-decoded)
+        (async/put! signal-ch :signal-update)
+        ;; Return empty SSE — close immediately. Datastar's @post is one-shot
+        ;; (no auto-reconnect), so the empty response is discarded. The real
+        ;; re-render happens on the existing SSE via signal-ch.
+        (sse/start-stream (fn [ch _] (async/close! ch)) pedestal-context heartbeat-delay))
+      ;; No existing SSE — start fresh
+      (stream-view-enter-events context query-name event-pubsub event-types
+                                debounce-ms heartbeat-delay event-tags pedestal-context))))
+
 (defn stream-view
   "Interceptor factory. Streams :datastar/hiccup via SSE.
 
    Modes:
    - Event-driven: when :event-types is non-empty AND :event-pubsub is in context,
-     re-renders only when relevant events fire.
+     re-renders only when relevant events fire. POST requests update the existing
+     SSE's query context (for signal changes like filters) without reconnecting.
    - Polling: when :fps is positive, polls at the given FPS.
    - One-shot: when :fps is 0 or nil, renders once and closes."
   [context query-name opts]
@@ -308,10 +414,14 @@
          :or {fps 30 heartbeat-delay 10 debounce-ms 50}} opts
         event-pubsub (:event-pubsub context)]
     (if (and (seq event-types) event-pubsub)
-      ;; Event-driven mode
+      ;; Event-driven mode — POST updates existing SSE, GET starts fresh
       {:name (keyword "ai.obney.grain.datastar.core" (str "stream-" (name query-name)))
-       :enter #(stream-view-enter-events context query-name event-pubsub event-types
-                                         debounce-ms heartbeat-delay event-tags %)}
+       :enter (fn [pedestal-context]
+                (if (= :post (get-in pedestal-context [:request :request-method]))
+                  (update-or-start-stream-events context query-name event-pubsub event-types
+                                                  debounce-ms heartbeat-delay event-tags pedestal-context)
+                  (stream-view-enter-events context query-name event-pubsub event-types
+                                            debounce-ms heartbeat-delay event-tags pedestal-context)))}
       ;; Polling / one-shot mode (unchanged)
       (let [interval-ms (when (and fps (pos? fps))
                           (long (/ 1000.0 fps)))]
@@ -328,8 +438,8 @@
 (defn- shim-page-enter
   "Enter fn for shim-page interceptor."
   [opts context]
-  (let [{:keys [title stream-path body head datastar-url html-attrs]
-         :or {title "Grain App" datastar-url default-datastar-url}} opts
+  (let [{:keys [title stream-path body head datastar-url html-attrs stream-method]
+         :or {title "Grain App" datastar-url default-datastar-url stream-method "get"}} opts
         query-string (get-in context [:request :query-string])
         effective-stream-path (when stream-path
                                 (if (and query-string (seq query-string))
@@ -345,7 +455,7 @@
                            [:script {:type "module" :src datastar-url}]
                            (when head (if (fn? head) (head) head))]
                           [:body (when effective-stream-path
-                                  {:data-init (str "@get('" effective-stream-path "')")})
+                                  {:data-init (str "@" stream-method "('" effective-stream-path "')")})
                            (when body body)
                            (when effective-stream-path
                              [:div {:id "app"}])]]))]
@@ -444,14 +554,20 @@
                         (seq event-types) (assoc :event-types event-types
                                                  :debounce-ms debounce-ms)
                         event-tags (assoc :event-tags event-tags))]
-      [;; Shim page route
-       [path :get (into interceptors [(shim-page shim-opts)])
-        :route-name (keyword (namespace route-base)
-                             (str (name route-base) "-page"))]
-       ;; Stream route
-       [stream-path :get (into interceptors [(stream-view context query-name stream-opts)])
-        :route-name (keyword (namespace route-base)
-                             (str (name route-base) "-stream"))]])))
+      (let [with-signals (fn [extra]
+                          (into [parse-datastar-signals] (concat interceptors extra)))]
+        [;; Shim page route (GET)
+         [path :get (with-signals [(shim-page shim-opts)])
+          :route-name (keyword (namespace route-base)
+                               (str (name route-base) "-page"))]
+         ;; Stream route (GET — initial page load via @get)
+         [stream-path :get (with-signals [(stream-view context query-name stream-opts)])
+          :route-name (keyword (namespace route-base)
+                               (str (name route-base) "-stream"))]
+         ;; Stream route (POST — @post sends signals in body)
+         [stream-path :post (with-signals [(stream-view context query-name stream-opts)])
+          :route-name (keyword (namespace route-base)
+                               (str (name route-base) "-stream-post"))]]))))
 
 (defn routes
   "Scans the query registry for entries with :datastar/path and generates

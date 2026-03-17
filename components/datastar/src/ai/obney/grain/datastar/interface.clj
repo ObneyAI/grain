@@ -31,6 +31,11 @@
   [signals opts]
   (core/patch-signals signals opts))
 
+(def parse-datastar-signals
+  "Interceptor that parses Datastar signals from GET query params or POST body.
+   Auto-included by `routes` on all generated routes."
+  core/parse-datastar-signals)
+
 (defn routes
   "Generate Pedestal routes from query registry metadata."
   ([context] (core/routes context))

@@ -28,6 +28,7 @@
    :test/auto-counters [:map]
    :test/event-counters [:map]
    :test/tagged-counters [:map]
+   :test/filterable-counters [:map [:filter {:optional true} :string]]
    :test/increment [:map [:counter-id :uuid]]
    :test/no-signals [:map]})
 
@@ -134,6 +135,35 @@
         [:div {:id (str (:id c))}
          (:name c) ": " (:value c)])]}))
 
+;; ------------------------------------------------- ;;
+;; Filterable Event-Driven Query (for POST tests)    ;;
+;; ------------------------------------------------- ;;
+
+#_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
+(rmp/defreadmodel :test filterable-counters-rm
+  {:events #{:test/counter-incremented}
+   :version 1}
+  [state event]
+  (update state :count (fnil inc 0)))
+
+(defquery :test filterable-counters
+  {:authorized? (constantly true)
+   :grain/read-models {:test/filterable-counters-rm 1}
+   :datastar/path "/filterable-counters"
+   :datastar/title "Filterable Counters"
+   :datastar/debounce-ms 50}
+  [context]
+  (let [state @(:test-state context)
+        counters (:counters state)
+        filter-val (get-in context [:query :filter])]
+    {:query/result {:counters counters :filter filter-val}
+     :datastar/hiccup
+     [:div#app
+      (when filter-val [:div#active-filter "filter:" filter-val])
+      (for [c counters]
+        [:div {:id (str (:id c))}
+         (:name c) ": " (:value c)])]}))
+
 ;; =========================== ;;
 ;; Pure Function Tests          ;;
 ;; =========================== ;;
@@ -174,6 +204,88 @@
     (let [result (ds/patch-signals {:key "val"} {:only-if-missing true})]
       (is (str/starts-with? (:data result) "onlyIfMissing true\n")))))
 
+;; ======================================= ;;
+;; parse-datastar-signals Interceptor Tests ;;
+;; ======================================= ;;
+
+(deftest parse-datastar-signals-test
+  (testing "GET with ?datastar= query param merges signals into :query-params"
+    (let [ctx {:request {:request-method :get
+                         :query-params {:datastar (json/write-str {:page "2" :search "foo"})}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= "2" (get-in result [:request :query-params :page])))
+      (is (= "foo" (get-in result [:request :query-params :search])))))
+
+  (testing "GET with string key datastar param"
+    (let [ctx {:request {:request-method :get
+                         :query-params {"datastar" (json/write-str {:filter "active"})}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= "active" (get-in result [:request :query-params :filter])))))
+
+  (testing "POST with wrapped JSON body merges datastar signals into :query-params"
+    (let [body-str (json/write-str {:datastar {:search "bar" :location_id "abc"}})
+          ctx {:request {:request-method :post
+                         :body body-str
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= "bar" (get-in result [:request :query-params :search])))
+      (is (= "abc" (get-in result [:request :query-params :location_id])))))
+
+  (testing "POST with empty body returns context unchanged"
+    (let [ctx {:request {:request-method :post
+                         :body ""
+                         :query-params {:existing "val"}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= {:existing "val"} (get-in result [:request :query-params])))))
+
+  (testing "GET with no datastar param returns context unchanged"
+    (let [ctx {:request {:request-method :get
+                         :query-params {:other "param"}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= {:other "param"} (get-in result [:request :query-params])))))
+
+  (testing "malformed JSON in datastar param returns context unchanged"
+    (let [ctx {:request {:request-method :get
+                         :query-params {:datastar "not-json{"}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= ctx result))))
+
+  (testing "malformed JSON in POST body returns context unchanged"
+    (let [ctx {:request {:request-method :post
+                         :body "not-json{"
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= ctx result))))
+
+  (testing "POST with flat JSON body (Datastar RC.7+) merges signals, values stringified"
+    (let [body-str (json/write-str {:location_id "loc-123" :filter "all" :page 1 :pageSize 25})
+          ctx {:request {:request-method :post
+                         :body body-str
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= "loc-123" (get-in result [:request :query-params :location_id])))
+      (is (= "all" (get-in result [:request :query-params :filter])))
+      (is (= "1" (get-in result [:request :query-params :page])))
+      (is (= "25" (get-in result [:request :query-params :pageSize])))))
+
+  (testing "POST with wrapped body {:datastar {...}} still works"
+    (let [body-str (json/write-str {:datastar {:search "wrapped"}})
+          ctx {:request {:request-method :post
+                         :body body-str
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= "wrapped" (get-in result [:request :query-params :search])))))
+
+  (testing "POST stringifies booleans and nil, preserves maps"
+    (let [body-str (json/write-str {:active true :count 0 :fieldErrors {:name "required"}})
+          ctx {:request {:request-method :post
+                         :body body-str
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= "true" (get-in result [:request :query-params :active])))
+      (is (= "0" (get-in result [:request :query-params :count])))
+      (is (= {:name "required"} (get-in result [:request :query-params :fieldErrors]))))))
+
 ;; =========================== ;;
 ;; Shim Page Tests              ;;
 ;; =========================== ;;
@@ -192,7 +304,13 @@
           result ((:enter interceptor) {})]
       (is (str/includes? (get-in result [:response :body]) "data-init"))
       ;; hiccup2 escapes ' to &apos; in attributes
-      (is (str/includes? (get-in result [:response :body]) "@get(&apos;/stream&apos;)")))))
+      (is (str/includes? (get-in result [:response :body]) "@get(&apos;/stream&apos;)"))))
+
+  (testing "with stream-method post"
+    (let [interceptor (ds/shim-page {:stream-path "/stream" :stream-method "post"})
+          result ((:enter interceptor) {})]
+      (is (str/includes? (get-in result [:response :body]) "data-init"))
+      (is (str/includes? (get-in result [:response :body]) "@post(&apos;/stream&apos;)")))))
 
 ;; =========================== ;;
 ;; Malli Coercion Tests         ;;
@@ -337,10 +455,26 @@
 (def ^:dynamic *e2e-state* nil)
 (def ^:dynamic *event-pubsub* nil)
 
+(def test-user-id-a #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+(def test-user-id-b #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
 (defn- get-server-port [webserver]
   (let [service-map (get webserver :ai.obney.grain.webserver.core/server)
         jetty-server (::http/server service-map)]
     (.getLocalPort (first (.getConnectors jetty-server)))))
+
+(defn- inject-auth-interceptor
+  "Interceptor that injects :grain/additional-context with auth claims.
+   Reads user-id from the X-Test-User-Id header, defaulting to test-user-id-a."
+  []
+  {:name ::inject-auth
+   :enter (fn [ctx]
+            (let [user-id-str (get-in ctx [:request :headers "x-test-user-id"])
+                  user-id (if user-id-str
+                            (parse-uuid user-id-str)
+                            test-user-id-a)]
+              (assoc ctx :grain/additional-context
+                     {:auth-claims {:user-id user-id}})))})
 
 (defn e2e-fixture [f]
   (let [state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
@@ -352,12 +486,22 @@
                  :command-registry @cp/command-registry*
                  :query-registry @qp/query-registry*
                  :event-pubsub event-pubsub}
+        auth-interceptor (inject-auth-interceptor)
+        event-types #{:test/counter-incremented}
+        stream-opts {:event-types event-types :debounce-ms 50}
         manual-routes #{["/counters" :get [(ds/shim-page {:stream-path "/counters/stream"})]
                          :route-name ::counters-page]
                         ["/counters/stream" :get [(ds/stream-view context :test/counters {:fps 10})]
                          :route-name ::counters-stream]
                         ["/ds/command" :post [(ds/action-handler context {})]
-                         :route-name ::ds-command]}
+                         :route-name ::ds-command]
+                        ;; POST-testable event-driven stream with auth
+                        ["/filterable/stream" :get [auth-interceptor
+                                                    (ds/stream-view context :test/filterable-counters stream-opts)]
+                         :route-name ::filterable-stream-get]
+                        ["/filterable/stream" :post [auth-interceptor
+                                                     (ds/stream-view context :test/filterable-counters stream-opts)]
+                         :route-name ::filterable-stream-post]}
         auto-routes (ds/routes context)
         routes (into manual-routes auto-routes)
         server (ws/start {:http/routes routes :http/port 0 :http/join? false})
@@ -464,26 +608,32 @@
          (#'ds/query-name->route-name :test/counters))))
 
 (deftest query->route-pair-test
-  (testing "entry with :datastar/path produces two routes"
+  (testing "entry with :datastar/path produces three routes"
     (let [entry {:handler-fn identity
                  :authorized? (constantly true)
                  :datastar/path "/my-page"
                  :datastar/title "My Page"
                  :datastar/fps 5}
           context {}
-          [shim-route stream-route] (#'ds/query->route-pair context :test/my-page entry)]
+          [shim-route stream-route post-stream-route] (#'ds/query->route-pair context :test/my-page entry)]
       (is (some? shim-route))
       (is (some? stream-route))
+      (is (some? post-stream-route))
       ;; Shim route
       (is (= "/my-page" (first shim-route)))
       (is (= :get (second shim-route)))
       (is (= :ai.obney.grain.datastar.core/test-my-page-page
              (last shim-route)))
-      ;; Stream route
+      ;; GET Stream route
       (is (= "/my-page/stream" (first stream-route)))
       (is (= :get (second stream-route)))
       (is (= :ai.obney.grain.datastar.core/test-my-page-stream
-             (last stream-route)))))
+             (last stream-route)))
+      ;; POST Stream route
+      (is (= "/my-page/stream" (first post-stream-route)))
+      (is (= :post (second post-stream-route)))
+      (is (= :ai.obney.grain.datastar.core/test-my-page-stream-post
+             (last post-stream-route)))))
 
   (testing "entry without :datastar/path returns nil"
     (is (nil? (#'ds/query->route-pair {} :test/counters
@@ -498,8 +648,8 @@
                                    :test/no-path {:handler-fn identity
                                                    :authorized? (constantly true)}}}
         generated (ds/routes context)]
-    (testing "correct number of routes (2 per annotated query)"
-      (is (= 2 (count generated))))
+    (testing "correct number of routes (3 per annotated query: shim + GET stream + POST stream)"
+      (is (= 3 (count generated))))
 
     (testing "queries without :datastar/path are excluded"
       (let [paths (set (map first generated))]
@@ -535,8 +685,9 @@
         generated (ds/routes context {:test/overridable {:datastar/interceptors [my-interceptor]}})
         shim-route (first (filter #(= "/overridable" (first %)) generated))
         interceptors (nth shim-route 2)]
-    (testing "override interceptors are prepended"
-      (is (= ::test-override-interceptor (:name (first interceptors)))))))
+    (testing "parse-datastar-signals is first, then override interceptor"
+      (is (= ::ds/parse-datastar-signals (:name (first interceptors))))
+      (is (= ::test-override-interceptor (:name (second interceptors)))))))
 
 (deftest routes-with-interceptors-test
   (let [my-interceptor {:name ::my-guard :enter identity}
@@ -546,17 +697,29 @@
                                                   :datastar/interceptors [my-interceptor]}}}
         generated (ds/routes context)
         shim-route (first (filter #(= "/guarded" (first %)) generated))
-        stream-route (first (filter #(= "/guarded/stream" (first %)) generated))
+        get-stream-route (first (filter #(and (= "/guarded/stream" (first %))
+                                               (= :get (second %))) generated))
+        post-stream-route (first (filter #(and (= "/guarded/stream" (first %))
+                                                (= :post (second %))) generated))
         shim-interceptors (nth shim-route 2)
-        stream-interceptors (nth stream-route 2)]
-    (testing "shim route has custom interceptor before shim-page"
-      (is (= ::my-guard (:name (first shim-interceptors))))
-      (is (= :ai.obney.grain.datastar.core/shim-page (:name (second shim-interceptors)))))
+        get-stream-interceptors (nth get-stream-route 2)
+        post-stream-interceptors (nth post-stream-route 2)]
+    (testing "shim route: parse-datastar-signals first, custom interceptor second, shim-page last"
+      (is (= ::ds/parse-datastar-signals (:name (first shim-interceptors))))
+      (is (= ::my-guard (:name (second shim-interceptors))))
+      (is (= :ai.obney.grain.datastar.core/shim-page (:name (nth shim-interceptors 2)))))
 
-    (testing "stream route has custom interceptor before stream-view"
-      (is (= ::my-guard (:name (first stream-interceptors))))
+    (testing "GET stream route: parse-datastar-signals first, custom interceptor second, stream-view last"
+      (is (= ::ds/parse-datastar-signals (:name (first get-stream-interceptors))))
+      (is (= ::my-guard (:name (second get-stream-interceptors))))
       (is (= :ai.obney.grain.datastar.core/stream-guarded
-             (:name (second stream-interceptors)))))))
+             (:name (nth get-stream-interceptors 2)))))
+
+    (testing "POST stream route: parse-datastar-signals first, custom interceptor second, stream-view last"
+      (is (= ::ds/parse-datastar-signals (:name (first post-stream-interceptors))))
+      (is (= ::my-guard (:name (second post-stream-interceptors))))
+      (is (= :ai.obney.grain.datastar.core/stream-guarded
+             (:name (nth post-stream-interceptors 2)))))))
 
 ;; =========================== ;;
 ;; E2E Auto-Routes Test         ;;
@@ -631,6 +794,21 @@
     (is (= 1 (count events)))
     (is (= "datastar-patch-elements" (:name (first events))))
     (is (str/includes? (:data (first events)) "elements"))))
+
+(deftest e2e-event-driven-post-initial-render-test
+  (testing "POST to event-driven stream returns initial render"
+    (let [client (HttpClient/newHttpClient)
+          body (json/write-str {:datastar {}})
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/event-counters/stream")))
+                      (.header "Content-Type" "application/json")
+                      (.POST (HttpRequest$BodyPublishers/ofString body))
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
+          events (parse-sse-events (.body response) 1 5000)]
+      (is (= 1 (count events)))
+      (is (= "datastar-patch-elements" (:name (first events))))
+      (is (str/includes? (:data (first events)) "elements")))))
 
 (deftest e2e-event-driven-rerender-on-event-test
   (let [client (HttpClient/newHttpClient)
@@ -762,6 +940,38 @@
     (is (= 2 (count stream-events)))
     (is (str/includes? (:data (second stream-events)) "77"))))
 
+;; =========================== ;;
+;; E2E POST Stream Tests       ;;
+;; =========================== ;;
+
+(deftest e2e-post-stream-test
+  (testing "POST to stream endpoint returns SSE events"
+    (let [client (HttpClient/newHttpClient)
+          body (json/write-str {:datastar {}})
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/auto-counters/stream")))
+                      (.header "Content-Type" "application/json")
+                      (.POST (HttpRequest$BodyPublishers/ofString body))
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
+          events (parse-sse-events (.body response) 1 5000)]
+      (is (= 1 (count events)))
+      (is (= "datastar-patch-elements" (:name (first events))))
+      (is (str/includes? (:data (first events)) "elements")))))
+
+(deftest e2e-post-stream-empty-body-test
+  (testing "POST with empty body still returns initial render"
+    (let [client (HttpClient/newHttpClient)
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/auto-counters/stream")))
+                      (.header "Content-Type" "application/json")
+                      (.POST (HttpRequest$BodyPublishers/ofString ""))
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
+          events (parse-sse-events (.body response) 1 5000)]
+      (is (= 1 (count events)))
+      (is (= "datastar-patch-elements" (:name (first events)))))))
+
 (deftest e2e-event-tags-non-matching-test
   (let [client (HttpClient/newHttpClient)
         counter-id "00000000-0000-0000-0000-000000000001"
@@ -781,3 +991,208 @@
     ;; Only initial render — event was filtered out by transducer
     (is (= 1 (count stream-events)))
     (is (not (str/includes? (:data (first stream-events)) "999")))))
+
+;; ============================================ ;;
+;; E2E POST Signal Update Tests                  ;;
+;; ============================================ ;;
+
+(deftest e2e-post-updates-existing-sse-signals-test
+  (testing "POST to event-driven stream updates context on existing GET SSE and triggers re-render"
+    (let [client (HttpClient/newHttpClient)
+          ;; 1. Open GET SSE stream (event-driven, with auth)
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                          (.header "X-Test-User-Id" (str test-user-id-a))
+                          (.GET)
+                          .build)
+          get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; Expect: initial render + 1 re-render after POST signal update = 2 events
+          stream-events-future (future (parse-sse-events (.body get-response) 2 10000))
+          ;; Wait for SSE to connect and register in active-stream-contexts
+          _ (Thread/sleep 500)
+          ;; 2. POST with filter param — should update existing SSE's context, not start new SSE
+          post-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/filterable/stream?filter=active")))
+                           (.header "Content-Type" "application/json")
+                           (.header "X-Test-User-Id" (str test-user-id-a))
+                           (.POST (HttpRequest$BodyPublishers/ofString ""))
+                           .build)
+          _ (.send client post-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; 3. Collect SSE events from the original GET stream
+          stream-events @stream-events-future]
+      ;; Initial render should NOT have the filter
+      (is (= 2 (count stream-events)))
+      (is (not (str/includes? (:data (first stream-events)) "filter:")))
+      ;; Re-render after POST should include the filter value
+      (is (str/includes? (:data (second stream-events)) "filter:active")))))
+
+(deftest e2e-post-no-existing-sse-starts-fresh-test
+  (testing "POST to event-driven stream starts a new SSE when no existing stream is open"
+    (let [client (HttpClient/newHttpClient)
+          ;; Use a unique user so no prior stream exists
+          unique-user-id (random-uuid)
+          ;; POST without a prior GET — should start a fresh SSE
+          post-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/filterable/stream?filter=new")))
+                           (.header "Content-Type" "application/json")
+                           (.header "X-Test-User-Id" (str unique-user-id))
+                           (.POST (HttpRequest$BodyPublishers/ofString (json/write-str {:datastar {}})))
+                           .build)
+          post-response (.send client post-request (HttpResponse$BodyHandlers/ofInputStream))
+          events (parse-sse-events (.body post-response) 1 10000)]
+      ;; Should get initial render with the filter applied
+      (is (= 1 (count events)))
+      (is (= "datastar-patch-elements" (:name (first events))))
+      (is (str/includes? (:data (first events)) "filter:new")))))
+
+(deftest e2e-post-signal-update-plus-domain-event-test
+  (testing "POST updates signals, then domain event triggers re-render with updated context"
+    (let [client (HttpClient/newHttpClient)
+          ;; 1. Open GET SSE stream
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                          (.header "X-Test-User-Id" (str test-user-id-a))
+                          (.GET)
+                          .build)
+          get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; Expect: initial + POST re-render + domain event re-render = 3
+          stream-events-future (future (parse-sse-events (.body get-response) 3 10000))
+          _ (Thread/sleep 500)
+          ;; 2. POST to update filter signal
+          post-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/filterable/stream?filter=vip")))
+                           (.header "Content-Type" "application/json")
+                           (.header "X-Test-User-Id" (str test-user-id-a))
+                           (.POST (HttpRequest$BodyPublishers/ofString ""))
+                           .build)
+          _ (.send client post-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; Wait for POST re-render to complete
+          _ (Thread/sleep 300)
+          ;; 3. Modify state and publish domain event
+          _ (swap! *e2e-state* assoc-in [:counters 0 :value] 555)
+          _ (pubsub/pub *event-pubsub* {:message {:event/type :test/counter-incremented}})
+          stream-events @stream-events-future]
+      ;; Event 1: initial render — no filter
+      (is (= 3 (count stream-events)))
+      (is (not (str/includes? (:data (first stream-events)) "filter:")))
+      ;; Event 2: POST signal update — filter:vip, old value
+      (is (str/includes? (:data (second stream-events)) "filter:vip"))
+      ;; Event 3: domain event re-render — filter still vip, new value 555
+      (is (str/includes? (:data (nth stream-events 2)) "filter:vip"))
+      (is (str/includes? (:data (nth stream-events 2)) "555")))))
+
+(deftest e2e-concurrent-users-independent-streams-test
+  (testing "Two users have independent SSE streams — POST from one doesn't affect the other"
+    (let [client (HttpClient/newHttpClient)
+          ;; 1. User A opens GET SSE stream
+          get-a (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                    (.header "X-Test-User-Id" (str test-user-id-a))
+                    (.GET)
+                    .build)
+          response-a (.send client get-a (HttpResponse$BodyHandlers/ofInputStream))
+          ;; User A: initial + POST re-render = 2
+          events-a-future (future (parse-sse-events (.body response-a) 2 10000))
+          _ (Thread/sleep 300)
+          ;; 2. User B opens GET SSE stream
+          get-b (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                    (.header "X-Test-User-Id" (str test-user-id-b))
+                    (.GET)
+                    .build)
+          response-b (.send client get-b (HttpResponse$BodyHandlers/ofInputStream))
+          ;; User B: initial only, no POST = 1 (timeout after waiting for 2nd)
+          events-b-future (future (parse-sse-events (.body response-b) 2 5000))
+          _ (Thread/sleep 300)
+          ;; 3. POST as User A — should only update User A's stream
+          post-a (-> (HttpRequest/newBuilder)
+                     (.uri (URI/create (str "http://localhost:" *port*
+                                            "/filterable/stream?filter=user-a-only")))
+                     (.header "Content-Type" "application/json")
+                     (.header "X-Test-User-Id" (str test-user-id-a))
+                     (.POST (HttpRequest$BodyPublishers/ofString ""))
+                     .build)
+          _ (.send client post-a (HttpResponse$BodyHandlers/ofInputStream))
+          events-a @events-a-future
+          events-b @events-b-future]
+      ;; User A got re-render with filter
+      (is (= 2 (count events-a)))
+      (is (str/includes? (:data (second events-a)) "filter:user-a-only"))
+      ;; User B only got initial render — no filter, no re-render from User A's POST
+      (is (= 1 (count events-b)))
+      (is (not (str/includes? (:data (first events-b)) "filter:"))))))
+
+(deftest e2e-stale-session-cleanup-test
+  (testing "POST skips stale registry entry with closed signal-ch"
+    ;; Directly manipulate the active-stream-contexts atom to simulate a stale entry
+    (let [stale-user-id (random-uuid)
+          session-key [stale-user-id :test/filterable-counters]
+          closed-ch (async/chan)]
+      ;; Close the channel to make it stale
+      (async/close! closed-ch)
+      ;; Insert stale entry
+      (swap! @#'ds/active-stream-contexts assoc session-key
+             {:context-atom (atom {}) :signal-ch closed-ch})
+      (try
+        (let [client (HttpClient/newHttpClient)
+              ;; POST should detect closed signal-ch and start fresh
+              post-request (-> (HttpRequest/newBuilder)
+                               (.uri (URI/create (str "http://localhost:" *port*
+                                                      "/filterable/stream?filter=after-stale")))
+                               (.header "Content-Type" "application/json")
+                               (.header "X-Test-User-Id" (str stale-user-id))
+                               (.POST (HttpRequest$BodyPublishers/ofString (json/write-str {:datastar {}})))
+                               .build)
+              post-response (.send client post-request (HttpResponse$BodyHandlers/ofInputStream))
+              events (parse-sse-events (.body post-response) 1 10000)]
+          ;; Fresh SSE started — should render with the filter
+          (is (= 1 (count events)))
+          (is (str/includes? (:data (first events)) "filter:after-stale")))
+        (finally
+          ;; Clean up any stale entry
+          (swap! @#'ds/active-stream-contexts dissoc session-key))))))
+
+(deftest e2e-multiple-post-signal-updates-test
+  (testing "Multiple POSTs update the same SSE stream, each triggering a re-render"
+    (let [client (HttpClient/newHttpClient)
+          ;; 1. Open GET SSE stream
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                          (.header "X-Test-User-Id" (str test-user-id-a))
+                          (.GET)
+                          .build)
+          get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; initial + 2 POST re-renders = 3
+          stream-events-future (future (parse-sse-events (.body get-response) 3 10000))
+          _ (Thread/sleep 500)
+          ;; 2. First POST — filter=first
+          post-1 (-> (HttpRequest/newBuilder)
+                     (.uri (URI/create (str "http://localhost:" *port*
+                                            "/filterable/stream?filter=first")))
+                     (.header "Content-Type" "application/json")
+                     (.header "X-Test-User-Id" (str test-user-id-a))
+                     (.POST (HttpRequest$BodyPublishers/ofString ""))
+                     .build)
+          _ (.send client post-1 (HttpResponse$BodyHandlers/ofInputStream))
+          ;; Wait for first re-render to complete before sending second
+          _ (Thread/sleep 300)
+          ;; 3. Second POST — filter=second (overwrites first)
+          post-2 (-> (HttpRequest/newBuilder)
+                     (.uri (URI/create (str "http://localhost:" *port*
+                                            "/filterable/stream?filter=second")))
+                     (.header "Content-Type" "application/json")
+                     (.header "X-Test-User-Id" (str test-user-id-a))
+                     (.POST (HttpRequest$BodyPublishers/ofString ""))
+                     .build)
+          _ (.send client post-2 (HttpResponse$BodyHandlers/ofInputStream))
+          stream-events @stream-events-future]
+      (is (= 3 (count stream-events)))
+      ;; Initial — no filter
+      (is (not (str/includes? (:data (first stream-events)) "filter:")))
+      ;; After first POST
+      (is (str/includes? (:data (second stream-events)) "filter:first"))
+      ;; After second POST — context overwritten
+      (is (str/includes? (:data (nth stream-events 2)) "filter:second")))))
