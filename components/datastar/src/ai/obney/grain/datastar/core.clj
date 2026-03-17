@@ -296,8 +296,8 @@
   [event-ch sse-ctx context query-name event-pubsub event-types debounce-ms additional-context event-tags]
   (let [request (:request sse-ctx)
         raw-query (extract-query-from-request request query-name)
-        nonce (or (:__ds_nonce raw-query) (get raw-query "__ds_nonce"))
-        decoded-query (decode-json-query raw-query)
+        nonce (or (:dsNonce raw-query) (get raw-query "dsNonce"))
+        decoded-query (decode-json-query (dissoc raw-query :dsNonce "dsNonce"))
         initial-context (merge context additional-context {:query decoded-query})
         context-atom (atom initial-context)
         signal-ch (async/chan (async/sliding-buffer 1))
@@ -380,7 +380,7 @@
   (let [additional-context (:grain/additional-context pedestal-context)
         request (:request pedestal-context)
         raw-query (extract-query-from-request request query-name)
-        nonce (or (:__ds_nonce raw-query) (get raw-query "__ds_nonce"))
+        nonce (or (:dsNonce raw-query) (get raw-query "dsNonce"))
         user-id (get-in additional-context [:auth-claims :user-id])
         session-key [user-id query-name nonce]
         existing (get @active-stream-contexts session-key)
@@ -393,7 +393,7 @@
                    existing)]
     (if existing
       ;; Update existing SSE's context with new signals (from :query-params, already parsed by interceptor)
-      (let [new-decoded (decode-json-query raw-query)
+      (let [new-decoded (decode-json-query (dissoc raw-query :dsNonce "dsNonce"))
             {:keys [context-atom signal-ch]} existing]
         (swap! context-atom assoc :query new-decoded)
         (async/put! signal-ch :signal-update)
@@ -459,7 +459,7 @@
                                              (str stream-path "?" query-string)
                                              stream-path)
                                       separator (if (string/includes? base "?") "&" "?")]
-                                  (str base separator "__ds_nonce=" nonce)))
+                                  (str base separator "dsNonce=" nonce)))
         page-html (str "<!DOCTYPE html>"
                        (h/html
                          [:html (or html-attrs {})
@@ -469,8 +469,13 @@
                            [:title title]
                            [:script {:type "module" :src datastar-url}]
                            (when head (if (fn? head) (head) head))]
-                          [:body (when effective-stream-path
-                                  {:data-init (str "@" stream-method "('" effective-stream-path "')")})
+                          [:body (cond-> {}
+                                  effective-stream-path
+                                  (assoc :data-init (str "@" stream-method "('" effective-stream-path "')"))
+                                  ;; For POST streams, nonce as signal so Datastar sends it with every @post
+                                  (and effective-stream-path (= stream-method "post"))
+                                  (assoc :data-signals (str "{'dsNonce': '" nonce "'}")))
+
 
                            (when body body)
                            (when effective-stream-path

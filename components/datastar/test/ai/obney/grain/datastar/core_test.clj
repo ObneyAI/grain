@@ -305,15 +305,18 @@
           result ((:enter interceptor) {})]
       (is (str/includes? (get-in result [:response :body]) "data-init"))
       ;; hiccup2 escapes ' to &apos; in attributes; nonce appended as query param
-      (is (str/includes? (get-in result [:response :body]) "@get(&apos;/stream?__ds_nonce="))))
+      (is (str/includes? (get-in result [:response :body]) "@get(&apos;/stream?dsNonce="))))
 
-  (testing "with stream-method post — nonce in URL"
+  (testing "with stream-method post — nonce in URL and as signal"
     (let [interceptor (ds/shim-page {:stream-path "/stream" :stream-method "post"})
           result ((:enter interceptor) {})
           body (get-in result [:response :body])]
       (is (str/includes? body "data-init"))
-      ;; POST: nonce IS in the URL (views pass it through to subsequent @post calls)
-      (is (str/includes? body "@post(&apos;/stream?__ds_nonce=")))))
+      ;; POST: nonce in URL for data-init
+      (is (str/includes? body "@post(&apos;/stream?dsNonce="))
+      ;; AND as data-signals for subsequent @post calls
+      (is (str/includes? body "data-signals"))
+      (is (str/includes? body "dsNonce")))))
 
 ;; =========================== ;;
 ;; Malli Coercion Tests         ;;
@@ -533,7 +536,7 @@
     (is (str/includes? body "<script"))
     (is (str/includes? body "datastar"))
     ;; hiccup2 escapes ' to &apos; in attributes
-    (is (str/includes? body "@get(&apos;/counters/stream?__ds_nonce="))))
+    (is (str/includes? body "@get(&apos;/counters/stream?dsNonce="))))
 
 (deftest e2e-sse-stream-test
   (let [client (HttpClient/newHttpClient)
@@ -741,7 +744,7 @@
         (is (str/includes? body "<script"))
         (is (str/includes? body "datastar"))
         (is (str/includes? body "Auto Counters"))
-        (is (str/includes? body "@get(&apos;/auto-counters/stream?__ds_nonce="))))
+        (is (str/includes? body "@get(&apos;/auto-counters/stream?dsNonce="))))
 
     (testing "SSE stream works at auto-generated path"
       (let [request (-> (HttpRequest/newBuilder)
@@ -871,7 +874,7 @@
         body (.body response)]
     (is (= 200 (.statusCode response)))
     (is (str/includes? body "Event Counters"))
-    (is (str/includes? body "@get(&apos;/event-counters/stream?__ds_nonce="))))
+    (is (str/includes? body "@get(&apos;/event-counters/stream?dsNonce="))))
 
 ;; ====================================== ;;
 ;; resolve-event-tags Unit Tests           ;;
@@ -1245,7 +1248,7 @@
           ;; Tab A: GET with nonce-a
           get-a (-> (HttpRequest/newBuilder)
                     (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?__ds_nonce=" nonce-a)))
+                                          "/filterable/stream?dsNonce=" nonce-a)))
                     (.header "X-Test-User-Id" (str test-user-id-a))
                     (.GET)
                     .build)
@@ -1256,18 +1259,18 @@
           ;; Tab B: GET with nonce-b (same user)
           get-b (-> (HttpRequest/newBuilder)
                     (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?__ds_nonce=" nonce-b)))
+                                          "/filterable/stream?dsNonce=" nonce-b)))
                     (.header "X-Test-User-Id" (str test-user-id-a))
                     (.GET)
                     .build)
           response-b (.send client get-b (HttpResponse$BodyHandlers/ofInputStream))
-          ;; Tab B: initial only (no POST sent to this nonce)
+          ;; Tab B: initial only (no POST to this nonce), timeout waiting for 2nd
           events-b-future (future (parse-sse-events (.body response-b) 2 5000))
           _ (Thread/sleep 300)
           ;; POST to Tab A's nonce — should only update Tab A
           post-a (-> (HttpRequest/newBuilder)
                      (.uri (URI/create (str "http://localhost:" *port*
-                                            "/filterable/stream?filter=tab-a-only&__ds_nonce=" nonce-a)))
+                                            "/filterable/stream?filter=tab-a-only&dsNonce=" nonce-a)))
                      (.header "Content-Type" "application/json")
                      (.header "X-Test-User-Id" (str test-user-id-a))
                      (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -1275,7 +1278,7 @@
           _ (.send client post-a (HttpResponse$BodyHandlers/ofInputStream))
           events-a @events-a-future
           events-b @events-b-future]
-      ;; Tab A got initial + POST re-render with filter
+      ;; Tab A got initial render + POST re-render with filter
       (is (= 2 (count events-a)))
       (is (str/includes? (:data (second events-a)) "filter:tab-a-only"))
       ;; Tab B only got initial render — POST to nonce-a didn't affect it
@@ -1299,7 +1302,7 @@
         ;; POST with new nonce — should NOT find the old nonce's entry, starts fresh
         (let [post-request (-> (HttpRequest/newBuilder)
                                (.uri (URI/create (str "http://localhost:" *port*
-                                                      "/filterable/stream?filter=fresh-page&__ds_nonce=" new-nonce)))
+                                                      "/filterable/stream?filter=fresh-page&dsNonce=" new-nonce)))
                                (.header "Content-Type" "application/json")
                                (.header "X-Test-User-Id" (str user-id))
                                (.POST (HttpRequest$BodyPublishers/ofString (json/write-str {:datastar {}})))
@@ -1324,25 +1327,25 @@
           ;; 1. GET SSE with nonce in URL (simulates data-init)
           get-request (-> (HttpRequest/newBuilder)
                           (.uri (URI/create (str "http://localhost:" *port*
-                                                "/filterable/stream?__ds_nonce=" nonce)))
+                                                "/filterable/stream?dsNonce=" nonce)))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
           get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
-          ;; Expect initial + signal update = 2 events
+          ;; Expect initial + POST re-render = 2 events
           stream-events-future (future (parse-sse-events (.body get-response) 2 10000))
           _ (Thread/sleep 500)
           ;; 2. POST with nonce in URL (simulates view-rendered @post path)
           post-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?filter=url-nonce&__ds_nonce=" nonce)))
+                                                  "/filterable/stream?filter=url-nonce&dsNonce=" nonce)))
                            (.header "Content-Type" "application/json")
                            (.header "X-Test-User-Id" (str test-user-id-a))
                            (.POST (HttpRequest$BodyPublishers/ofString ""))
                            .build)
           _ (.send client post-request (HttpResponse$BodyHandlers/ofInputStream))
           stream-events @stream-events-future]
-      ;; GET SSE should have received both initial render + signal update
+      ;; GET SSE should have received initial render + POST re-render
       (is (= 2 (count stream-events)))
       ;; Second event should have the filter from the POST
       (is (str/includes? (:data (second stream-events)) "filter:url-nonce")))))
