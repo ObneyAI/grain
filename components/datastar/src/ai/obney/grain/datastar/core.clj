@@ -296,14 +296,15 @@
   [event-ch sse-ctx context query-name event-pubsub event-types debounce-ms additional-context event-tags]
   (let [request (:request sse-ctx)
         raw-query (extract-query-from-request request query-name)
+        nonce (or (:__ds_nonce raw-query) (get raw-query "__ds_nonce"))
         decoded-query (decode-json-query raw-query)
         initial-context (merge context additional-context {:query decoded-query})
         context-atom (atom initial-context)
         signal-ch (async/chan (async/sliding-buffer 1))
         user-id (get-in additional-context [:auth-claims :user-id])
-        session-key [user-id query-name]
+        session-key [user-id query-name nonce]
         _ (swap! active-stream-contexts assoc session-key
-                 {:context-atom context-atom :signal-ch signal-ch})
+                 {:context-atom context-atom :signal-ch signal-ch :event-ch event-ch})
         event-filter-fn (when event-tags
                           (resolve-event-tags event-tags @context-atom))
         sub-chan (subscribe-to-events event-pubsub event-types event-filter-fn)]
@@ -377,18 +378,22 @@
    existing SSE without dropping the persistent connection."
   [context query-name event-pubsub event-types debounce-ms heartbeat-delay event-tags pedestal-context]
   (let [additional-context (:grain/additional-context pedestal-context)
+        request (:request pedestal-context)
+        raw-query (extract-query-from-request request query-name)
+        nonce (or (:__ds_nonce raw-query) (get raw-query "__ds_nonce"))
         user-id (get-in additional-context [:auth-claims :user-id])
-        session-key [user-id query-name]
+        session-key [user-id query-name nonce]
         existing (get @active-stream-contexts session-key)
-        ;; Only use existing if signal-ch is still open (not stale from a previous session)
+        ;; Only use existing if both signal-ch and event-ch are still open.
+        ;; event-ch closes when the browser disconnects (page navigation);
+        ;; signal-ch closes when the event loop's finally block runs.
         existing (when (and existing
-                            (not (async-protocols/closed? (:signal-ch existing))))
+                            (not (async-protocols/closed? (:signal-ch existing)))
+                            (not (async-protocols/closed? (:event-ch existing))))
                    existing)]
     (if existing
       ;; Update existing SSE's context with new signals (from :query-params, already parsed by interceptor)
-      (let [request (:request pedestal-context)
-            new-query (extract-query-from-request request query-name)
-            new-decoded (decode-json-query new-query)
+      (let [new-decoded (decode-json-query raw-query)
             {:keys [context-atom signal-ch]} existing]
         (swap! context-atom assoc :query new-decoded)
         (async/put! signal-ch :signal-update)
@@ -396,9 +401,13 @@
         ;; (no auto-reconnect), so the empty response is discarded. The real
         ;; re-render happens on the existing SSE via signal-ch.
         (sse/start-stream (fn [ch _] (async/close! ch)) pedestal-context heartbeat-delay))
-      ;; No existing SSE — start fresh
-      (stream-view-enter-events context query-name event-pubsub event-types
-                                debounce-ms heartbeat-delay event-tags pedestal-context))))
+      ;; No existing SSE (or stale) — clean up stale entry and start fresh.
+      ;; Close old signal-ch so the orphaned event loop exits cleanly.
+      (do
+        (when-let [stale (get @active-stream-contexts session-key)]
+          (async/close! (:signal-ch stale)))
+        (stream-view-enter-events context query-name event-pubsub event-types
+                                  debounce-ms heartbeat-delay event-tags pedestal-context)))))
 
 (defn stream-view
   "Interceptor factory. Streams :datastar/hiccup via SSE.
@@ -441,10 +450,16 @@
   (let [{:keys [title stream-path body head datastar-url html-attrs stream-method]
          :or {title "Grain App" datastar-url default-datastar-url stream-method "get"}} opts
         query-string (get-in context [:request :query-string])
+        ;; Generate a unique nonce per page load so each tab/navigation gets its own SSE.
+        ;; Emitted as a signal so Datastar includes it in every @post body automatically.
+        ;; For @get, appended to the stream URL as a query param.
+        nonce (str (random-uuid))
         effective-stream-path (when stream-path
-                                (if (and query-string (seq query-string))
-                                  (str stream-path "?" query-string)
-                                  stream-path))
+                                (let [base (if (and query-string (seq query-string))
+                                             (str stream-path "?" query-string)
+                                             stream-path)
+                                      separator (if (string/includes? base "?") "&" "?")]
+                                  (str base separator "__ds_nonce=" nonce)))
         page-html (str "<!DOCTYPE html>"
                        (h/html
                          [:html (or html-attrs {})
@@ -456,6 +471,7 @@
                            (when head (if (fn? head) (head) head))]
                           [:body (when effective-stream-path
                                   {:data-init (str "@" stream-method "('" effective-stream-path "')")})
+
                            (when body body)
                            (when effective-stream-path
                              [:div {:id "app"}])]]))]
