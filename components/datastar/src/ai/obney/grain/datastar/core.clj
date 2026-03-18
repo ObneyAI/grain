@@ -94,8 +94,7 @@
    - Wrapped:  {\"datastar\": {\"key\": \"val\"}}  (older Datastar convention)
    - Flat:     {\"key\": \"val\"}                   (Datastar RC.7+)
 
-   POST JSON values are stringified to match GET query-param behavior, since
-   query schemas expect string types (e.g. page, pageSize)."
+   Both GET and POST paths merge native JSON types (integers stay integers)."
   {:name ::parse-datastar-signals
    :enter
    (fn [ctx]
@@ -109,7 +108,7 @@
                            (when (seq body-str)
                              (let [parsed (json/read-str body-str :key-fn keyword)]
                                ;; Unwrap {:datastar {...}} if present, otherwise use flat signals
-                               (stringify-signal-values (or (:datastar parsed) parsed))))))
+                               (or (:datastar parsed) parsed)))))
                        (catch Exception _ nil)))]
        (cond
          ds-param
