@@ -258,7 +258,7 @@
           result ((:enter ds/parse-datastar-signals) ctx)]
       (is (= ctx result))))
 
-  (testing "POST with flat JSON body (Datastar RC.7+) merges signals, values stringified"
+  (testing "POST with flat JSON body (Datastar RC.7+) merges signals, native types preserved"
     (let [body-str (json/write-str {:location_id "loc-123" :filter "all" :page 1 :pageSize 25})
           ctx {:request {:request-method :post
                          :body body-str
@@ -266,8 +266,8 @@
           result ((:enter ds/parse-datastar-signals) ctx)]
       (is (= "loc-123" (get-in result [:request :query-params :location_id])))
       (is (= "all" (get-in result [:request :query-params :filter])))
-      (is (= "1" (get-in result [:request :query-params :page])))
-      (is (= "25" (get-in result [:request :query-params :pageSize])))))
+      (is (= 1 (get-in result [:request :query-params :page])))
+      (is (= 25 (get-in result [:request :query-params :pageSize])))))
 
   (testing "POST with wrapped body {:datastar {...}} still works"
     (let [body-str (json/write-str {:datastar {:search "wrapped"}})
@@ -277,14 +277,14 @@
           result ((:enter ds/parse-datastar-signals) ctx)]
       (is (= "wrapped" (get-in result [:request :query-params :search])))))
 
-  (testing "POST stringifies booleans and nil, preserves maps"
+  (testing "POST preserves native JSON types (booleans, numbers, maps)"
     (let [body-str (json/write-str {:active true :count 0 :fieldErrors {:name "required"}})
           ctx {:request {:request-method :post
                          :body body-str
                          :query-params {}}}
           result ((:enter ds/parse-datastar-signals) ctx)]
-      (is (= "true" (get-in result [:request :query-params :active])))
-      (is (= "0" (get-in result [:request :query-params :count])))
+      (is (= true (get-in result [:request :query-params :active])))
+      (is (= 0 (get-in result [:request :query-params :count])))
       (is (= {:name "required"} (get-in result [:request :query-params :fieldErrors]))))))
 
 ;; =========================== ;;
