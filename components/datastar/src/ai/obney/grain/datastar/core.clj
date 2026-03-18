@@ -482,7 +482,8 @@
                              [:div {:id "app"}])]]))]
     (assoc context :response
            {:status 200
-            :headers {"Content-Type" "text/html; charset=UTF-8"}
+            :headers {"Content-Type" "text/html; charset=UTF-8"
+                      "Cache-Control" "no-store"}
             :body page-html})))
 
 (defn shim-page
