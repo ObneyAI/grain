@@ -1,4 +1,50 @@
 (ns ai.obney.grain.datastar.core
+  "Server-side Datastar integration for Grain's CQRS architecture.
+
+   Connects the event-sourced command/query pipeline to the browser via SSE:
+
+     Command → Events → Pubsub → SSE event loops → Re-render query → Patch DOM
+
+   ## Three streaming modes
+
+   1. **Event-driven** (primary) — SSE stays open; re-renders when domain events
+      fire via pubsub subscription. Enabled when the query declares
+      `:grain/read-models` and `:event-pubsub` is in the context.
+
+   2. **Polling** — Re-renders on a timer (`:datastar/fps`). Fallback when no
+      pubsub is available.
+
+   3. **One-shot** — Renders once and closes (`:datastar/fps 0`).
+
+   ## Signal flow
+
+   Datastar signals flow in two directions:
+
+   - **Server → Client**: `datastar-patch-signals` SSE events push signal
+     changes (e.g., toast messages, field errors) to the browser.
+
+   - **Client → Server**: Datastar sends signals via `@get` (query params) or
+     `@post` (JSON body). The `parse-datastar-signals` interceptor normalizes
+     both into `:query-params` for the query handler.
+
+   ## Connection reuse via active-stream-contexts
+
+   When the user changes signals (e.g., filters, search), Datastar fires a new
+   `@post` to the stream URL. Rather than opening a duplicate SSE, the server
+   looks up the existing connection by `[user-id, query-name, nonce]` in the
+   `active-stream-contexts` registry, updates its context atom with the new
+   signals, and triggers a re-render on the existing SSE via `signal-ch`. The
+   `@post` response is an empty SSE that closes immediately.
+
+   ## Route generation
+
+   `routes` scans the query registry for entries with `:datastar/path` metadata
+   and auto-generates three Pedestal routes per query:
+     1. **Shim** (GET `/path`) — HTML shell that boots Datastar JS
+     2. **Stream GET** (`/path/stream`) — Initial SSE for page load
+     3. **Stream POST** (`/path/stream`) — Signal updates on existing SSE
+
+   See `ai.obney.grain.datastar.interface` for the public API."
   (:require [hiccup2.core :as h]
             [clojure.data.json :as json]
             [clojure.set :as set]
@@ -149,8 +195,17 @@
 ;; -------------------------------- ;;
 
 ;; Registry of active event-driven SSE connections.
-;; Maps [user-id query-name] -> {:context-atom atom :signal-ch channel}.
-;; Used by @post to update signals on an existing SSE without reconnecting.
+;; Key:   [user-id query-name nonce] — nonce is a per-page-load UUID so
+;;        multiple tabs viewing the same query get independent streams.
+;; Value: {:context-atom atom, :signal-ch channel, :event-ch channel}
+;;
+;; Lifecycle: entries are added in `stream-view-loop-events` when a GET
+;; opens a new SSE, and removed in its `finally` block when the stream
+;; closes (browser navigates away or server shuts down).
+;;
+;; Purpose: `update-or-start-stream-events` looks up an existing entry
+;; on @post to push new signals into the persistent SSE instead of
+;; opening a duplicate connection.
 (def ^:private active-stream-contexts (atom {}))
 
 ;; --------------- ;;
@@ -329,7 +384,13 @@
                 nil
                 (recur prev-result))
 
-              ;; Event or signal update — debounce, drain, re-render with current context
+              ;; Event or signal update received. Debounce then drain BOTH channels
+              ;; before re-rendering. Draining both is a correctness requirement, not
+              ;; just a performance optimization: if a domain event and a signal update
+              ;; arrive near-simultaneously, we must apply the signal change before
+              ;; re-rendering — otherwise the query runs with stale signals and the
+              ;; user sees a flash of old state before the signal update triggers
+              ;; another render cycle.
               :else
               (do
                 (when (pos? debounce-ms) (Thread/sleep (long debounce-ms)))
