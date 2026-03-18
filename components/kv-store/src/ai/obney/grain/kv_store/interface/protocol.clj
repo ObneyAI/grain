@@ -5,4 +5,5 @@
   (start [this])
   (stop [this])
   (get! [this args])
-  (put! [this args]))
+  (put! [this args])
+  (put-batch! [this args]))

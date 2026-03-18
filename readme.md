@@ -112,25 +112,9 @@ Authorization is enforced at the adapter level (request handlers, Datastar) befo
 
 ### Read Models / Projections
 
-Read models are built by reducing over events:
+Read models are pure reducer functions `(state, event) -> state` that project event streams into queryable state. The processor handles caching, incremental updates, and multi-tenant isolation automatically.
 
-```clojure
-(defn apply-events [events]
-  (reduce
-    (fn [state {:event/keys [type] :keys [counter-id name]}]
-      (case type
-        :example/counter-created
-        (assoc state counter-id {:id counter-id
-                                  :name name
-                                  :value 0})
-        :example/counter-incremented
-        (update-in state [counter-id :value] inc)
-        state))
-    {}
-    events))
-```
-
-### Read Model Registry
+#### Defining Read Models
 
 The `defreadmodel` macro defines and registers read model reducers, following the same pattern as `defcommand` and `defquery`:
 
@@ -154,6 +138,106 @@ Project it by name anywhere you have a context:
 ```clojure
 (rmp/project context :example/counters)
 ```
+
+#### Two-Tier Caching
+
+Projections use a two-tier cache inspired by [Datomic's object cache](https://docs.datomic.com/operation/caching.html):
+
+**L1 (in-process):** Deserialized Clojure maps held in a global LRU atom. Zero serialization cost on read. Configurable TTL controls the freshness/speed tradeoff:
+
+| TTL | Behavior | Use Case |
+| --- | --- | --- |
+| 0 (default) | Always checks event store for new events | Real-time consistency |
+| > 0 | Skips all I/O within TTL window (< 0.2ms) | Pagination, filter changes |
+
+**L2 (LMDB):** [Fressian](https://github.com/clojure/data.fressian)-serialized state on disk. Survives process restarts. Watermark-based incremental updates — on each call, the processor reads only events *after* the last watermark.
+
+Three L2 storage strategies are selected automatically:
+
+| Strategy | Trigger | Description |
+| --- | --- | --- |
+| **Monolithic** | < 10K keys | Single LMDB entry per read model |
+| **Segmented** | >= 10K keys | 64 hash-based segments; only changed segments are written back |
+| **Partitioned** | `partition-fn` + `entity-id-fn` in opts | Per-partition cache entries with a global manifest (see below) |
+
+L2 write-back is deferred until >= 10 new events have been processed, reducing I/O for rapidly changing state.
+
+Configure L1 TTL per read model:
+
+```clojure
+(defreadmodel :example counters
+  {:events #{:example/counter-created :example/counter-incremented}
+   :version 1
+   :l1-ttl-ms 1000}  ;; 1s TTL — pagination clicks return in < 0.2ms
+  [state event]
+  ...)
+```
+
+Manage the L1 cache programmatically:
+
+```clojure
+(rmp/l1-stats)   ;; => {:entries 42}
+(rmp/l1-clear!)  ;; clears all L1 entries (e.g., after deployment)
+```
+
+#### Tenant-Isolated Cache Keys
+
+Cache keys include the `tenant-id` from the context, ensuring strict multi-tenant isolation at both cache tiers. Two tenants projecting the same read model will never share a cache entry.
+
+#### Scoped Projections
+
+The optional `scope` map on `project` supports three patterns:
+
+```clojure
+;; Filter events by tag set
+(rmp/project context :example/counters {:tags #{[:counter counter-id]}})
+
+;; Override the event query entirely
+(rmp/project context :example/counters {:queries [{:types #{:example/counter-created}
+                                                   :tags #{[:counter counter-id]}}]})
+
+;; Single partition read (partitioned models only — see below)
+(rmp/project context :inventory/items {:partition-key location-id})
+```
+
+The scope is hashed into the cache key, so different scopes maintain independent caches.
+
+#### Partitioned Read Models
+
+For datasets that naturally partition (e.g., items by location, patients by clinic), supply `:partition-fn` and `:entity-id-fn` in the opts:
+
+```clojure
+(defreadmodel :inventory items
+  {:events       #{:inventory/item-created :inventory/item-moved}
+   :version      1
+   :partition-fn  (fn [entity] (:location-id entity))
+   :entity-id-fn :item-id}
+  [state event]
+  ...)
+```
+
+- **`partition-fn`** — `(entity -> partition-key)`. Operates on entity *state* (not events). Determines which partition an entity belongs to.
+- **`entity-id-fn`** — `(event -> entity-id)`. Extracts the entity identifier from an event. Used to route events to the correct partition.
+
+**How it works:**
+
+1. Each partition is stored as a separate LMDB entry with its own state map.
+2. A manifest tracks all partition keys and a global watermark.
+3. On projection, new events are routed through the reducer and assigned to partitions via `partition-fn`.
+4. **Cross-partition moves** are detected automatically: when `partition-fn` returns a different key after applying an event, the entity is evicted from the source partition and inserted into the destination.
+5. A transient in-memory `entity-id → partition-key` lookup provides O(1) routing during projection.
+
+**Reading a single partition** is much cheaper than projecting the full model — only events relevant to that partition are processed:
+
+```clojure
+;; All partitions merged (full projection)
+(rmp/project context :inventory/items)
+
+;; Single partition (incremental, no full replay)
+(rmp/project context :inventory/items {:partition-key location-id})
+```
+
+If no cache exists yet, a single-partition read triggers a full projection first (to build the partition manifest), then serves subsequent reads incrementally.
 
 ### Datastar (Reactive UI)
 

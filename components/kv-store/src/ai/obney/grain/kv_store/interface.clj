@@ -17,3 +17,7 @@
   [kv-store args]
   (p/put! kv-store args))
 
+(defn put-batch!
+  [kv-store args]
+  (p/put-batch! kv-store args))
+
