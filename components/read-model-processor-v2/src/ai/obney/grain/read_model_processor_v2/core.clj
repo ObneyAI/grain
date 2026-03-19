@@ -416,14 +416,30 @@
                  (:state l1))
         ;; TTL expired — check events
         (let [all-events (into [] (es/read event-store (add-watermark query (:watermark l1))))
-              relevant (filterv
-                        (fn [event]
-                          (let [eid (entity-id-fn event)]
-                            (or (contains? (:state l1) eid)
-                                (let [temp (f {} event)
-                                      new-ent (get temp eid)]
-                                  (and new-ent (= partition-key (partition-fn new-ent)))))))
-                        all-events)]
+              ;; Track entity-ids discovered as relevant during filtering
+              ;; so that later events for the same entity are also included.
+              {:keys [relevant]}
+              (reduce
+               (fn [{:keys [known-eids] :as acc} event]
+                 (let [eid (entity-id-fn event)]
+                   (if (or (contains? (:state l1) eid)
+                           (contains? known-eids eid))
+                     (-> acc
+                         (update :relevant conj event)
+                         (update :known-eids conj eid))
+                     (let [creates-here?
+                           (try
+                             (let [temp (f {} event)
+                                   new-ent (get temp eid)]
+                               (and new-ent (= partition-key (partition-fn new-ent))))
+                             (catch Exception _ false))]
+                       (if creates-here?
+                         (-> acc
+                             (update :relevant conj event)
+                             (update :known-eids conj eid))
+                         acc)))))
+               {:relevant [] :known-eids #{}}
+               all-events)]
           (if (empty? relevant)
             (u/trace ::l1-revalidated
                      [:metric/name "ReadModelL1Revalidated" :metric/resolution :high

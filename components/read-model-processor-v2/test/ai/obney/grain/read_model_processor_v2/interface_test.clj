@@ -662,7 +662,10 @@
 (defschemas partition-schemas
   {:test/item-created [:map [:item-id :uuid] [:bucket :string]]
    :test/item-updated [:map [:item-id :uuid] [:bucket :string] [:value :int]]
-   :test/item-moved   [:map [:item-id :uuid] [:old-bucket :string] [:new-bucket :string]]})
+   :test/item-moved   [:map [:item-id :uuid] [:old-bucket :string] [:new-bucket :string]]
+   ;; For unsafe-reducer partitioned tests
+   :test/order-created   [:map [:order-id :uuid] [:location :string]]
+   :test/payment-applied [:map [:order-id :uuid] [:amount :int]]})
 
 (defn item-reducer
   "Reducer for partitioned tests. Handles create, update, and cross-partition move.
@@ -1046,3 +1049,114 @@
     (is (pos? (:entries (rmp/l1-stats))))
     (rmp/l1-clear!)
     (is (= 0 (:entries (rmp/l1-stats))))))
+
+;; ==========================================================================
+;; Partitioned: Unsafe reducer resilience
+;; ==========================================================================
+;;
+;; Reducers that don't guard against nil entity state should not crash the
+;; partition relevance filter. The framework calls (f {} event) speculatively
+;; to check if a new event would create an entity for a partition. Non-creation
+;; events will naturally fail when accessing fields on a nil entity — the
+;; framework must handle this gracefully.
+
+(defn unsafe-order-reducer
+  "A reducer that does NOT guard against missing entity state.
+   This is realistic — developers naturally write reducers assuming
+   creation events come before update events."
+  [state event]
+  (case (:event/type event)
+    :test/order-created
+    (assoc state (:order-id event)
+           {:id (:order-id event)
+            :location (:location event)
+            :total 0})
+
+    :test/payment-applied
+    (let [order (get state (:order-id event))]
+      ;; UNSAFE: accesses :total on potentially nil order
+      (assoc-in state [(:order-id event) :total]
+                (+ (:total order) (:amount event))))
+
+    state))
+
+(defn make-order-partitioned-args
+  ([] (make-order-partitioned-args {}))
+  ([overrides]
+   (merge {:f             unsafe-order-reducer
+           :query         {:types #{:test/order-created :test/payment-applied}}
+           :name          "test-orders"
+           :version       1
+           :partition-fn  :location
+           :entity-id-fn :order-id
+           :l1-ttl-ms    0}
+          overrides)))
+
+;; I-unsafe-1
+(deftest partitioned-unsafe-reducer-relevance-filter
+  (testing "non-creation event for new entity in relevance filter does not crash"
+    ;; Seed an initial order to populate L1 for partition "east"
+    (let [seed-id (random-uuid)]
+      (es/append *event-store*
+        {:tenant-id test-tenant-id
+         :events [(es/->event {:type :test/order-created
+                               :body {:order-id seed-id :location "east"}})]})
+      ;; Full project → L2, then single-partition read → L1 for "east"
+      (rmp/p (make-context) (make-order-partitioned-args))
+      (rmp/p (make-context) (make-order-partitioned-args {:partition-key "east"}))
+      ;; Now append a NEW order (create + payment) in a single batch.
+      ;; L1 for "east" exists but is expired (TTL=0).
+      ;; The relevance filter iterates all-events since watermark.
+      ;; For payment-applied: eid is new-order-id, NOT in L1 state.
+      ;; Filter calls (f {} payment-applied-event) → unsafe reducer NPEs
+      ;; on (:total nil).
+      (let [new-id (random-uuid)]
+        (es/append *event-store*
+          {:tenant-id test-tenant-id
+           :events [(es/->event {:type :test/order-created
+                                 :body {:order-id new-id :location "east"}})
+                    (es/->event {:type :test/payment-applied
+                                 :body {:order-id new-id :amount 4000}})]})
+        (let [result (rmp/p (make-context)
+                            (make-order-partitioned-args {:partition-key "east"}))]
+          (is (= 2 (count result)))
+          (is (= 4000 (:total (get result new-id)))))))))
+
+;; I-unsafe-2
+(deftest partitioned-unsafe-reducer-new-entity-in-batch
+  (testing "new entity creation + update in same batch does not crash with unsafe reducer"
+    ;; Both events arrive in a single batch after L2 is populated.
+    ;; The relevance filter probes payment-applied with (f {} event) —
+    ;; the entity doesn't exist in L1 state yet because it was just created
+    ;; in the same batch.
+    ;; Full project with empty state first
+    (rmp/p (make-context) (make-order-partitioned-args))
+    ;; Now append both events at once
+    (let [order-id (random-uuid)]
+      (es/append *event-store*
+        {:tenant-id test-tenant-id
+         :events [(es/->event {:type :test/order-created
+                               :body {:order-id order-id :location "west"}})
+                  (es/->event {:type :test/payment-applied
+                               :body {:order-id order-id :amount 2000}})]})
+      ;; Single partition read — both events are new since watermark
+      (let [result (rmp/p (make-context)
+                          (make-order-partitioned-args {:partition-key "west"}))]
+        (is (= 1 (count result)))
+        (is (= 2000 (:total (get result order-id))))))))
+
+;; I-unsafe-3
+(deftest partitioned-unsafe-reducer-full-rebuild
+  (testing "full partition rebuild with unsafe reducer processes all events correctly"
+    ;; process-events-partitioned also calls (f {} event) for unknown entities
+    (let [order-id (random-uuid)]
+      (es/append *event-store*
+        {:tenant-id test-tenant-id
+         :events [(es/->event {:type :test/order-created
+                               :body {:order-id order-id :location "north"}})
+                  (es/->event {:type :test/payment-applied
+                               :body {:order-id order-id :amount 7500}})]})
+      ;; Full rebuild (no cache)
+      (let [result (rmp/p (make-context) (make-order-partitioned-args))]
+        (is (= 1 (count result)))
+        (is (= 7500 (:total (get result order-id))))))))
