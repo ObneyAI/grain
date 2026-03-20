@@ -764,8 +764,11 @@
           (is (map? (:data p-data)))
           (is (uuid? (:watermark p-data)))))
 
-      ;; No entity index stored — eliminated in favor of partition-fn on entity state
-      (is (nil? (kv/get! *cache* {:k (core/suffix-key base-key ":pidx")}))))))
+      ;; Entity index stored for cross-partition move detection
+      (let [idx (core/fressian-decode
+                 (kv/get! *cache* {:k (core/suffix-key base-key ":eidx")}))]
+        (is (= 60 (count idx)))
+        (is (every? #(contains? #{"x" "y" "z"} (val %)) idx))))))
 
 ;; I4
 (deftest partitioned-incremental-single-partition
@@ -955,6 +958,111 @@
         (let [result-b (rmp/p (make-context) (make-partitioned-args {:partition-key "b"}))]
           (is (contains? result-b moved-id))
           (is (= "b" (:bucket (get result-b moved-id)))))))))
+
+;; Shared setup for compound partition tests (simulates appointment reschedule scenario).
+;; partition-fn depends on [category bucket] but move events only update bucket.
+(def compound-reducer
+  (fn [state event]
+    (case (:event/type event)
+      :test/item-created
+      (assoc state (:item-id event)
+             {:id (:item-id event)
+              :category (:category event)
+              :bucket (:bucket event)})
+      :test/item-moved
+      (update state (:item-id event) assoc :bucket (:new-bucket event))
+      state)))
+
+(def compound-partition-fn (fn [entity] [(:category entity) (:bucket entity)]))
+
+(defn make-compound-args [overrides]
+  (merge {:f compound-reducer
+          :query {:types #{:test/item-created :test/item-moved}}
+          :name "compound-items"
+          :version 1
+          :partition-fn compound-partition-fn
+          :entity-id-fn :item-id
+          :l1-ttl-ms 0}
+         overrides))
+
+(defn create-compound-item! [category bucket]
+  (let [id (random-uuid)]
+    (es/append *event-store*
+               {:tenant-id test-tenant-id
+                :events [(es/->event {:type :test/item-created
+                                      :body {:item-id id :category category :bucket bucket}})]})
+    id))
+
+(defn move-compound-item! [item-id new-bucket]
+  (es/append *event-store*
+             {:tenant-id test-tenant-id
+              :events [(es/->event {:type :test/item-moved
+                                    :body {:item-id item-id
+                                           :old-bucket "ignored"
+                                           :new-bucket new-bucket}})]}))
+
+(deftest partitioned-cross-partition-move-destination-first
+  (testing "reading destination partition first detects move without reading source"
+    (let [item-id (create-compound-item! "east" "a")]
+      (rmp/p (make-context) (make-compound-args {}))
+      (move-compound-item! item-id "b")
+
+      (let [result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "b"]}))]
+        (is (contains? result item-id) "Entity should appear in destination partition")
+        (is (= "b" (:bucket (get result item-id)))))
+
+      (let [result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "a"]}))]
+        (is (not (contains? result item-id)) "Entity should be removed from source partition")))))
+
+(deftest partitioned-l1-syncs-after-cross-partition-move
+  (testing "L1 populated with empty state syncs with L2 after entity moves in"
+    ;; Simulates: double-booking check populates L1 for destination with empty state,
+    ;; then entity moves in via another partition's processing, next read must see it.
+    (let [item-id (create-compound-item! "east" "a")]
+      ;; Full projection → L1+L2 populated
+      (rmp/p (make-context) (make-compound-args {}))
+      ;; Read destination partition → L1 populated with empty state for ["east" "b"]
+      (let [empty-result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "b"]}))]
+        (is (empty? empty-result)))
+      ;; Move entity from "a" to "b"
+      (move-compound-item! item-id "b")
+      ;; Read destination again → L1-stale must detect entity moved in
+      (let [result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "b"]}))]
+        (is (= 1 (count result)) "Entity should appear in destination after L1-stale sync")
+        (is (= "b" (:bucket (get result item-id)))))
+      ;; Source should be empty
+      (let [result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "a"]}))]
+        (is (not (contains? result item-id)) "Entity should be gone from source")))))
+
+(deftest partitioned-l1-removes-entity-after-move-out
+  (testing "L1 with entity reflects removal after entity moves to another partition"
+    (let [item-id (create-compound-item! "east" "a")]
+      (rmp/p (make-context) (make-compound-args {}))
+      ;; Warm L1 for source — has 1 entity
+      (let [result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "a"]}))]
+        (is (= 1 (count result))))
+      ;; Move entity
+      (move-compound-item! item-id "b")
+      ;; Read DESTINATION first
+      (let [result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "b"]}))]
+        (is (contains? result item-id) "Entity should be in destination"))
+      ;; Read SOURCE — L1-stale should see entity gone
+      (let [result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "a"]}))]
+        (is (empty? result) "Source partition should be empty after move out")))))
+
+(deftest partitioned-l1-consistent-after-multiple-reads
+  (testing "repeated reads after cross-partition move are consistent"
+    (let [item-id (create-compound-item! "east" "a")]
+      (rmp/p (make-context) (make-compound-args {}))
+      ;; Populate L1 for destination with empty state
+      (rmp/p (make-context) (make-compound-args {:partition-key ["east" "b"]}))
+      ;; Move entity
+      (move-compound-item! item-id "b")
+      ;; Three consecutive reads — all must return the entity
+      (dotimes [_ 3]
+        (let [result (rmp/p (make-context) (make-compound-args {:partition-key ["east" "b"]}))]
+          (is (= 1 (count result)) "Entity must be present on every read")
+          (is (= "b" (:bucket (get result item-id)))))))))
 
 ;; I12
 (deftest partitioned-cached-read-is-fast

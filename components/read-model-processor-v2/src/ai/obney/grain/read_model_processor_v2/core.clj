@@ -3,7 +3,6 @@
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]
             [clojure.data.fressian :as fressian]
-            [clojure.walk :as walk]
             [com.brunobonacci.mulog :as u])
   (:import [java.io ByteArrayInputStream]))
 
@@ -17,14 +16,50 @@
     (.get buf arr)
     arr))
 
+(defn- deep-clojurize
+  "Recursively convert Java collections to Clojure equivalents.
+   clojure.walk/postwalk doesn't recurse into Java collections (they fail coll?),
+   so nested structures like sets-of-vectors round-trip as sets-of-ArrayLists.
+   Only converts Java collection types; Clojure collections are recursed into
+   to find nested Java collections but are not themselves converted."
+  [x]
+  (cond
+    ;; Java Map (not Clojure) → convert to Clojure map, recurse values
+    (and (instance? java.util.Map x) (not (map? x)))
+    (persistent!
+     (reduce (fn [m e] (assoc! m (deep-clojurize (.getKey e)) (deep-clojurize (.getValue e))))
+             (transient {}) x))
+
+    ;; Java Set (not Clojure) → convert to Clojure set, recurse elements
+    (and (instance? java.util.Set x) (not (set? x)))
+    (persistent!
+     (reduce (fn [s v] (conj! s (deep-clojurize v)))
+             (transient #{}) x))
+
+    ;; Java List (not Clojure vector) → convert to vector, recurse elements
+    (and (instance? java.util.List x) (not (vector? x)))
+    (mapv deep-clojurize x)
+
+    ;; Clojure map — recurse to find nested Java collections
+    (map? x)
+    (persistent!
+     (reduce-kv (fn [m k v] (assoc! m (deep-clojurize k) (deep-clojurize v)))
+                (transient {}) x))
+
+    ;; Clojure set — recurse to find nested Java collections
+    (set? x)
+    (persistent!
+     (reduce (fn [s v] (conj! s (deep-clojurize v)))
+             (transient #{}) x))
+
+    ;; Clojure vector — recurse to find nested Java collections
+    (vector? x)
+    (mapv deep-clojurize x)
+
+    :else x))
+
 (defn fressian-decode [bytes]
-  (walk/postwalk
-   (fn [x]
-     (cond
-       (instance? java.util.Set x) (set x)
-       (and (instance? java.util.List x) (not (vector? x))) (vec x)
-       :else x))
-   (fressian/read (ByteArrayInputStream. bytes))))
+  (deep-clojurize (fressian/read (ByteArrayInputStream. bytes))))
 
 ;; ---------------------------------------------------------------------------
 ;; Cache key helpers
@@ -58,8 +93,10 @@
   ^bytes [^bytes base-key partition-key]
   (suffix-key base-key (format ":p%s" (Integer/toHexString (hash partition-key)))))
 
-;; index-cache-key removed — entity index eliminated in favor of
-;; partition-fn operating on entity state + transient in-memory lookup
+(defn- entity-index-cache-key
+  "Cache key for the entity-to-partition index: base-key:eidx"
+  ^bytes [^bytes base-key]
+  (suffix-key base-key ":eidx"))
 
 ;; ---------------------------------------------------------------------------
 ;; Event query helpers
@@ -293,9 +330,11 @@
 
 (defn- process-events-single-partition
   "Process events for a single partition read. Only applies events relevant to this partition.
-   partition-fn operates on entity state.
-   Returns {:state partition-state :evictions {pk {eid entity}} :event-count n :new-watermark uuid}"
-  [partition-key partition-state events f partition-fn entity-id-fn]
+   partition-fn operates on entity state. find-entity-fn, when provided, is called with an
+   entity-id to locate entities in other partitions — returns [source-pk entity] or nil.
+   Returns {:state partition-state :evictions {pk {eid entity}} :source-removals {pk #{eids}}
+            :event-count n :new-watermark uuid}"
+  [partition-key partition-state events f partition-fn entity-id-fn find-entity-fn]
   (reduce
    (fn [acc event]
      (let [eid (entity-id-fn event)
@@ -319,19 +358,37 @@
 
          ;; Entity not here — check if it's moving IN
          (let [temp-state (f {} event)
-               new-entity (get temp-state eid)]
-           (if (and new-entity (= partition-key (partition-fn new-entity)))
-             ;; Entity belongs here — adopt
+               new-entity (get temp-state eid)
+               adopts-here? (and new-entity (= partition-key (partition-fn new-entity)))]
+           (if adopts-here?
+             ;; Heuristic matched — adopt
              (-> acc
                  (update :state assoc eid new-entity)
                  (update :event-count inc)
                  (assoc :new-watermark (:event/id event)))
-             ;; Doesn't concern this partition — skip
-             (-> acc
-                 (update :event-count inc)
-                 (assoc :new-watermark (:event/id event))))))))
+             ;; Heuristic failed — try finding entity in another partition
+             (if-let [[source-pk source-entity] (when find-entity-fn (find-entity-fn eid))]
+               (let [new-state (f {eid source-entity} event)
+                     moved-entity (get new-state eid)]
+                 (if (and moved-entity (= partition-key (partition-fn moved-entity)))
+                   ;; Entity moved/belongs here — adopt + remove from source if different
+                   (cond-> acc
+                     true (update :state assoc eid moved-entity)
+                     (not= source-pk partition-key)
+                     (update-in [:source-removals source-pk] (fnil conj #{}) eid)
+                     true (update :event-count inc)
+                     true (assoc :new-watermark (:event/id event)))
+                   ;; Updated but didn't move here — skip
+                   (-> acc
+                       (update :event-count inc)
+                       (assoc :new-watermark (:event/id event)))))
+               ;; Not found anywhere — skip
+               (-> acc
+                   (update :event-count inc)
+                   (assoc :new-watermark (:event/id event)))))))))
    {:state partition-state
     :evictions {}
+    :source-removals {}
     :event-count 0}
    events))
 
@@ -359,6 +416,35 @@
        acc))
    {}
    (:partition-keys manifest)))
+
+(defn- read-entity-index
+  "Read the entity-to-partition index from cache. Returns {eid → pk} or nil."
+  [cache base-key]
+  (when-let [raw (kv/get! cache {:k (entity-index-cache-key base-key)})]
+    (fressian-decode raw)))
+
+(defn- write-entity-index!
+  "Write the entity-to-partition index to cache."
+  [cache base-key index]
+  (kv/put! cache {:k (entity-index-cache-key base-key)
+                  :v (fressian-encode index)}))
+
+(defn- build-entity-index
+  "Build {eid → pk} from a partitions map {pk → {eid → entity}}."
+  [partitions]
+  (reduce-kv
+   (fn [idx pk state]
+     (reduce-kv (fn [idx eid _] (assoc idx eid pk)) idx state))
+   {} partitions))
+
+(defn- find-entity-via-index
+  "Look up an entity's partition from the index, then read it. Returns [source-pk entity] or nil.
+   Includes entities already indexed to the current partition — they may be in L2 but not yet in L1."
+  [cache base-key index _exclude-pk eid]
+  (when-let [source-pk (get index eid)]
+    (when-let [partition-data (:data (read-single-partition cache base-key source-pk))]
+      (when-let [entity (get partition-data eid)]
+        [source-pk entity]))))
 
 (defn- write-partitions!
   "Write changed partitions and manifest atomically."
@@ -393,6 +479,40 @@
                         evictions)]
       (kv/put-batch! cache {:entries entries}))))
 
+(defn- update-entity-index!
+  "Update the entity index after single-partition processing.
+   Adds all entities in current partition, handles evictions and source removals."
+  [cache base-key partition-key state evictions source-removals]
+  (let [idx (or (read-entity-index cache base-key) {})
+        ;; Add all entities in current partition
+        idx (reduce-kv (fn [idx eid _] (assoc idx eid partition-key)) idx state)
+        ;; Map evicted entities to their destination partitions
+        idx (reduce-kv
+             (fn [idx pk entities]
+               (reduce-kv (fn [idx eid _] (assoc idx eid pk)) idx entities))
+             idx evictions)
+        ;; Source removals moved INTO current partition (already in state above)
+        ;; but remove stale source-pk mappings
+        idx (reduce-kv
+             (fn [idx _src-pk eids]
+               (reduce (fn [idx eid] (assoc idx eid partition-key)) idx eids))
+             idx source-removals)]
+    (write-entity-index! cache base-key idx)))
+
+(defn- write-source-removals!
+  "Remove entities from their source partitions after cross-partition adoption."
+  [cache base-key source-removals global-watermark]
+  (when (seq source-removals)
+    (let [entries (into []
+                        (mapcat
+                         (fn [[pk eids]]
+                           (let [existing (or (:data (read-single-partition cache base-key pk)) {})
+                                 cleaned (apply dissoc existing eids)]
+                             [{:k (partition-cache-key base-key pk)
+                               :v (fressian-encode {:data cleaned :watermark global-watermark})}])))
+                        source-removals)]
+      (kv/put-batch! cache {:entries entries}))))
+
 (def ^:const default-l1-ttl-ms 0)
 (def ^:const default-l1-max-entries 10000)
 
@@ -416,6 +536,12 @@
                  (:state l1))
         ;; TTL expired — check events
         (let [all-events (into [] (es/read event-store (add-watermark query (:watermark l1))))
+              entity-index_ (delay (read-entity-index cache cache-key))
+              find-entity-fn (when manifest
+                               (fn [eid]
+                                 (when-let [idx @entity-index_]
+                                   (find-entity-via-index
+                                    cache cache-key idx partition-key eid))))
               ;; Track entity-ids discovered as relevant during filtering
               ;; so that later events for the same entity are also included.
               {:keys [relevant]}
@@ -427,13 +553,18 @@
                      (-> acc
                          (update :relevant conj event)
                          (update :known-eids conj eid))
-                     (let [creates-here?
+                     (let [relevant-here?
                            (try
                              (let [temp (f {} event)
                                    new-ent (get temp eid)]
-                               (and new-ent (= partition-key (partition-fn new-ent))))
+                               (if (and new-ent (= partition-key (partition-fn new-ent)))
+                                 true
+                                 ;; Heuristic failed — check other partitions
+                                 (when-let [[_ src-entity] (when find-entity-fn (find-entity-fn eid))]
+                                   (let [new-ent (get (f {eid src-entity} event) eid)]
+                                     (and new-ent (= partition-key (partition-fn new-ent)))))))
                              (catch Exception _ false))]
-                       (if creates-here?
+                       (if relevant-here?
                          (-> acc
                              (update :relevant conj event)
                              (update :known-eids conj eid))
@@ -445,21 +576,26 @@
                      [:metric/name "ReadModelL1Revalidated" :metric/resolution :high
                       :read-model/cache-tier "l1-revalidated" :read-model/name name]
                      (do (l1/touch-validated! l1-key) (:state l1)))
-            (let [{:keys [state evictions event-count new-watermark]}
+            (let [{:keys [state evictions source-removals event-count new-watermark]}
                   (process-events-single-partition
-                   partition-key (:state l1) relevant f partition-fn entity-id-fn)
+                   partition-key (:state l1) relevant f partition-fn entity-id-fn find-entity-fn)
                   wm (or new-watermark (:watermark l1))]
               (u/trace ::l1-stale
                        [:metric/name "ReadModelL1Stale" :metric/resolution :high
                         :read-model/cache-tier "l1-stale" :read-model/name name
                         :read-model/events-processed event-count]
                        (do (l1/update-entry! l1-key state wm)
-                           (when (and manifest (seq evictions))
-                             (write-partitions! cache cache-key
-                                               {partition-key state} #{partition-key} wm
-                                               (into (:partition-keys manifest)
-                                                     (cons partition-key (keys evictions))))
-                             (write-evictions! cache cache-key evictions wm))
+                           (when manifest
+                             (when (or (seq evictions) (seq source-removals))
+                               (write-evictions! cache cache-key evictions wm)
+                               (write-source-removals! cache cache-key source-removals wm))
+                             (when (pos? event-count)
+                               (write-partitions! cache cache-key
+                                                 {partition-key state} #{partition-key} wm
+                                                 (into (:partition-keys manifest)
+                                                       (cons partition-key (keys evictions))))
+                               (update-entity-index! cache cache-key partition-key
+                                                     state evictions source-removals)))
                            state))))))
 
       ;; ── L1 miss ──
@@ -478,23 +614,31 @@
           (let [cp (read-single-partition cache cache-key partition-key)
                 watermark (or (:watermark cp) (:global-watermark manifest))
                 pstate (or (:data cp) {})
-                events (into [] (es/read event-store (add-watermark query watermark)))]
-            (if (empty? events)
+                events (into [] (es/read event-store (add-watermark query watermark)))
+                entity-index_ (delay (read-entity-index cache cache-key))
+                find-entity-fn (fn [eid]
+                                 (when-let [idx @entity-index_]
+                                   (find-entity-via-index
+                                    cache cache-key idx partition-key eid)))]
+                    (if (empty? events)
               (do (l1/put-entry! l1-key pstate watermark max-entries) pstate)
-              (let [{:keys [state evictions event-count new-watermark]}
+              (let [{:keys [state evictions source-removals event-count new-watermark]}
                     (process-events-single-partition
-                     partition-key pstate events f partition-fn entity-id-fn)
+                     partition-key pstate events f partition-fn entity-id-fn find-entity-fn)
                     wm (or new-watermark watermark)]
-                (when (seq evictions)
+                (when (or (seq evictions) (seq source-removals))
+                  (write-evictions! cache cache-key evictions wm)
+                  (write-source-removals! cache cache-key source-removals wm))
+                ;; Always write partition + entity index to L2 when events are
+                ;; processed. Entity index must stay consistent with L2 state
+                ;; so cross-partition lookups can find entities.
+                (when (pos? event-count)
                   (write-partitions! cache cache-key
                                     {partition-key state} #{partition-key} wm
                                     (into (:partition-keys manifest)
                                           (cons partition-key (keys evictions))))
-                  (write-evictions! cache cache-key evictions wm))
-                (when (and (empty? evictions) (>= event-count 10))
-                  (write-partitions! cache cache-key
-                                    {partition-key state} #{partition-key} wm
-                                    (into (:partition-keys manifest) [partition-key])))
+                  (update-entity-index! cache cache-key partition-key
+                                        state evictions source-removals))
                 (l1/put-entry! l1-key state wm max-entries)
                 state))))))))
 
@@ -509,10 +653,12 @@
         {:keys [partitions changed-pks event-count new-watermark]}
         (process-events-partitioned partitions events f partition-fn entity-id-fn)]
     (when (or (nil? manifest) (pos? event-count))
-      (write-partitions! cache cache-key partitions
-                        (if (nil? manifest) (set (keys partitions)) changed-pks)
-                        (or new-watermark watermark)
-                        (keys partitions)))
+      (let [eidx (build-entity-index partitions)]
+        (write-partitions! cache cache-key partitions
+                          (if (nil? manifest) (set (keys partitions)) changed-pks)
+                          (or new-watermark watermark)
+                          (keys partitions))
+        (write-entity-index! cache cache-key eidx)))
     (reduce merge {} (vals partitions))))
 
 (defn- p-partitioned
