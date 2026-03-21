@@ -431,3 +431,47 @@
           result (core/process-event (make-context event handler))]
       (is (= ::anom/conflict (::anom/category result)))
       (is (not= "Error storing events." (::anom/message result))))))
+
+;; 8. Lease Check Guard
+
+(deftest lease-check-skips-unowned-tenants
+  (testing "process-event skips processing when lease-check-fn returns false"
+    (let [processed (atom false)
+          handler (fn [_] (reset! processed true) {})
+          event (make-event :test/event-1 :body {:num 1})
+          result (core/process-event
+                   (assoc (make-context event handler)
+                     :processor-name :test/proc
+                     :lease-check-fn (fn [_tid _pname] false)))]
+      (is (not @processed)))))
+
+(deftest lease-check-allows-owned-tenants
+  (testing "process-event processes normally when lease-check-fn returns true"
+    (let [processed (atom false)
+          handler (fn [_] (reset! processed true) {})
+          event (make-event :test/event-1 :body {:num 1})
+          result (core/process-event
+                   (assoc (make-context event handler)
+                     :processor-name :test/proc
+                     :lease-check-fn (fn [_tid _pname] true)))]
+      (is @processed))))
+
+(deftest no-lease-check-fn-processes-normally
+  (testing "process-event works normally when no lease-check-fn is provided"
+    (let [processed (atom false)
+          handler (fn [_] (reset! processed true) {})
+          event (make-event :test/event-1 :body {:num 1})
+          result (core/process-event (make-context event handler))]
+      (is @processed))))
+
+;; 9. Processor Registry
+
+(deftest processor-registry-register-and-read
+  (testing "Registering a processor makes it discoverable"
+    (let [prev @core/processor-registry*]
+      (try
+        (core/register-processor! :test/my-proc {:topics [:test/event-1] :handler-fn identity})
+        (is (contains? @core/processor-registry* :test/my-proc))
+        (is (= [:test/event-1] (get-in @core/processor-registry* [:test/my-proc :topics])))
+        (finally
+          (reset! core/processor-registry* prev))))))

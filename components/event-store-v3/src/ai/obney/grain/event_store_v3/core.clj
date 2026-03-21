@@ -65,6 +65,10 @@
             (when event-pubsub
               (run! #(pubsub/pub event-pubsub {:message (assoc % :grain/tenant-id tenant-id)}) events))))))))
 
+(defn tenant-ids
+  [event-store]
+  (p/tenant-ids event-store))
+
 (defn read
   [event-store args]
   (if-let [validation-error (mc/explain ::schemas/read-args args)]

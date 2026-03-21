@@ -79,4 +79,15 @@
    :grain/tx
    [:map
     [:event-ids [:set ::id]]
-    [:metadata {:optional true} [:map]]]})
+    [:metadata {:optional true} [:map]]]
+
+   :grain/todo-processor-checkpoint
+   [:map
+    [:processor/name :keyword]
+    [:triggered-by ::id]]
+
+   :grain/todo-processor-effect-failure
+   [:map
+    [:processor/name :keyword]
+    [:triggered-by ::id]
+    [:error/message :string]]})

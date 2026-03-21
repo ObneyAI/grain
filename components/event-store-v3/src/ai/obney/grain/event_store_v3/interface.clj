@@ -16,6 +16,10 @@
   [event-store]
   (core/stop event-store))
 
+(defn tenant-ids
+  [event-store]
+  (core/tenant-ids event-store))
+
 (defn append
   [event-store args]
   (core/append event-store args))

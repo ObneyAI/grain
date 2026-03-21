@@ -1,0 +1,8 @@
+.git
+.cpcache
+.nrepl-port
+target
+*.jar
+node_modules
+.clj-kondo
+.lsp

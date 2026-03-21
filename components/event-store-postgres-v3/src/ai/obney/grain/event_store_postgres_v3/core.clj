@@ -329,13 +329,21 @@
                                             ::none plan)]
                                (if (= r ::none) (f) r))))]
           (if (predicate-fn cas-events)
-            (insert-events conn tenant-id events*)
+            (do (insert-events conn tenant-id events*)
+                (jdbc/execute! conn ["SELECT pg_notify('grain_events', ?)" (str tenant-id)]))
             (let [anomaly  {::anom/category ::anom/conflict
                             ::anom/message "CAS failed"
                             ::cas cas}]
               (u/log ::cas-failed :anomaly anomaly)
               anomaly)))
-        (insert-events conn tenant-id events*)))))
+        (do (insert-events conn tenant-id events*)
+            (jdbc/execute! conn ["SELECT pg_notify('grain_events', ?)" (str tenant-id)]))))))
+
+(defn tenant-ids
+  [event-store]
+  (let [conn (get-in event-store [:state ::connection-pool])
+        rows (jdbc/execute! conn ["SELECT id FROM grain.tenants"])]
+    (set (map :tenants/id rows))))
 
 ;; ----------------- ;;
 ;; Record Definition ;;
@@ -350,6 +358,9 @@
   (stop [this]
     (stop (:state this))
     (dissoc this :state))
+
+  (tenant-ids [this]
+    (tenant-ids this))
 
   (append [this args]
     (append this args))

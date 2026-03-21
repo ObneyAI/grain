@@ -130,6 +130,10 @@
         (alter (:state event-store) update :events into
                (tag-events-with-tenant tenant-id (conj events tx))))))))
 
+(defn tenant-ids
+  [event-store]
+  (-> event-store :state deref :tenants))
+
 (defrecord InMemoryEventStore [config]
   p/EventStore
 
@@ -139,6 +143,9 @@
   (stop [this]
     (stop (:state this))
     (dissoc this :state))
+
+  (tenant-ids [this]
+    (tenant-ids this))
 
   (append [this args]
     (append this args))

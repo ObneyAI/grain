@@ -2,11 +2,13 @@
   (:require [ai.obney.grain.command-request-handler.interface :as crh]
             [ai.obney.grain.query-request-handler.interface :as qrh]
             [ai.obney.grain.periodic-task.interface :as pt]
-            [ai.obney.grain.event-store-v2.interface :as es] 
+            [ai.obney.grain.event-store-v2.interface :as es]
             [ai.obney.grain.event-store-postgres-v2.interface]
             [ai.obney.grain.webserver.interface :as ws]
             [ai.obney.grain.pubsub.interface :as ps]
             [ai.obney.grain.todo-processor.interface :as tp]
+            [ai.obney.grain.control-plane.interface :as control-plane]
+            [ai.obney.grain.event-notifier-postgres.interface :as event-notifier]
             [ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface :as cloudwatch-emf]
             [clojure.set :as set]
             [com.brunobonacci.mulog :as u]
@@ -60,6 +62,27 @@
               :command-registry commands/commands
               :query-registry queries/queries
               :event-pubsub (ig/ref ::event-pubsub)}
+
+   ;; Control plane — commented out by default (single-instance mode).
+   ;; Uncomment to enable multi-instance coordination.
+   #_#_
+   ::control-plane {:event-store (ig/ref ::event-store)
+                    :cache nil ;; provide a kv-store for L2 cache
+                    :processor-names [:example/calculate-average-counter-value]
+                    :heartbeat-interval-ms 5000
+                    :staleness-threshold-ms 15000
+                    :strategy :round-robin}
+
+   ;; Event notifier — commented out by default.
+   ;; Requires Postgres event store for LISTEN/NOTIFY.
+   #_#_
+   ::event-notifier {:connection-config {:server-name "localhost"
+                                         :port-number "5432"
+                                         :username "postgres"
+                                         :password "password"
+                                         :database-name "obneyai"}
+                     :event-pubsub (ig/ref ::event-pubsub)
+                     :event-store (ig/ref ::event-store)}
 
    ::routes {:context (ig/ref ::context)}
 
@@ -117,6 +140,21 @@
 
 (defmethod ig/halt-key! ::example-periodic-task [_ task]
   (pt/stop task))
+
+(defmethod ig/init-key ::control-plane [_ config]
+  (control-plane/start config))
+
+(defmethod ig/halt-key! ::control-plane [_ cp]
+  (control-plane/stop cp))
+
+(defmethod ig/init-key ::event-notifier [_ {:keys [connection-config event-pubsub event-store]}]
+  (event-notifier/start-listener
+   {:connection-config connection-config
+    :on-notification (fn [tenant-id-str]
+                       (u/log ::event-notification :tenant-id tenant-id-str))}))
+
+(defmethod ig/halt-key! ::event-notifier [_ listener]
+  (event-notifier/stop-listener listener))
 
 (defmethod ig/init-key ::context [_ context]
   context)

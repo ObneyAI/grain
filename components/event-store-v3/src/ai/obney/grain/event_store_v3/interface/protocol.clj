@@ -32,6 +32,10 @@
 
        :predicate-fn - A function with signature [events] that returns true or false, deciding whether the events will be stored or not.")
 
+  (tenant-ids [this]
+    "Returns the set of tenant UUIDs known to this event store.
+     This is administrative metadata, not a cross-tenant event read.")
+
   (read [this args]
     "Read an ordered stream of events from the event store.
 
