@@ -68,7 +68,6 @@
    #_#_
    ::control-plane {:event-store (ig/ref ::event-store)
                     :cache nil ;; provide a kv-store for L2 cache
-                    :processor-names [:example/calculate-average-counter-value]
                     :heartbeat-interval-ms 5000
                     :staleness-threshold-ms 15000
                     :strategy :round-robin}

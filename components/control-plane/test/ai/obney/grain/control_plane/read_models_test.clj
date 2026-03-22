@@ -121,31 +121,31 @@
   (let [node-a (uuid/v7)
         tenant-1 (uuid/v4)
         tenant-2 (uuid/v4)]
-    (append-control-events! [(events/->lease-acquired node-a tenant-1 :proc/a)
-                             (events/->lease-acquired node-a tenant-2 :proc/b)])
+    (append-control-events! [(events/->lease-acquired node-a tenant-1)
+                             (events/->lease-acquired node-a tenant-2)])
     (let [leases (project-lease-ownership)]
       (is (= 2 (count leases)))
-      (is (= node-a (get leases [tenant-1 :proc/a])))
-      (is (= node-a (get leases [tenant-2 :proc/b]))))))
+      (is (= node-a (get leases tenant-1)))
+      (is (= node-a (get leases tenant-2))))))
 
 (deftest lease-ownership-release-removes-lease
   (let [node-a (uuid/v7)
         tenant-1 (uuid/v4)]
-    (append-control-events! [(events/->lease-acquired node-a tenant-1 :proc/a)])
+    (append-control-events! [(events/->lease-acquired node-a tenant-1)])
     (is (= 1 (count (project-lease-ownership))))
-    (append-control-events! [(events/->lease-released node-a tenant-1 :proc/a)])
+    (append-control-events! [(events/->lease-released node-a tenant-1)])
     (is (= 0 (count (project-lease-ownership))))))
 
 (deftest lease-ownership-transfer
   (let [node-a (uuid/v7)
         node-b (uuid/v7)
         tenant-1 (uuid/v4)]
-    (append-control-events! [(events/->lease-acquired node-a tenant-1 :proc/a)])
-    (is (= node-a (get (project-lease-ownership) [tenant-1 :proc/a])))
+    (append-control-events! [(events/->lease-acquired node-a tenant-1)])
+    (is (= node-a (get (project-lease-ownership) tenant-1)))
     ;; Release from A, then acquire by B (separate appends to guarantee order)
-    (append-control-events! [(events/->lease-released node-a tenant-1 :proc/a)])
-    (append-control-events! [(events/->lease-acquired node-b tenant-1 :proc/a)])
-    (is (= node-b (get (project-lease-ownership) [tenant-1 :proc/a])))))
+    (append-control-events! [(events/->lease-released node-a tenant-1)])
+    (append-control-events! [(events/->lease-acquired node-b tenant-1)])
+    (is (= node-b (get (project-lease-ownership) tenant-1)))))
 
 ;; =====================================
 ;; CP8: Tenant Isolation

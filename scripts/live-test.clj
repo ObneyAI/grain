@@ -95,8 +95,8 @@
   (eval-read port
     "(let [s @app/app]
        (->> (app/leases s)
-            (map (fn [[[tid pname] owner]]
-                   {:tenant (str tid) :processor (str pname) :owner (str owner)}))
+            (map (fn [[tid owner]]
+                   {:tenant (str tid) :owner (str owner)}))
             vec))"))
 
 (defn create-tenants! [port n]
@@ -438,6 +438,74 @@
         (setup-node! node-a-port))
       (fail "No tenants owned by node-a"))))
 
+;; =====================================
+;; Scenario 13: In-progress work during crash
+;; =====================================
+
+(defn diagnose-slow-work [port tenant-id]
+  (eval-read port
+    (format "(app/diagnose-slow-work @app/app (java.util.UUID/fromString \"%s\"))" tenant-id)))
+
+(defn submit-slow-work! [port tenant-id]
+  (eval-on port
+    (format "(app/submit-slow-work! @app/app (java.util.UUID/fromString \"%s\"))" tenant-id)))
+
+(defn scenario-13 []
+  (header "Scenario 13: In-progress work during node crash")
+  ;; Ensure both nodes are up
+  (restart-node-b!)
+  (Thread/sleep 4000)
+  ;; Find a tenant owned by node-b
+  (let [leases (lease-details node-a-port)
+        node-b-id (:node-id (node-status node-b-port))
+        b-tenant (->> leases
+                      (filter #(= node-b-id (:owner %)))
+                      first :tenant)]
+    (if b-tenant
+      (do
+        (info (str "Tenant " b-tenant " slow-processor owned by node-b"))
+        ;; Submit 3 slow-work events (each takes 2s to process)
+        (info "Submitting 3 slow-work events...")
+        (dotimes [_ 3]
+          (submit-slow-work! node-a-port b-tenant))
+        ;; Wait just long enough for node-b to start processing the first one
+        ;; (poll interval 250ms + handler starts 2s sleep)
+        (info "Waiting 1s for processing to begin...")
+        (Thread/sleep 1000)
+        ;; Kill node-b mid-processing
+        (info "Killing node-b mid-processing...")
+        (kill-node-b!)
+        ;; Diagnose from node-a before failover
+        (let [diag-before (diagnose-slow-work node-a-port b-tenant)]
+          (info (str "Before failover: " (pr-str diag-before))))
+        ;; Wait for failover — node-a takes over
+        (info "Waiting for failover + catch-up (20s)...")
+        (Thread/sleep 20000)
+        ;; Diagnose after failover
+        (let [diag-after (diagnose-slow-work node-a-port b-tenant)]
+          (info (str "After failover:  " (pr-str diag-after)))
+          (info "")
+          (info "Analysis:")
+          (info (str "  Submitted: " (:submitted diag-after)))
+          (info (str "  Completed: " (:completed diag-after)))
+          (info (str "  Checkpointed: " (:checkpointed diag-after)))
+          (info (str "  Failures: " (:failures diag-after)))
+          (info (str "  By node: " (pr-str (:completed-by-node diag-after))))
+          (info (str "  Events by type: " (pr-str (:events-by-type diag-after))))
+          (info "")
+          ;; The key assertions:
+          ;; 1. All 3 events should eventually be processed (at-least-once)
+          (check (str "All submitted work completed (" (:completed diag-after) "/3)")
+                 (= 3 (:completed diag-after)))
+          ;; 2. All 3 should have checkpoints
+          (check (str "All work checkpointed (" (:checkpointed diag-after) "/3)")
+                 (>= (:checkpointed diag-after) 3))
+          ;; 3. Node-a should have picked up the remaining work
+          (check "Node A processed some work after failover"
+                 (some? (get (:completed-by-node diag-after)
+                             (:node-id (node-status node-a-port)))))))
+      (fail "No slow-processor tenant owned by node-b"))))
+
 ;; -------------------------------- ;;
 ;; Main runner                      ;;
 ;; -------------------------------- ;;
@@ -468,6 +536,9 @@
     (scenario-10)
     (scenario-11)
     (scenario-12)
+
+    ;; In-progress work
+    (scenario-13)
 
     (catch Throwable t
       (swap! results update :error inc)

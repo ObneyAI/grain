@@ -14,11 +14,9 @@
    :grain.control/lease-acquired
    [:map
     [:lease/node-id :uuid]
-    [:lease/tenant-id :uuid]
-    [:lease/processor-name :keyword]]
+    [:lease/tenant-id :uuid]]
 
    :grain.control/lease-released
    [:map
     [:lease/node-id :uuid]
-    [:lease/tenant-id :uuid]
-    [:lease/processor-name :keyword]]})
+    [:lease/tenant-id :uuid]]})

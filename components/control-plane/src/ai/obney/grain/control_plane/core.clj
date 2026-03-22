@@ -46,30 +46,27 @@
   "Given desired assignment and current leases, returns {:acquire [...] :release [...]}."
   [desired-assignment current-leases]
   (let [desired-flat (into {}
-                       (for [[node-id pairs] desired-assignment
-                             pair pairs]
-                         [pair node-id]))
+                       (for [[node-id tenants] desired-assignment
+                             tid tenants]
+                         [tid node-id]))
         to-release (into []
-                     (for [[pair current-owner] current-leases
-                           :when (not= current-owner (get desired-flat pair))]
-                       {:node-id current-owner :tenant-id (first pair) :processor-name (second pair)}))
+                     (for [[tid current-owner] current-leases
+                           :when (not= current-owner (get desired-flat tid))]
+                       {:node-id current-owner :tenant-id tid}))
         to-acquire (into []
-                     (for [[pair desired-owner] desired-flat
-                           :when (not= desired-owner (get current-leases pair))]
-                       {:node-id desired-owner :tenant-id (first pair) :processor-name (second pair)}))]
+                     (for [[tid desired-owner] desired-flat
+                           :when (not= desired-owner (get current-leases tid))]
+                       {:node-id desired-owner :tenant-id tid}))]
     {:release to-release
      :acquire to-acquire}))
 
 (defn emit-lease-changes!
-  "Emit lease-released and lease-acquired events.
-   The coordinator is deterministically elected (only one coordinator at a time),
-   so CAS is not needed here — the assignment function is idempotent and
-   only the coordinator emits lease events."
+  "Emit lease-released and lease-acquired events."
   [ctx releases acquisitions]
   (let [events (concat
-                (map #(events/->lease-released (:node-id %) (:tenant-id %) (:processor-name %))
+                (map #(events/->lease-released (:node-id %) (:tenant-id %))
                      releases)
-                (map #(events/->lease-acquired (:node-id %) (:tenant-id %) (:processor-name %))
+                (map #(events/->lease-acquired (:node-id %) (:tenant-id %))
                      acquisitions))]
     (when (seq events)
       (es/append (:event-store ctx)
@@ -79,17 +76,12 @@
 (defn run-assignment!
   "Run one assignment cycle: project state, compute assignment, emit diffs.
    Only the coordinator should call this."
-  [ctx node-id processor-names staleness-threshold-ms strategy]
+  [ctx node-id staleness-threshold-ms strategy]
   (let [active-nodes (project-active-nodes ctx staleness-threshold-ms)
         current-leases (project-lease-ownership ctx)
         tenant-ids (es/tenant-ids (:event-store ctx))
-        ;; Remove the control plane tenant from assignment
         domain-tenants (disj tenant-ids events/control-plane-tenant-id)
-        ;; Build all (tenant, processor) pairs
-        pairs (set (for [tid domain-tenants
-                         pname processor-names]
-                     [tid pname]))
-        desired (assignment/assign active-nodes pairs current-leases strategy)
+        desired (assignment/assign active-nodes domain-tenants current-leases strategy)
         {:keys [release acquire]} (compute-lease-diff desired current-leases)]
     (when (or (seq release) (seq acquire))
       (emit-lease-changes! ctx release acquire))))
@@ -106,43 +98,46 @@
 
 (defn- reconcile-processors!
   "Diff lease assignments for this node against running processors.
-   Start new ones (poll-based), stop released ones."
+   A lease is per-tenant. When a tenant is acquired, start ALL registered
+   processors for it. When released, stop all of them."
   [ctx node-id running-processors-atom]
   (let [leases (project-lease-ownership ctx)
-        my-leases (into #{}
-                    (comp (filter (fn [[_ owner]] (= owner node-id)))
-                          (map key))
-                    leases)
+        my-tenants (into #{}
+                     (comp (filter (fn [[_ owner]] (= owner node-id)))
+                           (map key))
+                     leases)
         currently-running (set (keys @running-processors-atom))
-        to-start (clojure.set/difference my-leases currently-running)
-        to-stop (clojure.set/difference currently-running my-leases)
+        to-start (clojure.set/difference my-tenants currently-running)
+        to-stop (clojure.set/difference currently-running my-tenants)
         registry @tp/processor-registry*]
-    ;; Stop released processors
-    (doseq [k to-stop]
-      (when-let [proc (get @running-processors-atom k)]
-        (u/log ::reactor-stopping-processor :key k)
-        (tp/stop-polling proc)
-        (swap! running-processors-atom dissoc k)))
-    ;; Start newly assigned processors (poll-based)
-    (doseq [[tenant-id proc-name :as k] to-start]
-      (when-let [proc-config (get registry proc-name)]
-        (u/log ::reactor-starting-processor :key k)
-        (let [lease-check-fn (fn [tid pname]
-                               (= node-id (get (project-lease-ownership ctx)
-                                               [tid pname])))
-              proc (tp/start-polling
-                     {:event-store (:event-store ctx)
-                      :tenant-id tenant-id
-                      :topics (:topics proc-config)
-                      :handler-fn (:handler-fn proc-config)
-                      :processor-name proc-name
-                      :lease-check-fn lease-check-fn})]
-          (swap! running-processors-atom assoc k proc))))))
+    ;; Stop all processors for released tenants
+    (doseq [tid to-stop]
+      (when-let [procs (get @running-processors-atom tid)]
+        (u/log ::reactor-stopping-tenant :tenant-id tid)
+        (doseq [[proc-name proc] procs]
+          (tp/stop-polling proc))
+        (swap! running-processors-atom dissoc tid)))
+    ;; Start all processors for newly acquired tenants
+    (doseq [tid to-start]
+      (u/log ::reactor-starting-tenant :tenant-id tid)
+      (let [lease-check-fn (fn [tenant-id _pname]
+                             (= node-id (get (project-lease-ownership ctx) tenant-id)))
+            procs (into {}
+                    (for [[proc-name proc-config] registry]
+                      [proc-name
+                       (tp/start-polling
+                         {:event-store (:event-store ctx)
+                          :tenant-id tid
+                          :topics (:topics proc-config)
+                          :handler-fn (:handler-fn proc-config)
+                          :processor-name proc-name
+                          :lease-check-fn lease-check-fn})]))]
+        (swap! running-processors-atom assoc tid procs)))))
 
 (defn- coordinator-handler
   "Called periodically to run the assignment cycle if this node is coordinator,
    then reconcile local processors with lease assignments."
-  [{:keys [ctx node-id processor-names staleness-threshold-ms strategy
+  [{:keys [ctx node-id staleness-threshold-ms strategy
            running-processors-atom]}]
   (fn [_time]
     (try
@@ -151,7 +146,7 @@
             coordinator (assignment/coordinator active-nodes)]
         (when (= node-id coordinator)
           (u/log ::running-assignment :node-id node-id)
-          (run-assignment! ctx node-id processor-names staleness-threshold-ms strategy)))
+          (run-assignment! ctx node-id staleness-threshold-ms strategy)))
       ;; Reconcile processors regardless of coordinator status
       (reconcile-processors! ctx node-id running-processors-atom)
       (catch Throwable t
@@ -165,17 +160,15 @@
      :cache                - the kv-store for read model L2 cache
      :node-id              - UUID v7 identifying this node (generated if not provided)
      :node-metadata        - optional metadata map for this node
-     :processor-names      - vector of processor name keywords to assign
      :heartbeat-interval-ms - heartbeat period (default 5000)
      :staleness-threshold-ms - time before a node is considered dead (default 15000)
      :strategy             - assignment strategy (default :round-robin)"
-  [{:keys [event-store cache node-id node-metadata processor-names
+  [{:keys [event-store cache node-id node-metadata
            heartbeat-interval-ms staleness-threshold-ms strategy]
     :or {heartbeat-interval-ms 5000
          staleness-threshold-ms 15000
          strategy :round-robin
-         node-metadata {}
-         processor-names []}}]
+         node-metadata {}}}]
   (let [node-id (or node-id (uuid/v7))
         ctx {:event-store event-store
              :cache cache
@@ -189,7 +182,6 @@
                               (chime/periodic-seq (Instant/now) interval)
                               (coordinator-handler {:ctx ctx
                                                     :node-id node-id
-                                                    :processor-names processor-names
                                                     :staleness-threshold-ms staleness-threshold-ms
                                                     :strategy strategy
                                                     :running-processors-atom running-processors-atom}))]
@@ -213,9 +205,10 @@
   (u/log ::control-plane-stopping :node-id node-id)
   (.close heartbeat-schedule)
   (.close coordinator-schedule)
-  ;; Stop all running processors
-  (doseq [[k proc] @running-processors]
-    (u/log ::stopping-reactor-processor :key k)
+  ;; Stop all running processors (keyed by {tenant-id -> {proc-name -> proc}})
+  (doseq [[tid procs] @running-processors
+          [proc-name proc] procs]
+    (u/log ::stopping-reactor-processor :tenant-id tid :processor proc-name)
     (tp/stop-polling proc))
   (reset! running-processors {})
   (emit-node-departed! ctx node-id)

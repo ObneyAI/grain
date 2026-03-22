@@ -52,8 +52,8 @@
   (cp/project-lease-ownership ctx))
 
 (defn run-assignment!
-  [{:keys [ctx node-id]} processor-names staleness-threshold-ms strategy]
-  (cp/run-assignment! ctx node-id processor-names staleness-threshold-ms strategy))
+  [{:keys [ctx node-id]} staleness-threshold-ms strategy]
+  (cp/run-assignment! ctx node-id staleness-threshold-ms strategy))
 
 (defn is-coordinator?
   "Returns true if this instance is the coordinator."

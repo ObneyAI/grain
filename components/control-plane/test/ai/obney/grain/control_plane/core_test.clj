@@ -33,8 +33,7 @@
       (try
         (let [cp-instance (cp/start {:event-store store
                                      :cache cache
-                                     :processor-names []
-                                     :heartbeat-interval-ms 200
+                                                                          :heartbeat-interval-ms 200
                                      :staleness-threshold-ms 1000})]
           (try
             ;; Wait for a few heartbeat cycles
@@ -71,8 +70,7 @@
                           :events [(es/->event {:type :test/lifecycle-event :body {}})]})
         (let [cp-instance (cp/start {:event-store store
                                      :cache cache
-                                     :processor-names [:proc/a]
-                                     :heartbeat-interval-ms 200
+                                                                          :heartbeat-interval-ms 200
                                      :staleness-threshold-ms 1000})]
           (try
             ;; Wait for heartbeat + coordinator cycle
@@ -84,7 +82,7 @@
                   leases (rmp/project ctx :grain.control/lease-ownership)]
               (is (= 1 (count leases)))
               (is (= (:node-id cp-instance)
-                     (get leases [tenant-1 :proc/a]))))
+                     (get leases tenant-1))))
             (finally
               (cp/stop cp-instance))))
         (finally
@@ -121,8 +119,7 @@
             (let [cp-instance (cp/start {:event-store store
                                          :cache cache
                                          :event-pubsub ps
-                                         :processor-names [:test/reactor-proc]
-                                         :heartbeat-interval-ms 200
+                                                                                  :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
               (try
                 ;; Wait for heartbeat + assignment + reactor to start processor
@@ -166,8 +163,7 @@
             (let [cp-instance (cp/start {:event-store store
                                          :cache cache
                                          :event-pubsub ps
-                                         :processor-names [:test/stop-proc]
-                                         :heartbeat-interval-ms 200
+                                                                                  :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
               ;; Wait for reactor to start processors
               (Thread/sleep 1000)

@@ -75,6 +75,50 @@
 ;; Event Processing    ;;
 ;; ------------------- ;;
 
+(defn- make-effect-failure-event
+  [processor-name triggering-event-id error-message]
+  (let [proc-uuid (processor-name->uuid processor-name)]
+    (event-store/->event
+     {:type :grain/todo-processor-effect-failure
+      :tags #{[:processor proc-uuid]}
+      :body {:processor/name processor-name
+             :triggered-by triggering-event-id
+             :error/message error-message}})))
+
+(defn- process-effect-after
+  "At-least-once: run effect first, then append events + checkpoint."
+  [{:keys [event-store tenant-id processor-name event]} result]
+  (let [triggering-id (:event/id event)
+        effect-fn (:result/effect result)]
+    (try
+      (effect-fn)
+      (append-with-checkpoint event-store tenant-id processor-name
+                              triggering-id (or (:result/on-success result) []))
+      (catch Throwable effect-ex
+        (u/log ::effect-failed :processor-name processor-name
+               :triggered-by triggering-id :exception effect-ex)
+        (try
+          (append-with-checkpoint event-store tenant-id processor-name
+                                  triggering-id (or (:result/on-failure result) []))
+          (catch Throwable failure-ex
+            (u/log ::effect-failure-handler-failed :exception failure-ex)
+            (let [failure-event (make-effect-failure-event
+                                 processor-name triggering-id
+                                 (str (ex-message effect-ex)))]
+              (append-with-checkpoint event-store tenant-id processor-name
+                                      triggering-id [failure-event]))))))))
+
+(defn- process-effect-before
+  "At-most-once: append events + checkpoint first, then run effect."
+  [{:keys [event-store tenant-id processor-name event]} result]
+  (let [triggering-id (:event/id event)
+        append-result (append-with-checkpoint
+                        event-store tenant-id processor-name
+                        triggering-id (or (:result/on-success result) []))]
+    (when-not (and (anomaly? append-result)
+                   (= ::anom/conflict (::anom/category append-result)))
+      ((:result/effect result)))))
+
 (defn- process-pure-result
   "Handles the pure (no side effect) path for a handler result."
   [{:keys [event-store tenant-id processor-name event]} result]
@@ -127,7 +171,11 @@
                  (when (and processor-name (not retry-on-error?))
                    (append-with-checkpoint event-store tenant-id processor-name
                                            (:event/id event) [])))
-             (process-pure-result context result)))
+             (if (:result/effect result)
+               (case (:result/checkpoint result)
+                 :after  (process-effect-after context result)
+                 :before (process-effect-before context result))
+               (process-pure-result context result))))
          (catch Throwable t
            (u/log ::uncaught-exception-in-todo-processor :exception t)
            (when (and processor-name (not retry-on-error?))

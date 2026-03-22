@@ -21,15 +21,15 @@
 
 (defreadmodel :grain.control lease-ownership
   {:events #{:grain.control/lease-acquired :grain.control/lease-released}
-   :version 1
+   :version 2
    :l1-ttl-ms 0}
   [state event]
-  (let [k [(:lease/tenant-id event) (:lease/processor-name event)]]
+  (let [tid (:lease/tenant-id event)]
     (case (:event/type event)
       :grain.control/lease-acquired
-      (assoc state k (:lease/node-id event))
+      (assoc state tid (:lease/node-id event))
 
       :grain.control/lease-released
-      (dissoc state k)
+      (dissoc state tid)
 
       state)))

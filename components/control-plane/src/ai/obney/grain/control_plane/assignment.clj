@@ -24,16 +24,15 @@
      (map-indexed vector sorted-pairs))))
 
 (defn assign
-  "Pure function. Given active nodes, tenant-processor pairs, current leases,
-   and a strategy, returns {node-id -> #{[tenant-id processor-name] ...}}.
-   Every pair is assigned to exactly one node. No pair is duplicated."
-  [active-nodes tenant-processor-pairs current-leases strategy]
-  (if (or (empty? active-nodes) (empty? tenant-processor-pairs))
+  "Pure function. Given active nodes, tenant-ids, current leases,
+   and a strategy, returns {node-id -> #{tenant-id ...}}.
+   Every tenant is assigned to exactly one node."
+  [active-nodes tenant-ids current-leases strategy]
+  (if (or (empty? active-nodes) (empty? tenant-ids))
     {}
     (let [node-ids (keys active-nodes)]
       (case strategy
-        :round-robin (round-robin-assign node-ids tenant-processor-pairs)
-        ;; If strategy is a function, call it directly
+        :round-robin (round-robin-assign node-ids tenant-ids)
         (if (fn? strategy)
-          (strategy active-nodes tenant-processor-pairs current-leases)
-          (round-robin-assign node-ids tenant-processor-pairs))))))
+          (strategy active-nodes tenant-ids current-leases)
+          (round-robin-assign node-ids tenant-ids))))))

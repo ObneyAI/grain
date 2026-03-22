@@ -18,7 +18,9 @@
    :test/event-1 [:map [:num :int]]
    :test/event-2 [:map [:num :int]]
    :test/event-3 [:map [:num :int]]
-   :test/cas-event [:map [:n :int]]})
+   :test/cas-event [:map [:n :int]]
+   :test/effect-succeeded [:map [:msg :string]]
+   :test/effect-failed [:map [:msg :string]]})
 
 ;; Test Fixtures
 
@@ -556,3 +558,75 @@
               (str "After new events: expected 15, got " (count @processed)))
           (finally
             (core/stop-polling processor)))))))
+
+;; 11. Effect paths: at-least-once and at-most-once
+
+(deftest effect-after-success-at-least-once
+  (testing "At-least-once: effect runs, then checkpoint + on-success events appended"
+    (let [effect-ran (atom false)
+          handler (fn [_]
+                    {:result/effect (fn [] (reset! effect-ran true))
+                     :result/checkpoint :after
+                     :result/on-success [(es/->event {:type :test/effect-succeeded
+                                                       :body {:msg "ok"}})]})
+          event (make-event :test/event-1 :body {:num 1})
+          ctx (assoc (make-context event handler)
+                :processor-name :test/effect-after)]
+      (core/process-event ctx)
+      (is @effect-ran "Effect should have run")
+      ;; on-success event + checkpoint should exist
+      (let [all (into [] (es/read *event-store* {:tenant-id test-tenant-id}))
+            successes (filter #(= :test/effect-succeeded (:event/type %)) all)
+            checkpoints (filter #(= :grain/todo-processor-checkpoint (:event/type %)) all)]
+        (is (= 1 (count successes)) "One success event")
+        (is (= 1 (count checkpoints)) "One checkpoint")))))
+
+(deftest effect-after-failure-at-least-once
+  (testing "At-least-once: effect fails, on-failure events + checkpoint appended"
+    (let [handler (fn [_]
+                    {:result/effect (fn [] (throw (ex-info "boom" {})))
+                     :result/checkpoint :after
+                     :result/on-failure [(es/->event {:type :test/effect-failed
+                                                       :body {:msg "failed"}})]})
+          event (make-event :test/event-1 :body {:num 1})
+          ctx (assoc (make-context event handler)
+                :processor-name :test/effect-after-fail)]
+      (core/process-event ctx)
+      (let [all (into [] (es/read *event-store* {:tenant-id test-tenant-id}))
+            failures (filter #(= :test/effect-failed (:event/type %)) all)
+            checkpoints (filter #(= :grain/todo-processor-checkpoint (:event/type %)) all)]
+        (is (= 1 (count failures)) "One failure event")
+        (is (= 1 (count checkpoints)) "Checkpoint written even on failure")))))
+
+(deftest effect-before-at-most-once
+  (testing "At-most-once: checkpoint first, then effect runs"
+    (let [effect-ran (atom false)
+          handler (fn [_]
+                    {:result/effect (fn [] (reset! effect-ran true))
+                     :result/checkpoint :before
+                     :result/on-success [(es/->event {:type :test/effect-succeeded
+                                                       :body {:msg "ok"}})]})
+          event (make-event :test/event-1 :body {:num 1})
+          ctx (assoc (make-context event handler)
+                :processor-name :test/effect-before)]
+      (core/process-event ctx)
+      (is @effect-ran "Effect should have run")
+      (let [checkpoints (filter #(= :grain/todo-processor-checkpoint (:event/type %))
+                                (into [] (es/read *event-store* {:tenant-id test-tenant-id})))]
+        (is (= 1 (count checkpoints)) "Checkpoint written before effect")))))
+
+(deftest effect-before-no-rerun-on-replay
+  (testing "At-most-once: replay does not re-run effect (checkpoint already exists)"
+    (let [effect-count (atom 0)
+          handler (fn [_]
+                    {:result/effect (fn [] (swap! effect-count inc))
+                     :result/checkpoint :before})
+          event (make-event :test/event-1 :body {:num 1})
+          ctx (assoc (make-context event handler)
+                :processor-name :test/effect-before-replay)]
+      ;; First run
+      (core/process-event ctx)
+      (is (= 1 @effect-count))
+      ;; Replay — checkpoint exists, CAS conflict, effect should NOT run
+      (core/process-event ctx)
+      (is (= 1 @effect-count) "Effect must not run twice"))))

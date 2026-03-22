@@ -24,7 +24,17 @@
   {:test/counter-incremented [:map]
    :test/counter-processed [:map
                             [:processed-by/node-id :uuid]
-                            [:processed-by/event-id :uuid]]})
+                            [:processed-by/event-id :uuid]]
+   :test/slow-work [:map]
+   :test/slow-work-done [:map
+                         [:processed-by/node-id :uuid]
+                         [:processed-by/event-id :uuid]
+                         [:processing-time-ms :int]]
+   :test/slow-work-failed [:map [:msg :string]]
+   :grain/todo-processor-effect-failure [:map
+                                         [:processor/name :keyword]
+                                         [:triggered-by :uuid]
+                                         [:error/message :string]]})
 
 ;; ------------------- ;;
 ;; Processor           ;;
@@ -43,10 +53,30 @@
                    :body {:processed-by/node-id node-id
                           :processed-by/event-id (:event/id event)}})]}))
 
-;; Register the processor so the control plane can discover it
+(defn slow-work-handler
+  "Processes :test/slow-work events with a deliberate delay.
+   Uses at-least-once effect path so we can observe what happens
+   when a node dies mid-processing."
+  [{:keys [event event-store tenant-id]}]
+  (let [node-id @node-id-atom
+        start-ms (System/currentTimeMillis)]
+    {:result/effect (fn []
+                      ;; Simulate slow work (2 seconds)
+                      (Thread/sleep 2000))
+     :result/checkpoint :after
+     :result/on-success [(es/->event {:type :test/slow-work-done
+                                       :body {:processed-by/node-id node-id
+                                              :processed-by/event-id (:event/id event)
+                                              :processing-time-ms 2000}})]}))
+
+;; Register processors so the control plane can discover them
 (tp/register-processor! :test/counter-processor
   {:topics [:test/counter-incremented]
    :handler-fn #'counter-processor-handler})
+
+(tp/register-processor! :test/slow-processor
+  {:topics [:test/slow-work]
+   :handler-fn #'slow-work-handler})
 
 ;; ------------------- ;;
 ;; System              ;;
@@ -77,7 +107,8 @@
         cp (control-plane/start {:event-store event-store
                                  :cache cache
                                  :event-pubsub event-pubsub
-                                 :processor-names [:test/counter-processor]
+                                 ;; No processor-names needed — control plane assigns tenants,
+                                 ;; reactor starts all registered processors per tenant
                                  :heartbeat-interval-ms 2000
                                  :staleness-threshold-ms 6000})
 
@@ -131,6 +162,13 @@
     {:tenant-id tenant-id
      :events [(es/->event {:type :test/counter-incremented :body {}})]}))
 
+(defn submit-slow-work!
+  "Append a slow-work event to a tenant."
+  [system tenant-id]
+  (es/append (:event-store system)
+    {:tenant-id tenant-id
+     :events [(es/->event {:type :test/slow-work :body {}})]}))
+
 (defn active-nodes
   "Show active (non-stale) nodes."
   [system]
@@ -150,6 +188,25 @@
     (comp (remove #(= :grain/tx (:event/type %)))
           (filter #(= :test/counter-processed (:event/type %))))
     (es/read (:event-store system) {:tenant-id tenant-id})))
+
+(defn diagnose-slow-work
+  "Analyze slow-work processing for a tenant: how many submitted,
+   how many completed, how many checkpointed, which nodes processed them."
+  [system tenant-id]
+  (let [all (into []
+              (remove #(= :grain/tx (:event/type %)))
+              (es/read (:event-store system) {:tenant-id tenant-id}))
+        submitted (filter #(= :test/slow-work (:event/type %)) all)
+        done (filter #(= :test/slow-work-done (:event/type %)) all)
+        checkpoints (filter #(= :grain/todo-processor-checkpoint (:event/type %)) all)
+        failures (filter #(= :grain/todo-processor-effect-failure (:event/type %)) all)
+        done-by-node (frequencies (map :processed-by/node-id done))]
+    {:submitted (count submitted)
+     :completed (count done)
+     :checkpointed (count checkpoints)
+     :failures (count failures)
+     :completed-by-node (into {} (map (fn [[k v]] [(str k) v])) done-by-node)
+     :events-by-type (frequencies (map :event/type all))}))
 
 (defn all-events
   "Show all non-tx events for a tenant."

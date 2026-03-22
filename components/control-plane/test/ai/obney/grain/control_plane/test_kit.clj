@@ -47,12 +47,12 @@
                           :events [(es/->event {:type :test/domain-event :body {:n 2}})]})
         (harness/emit-heartbeat! inst-a)
         (harness/emit-heartbeat! inst-b)
-        (harness/run-assignment! inst-a [:proc/a :proc/b] staleness-ms :round-robin)
+        (harness/run-assignment! inst-a staleness-ms :round-robin)
         (rmp/l1-clear!)
         (let [leases-a (harness/project-lease-ownership inst-a)
               leases-b (harness/project-lease-ownership inst-b)]
           (is (= leases-a leases-b) "Both instances see the same leases")
-          (is (= 4 (count leases-a)) "2 tenants * 2 processors = 4 leases")
+          (is (= 2 (count leases-a)) "2 tenants = 2 leases")
           (let [owners (set (vals leases-a))]
             (is (every? #{(:node-id inst-a) (:node-id inst-b)} owners)
                 "All leases owned by one of the two nodes")))
@@ -71,14 +71,14 @@
                           :events [(es/->event {:type :test/domain-event :body {:n 1}})]})
         (harness/emit-heartbeat! inst-a)
         (harness/emit-heartbeat! inst-b)
-        (let [ra (future (harness/run-assignment! inst-a [:proc/a] staleness-ms :round-robin))
-              rb (future (harness/run-assignment! inst-b [:proc/a] staleness-ms :round-robin))]
+        (let [ra (future (harness/run-assignment! inst-a staleness-ms :round-robin))
+              rb (future (harness/run-assignment! inst-b staleness-ms :round-robin))]
           @ra @rb)
         (rmp/l1-clear!)
         (let [leases (harness/project-lease-ownership inst-a)]
-          (is (= 1 (count leases)) "Exactly one lease for the pair")
+          (is (= 1 (count leases)) "Exactly one lease for the tenant")
           (is (contains? #{(:node-id inst-a) (:node-id inst-b)}
-                         (get leases [tenant-1 :proc/a]))))
+                         (get leases tenant-1))))
         (finally
           (harness/stop-instance inst-a)
           (harness/stop-instance inst-b)
@@ -121,16 +121,16 @@
                           :events [(es/->event {:type :test/domain-event :body {:n 1}})]})
         (harness/emit-heartbeat! inst-a)
         (harness/emit-heartbeat! inst-b)
-        (harness/run-assignment! inst-a [:proc/a :proc/b] staleness-ms :round-robin)
+        (harness/run-assignment! inst-a staleness-ms :round-robin)
         (rmp/l1-clear!)
         (let [leases-before (harness/project-lease-ownership inst-a)]
-          (is (= 2 (count leases-before)))
+          (is (= 1 (count leases-before)))
           (harness/emit-departed! inst-a)
           (rmp/l1-clear!)
-          (harness/run-assignment! inst-b [:proc/a :proc/b] staleness-ms :round-robin)
+          (harness/run-assignment! inst-b staleness-ms :round-robin)
           (rmp/l1-clear!)
           (let [leases-after (harness/project-lease-ownership inst-b)]
-            (is (= 2 (count leases-after)) "All work reassigned")
+            (is (= 1 (count leases-after)) "All work reassigned")
             (is (every? #(= (:node-id inst-b) %) (vals leases-after))
                 "All leases now on node B")))
         (finally
@@ -180,7 +180,7 @@
         (es/append store {:tenant-id tenant-2
                           :events [(es/->event {:type :test/domain-event :body {:n 2}})]})
         (harness/emit-heartbeat! inst-a)
-        (harness/run-assignment! inst-a [:proc/a] staleness-ms :round-robin)
+        (harness/run-assignment! inst-a staleness-ms :round-robin)
         (rmp/l1-clear!)
         (let [leases-before (harness/project-lease-ownership inst-a)]
           (is (= 2 (count leases-before)))
@@ -191,7 +191,7 @@
           (try
             (harness/emit-heartbeat! inst-b)
             (rmp/l1-clear!)
-            (harness/run-assignment! inst-a [:proc/a] staleness-ms :round-robin)
+            (harness/run-assignment! inst-a staleness-ms :round-robin)
             (rmp/l1-clear!)
             (let [leases-after (harness/project-lease-ownership inst-a)
                   owners (set (vals leases-after))]

@@ -47,3 +47,21 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  node-c:
+    build:
+      context: .
+      dockerfile: Dockerfile.cp-test
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: postgres
+      PG_PASSWORD: password
+      PG_DATABASE: grain_test
+      NREPL_PORT: "7892"
+      START_DELAY_MS: "6000"
+    ports:
+      - "7892:7892"
+    depends_on:
+      postgres:
+        condition: service_healthy
