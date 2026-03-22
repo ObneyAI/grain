@@ -329,15 +329,13 @@
                                             ::none plan)]
                                (if (= r ::none) (f) r))))]
           (if (predicate-fn cas-events)
-            (do (insert-events conn tenant-id events*)
-                (jdbc/execute! conn ["SELECT pg_notify('grain_events', ?)" (str tenant-id)]))
+            (insert-events conn tenant-id events*)
             (let [anomaly  {::anom/category ::anom/conflict
                             ::anom/message "CAS failed"
                             ::cas cas}]
               (u/log ::cas-failed :anomaly anomaly)
               anomaly)))
-        (do (insert-events conn tenant-id events*)
-            (jdbc/execute! conn ["SELECT pg_notify('grain_events', ?)" (str tenant-id)]))))))
+        (insert-events conn tenant-id events*)))))
 
 (defn tenant-ids
   [event-store]

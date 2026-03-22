@@ -475,3 +475,84 @@
         (is (= [:test/event-1] (get-in @core/processor-registry* [:test/my-proc :topics])))
         (finally
           (reset! core/processor-registry* prev))))))
+
+;; 10. Poll-based processing (EP1, EP4)
+
+(deftest poll-based-processor-processes-all-events
+  (testing "EP1: Poll-based processor processes every appended event without pubsub"
+    (let [processed (atom [])
+          handler (fn [{:keys [event]}]
+                    (swap! processed conj (:event/id event))
+                    {})
+          tenant-id (random-uuid)
+          ;; Append 50 events
+          events (mapv (fn [_] (make-event :test/event-1 :body {:num 1})) (range 50))]
+      (es/append *event-store* {:tenant-id tenant-id :events events})
+      ;; Start a poll-based processor (no pubsub)
+      (let [processor (core/start-polling
+                        {:event-store *event-store*
+                         :tenant-id tenant-id
+                         :topics [:test/event-1]
+                         :handler-fn handler
+                         :processor-name :test/poll-proc
+                         :poll-interval-ms 100})]
+        (try
+          (Thread/sleep 2000)
+          (is (= 50 (count @processed))
+              (str "Expected 50 processed, got " (count @processed)))
+          (finally
+            (core/stop-polling processor)))))))
+
+(deftest poll-based-processor-no-pubsub-dependency
+  (testing "EP4: Processor works with no pubsub configured at all"
+    (let [processed (atom [])
+          handler (fn [{:keys [event]}]
+                    (swap! processed conj (:event/id event))
+                    {})
+          tenant-id (random-uuid)
+          event (make-event :test/event-1 :body {:num 1})]
+      (es/append *event-store* {:tenant-id tenant-id :events [event]})
+      (let [processor (core/start-polling
+                        {:event-store *event-store*
+                         :tenant-id tenant-id
+                         :topics [:test/event-1]
+                         :handler-fn handler
+                         :processor-name :test/no-pubsub-proc
+                         :poll-interval-ms 100})]
+        (try
+          (Thread/sleep 1000)
+          (is (= 1 (count @processed)))
+          (finally
+            (core/stop-polling processor)))))))
+
+(deftest poll-based-processor-catches-up-and-continues
+  (testing "EP1: Processor catches up existing events and processes new ones"
+    (let [processed (atom [])
+          handler (fn [{:keys [event]}]
+                    (swap! processed conj (:event/id event))
+                    {})
+          tenant-id (random-uuid)
+          ;; Append 10 events before processor starts
+          events-before (mapv (fn [_] (make-event :test/event-1 :body {:num 1})) (range 10))]
+      (es/append *event-store* {:tenant-id tenant-id :events events-before})
+      (let [processor (core/start-polling
+                        {:event-store *event-store*
+                         :tenant-id tenant-id
+                         :topics [:test/event-1]
+                         :handler-fn handler
+                         :processor-name :test/catchup-poll-proc
+                         :poll-interval-ms 100})]
+        (try
+          (Thread/sleep 1000)
+          ;; Should have caught up the 10 existing events
+          (is (= 10 (count @processed))
+              (str "Catch-up: expected 10, got " (count @processed)))
+          ;; Append 5 more while processor is running
+          (let [events-after (mapv (fn [_] (make-event :test/event-1 :body {:num 2})) (range 5))]
+            (es/append *event-store* {:tenant-id tenant-id :events events-after}))
+          (Thread/sleep 1000)
+          ;; Should have processed all 15
+          (is (= 15 (count @processed))
+              (str "After new events: expected 15, got " (count @processed)))
+          (finally
+            (core/stop-polling processor)))))))

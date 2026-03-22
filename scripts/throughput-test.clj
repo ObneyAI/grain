@@ -8,7 +8,7 @@
 (def cf "docker-compose.cp-test.yml")
 (def port-a 7890)
 (def port-b 7891)
-(def n-tenants 10)
+(def n-tenants 500)
 (def events-per-tenant 100)
 (def total-events (* n-tenants events-per-tenant))
 
@@ -122,13 +122,6 @@
       (check (str "All tenants: zero missing events") (zero? @total-missing))
       (check (str "Grand total: " total-inc " == " total-proc)
              (= total-inc total-proc)))
-    ;; Bridge stats from both nodes
-    (header "Throughput: Bridge stats")
-    (let [stats-a (eval-read port-a "(app/bridge-stats @app/app)")
-          stats-b (eval-read port-b "(app/bridge-stats @app/app)")]
-      (info (str "Node A bridge: " (pr-str stats-a)))
-      (info (str "Node B bridge: " (pr-str stats-b))))
-
     ;; Detailed diagnosis for first failing tenant
     (when-not @all-ok
       (header "Throughput: Detailed diagnosis (first failing tenant)")

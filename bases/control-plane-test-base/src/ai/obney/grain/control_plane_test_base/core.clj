@@ -7,7 +7,6 @@
             [ai.obney.grain.event-store-postgres-v3.interface]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.control-plane.interface :as control-plane]
-            [ai.obney.grain.event-notifier-postgres.interface :as event-notifier]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.kv-store.interface :as kv]
@@ -82,11 +81,6 @@
                                  :heartbeat-interval-ms 2000
                                  :staleness-threshold-ms 6000})
 
-        ;; Event notifier bridge (cross-instance delivery)
-        bridge (event-notifier/start-bridge {:connection-config (pg-config)
-                                             :event-store event-store
-                                             :event-pubsub event-pubsub})
-
         ;; nREPL for live interaction
         nrepl-server (nrepl/start-server :bind "0.0.0.0" :port nrepl-port)]
 
@@ -101,7 +95,6 @@
      :cache cache
      :cache-dir cache-dir
      :control-plane cp
-     :bridge bridge
      :nrepl-server nrepl-server
      :console-stop console-stop
      :ctx {:event-store event-store
@@ -110,9 +103,8 @@
 
 (defn stop
   "Stop the test app."
-  [{:keys [control-plane bridge nrepl-server event-pubsub event-store cache console-stop]}]
+  [{:keys [control-plane nrepl-server event-pubsub event-store cache console-stop]}]
   (control-plane/stop control-plane)
-  (event-notifier/stop-bridge bridge)
   (nrepl/stop-server nrepl-server)
   (pubsub/stop event-pubsub)
   (kv/stop cache)
@@ -170,25 +162,6 @@
   "Show running processors on this node."
   [system]
   (control-plane/running-processors (:control-plane system)))
-
-(defn bridge-stats
-  "Get bridge notification/read/publish counters."
-  [system]
-  (let [stats (get-in system [:bridge :stats])]
-    {:notified @(:notify-count stats)
-     :reads @(:read-count stats)
-     :published @(:publish-count stats)
-     :empty-reads @(:empty-read-count stats)}))
-
-(defn bridge-trace
-  "Get the bridge trace log — every read with watermarks and event IDs."
-  [system]
-  @(get-in system [:bridge :trace-log]))
-
-(defn bridge-watermarks
-  "Get current bridge watermarks per tenant."
-  [system]
-  (into {} (map (fn [[k v]] [(str k) (str v)])) @(get-in system [:bridge :watermarks])))
 
 (defn diagnose-tenant
   "Full diagnostic for a tenant: which events were incremented, which were

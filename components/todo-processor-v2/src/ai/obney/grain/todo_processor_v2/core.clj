@@ -279,3 +279,63 @@
 (defn stop
   [todo-processor]
   (ig/halt! todo-processor))
+
+;; ----------------------------- ;;
+;; Poll-based processor          ;;
+;; ----------------------------- ;;
+
+(defn start-polling
+  "Start a pull-based processor that polls the event store directly.
+   No pubsub, no channels, no NOTIFY. The event store is the delivery mechanism.
+
+   config keys:
+     :event-store      - the event store instance
+     :tenant-id        - the tenant to poll for
+     :topics           - set/vector of event types to process
+     :handler-fn       - the handler function
+     :processor-name   - keyword name (used for checkpoints)
+     :poll-interval-ms - poll frequency (default 250)
+     :lease-check-fn   - optional lease check function"
+  [{:keys [event-store tenant-id topics handler-fn processor-name
+           poll-interval-ms lease-check-fn]
+    :or {poll-interval-ms 250}}]
+  (let [running (atom true)
+        thread (Thread.
+                (fn []
+                  (u/log ::poll-processor-started :processor-name processor-name
+                         :tenant-id tenant-id :topics topics)
+                  ;; Find the last checkpoint to resume from
+                  (let [last-id (atom (get-last-processed-id event-store tenant-id processor-name))]
+                    (while @running
+                      (try
+                        (let [read-args (cond-> {:tenant-id tenant-id
+                                                 :types (set topics)}
+                                          @last-id (assoc :after @last-id))
+                              events (into []
+                                       (remove #(= :grain/tx (:event/type %)))
+                                       (event-store/read event-store read-args))]
+                          (doseq [event events]
+                            (when @running
+                              (process-event
+                                (cond-> {:event event
+                                         :handler-fn handler-fn
+                                         :event-store event-store
+                                         :tenant-id tenant-id
+                                         :processor-name processor-name}
+                                  lease-check-fn (assoc :lease-check-fn lease-check-fn)))
+                              (reset! last-id (:event/id event)))))
+                        (catch Throwable t
+                          (u/log ::poll-processor-error :exception t)))
+                      (Thread/sleep poll-interval-ms)))))]
+    (.setDaemon thread true)
+    (.setName thread (str "grain-poll-" (name processor-name)))
+    (.start thread)
+    {:running running :thread thread}))
+
+(defn stop-polling
+  "Stop a poll-based processor."
+  [{:keys [running thread]}]
+  (when running
+    (reset! running false))
+  (when thread
+    (.join thread 2000)))

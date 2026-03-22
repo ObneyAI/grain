@@ -69,10 +69,19 @@
     (when v (read-string v))))
 
 (defn setup-node! [port]
-  (eval-on port
-    "(require '[ai.obney.grain.control-plane-test-base.core :as app])
-     (require '[clj-uuid :as uuid])
-     :ok"))
+  (loop [attempts 5]
+    (let [result (try
+                   (eval-on port
+                     "(require '[ai.obney.grain.control-plane-test-base.core :as app])
+                      (require '[clj-uuid :as uuid])
+                      :ok")
+                   (catch Exception e
+                     (when (pos? attempts)
+                       (Thread/sleep 2000))
+                     nil))]
+      (if (or result (zero? attempts))
+        result
+        (recur (dec attempts))))))
 
 (defn node-status [port]
   (eval-read port

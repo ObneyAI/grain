@@ -14,3 +14,11 @@
 (defn stop
   [todo-processor]
   (core/stop todo-processor))
+
+(defn start-polling
+  [config]
+  (core/start-polling config))
+
+(defn stop-polling
+  [polling-processor]
+  (core/stop-polling polling-processor))

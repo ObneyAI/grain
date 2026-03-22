@@ -106,10 +106,9 @@
 
 (defn- reconcile-processors!
   "Diff lease assignments for this node against running processors.
-   Start new ones, stop released ones."
-  [ctx node-id event-pubsub running-processors-atom]
+   Start new ones (poll-based), stop released ones."
+  [ctx node-id running-processors-atom]
   (let [leases (project-lease-ownership ctx)
-        ;; Leases assigned to this node
         my-leases (into #{}
                     (comp (filter (fn [[_ owner]] (= owner node-id)))
                           (map key))
@@ -122,29 +121,29 @@
     (doseq [k to-stop]
       (when-let [proc (get @running-processors-atom k)]
         (u/log ::reactor-stopping-processor :key k)
-        (tp/stop proc)
+        (tp/stop-polling proc)
         (swap! running-processors-atom dissoc k)))
-    ;; Start newly assigned processors
+    ;; Start newly assigned processors (poll-based)
     (doseq [[tenant-id proc-name :as k] to-start]
       (when-let [proc-config (get registry proc-name)]
         (u/log ::reactor-starting-processor :key k)
         (let [lease-check-fn (fn [tid pname]
                                (= node-id (get (project-lease-ownership ctx)
                                                [tid pname])))
-              proc (tp/start {:event-pubsub event-pubsub
-                              :topics (:topics proc-config)
-                              :handler-fn (:handler-fn proc-config)
-                              :processor-name proc-name
-                              :context (assoc ctx
-                                         :tenant-id tenant-id
-                                         :lease-check-fn lease-check-fn)})]
+              proc (tp/start-polling
+                     {:event-store (:event-store ctx)
+                      :tenant-id tenant-id
+                      :topics (:topics proc-config)
+                      :handler-fn (:handler-fn proc-config)
+                      :processor-name proc-name
+                      :lease-check-fn lease-check-fn})]
           (swap! running-processors-atom assoc k proc))))))
 
 (defn- coordinator-handler
   "Called periodically to run the assignment cycle if this node is coordinator,
    then reconcile local processors with lease assignments."
   [{:keys [ctx node-id processor-names staleness-threshold-ms strategy
-           event-pubsub running-processors-atom]}]
+           running-processors-atom]}]
   (fn [_time]
     (try
       (rmp/l1-clear!)
@@ -154,7 +153,7 @@
           (u/log ::running-assignment :node-id node-id)
           (run-assignment! ctx node-id processor-names staleness-threshold-ms strategy)))
       ;; Reconcile processors regardless of coordinator status
-      (reconcile-processors! ctx node-id event-pubsub running-processors-atom)
+      (reconcile-processors! ctx node-id running-processors-atom)
       (catch Throwable t
         (u/log ::coordinator-error :exception t)))))
 
@@ -167,11 +166,10 @@
      :node-id              - UUID v7 identifying this node (generated if not provided)
      :node-metadata        - optional metadata map for this node
      :processor-names      - vector of processor name keywords to assign
-     :event-pubsub         - the local pubsub instance (needed by reactor to start processors)
      :heartbeat-interval-ms - heartbeat period (default 5000)
      :staleness-threshold-ms - time before a node is considered dead (default 15000)
      :strategy             - assignment strategy (default :round-robin)"
-  [{:keys [event-store cache node-id node-metadata processor-names event-pubsub
+  [{:keys [event-store cache node-id node-metadata processor-names
            heartbeat-interval-ms staleness-threshold-ms strategy]
     :or {heartbeat-interval-ms 5000
          staleness-threshold-ms 15000
@@ -194,7 +192,6 @@
                                                     :processor-names processor-names
                                                     :staleness-threshold-ms staleness-threshold-ms
                                                     :strategy strategy
-                                                    :event-pubsub event-pubsub
                                                     :running-processors-atom running-processors-atom}))]
     (u/log ::control-plane-started :node-id node-id)
     ;; Emit initial heartbeat immediately
@@ -219,7 +216,7 @@
   ;; Stop all running processors
   (doseq [[k proc] @running-processors]
     (u/log ::stopping-reactor-processor :key k)
-    (tp/stop proc))
+    (tp/stop-polling proc))
   (reset! running-processors {})
   (emit-node-departed! ctx node-id)
   (u/log ::control-plane-stopped :node-id node-id))

@@ -8,7 +8,7 @@
             [ai.obney.grain.pubsub.interface :as ps]
             [ai.obney.grain.todo-processor.interface :as tp]
             [ai.obney.grain.control-plane.interface :as control-plane]
-            [ai.obney.grain.event-notifier-postgres.interface :as event-notifier]
+            ;; event-notifier-postgres removed — todo processors poll the event store directly
             [ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface :as cloudwatch-emf]
             [clojure.set :as set]
             [com.brunobonacci.mulog :as u]
@@ -73,17 +73,6 @@
                     :staleness-threshold-ms 15000
                     :strategy :round-robin}
 
-   ;; Event notifier — commented out by default.
-   ;; Requires Postgres event store for LISTEN/NOTIFY.
-   #_#_
-   ::event-notifier {:connection-config {:server-name "localhost"
-                                         :port-number "5432"
-                                         :username "postgres"
-                                         :password "password"
-                                         :database-name "obneyai"}
-                     :event-pubsub (ig/ref ::event-pubsub)
-                     :event-store (ig/ref ::event-store)}
-
    ::routes {:context (ig/ref ::context)}
 
    ::webserver {:http/routes (ig/ref ::routes)
@@ -146,15 +135,6 @@
 
 (defmethod ig/halt-key! ::control-plane [_ cp]
   (control-plane/stop cp))
-
-(defmethod ig/init-key ::event-notifier [_ {:keys [connection-config event-pubsub event-store]}]
-  (event-notifier/start-listener
-   {:connection-config connection-config
-    :on-notification (fn [tenant-id-str]
-                       (u/log ::event-notification :tenant-id tenant-id-str))}))
-
-(defmethod ig/halt-key! ::event-notifier [_ listener]
-  (event-notifier/stop-listener listener))
 
 (defmethod ig/init-key ::context [_ context]
   context)
