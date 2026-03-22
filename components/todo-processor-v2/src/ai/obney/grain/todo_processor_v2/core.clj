@@ -336,6 +336,9 @@
   "Start a pull-based processor that polls the event store directly.
    No pubsub, no channels, no NOTIFY. The event store is the delivery mechanism.
 
+   Processes events in batches. Pure handlers (no :result/effect) are batched —
+   one checkpoint per batch. Effect handlers checkpoint per-event.
+
    config keys:
      :event-store      - the event store instance
      :tenant-id        - the tenant to poll for
@@ -343,16 +346,17 @@
      :handler-fn       - the handler function
      :processor-name   - keyword name (used for checkpoints)
      :poll-interval-ms - poll frequency (default 250)
+     :batch-size       - max events per poll cycle (default 100)
      :lease-check-fn   - optional lease check function"
   [{:keys [event-store tenant-id topics handler-fn processor-name
-           poll-interval-ms lease-check-fn]
-    :or {poll-interval-ms 250}}]
+           poll-interval-ms batch-size lease-check-fn]
+    :or {poll-interval-ms 250
+         batch-size 100}}]
   (let [running (atom true)
         thread (Thread.
                 (fn []
                   (u/log ::poll-processor-started :processor-name processor-name
-                         :tenant-id tenant-id :topics topics)
-                  ;; Find the last checkpoint to resume from
+                         :tenant-id tenant-id :topics topics :batch-size batch-size)
                   (let [last-id (atom (get-last-processed-id event-store tenant-id processor-name))]
                     (while @running
                       (try
@@ -360,18 +364,37 @@
                                                  :types (set topics)}
                                           @last-id (assoc :after @last-id))
                               events (into []
-                                       (remove #(= :grain/tx (:event/type %)))
-                                       (event-store/read event-store read-args))]
+                                       (comp (remove #(= :grain/tx (:event/type %)))
+                                             (take batch-size))
+                                       (event-store/read event-store read-args))
+                              batch-result-events (atom [])
+                              last-batch-event-id (atom nil)]
                           (doseq [event events]
                             (when @running
-                              (process-event
-                                (cond-> {:event event
-                                         :handler-fn handler-fn
-                                         :event-store event-store
-                                         :tenant-id tenant-id
-                                         :processor-name processor-name}
-                                  lease-check-fn (assoc :lease-check-fn lease-check-fn)))
-                              (reset! last-id (:event/id event)))))
+                              (if (and lease-check-fn
+                                       (not (lease-check-fn tenant-id processor-name)))
+                                (u/log ::lease-check-skipped :tenant-id tenant-id)
+                                (let [context {:event event
+                                               :handler-fn handler-fn
+                                               :event-store event-store
+                                               :tenant-id tenant-id}
+                                      result (or (handler-fn context)
+                                                 {})]
+                                  (if (:result/effect result)
+                                    ;; Effect handler: checkpoint per-event (delegating to process-event)
+                                    (process-event (cond-> (assoc context
+                                                             :processor-name processor-name)
+                                                     lease-check-fn (assoc :lease-check-fn lease-check-fn)))
+                                    ;; Pure handler: collect result events for batch checkpoint
+                                    (when-let [revents (:result/events result)]
+                                      (swap! batch-result-events into revents)))))
+                              (reset! last-batch-event-id (:event/id event))))
+                          ;; After batch: one checkpoint for all pure results
+                          (when @last-batch-event-id
+                            (append-with-checkpoint event-store tenant-id processor-name
+                                                    @last-batch-event-id
+                                                    @batch-result-events)
+                            (reset! last-id @last-batch-event-id)))
                         (catch Throwable t
                           (u/log ::poll-processor-error :exception t)))
                       (Thread/sleep poll-interval-ms)))))]

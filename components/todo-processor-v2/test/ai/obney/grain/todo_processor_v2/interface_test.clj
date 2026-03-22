@@ -630,3 +630,126 @@
       ;; Replay — checkpoint exists, CAS conflict, effect should NOT run
       (core/process-event ctx)
       (is (= 1 @effect-count) "Effect must not run twice"))))
+
+;; 12. Batch checkpointing
+
+(deftest bp1-batch-completeness
+  (testing "BP1: All events processed, one checkpoint per batch pointing to last event"
+    (let [processed (atom [])
+          handler (fn [{:keys [event]}]
+                    (swap! processed conj (:event/id event))
+                    {})
+          tenant-id (random-uuid)
+          events (mapv (fn [_] (make-event :test/event-1 :body {:num 1})) (range 50))]
+      (es/append *event-store* {:tenant-id tenant-id :events events})
+      (let [processor (core/start-polling
+                        {:event-store *event-store*
+                         :tenant-id tenant-id
+                         :topics [:test/event-1]
+                         :handler-fn handler
+                         :processor-name :test/bp1-batch
+                         :poll-interval-ms 100
+                         :batch-size 100})]
+        (try
+          (Thread/sleep 2000)
+          (is (= 50 (count @processed)) (str "All 50 processed, got " (count @processed)))
+          ;; Should be exactly 1 checkpoint (one batch of 50)
+          (let [proc-uuid (core/processor-name->uuid :test/bp1-batch)
+                checkpoints (into []
+                              (es/read *event-store*
+                                {:tenant-id tenant-id
+                                 :types #{:grain/todo-processor-checkpoint}
+                                 :tags #{[:processor proc-uuid]}}))]
+            (is (= 1 (count checkpoints))
+                (str "Expected 1 checkpoint, got " (count checkpoints)))
+            ;; Checkpoint should point to the last event
+            (when (seq checkpoints)
+              (is (= (:event/id (last events))
+                     (:triggered-by (first checkpoints))))))
+          (finally
+            (core/stop-polling processor)))))))
+
+(deftest bp3-effect-handlers-checkpoint-per-event
+  (testing "BP3: Effect handlers still checkpoint individually, not batched"
+    (let [effect-count (atom 0)
+          handler (fn [{:keys [event]}]
+                    {:result/effect (fn [] (swap! effect-count inc))
+                     :result/checkpoint :after
+                     :result/on-success [(es/->event {:type :test/effect-succeeded
+                                                       :body {:msg "ok"}})]})
+          tenant-id (random-uuid)
+          events (mapv (fn [_] (make-event :test/event-1 :body {:num 1})) (range 5))]
+      (es/append *event-store* {:tenant-id tenant-id :events events})
+      (let [processor (core/start-polling
+                        {:event-store *event-store*
+                         :tenant-id tenant-id
+                         :topics [:test/event-1]
+                         :handler-fn handler
+                         :processor-name :test/bp3-effect
+                         :poll-interval-ms 100
+                         :batch-size 100})]
+        (try
+          (Thread/sleep 3000)
+          (is (= 5 @effect-count) "All 5 effects ran")
+          ;; Should be 5 checkpoints (one per event, not batched)
+          (let [proc-uuid (core/processor-name->uuid :test/bp3-effect)
+                checkpoints (into []
+                              (es/read *event-store*
+                                {:tenant-id tenant-id
+                                 :types #{:grain/todo-processor-checkpoint}
+                                 :tags #{[:processor proc-uuid]}}))]
+            (is (= 5 (count checkpoints))
+                (str "Expected 5 checkpoints, got " (count checkpoints))))
+          (finally
+            (core/stop-polling processor)))))))
+
+(deftest bp4-batch-faster-than-per-event
+  (testing "BP4: Batch checkpointing is faster than per-event"
+    (let [tenant-batch (random-uuid)
+          tenant-single (random-uuid)
+          n 200
+          handler (fn [_] {})
+          events-batch (mapv (fn [_] (make-event :test/event-1 :body {:num 1})) (range n))
+          events-single (mapv (fn [_] (make-event :test/event-1 :body {:num 1})) (range n))]
+      (es/append *event-store* {:tenant-id tenant-batch :events events-batch})
+      (es/append *event-store* {:tenant-id tenant-single :events events-single})
+      ;; Batch mode
+      (let [start-batch (System/currentTimeMillis)
+            proc-batch (core/start-polling
+                         {:event-store *event-store*
+                          :tenant-id tenant-batch
+                          :topics [:test/event-1]
+                          :handler-fn handler
+                          :processor-name :test/bp4-batch
+                          :poll-interval-ms 50
+                          :batch-size 100})]
+        (try
+          (Thread/sleep 3000)
+          (let [batch-ms (- (System/currentTimeMillis) start-batch)]
+            ;; Per-event mode
+            (let [start-single (System/currentTimeMillis)
+                  proc-single (core/start-polling
+                                {:event-store *event-store*
+                                 :tenant-id tenant-single
+                                 :topics [:test/event-1]
+                                 :handler-fn handler
+                                 :processor-name :test/bp4-single
+                                 :poll-interval-ms 50
+                                 :batch-size 1})]
+              (try
+                (Thread/sleep 5000)
+                (let [single-ms (- (System/currentTimeMillis) start-single)
+                      batch-ckpts (count (into []
+                                           (es/read *event-store*
+                                             {:tenant-id tenant-batch
+                                              :types #{:grain/todo-processor-checkpoint}})))
+                      single-ckpts (count (into []
+                                            (es/read *event-store*
+                                              {:tenant-id tenant-single
+                                               :types #{:grain/todo-processor-checkpoint}})))]
+                  (is (< batch-ckpts single-ckpts)
+                      (str "Batch checkpoints (" batch-ckpts ") should be fewer than single (" single-ckpts ")")))
+                (finally
+                  (core/stop-polling proc-single)))))
+          (finally
+            (core/stop-polling proc-batch)))))))

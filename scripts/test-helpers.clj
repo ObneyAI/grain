@@ -41,17 +41,21 @@
 ;; nREPL helpers                    ;;
 ;; -------------------------------- ;;
 
-(defn eval-on [port code]
-  (with-open [conn (nrepl/connect :port port)]
-    (let [client (nrepl/client conn 30000)
-          results (nrepl/message client {:op :eval :code code})]
-      (doseq [r results]
-        (when (:err r) (binding [*out* *err*] (print (:err r)))))
-      (some :value results))))
+(defn eval-on
+  ([port code] (eval-on port code 30000))
+  ([port code timeout-ms]
+   (with-open [conn (nrepl/connect :port port)]
+     (let [client (nrepl/client conn timeout-ms)
+           results (nrepl/message client {:op :eval :code code})]
+       (doseq [r results]
+         (when (:err r) (binding [*out* *err*] (print (:err r)))))
+       (some :value results)))))
 
-(defn eval-read [port code]
-  (let [v (eval-on port code)]
-    (when v (read-string v))))
+(defn eval-read
+  ([port code] (eval-read port code 30000))
+  ([port code timeout-ms]
+   (let [v (eval-on port code timeout-ms)]
+     (when v (read-string v)))))
 
 (defn setup-node! [port]
   (loop [attempts 3]
@@ -85,12 +89,14 @@
             vec))"))
 
 (defn create-tenants! [port n]
-  (eval-read port
-    (format
-      "(let [s @app/app
-             tids (repeatedly %d uuid/v4)]
-         (doseq [t tids] (app/create-tenant! s t))
-         (mapv str tids))" n)))
+  (let [timeout (max 30000 (* n 10))]
+    (eval-read port
+      (format
+        "(let [s @app/app
+               tids (repeatedly %d uuid/v4)]
+           (doseq [t tids] (app/create-tenant! s t))
+           (mapv str tids))" n)
+      timeout)))
 
 (defn increment! [port tenant-id]
   (eval-on port

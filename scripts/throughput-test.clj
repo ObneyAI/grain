@@ -10,8 +10,8 @@
 (def port-b 7891)
 (def port-c 7892)
 (def all-ports [port-a port-b port-c])
-(def n-tenants 1000)
-(def events-per-tenant 100)
+(def n-tenants 5000)
+(def events-per-tenant 20)
 (def total-events (* n-tenants events-per-tenant))
 
 ;; -------------------------------- ;;
@@ -46,10 +46,18 @@
 
 (defn scenario-setup []
   (header "Throughput: Setup")
-  (info (str "Creating " n-tenants " tenants..."))
-  (let [tids (create-tenants! port-a n-tenants)]
-    (info "Waiting for assignment (15s)...")
-    (Thread/sleep 15000)
+  (info (str "Creating " n-tenants " tenants in batches of 1000..."))
+  (let [tids (loop [remaining n-tenants
+                     all-tids []]
+               (if (<= remaining 0)
+                 all-tids
+                 (let [batch (min 1000 remaining)
+                       batch-tids (create-tenants! port-a batch)]
+                   (info (str "  Created " (+ (count all-tids) (count batch-tids)) "/" n-tenants))
+                   (recur (- remaining batch) (into all-tids batch-tids)))))]
+    (let [wait-s (max 15 (/ n-tenants 200))]
+      (info (str "Waiting for assignment (" wait-s "s)..."))
+      (Thread/sleep (* wait-s 1000)))
     (let [sa (node-status port-a)]
       (check (str n-tenants " leases assigned (got " (:leases sa) ")")
              (= n-tenants (:leases sa)))
@@ -97,7 +105,8 @@
                                               _ (range %d)]
                                         (app/increment! s (java.util.UUID/fromString tid-str)))
                                       :done)"
-                                    (pr-str tenants) events-per-tenant)))))
+                                    (pr-str tenants) events-per-tenant)
+                            (max 60000 (* (count tenants) events-per-tenant 10))))))
                     node-tenants)]
       ;; Wait for all appends to finish
       (doseq [f futures] @f)
