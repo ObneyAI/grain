@@ -434,7 +434,7 @@
         ;; Local watermarks: {tenant-id -> last-processed-event-id}
         watermarks (atom {})
         ;; Thread pool for handler dispatch
-        pool (java.util.concurrent.Executors/newFixedThreadPool thread-pool-size)
+        pool (java.util.concurrent.Executors/newCachedThreadPool)
         registry-snapshot (fn [] @processor-registry*)
         ;; Resolve tenant-ids (can be atom or set)
         owned-tenants (fn [] (if (instance? clojure.lang.Atom tenant-ids)
@@ -456,52 +456,47 @@
              (try
                (let [tids (owned-tenants)
                      registry (registry-snapshot)]
+                 ;; Submit each tenant+processor as an independent unit to the pool
+                 ;; The poll thread doesn't wait — all tenants run concurrently
                  (doseq [tid tids]
                    (when @running
                      (doseq [[proc-name proc-config] registry]
                        (when @running
-                         (let [wm (get-in @watermarks [tid proc-name])
-                               read-args (cond-> {:tenant-id tid
-                                                   :types (set (:topics proc-config))}
-                                           wm (assoc :after wm))
-                               events (into []
-                                        (comp (remove #(= :grain/tx (:event/type %)))
-                                              (take batch-size))
-                                        (event-store/read event-store read-args))]
-                           (when (seq events)
-                             ;; Process events — handlers run on the thread pool
-                             (let [batch-result-events (atom [])
-                                   handler-fn (:handler-fn proc-config)
-                                   latch (java.util.concurrent.CountDownLatch. (count events))]
-                               ;; Submit each event to the pool
-                               (doseq [event events]
-                                 (.submit pool
-                                   ^Runnable
-                                   (fn []
-                                     (try
-                                       (let [ctx {:event event
-                                                  :handler-fn handler-fn
-                                                  :event-store event-store
-                                                  :tenant-id tid}
-                                             result (or (handler-fn ctx) {})]
-                                         (if (:result/effect result)
-                                           ;; Effect handler: per-event checkpoint
-                                           (process-event (assoc ctx :processor-name proc-name))
-                                           ;; Pure handler: collect results
-                                           (when-let [revents (:result/events result)]
-                                             (swap! batch-result-events into revents))))
-                                       (catch Throwable t
-                                         (u/log ::poller-handler-error :exception t))
-                                       (finally
-                                         (.countDown latch))))))
-                               ;; Wait for all handlers in this batch to complete
-                               (.await latch 30 java.util.concurrent.TimeUnit/SECONDS)
-                               ;; Batch checkpoint for this tenant+processor
-                               (let [last-event-id (:event/id (last events))]
-                                 (append-with-checkpoint event-store tid proc-name
-                                                         last-event-id
-                                                         @batch-result-events)
-                                 (swap! watermarks assoc-in [tid proc-name] last-event-id))))))))))
+                         (.submit pool
+                           ^Runnable
+                           (fn []
+                             (try
+                               (let [wm (get-in @watermarks [tid proc-name])
+                                     read-args (cond-> {:tenant-id tid
+                                                         :types (set (:topics proc-config))}
+                                                 wm (assoc :after wm))
+                                     events (into []
+                                              (comp (remove #(= :grain/tx (:event/type %)))
+                                                    (take batch-size))
+                                              (event-store/read event-store read-args))]
+                                 (when (seq events)
+                                   (let [batch-result-events (atom [])
+                                         handler-fn (:handler-fn proc-config)]
+                                     ;; Process events sequentially within this tenant
+                                     (doseq [event events]
+                                       (when @running
+                                         (let [ctx {:event event
+                                                    :handler-fn handler-fn
+                                                    :event-store event-store
+                                                    :tenant-id tid}
+                                               result (or (handler-fn ctx) {})]
+                                           (if (:result/effect result)
+                                             (process-event (assoc ctx :processor-name proc-name))
+                                             (when-let [revents (:result/events result)]
+                                               (swap! batch-result-events into revents))))))
+                                     ;; Batch checkpoint
+                                     (let [last-event-id (:event/id (last events))]
+                                       (append-with-checkpoint event-store tid proc-name
+                                                               last-event-id
+                                                               @batch-result-events)
+                                       (swap! watermarks assoc-in [tid proc-name] last-event-id)))))
+                               (catch Throwable t
+                                 (u/log ::poller-handler-error :exception t))))))))))
                (catch Throwable t
                  (u/log ::tenant-poller-error :exception t)))
              (Thread/sleep poll-interval-ms))))]

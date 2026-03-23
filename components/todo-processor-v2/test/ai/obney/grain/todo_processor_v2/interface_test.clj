@@ -931,3 +931,41 @@
             checkpoints (filter #(= :grain/todo-processor-checkpoint (:event/type %)) all)]
         (is (= 1 (count billing-results)) "Exactly one billing result")
         (is (= 1 (count checkpoints)) "Exactly one checkpoint")))))
+
+;; 15. Blocking handlers don't starve other tenants (cached thread pool)
+
+(deftest gl1-blocking-handlers-at-scale
+  (testing "GL1: 100 tenants with 2s blocking handlers all complete within 5s (proves no fixed pool queuing)"
+    (let [n-tenants 100
+          tenants (repeatedly n-tenants random-uuid)
+          processed (java.util.concurrent.ConcurrentHashMap.)]
+      ;; Append one event per tenant
+      (doseq [tid tenants]
+        (es/append *event-store* {:tenant-id tid
+                                  :events [(make-event :test/event-1 :body {:num 1})]}))
+      (let [prev @core/processor-registry*]
+        (try
+          (core/register-processor! :test/gl1-proc
+            {:topics [:test/event-1]
+             :handler-fn (fn [{:keys [tenant-id]}]
+                           (Thread/sleep 2000)
+                           (.put processed tenant-id true)
+                           {})})
+          (let [start-ms (System/currentTimeMillis)
+                poller (core/start-tenant-poller
+                         {:event-store *event-store*
+                          :tenant-ids (set tenants)
+                          :poll-interval-ms 100
+                          :batch-size 100})]
+            (try
+              ;; 5s is enough for concurrent execution (2s sleep + overhead)
+              ;; but not enough for serial/batched execution (ceil(100/32)*2s = 8s)
+              (Thread/sleep 5000)
+              (let [done (.size processed)
+                    elapsed (- (System/currentTimeMillis) start-ms)]
+                (is (= n-tenants done)
+                    (str "All " n-tenants " tenants should complete in 5s, got " done " in " elapsed "ms")))
+              (finally
+                (core/stop-tenant-poller poller))))
+          (finally
+            (reset! core/processor-registry* prev)))))))

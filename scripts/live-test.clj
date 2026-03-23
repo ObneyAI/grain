@@ -504,9 +504,43 @@
         (check "Every tenant has exactly 1 trigger (CAS deduped across 3 nodes)"
                (every? #(= 1 %) trigger-counts))))))
 
+(defn scenario-15 []
+  (header "Scenario 15: Blocking handlers don't starve other tenants")
+  ;; Ensure all nodes are up
+  (restart-victim!)
+  (Thread/sleep 6000)
+  ;; Submit slow-work to 3 tenants (handler sleeps 2s each)
+  ;; and regular increments to the other 3
+  (let [tids @tenant-ids
+        slow-tids (take 3 tids)
+        fast-tids (drop 3 tids)]
+    (info (str "Submitting slow-work to " (count slow-tids) " tenants (2s sleep each)..."))
+    (doseq [tid slow-tids]
+      (eval-on primary-port
+        (format "(app/submit-slow-work! @app/app (java.util.UUID/fromString \"%s\"))" tid)))
+    (info (str "Submitting fast increments to " (count fast-tids) " tenants..."))
+    (doseq [tid fast-tids]
+      (increment! primary-port tid))
+    ;; Wait 1.5s — fast tenants should be done, slow ones still blocking
+    (Thread/sleep 1500)
+    (let [fast-done (reduce + (map #(processed-count primary-port %) fast-tids))]
+      (info (str "Fast tenants processed after 1.5s: " fast-done))
+      (check "Fast tenants processed while slow ones block"
+             (pos? fast-done)))
+    ;; Wait for slow tenants to finish
+    (Thread/sleep 5000)
+    (let [slow-done (eval-read primary-port
+                      (format "(reduce + (map (fn [tid-str]
+                                                (:completed (app/diagnose-slow-work @app/app
+                                                              (java.util.UUID/fromString tid-str))))
+                                              %s))"
+                              (pr-str (vec slow-tids))))]
+      (info (str "Slow tenants completed after total wait: " slow-done))
+      (check (str "All slow work eventually completed (" slow-done "/3)")
+             (= 3 slow-done)))))
+
 ;; -------------------------------- ;;
 ;; Main runner                      ;;
-;; -------------------------------- ;;
 
 (defn run-all []
   (println "\n╔══════════════════════════════════════════╗")
@@ -534,6 +568,7 @@
     (scenario-12)
     (scenario-13)
     (scenario-14)
+    (scenario-15)
 
     (catch Throwable t
       (swap! results update :error inc)
