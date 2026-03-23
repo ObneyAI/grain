@@ -753,3 +753,116 @@
                   (core/stop-polling proc-single)))))
           (finally
             (core/stop-polling proc-batch)))))))
+
+;; 13. Coalesced tenant poller
+
+(deftest tw2-change-detection-completeness
+  (testing "TW2: Coalesced poller detects and processes only changed tenants"
+    (let [processed (atom {})
+          handler (fn [{:keys [event tenant-id]}]
+                    (swap! processed update tenant-id (fnil conj []) (:event/id event))
+                    {})
+          tenants (repeatedly 20 random-uuid)
+          changed-tenants (take 5 tenants)]
+      ;; Create all 20 tenants with one initial event each
+      (doseq [tid tenants]
+        (es/append *event-store* {:tenant-id tid
+                                  :events [(make-event :test/event-1 :body {:num 0})]}))
+      ;; Register a test processor
+      (let [prev @core/processor-registry*]
+        (try
+          (core/register-processor! :test/tw2-proc
+            {:topics [:test/event-1]
+             :handler-fn handler})
+          (let [poller (core/start-tenant-poller
+                         {:event-store *event-store*
+                          :tenant-ids (set tenants)
+                          :poll-interval-ms 100
+                          :batch-size 100
+                          :thread-pool-size 4})]
+            (try
+              ;; Wait for initial catch-up
+              (Thread/sleep 2000)
+              (reset! processed {})
+              ;; Append events to only 5 tenants
+              (doseq [tid changed-tenants]
+                (es/append *event-store* {:tenant-id tid
+                                          :events [(make-event :test/event-1 :body {:num 1})]}))
+              (Thread/sleep 1000)
+              ;; Only the 5 changed tenants should have new events processed
+              (is (= 5 (count @processed))
+                  (str "Expected 5 changed tenants, got " (count @processed)))
+              (doseq [tid changed-tenants]
+                (is (= 1 (count (get @processed tid)))
+                    (str "Tenant " tid " should have 1 new event")))
+              (finally
+                (core/stop-tenant-poller poller))))
+          (finally
+            (reset! core/processor-registry* prev)))))))
+
+(deftest tw3-delivery-completeness-under-load
+  (testing "TW3: All events processed at high tenant count"
+    (let [processed (atom 0)
+          handler (fn [_] (swap! processed inc) {})
+          n-tenants 100
+          events-per 50
+          tenants (repeatedly n-tenants random-uuid)]
+      ;; Create tenants with events
+      (doseq [tid tenants]
+        (es/append *event-store*
+          {:tenant-id tid
+           :events (mapv (fn [_] (make-event :test/event-1 :body {:num 1}))
+                         (range events-per))}))
+      (let [prev @core/processor-registry*]
+        (try
+          (core/register-processor! :test/tw3-proc
+            {:topics [:test/event-1]
+             :handler-fn handler})
+          (let [poller (core/start-tenant-poller
+                         {:event-store *event-store*
+                          :tenant-ids (set tenants)
+                          :poll-interval-ms 100
+                          :batch-size 100
+                          :thread-pool-size 8})]
+            (try
+              (Thread/sleep 10000)
+              (is (= (* n-tenants events-per) @processed)
+                  (str "Expected " (* n-tenants events-per) " processed, got " @processed))
+              (finally
+                (core/stop-tenant-poller poller))))
+          (finally
+            (reset! core/processor-registry* prev)))))))
+
+(deftest tw5-batch-checkpoint-per-tenant-per-cycle
+  (testing "TW5: One checkpoint per tenant per cycle, not per event"
+    (let [handler (fn [_] {})
+          tenant-id (random-uuid)]
+      (es/append *event-store*
+        {:tenant-id tenant-id
+         :events (mapv (fn [_] (make-event :test/event-1 :body {:num 1}))
+                       (range 50))})
+      (let [prev @core/processor-registry*]
+        (try
+          (core/register-processor! :test/tw5-proc
+            {:topics [:test/event-1]
+             :handler-fn handler})
+          (let [poller (core/start-tenant-poller
+                         {:event-store *event-store*
+                          :tenant-ids #{tenant-id}
+                          :poll-interval-ms 100
+                          :batch-size 100
+                          :thread-pool-size 2})]
+            (try
+              (Thread/sleep 2000)
+              (let [proc-uuid (core/processor-name->uuid :test/tw5-proc)
+                    checkpoints (into []
+                                  (es/read *event-store*
+                                    {:tenant-id tenant-id
+                                     :types #{:grain/todo-processor-checkpoint}
+                                     :tags #{[:processor proc-uuid]}}))]
+                (is (= 1 (count checkpoints))
+                    (str "Expected 1 batch checkpoint, got " (count checkpoints))))
+              (finally
+                (core/stop-tenant-poller poller))))
+          (finally
+            (reset! core/processor-registry* prev)))))))

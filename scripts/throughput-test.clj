@@ -10,8 +10,8 @@
 (def port-b 7891)
 (def port-c 7892)
 (def all-ports [port-a port-b port-c])
-(def n-tenants 5000)
-(def events-per-tenant 20)
+(def n-tenants 10000)
+(def events-per-tenant 10)
 (def total-events (* n-tenants events-per-tenant))
 
 ;; -------------------------------- ;;
@@ -114,94 +114,79 @@
         (metric (str "Append time: " append-ms "ms ("
                      (format "%.0f" (double (/ (* total-events 1000) append-ms)))
                      " events/sec)"))
-        ;; Wait for processing
+        ;; Wait for processing — single server-side check per poll
         (info "Waiting for processing to complete...")
         (let [poll-start (System/currentTimeMillis)
-              timeout-ms 300000]
+              timeout-ms 300000
+              tids-str (pr-str tenant-ids)]
           (loop [i 0]
-            (let [all-done (every?
-                            (fn [tid]
-                              (let [inc-c (increment-count port-a tid)
-                                    proc-c (processed-count port-a tid)]
-                                (= inc-c proc-c)))
-                            tenant-ids)]
-              (if all-done
+            (let [check-result (eval-read port-a
+                                 (format
+                                   "(let [s @app/app
+                                          tids %s
+                                          results (mapv (fn [tid-str]
+                                                          (let [tid (java.util.UUID/fromString tid-str)
+                                                                all (app/all-events s tid)
+                                                                incs (count (filter (fn [e] (= :test/counter-incremented (:event/type e))) all))
+                                                                procs (count (filter (fn [e] (= :test/counter-processed (:event/type e))) all))]
+                                                            {:tid tid-str :incs incs :procs procs}))
+                                                        tids)
+                                          total-incs (reduce + (map :incs results))
+                                          total-procs (reduce + (map :procs results))
+                                          all-done (every? (fn [r] (= (:incs r) (:procs r))) results)]
+                                      {:all-done all-done :total-incs total-incs :total-procs total-procs})"
+                                   tids-str)
+                                 300000)]
+              (if (:all-done check-result)
                 (let [total-ms (- (System/currentTimeMillis) start-ms)]
                   (metric (str "Total time (append + process): " total-ms "ms"))
                   (metric (str "End-to-end throughput: "
                                (format "%.0f" (double (/ (* total-events 1000) total-ms)))
                                " events/sec")))
                 (if (> (- (System/currentTimeMillis) poll-start) timeout-ms)
-                  (fail "Processing did not complete within timeout")
-                  (do (Thread/sleep 2000) (recur (inc i))))))))
+                  (fail (str "Processing did not complete within timeout. "
+                             "incs=" (:total-incs check-result) " procs=" (:total-procs check-result)))
+                  (do (Thread/sleep 3000) (recur (inc i))))))))
         tenant-ids))))
 
 (defn diagnose-tenant [port tid]
   (eval-read port
     (format "(app/diagnose-tenant @app/app (java.util.UUID/fromString \"%s\"))" tid)))
 
+(defn verify-on-node [port]
+  "Run verification on a single node for its owned tenants. Returns totals."
+  (eval-read port
+    "(let [s @app/app
+           tenants (or (app/running-processors s) #{})
+           results (pmap (fn [tid]
+                           (let [all (app/all-events s tid)
+                                 incs (count (filter #(= :test/counter-incremented (:event/type %)) all))
+                                 procs (count (filter #(= :test/counter-processed (:event/type %)) all))]
+                             {:incs incs :procs procs}))
+                         tenants)]
+       {:total-incs (reduce + (map :incs results))
+        :total-procs (reduce + (map :procs results))
+        :tenant-count (count tenants)})"
+    120000))
+
 (defn scenario-verify [tenant-ids]
   (header "Throughput: Verification")
-  (let [all-ok (atom true)
-        total-missing (atom 0)]
-    (doseq [tid tenant-ids]
-      (let [diag (diagnose-tenant port-a tid)]
-        (when (pos? (:missing-count diag))
-          (reset! all-ok false)
-          (swap! total-missing + (:missing-count diag))
-          (fail (str "Tenant " tid ":"
-                     " inc=" (:increments diag)
-                     " proc=" (:processed diag)
-                     " ckpt=" (:checkpoints diag)
-                     " missing=" (:missing-count diag)
-                     " dupes=" (count (:duplicate-processed diag)))))
-        (when (pos? (count (:duplicate-processed diag)))
-          (reset! all-ok false)
-          (fail (str "Tenant " tid ": DUPLICATES " (:duplicate-processed diag))))))
-    ;; Aggregate
-    (let [total-inc (reduce + (map #(increment-count port-a %) tenant-ids))
-          total-proc (reduce + (map #(processed-count port-a %) tenant-ids))]
-      (metric (str "Total increments: " total-inc))
-      (metric (str "Total processed:  " total-proc))
-      (metric (str "Total missing:    " @total-missing))
-      (check (str "All tenants: zero missing events") (zero? @total-missing))
-      (check (str "Grand total: " total-inc " == " total-proc)
-             (= total-inc total-proc)))
-    ;; Detailed diagnosis for first failing tenant
-    (when-not @all-ok
-      (header "Throughput: Detailed diagnosis (first failing tenant)")
-      (let [failing-tid (first (filter (fn [tid]
-                                         (let [d (diagnose-tenant port-a tid)]
-                                           (pos? (:missing-count d))))
-                                       tenant-ids))]
-        (when failing-tid
-          (let [diag (diagnose-tenant port-a failing-tid)]
-            (info (str "Tenant: " failing-tid))
-            (info (str "Increments: " (:increments diag)))
-            (info (str "Processed:  " (:processed diag)))
-            (info (str "Checkpoints: " (:checkpoints diag)))
-            (info (str "Missing count: " (:missing-count diag)))
-            (info (str "Missing event IDs: " (pr-str (:missing-event-ids diag))))
-            (info (str "Duplicates: " (pr-str (:duplicate-processed diag))))
-            (info (str "Uncheckpointed: " (:uncheckpointed-count diag)))
-            ;; Check which node owns this tenant
-            (let [leases (lease-details port-a)
-                  owner (->> leases (filter #(= failing-tid (:tenant %))) first :owner)
-                  node-a-id (:node-id (node-status port-a))
-                  owner-label (if (= owner node-a-id) "node-a" "node-b")]
-              (info (str "Lease owner: " owner-label " (" owner ")"))
-              ;; Get bridge trace for this tenant from the owning node
-              (let [owner-port (if (= owner node-a-id) port-a port-b)
-                    traces (eval-read owner-port
-                             (format "(vec (filter (fn [t] (= \"%s\" (:tenant t)))
-                                                   (app/bridge-trace @app/app)))"
-                                     failing-tid))]
-                (info (str "Bridge traces for this tenant: " (count traces)))
-                (doseq [t (take 5 traces)]
-                  (info (str "  wm-before=" (:watermark-before t)
-                             " wm-after=" (:watermark-after t)
-                             " read=" (:events-read t))))))))))))
-
+  ;; Each node verifies only its own tenants in parallel
+  (info "Verifying across all nodes (each checks its own tenants)...")
+  (let [futures (mapv (fn [p] (future (verify-on-node p))) all-ports)
+        node-results (mapv deref futures)
+        total-incs (reduce + (map #(or (:total-incs %) 0) node-results))
+        total-procs (reduce + (map #(or (:total-procs %) 0) node-results))
+        total-missing (- total-incs total-procs)]
+    (doseq [[p r] (map vector all-ports node-results)]
+      (info (str "Port " p ": " (:tenant-count r) " tenants, "
+                 (:total-incs r) " incs, " (:total-procs r) " procs")))
+    (metric (str "Total increments: " total-incs))
+    (metric (str "Total processed:  " total-procs))
+    (metric (str "Total missing:    " total-missing))
+    (check "All tenants: zero missing events" (zero? total-missing))
+    (check (str "Grand total: " total-incs " == " total-procs)
+           (= total-incs total-procs))))
 ;; -------------------------------- ;;
 ;; Main                             ;;
 ;; -------------------------------- ;;

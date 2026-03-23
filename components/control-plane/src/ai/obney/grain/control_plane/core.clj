@@ -96,49 +96,41 @@
       (catch Throwable t
         (u/log ::heartbeat-error :exception t)))))
 
-(defn- reconcile-processors!
-  "Diff lease assignments for this node against running processors.
-   A lease is per-tenant. When a tenant is acquired, start ALL registered
-   processors for it. When released, stop all of them."
-  [ctx node-id running-processors-atom]
+(defn- reconcile-tenants!
+  "Update the tenant poller's owned-tenant set based on lease assignments.
+   Starts the poller on first call, updates tenant set on subsequent calls."
+  [ctx node-id poller-atom]
   (let [leases (project-lease-ownership ctx)
         my-tenants (into #{}
                      (comp (filter (fn [[_ owner]] (= owner node-id)))
                            (map key))
-                     leases)
-        currently-running (set (keys @running-processors-atom))
-        to-start (clojure.set/difference my-tenants currently-running)
-        to-stop (clojure.set/difference currently-running my-tenants)
-        registry @tp/processor-registry*]
-    ;; Stop all processors for released tenants
-    (doseq [tid to-stop]
-      (when-let [procs (get @running-processors-atom tid)]
-        (u/log ::reactor-stopping-tenant :tenant-id tid)
-        (doseq [[proc-name proc] procs]
-          (tp/stop-polling proc))
-        (swap! running-processors-atom dissoc tid)))
-    ;; Start all processors for newly acquired tenants
-    (doseq [tid to-start]
-      (u/log ::reactor-starting-tenant :tenant-id tid)
-      (let [lease-check-fn (fn [tenant-id _pname]
-                             (= node-id (get (project-lease-ownership ctx) tenant-id)))
-            procs (into {}
-                    (for [[proc-name proc-config] registry]
-                      [proc-name
-                       (tp/start-polling
-                         {:event-store (:event-store ctx)
-                          :tenant-id tid
-                          :topics (:topics proc-config)
-                          :handler-fn (:handler-fn proc-config)
-                          :processor-name proc-name
-                          :lease-check-fn lease-check-fn})]))]
-        (swap! running-processors-atom assoc tid procs)))))
+                     leases)]
+    ;; Start poller if not running, or update tenant set
+    (if-let [poller @poller-atom]
+      ;; Poller exists — update its tenant set
+      (let [current-tenants @(:tenant-ids-atom poller)]
+        (when (not= current-tenants my-tenants)
+          (u/log ::reactor-updating-tenants
+                 :added (count (clojure.set/difference my-tenants current-tenants))
+                 :removed (count (clojure.set/difference current-tenants my-tenants)))
+          (reset! (:tenant-ids-atom poller) my-tenants)))
+      ;; No poller yet — start one
+      (when (seq my-tenants)
+        (u/log ::reactor-starting-poller :tenant-count (count my-tenants))
+        (let [tenant-ids-atom (atom my-tenants)
+              poller (tp/start-tenant-poller
+                       {:event-store (:event-store ctx)
+                        :tenant-ids tenant-ids-atom
+                        :poll-interval-ms 250
+                        :batch-size 100
+                        :thread-pool-size 32})]
+          (reset! poller-atom (assoc poller :tenant-ids-atom tenant-ids-atom)))))))
 
 (defn- coordinator-handler
   "Called periodically to run the assignment cycle if this node is coordinator,
    then reconcile local processors with lease assignments."
   [{:keys [ctx node-id staleness-threshold-ms strategy
-           running-processors-atom]}]
+           poller-atom]}]
   (fn [_time]
     (try
       (rmp/l1-clear!)
@@ -147,8 +139,8 @@
         (when (= node-id coordinator)
           (u/log ::running-assignment :node-id node-id)
           (run-assignment! ctx node-id staleness-threshold-ms strategy)))
-      ;; Reconcile processors regardless of coordinator status
-      (reconcile-processors! ctx node-id running-processors-atom)
+      ;; Reconcile tenants regardless of coordinator status
+      (reconcile-tenants! ctx node-id poller-atom)
       (catch Throwable t
         (u/log ::coordinator-error :exception t)))))
 
@@ -173,7 +165,7 @@
         ctx {:event-store event-store
              :cache cache
              :tenant-id events/control-plane-tenant-id}
-        running-processors-atom (atom {})
+        poller-atom (atom nil)
         interval (Duration/ofMillis heartbeat-interval-ms)
         heartbeat-schedule (chime/chime-at
                             (chime/periodic-seq (Instant/now) interval)
@@ -184,7 +176,7 @@
                                                     :node-id node-id
                                                     :staleness-threshold-ms staleness-threshold-ms
                                                     :strategy strategy
-                                                    :running-processors-atom running-processors-atom}))]
+                                                    :poller-atom poller-atom}))]
     (u/log ::control-plane-started :node-id node-id)
     ;; Emit initial heartbeat immediately
     (emit-heartbeat! ctx node-id node-metadata)
@@ -192,24 +184,23 @@
      :ctx ctx
      :heartbeat-schedule heartbeat-schedule
      :coordinator-schedule coordinator-schedule
-     :running-processors running-processors-atom}))
+     :poller-atom poller-atom}))
 
 (defn running-processors
-  "Returns a map of currently running processor instances managed by the reactor."
+  "Returns the set of tenant-ids being processed by this node's poller."
   [cp-instance]
-  @(:running-processors cp-instance))
+  (when-let [poller @(:poller-atom cp-instance)]
+    @(:tenant-ids-atom poller)))
 
 (defn stop
   "Stop the control plane. Emits a departure event for graceful shutdown."
-  [{:keys [node-id ctx heartbeat-schedule coordinator-schedule running-processors]}]
+  [{:keys [node-id ctx heartbeat-schedule coordinator-schedule poller-atom]}]
   (u/log ::control-plane-stopping :node-id node-id)
   (.close heartbeat-schedule)
   (.close coordinator-schedule)
-  ;; Stop all running processors (keyed by {tenant-id -> {proc-name -> proc}})
-  (doseq [[tid procs] @running-processors
-          [proc-name proc] procs]
-    (u/log ::stopping-reactor-processor :tenant-id tid :processor proc-name)
-    (tp/stop-polling proc))
-  (reset! running-processors {})
+  ;; Stop the tenant poller
+  (when-let [poller @poller-atom]
+    (tp/stop-tenant-poller poller)
+    (reset! poller-atom nil))
   (emit-node-departed! ctx node-id)
   (u/log ::control-plane-stopped :node-id node-id))

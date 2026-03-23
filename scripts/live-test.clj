@@ -1,21 +1,22 @@
 #!/usr/bin/env clojure -M:dev
 
 ;; Comprehensive live test runner for the Grain control plane.
-;; Manages Docker lifecycle, runs all 12 test scenarios, reports results.
+;; Parameterized for arbitrary node count. Manages Docker lifecycle.
 ;;
-;; Usage:
-;;   clojure -M:dev scripts/live-test.clj
-;;
-;; Requires: docker compose, running Docker daemon.
-;; The script starts and stops all containers itself.
+;; Usage: clojure -M:dev scripts/live-test.clj
 
 (require '[nrepl.core :as nrepl])
 (require '[clojure.java.shell :refer [sh]])
 (require '[clojure.string :as str])
 
 (def compose-file "docker-compose.cp-test.yml")
-(def node-a-port 7890)
-(def node-b-port 7891)
+(def all-ports [7890 7891 7892])
+(def primary-port (first all-ports))
+(def victim-port (last all-ports))
+(def victim-service "node-c")
+(def victim-container "grain-node-c-1")
+(def n-nodes (count all-ports))
+(def n-tenants 6) ;; divisible by 3 and 2 for even splits
 
 ;; -------------------------------- ;;
 ;; State                            ;;
@@ -25,7 +26,7 @@
 (def tenant-ids (atom []))
 
 ;; -------------------------------- ;;
-;; Shell helpers                    ;;
+;; Shell / Docker helpers           ;;
 ;; -------------------------------- ;;
 
 (defn docker [& args]
@@ -38,9 +39,7 @@
 (defn compose [& args]
   (apply docker "compose" "-f" compose-file args))
 
-(defn wait-for-port
-  "Poll until a port accepts connections, or timeout."
-  [port timeout-ms]
+(defn wait-for-port [port timeout-ms]
   (let [start (System/currentTimeMillis)]
     (loop []
       (if (> (- (System/currentTimeMillis) start) timeout-ms)
@@ -115,6 +114,11 @@
   (eval-read port
     (format "(count (app/processed-events @app/app (java.util.UUID/fromString \"%s\")))" tenant-id)))
 
+(defn increment-count [port tenant-id]
+  (eval-read port
+    (format "(count (filter (fn [e] (= :test/counter-incremented (:event/type e)))
+                            (app/all-events @app/app (java.util.UUID/fromString \"%s\"))))" tenant-id)))
+
 (defn node-reachable? [port]
   (try (node-status port) true
        (catch Exception _ false)))
@@ -139,372 +143,310 @@
   pred)
 
 ;; -------------------------------- ;;
+;; Multi-node helpers               ;;
+;; -------------------------------- ;;
+
+(defn all-statuses []
+  (mapv (fn [p]
+          (try (assoc (node-status p) :port p :reachable true)
+               (catch Exception _ {:port p :reachable false})))
+        all-ports))
+
+(defn reachable-statuses [] (filter :reachable (all-statuses)))
+
+(defn total-running []
+  (reduce + (map #(or (:running %) 0) (reachable-statuses))))
+
+(defn find-tenant-owned-by [port owner-port]
+  (let [leases (lease-details port)
+        owner-id (:node-id (node-status owner-port))]
+    (->> leases (filter #(= owner-id (:owner %))) first :tenant)))
+
+(defn find-tenant-not-owned-by [port excluded-port]
+  (let [leases (lease-details port)
+        excluded-id (:node-id (node-status excluded-port))]
+    (->> leases (filter #(not= excluded-id (:owner %))) first :tenant)))
+
+;; -------------------------------- ;;
 ;; Docker lifecycle                 ;;
 ;; -------------------------------- ;;
 
-(defn start-cluster!
-  "Start fresh cluster: postgres + both nodes."
-  []
-  (info "Starting fresh cluster...")
+(defn start-cluster! []
+  (info (str "Starting " n-nodes "-node cluster..."))
   (compose "down" "-v")
   (compose "build")
+  ;; Staggered start to avoid schema creation race
+  (compose "up" "-d" "postgres")
+  (Thread/sleep 5000)
+  (compose "up" "-d" "node-a")
+  (wait-for-port primary-port 60000)
+  (Thread/sleep 3000)
   (compose "up" "-d")
-  (info "Waiting for nodes to start...")
-  (let [a-ok (wait-for-port node-a-port 60000)
-        b-ok (wait-for-port node-b-port 60000)]
-    (when-not a-ok (fail "Node A did not start"))
-    (when-not b-ok (fail "Node B did not start"))
-    ;; Extra wait for the control plane to settle
-    (Thread/sleep 8000)
-    (setup-node! node-a-port)
-    (setup-node! node-b-port)
-    (and a-ok b-ok)))
+  (info "Waiting for all nodes...")
+  (let [ok (every? true? (map #(wait-for-port % 90000) all-ports))]
+    (when-not ok (fail "Not all nodes started"))
+    (Thread/sleep 12000)
+    (doseq [p all-ports] (setup-node! p))
+    ok))
 
-(defn restart-node-b!
-  "Restart node-b container and wait for it to be ready."
-  []
-  (info "Restarting node-b container...")
-  (compose "restart" "node-b")
-  (wait-for-port node-b-port 60000)
+(defn restart-victim! []
+  (info (str "Restarting " victim-service " container..."))
+  (compose "restart" victim-service)
+  (wait-for-port victim-port 60000)
   (Thread/sleep 8000)
-  (setup-node! node-b-port))
+  (setup-node! victim-port))
 
-(defn kill-node-b!
-  "Hard kill node-b container (SIGKILL, no graceful shutdown)."
-  []
-  (info "Hard killing node-b container...")
-  (docker "kill" "grain-node-b-1"))
+(defn kill-victim! []
+  (info (str "Hard killing " victim-container "..."))
+  (docker "kill" victim-container))
 
-(defn stop-cluster!
-  "Tear down everything."
-  []
+(defn stop-cluster! []
   (info "Stopping cluster...")
   (compose "down" "-v"))
 
 ;; -------------------------------- ;;
-;; Scenarios 1-7: Normal operations ;;
+;; Scenarios                        ;;
 ;; -------------------------------- ;;
 
 (defn scenario-1 []
   (header "Scenario 1: Basic work distribution")
-  (let [sa (node-status node-a-port)
-        sb (node-status node-b-port)]
-    (info (str "Node A: " (:node-id sa)))
-    (info (str "Node B: " (:node-id sb)))
-    (check "Both nodes see 2 active nodes"
-           (and (= 2 (:active-nodes sa)) (= 2 (:active-nodes sb))))
-    (info "Creating 4 tenants...")
-    (let [tids (create-tenants! node-a-port 4)]
+  (let [statuses (reachable-statuses)]
+    (doseq [s statuses]
+      (info (str "Port " (:port s) ": node " (:node-id s))))
+    (check (str "All " n-nodes " nodes active")
+           (every? #(= n-nodes (:active-nodes %)) statuses))
+    (info (str "Creating " n-tenants " tenants..."))
+    (let [tids (create-tenants! primary-port n-tenants)]
       (reset! tenant-ids tids)
-      (info (str "Tenants: " (pr-str tids)))
       (info "Waiting for assignment...")
-      (Thread/sleep 6000)
-      (let [sa (node-status node-a-port)
-            sb (node-status node-b-port)]
-        (check (str "4 leases assigned (A sees " (:leases sa) ")")
-               (= 4 (:leases sa)))
-        (check (str "4 leases assigned (B sees " (:leases sb) ")")
-               (= 4 (:leases sb)))
-        (check "Node A running processors" (pos? (:running sa)))
-        (check "Node B running processors" (pos? (:running sb)))
-        (check "Work split across both nodes"
-               (and (pos? (:running sa)) (pos? (:running sb))))))))
+      (Thread/sleep 8000)
+      (let [s (node-status primary-port)]
+        (check (str n-tenants " leases assigned (got " (:leases s) ")")
+               (= n-tenants (:leases s))))
+      (let [tr (total-running)]
+        (check (str "Total running = " n-tenants " (got " tr ")")
+               (= n-tenants tr)))
+      (check "All nodes running processors"
+             (every? #(pos? (:running %)) (reachable-statuses))))))
 
 (defn scenario-2 []
   (header "Scenario 2: Event processing with correct routing")
   (let [t1 (first @tenant-ids)]
     (info (str "Incrementing tenant " t1 "..."))
-    (increment! node-a-port t1)
+    (increment! primary-port t1)
     (Thread/sleep 3000)
-    (let [c (processed-count node-a-port t1)]
+    (let [c (processed-count primary-port t1)]
       (check (str "Tenant processed " c " events (expected >= 2)") (>= c 2)))))
 
 (defn scenario-3 []
   (header "Scenario 3: Cross-instance event delivery")
-  (let [leases (lease-details node-a-port)
-        node-b-id (:node-id (node-status node-b-port))
-        b-tenant (->> leases
-                      (filter #(= node-b-id (:owner %)))
-                      first :tenant)]
-    (if b-tenant
-      (let [before (processed-count node-a-port b-tenant)]
-        (info (str "Tenant " b-tenant " owned by node-b, processed=" before))
-        (info "Appending event via node-a...")
-        (increment! node-a-port b-tenant)
+  (let [non-primary-tenant (find-tenant-not-owned-by primary-port primary-port)]
+    (if non-primary-tenant
+      (let [before (processed-count primary-port non-primary-tenant)]
+        (info (str "Tenant " non-primary-tenant " owned by non-primary, processed=" before))
+        (info "Appending event via primary node...")
+        (increment! primary-port non-primary-tenant)
         (Thread/sleep 5000)
-        (let [after (processed-count node-a-port b-tenant)]
+        (let [after (processed-count primary-port non-primary-tenant)]
           (info (str "Processed after: " after))
           (check "Cross-instance event processed" (> after before))))
-      (fail "No tenants owned by node-b"))))
+      (fail "No tenants owned by non-primary nodes"))))
 
 (defn scenario-4 []
   (header "Scenario 4: Graceful failover")
-  (let [before (node-status node-a-port)]
-    (info (str "Before: A running " (:running before) " processors"))
-    (info "Stopping node-b control plane gracefully...")
-    (eval-on node-b-port
+  (let [before-running (total-running)]
+    (info (str "Before: total running " before-running))
+    (info (str "Stopping " victim-service " control plane gracefully..."))
+    (eval-on victim-port
       "(ai.obney.grain.control-plane.interface/stop (:control-plane @app/app))")
-    (info "Waiting for reassignment (10s)...")
-    (Thread/sleep 10000)
-    (let [after (node-status node-a-port)]
-      (info (str "After: A running " (:running after) " processors"))
-      (check "Node A took over all leases" (= 4 (:leases after)))
-      (check "Node A running all processors" (= 4 (:running after))))))
+    (info "Waiting for reassignment (12s)...")
+    (Thread/sleep 12000)
+    (let [s (node-status primary-port)
+          tr (total-running)]
+      (check (str "All " n-tenants " leases assigned (got " (:leases s) ")")
+             (= n-tenants (:leases s)))
+      (check (str "Total running = " n-tenants " (got " tr ")")
+             (= n-tenants tr)))))
 
 (defn scenario-5 []
   (header "Scenario 5: Hard failover (docker kill)")
-  ;; First restart node-b from scenario 4
-  (restart-node-b!)
-  ;; Verify both running
+  (restart-victim!)
   (Thread/sleep 4000)
-  (let [sa (node-status node-a-port)]
-    (info (str "Before kill: A running " (:running sa) ", leases=" (:leases sa))))
-  ;; Kill
-  (kill-node-b!)
+  (let [before (node-status primary-port)]
+    (info (str "Before kill: primary running " (:running before) ", leases=" (:leases before))))
+  (kill-victim!)
   (info "Waiting for staleness detection (12s)...")
   (Thread/sleep 12000)
-  (let [sa (node-status node-a-port)]
-    (info (str "After kill: A sees " (:active-nodes sa) " active, running " (:running sa)))
-    (check "Node A sees only 1 active node" (= 1 (:active-nodes sa)))
-    (check "Node A owns all leases" (= 4 (:leases sa)))
-    (check "Node A running all processors" (= 4 (:running sa)))))
+  (let [s (node-status primary-port)
+        expected-active (dec n-nodes)]
+    (check (str "Primary sees " expected-active " active (got " (:active-nodes s) ")")
+           (= expected-active (:active-nodes s)))
+    (check (str "All " n-tenants " leases assigned (got " (:leases s) ")")
+           (= n-tenants (:leases s)))
+    (let [tr (total-running)]
+      (check (str "Total running = " n-tenants " (got " tr ")")
+             (= n-tenants tr)))))
 
 (defn scenario-6 []
   (header "Scenario 6: Scale up")
-  ;; Currently only A is running (B was killed in scenario 5)
-  (let [before (node-status node-a-port)]
-    (info (str "Before: A running " (:running before) " processors (solo)"))
-    (check "A owns all 4 leases before scale-up" (= 4 (:leases before))))
-  ;; Bring B back
-  (restart-node-b!)
-  (Thread/sleep 4000)
-  (let [sa (node-status node-a-port)
-        sb (node-status node-b-port)]
-    (info (str "After: A running " (:running sa) ", B running " (:running sb)))
-    (check "Both nodes active" (= 2 (:active-nodes sa)))
-    (check "Work rebalanced to A" (pos? (:running sa)))
-    (check "Work rebalanced to B" (pos? (:running sb)))
-    (check "Total processors = 4" (= 4 (+ (:running sa) (:running sb))))))
+  (let [before (total-running)]
+    (info (str "Before: total running " before " (victim down)"))
+    (check (str "All " n-tenants " leases before scale-up")
+           (= n-tenants (:leases (node-status primary-port)))))
+  (restart-victim!)
+  (Thread/sleep 6000)
+  (let [s (node-status primary-port)
+        tr (total-running)]
+    (check (str "All " n-nodes " nodes active (got " (:active-nodes s) ")")
+           (= n-nodes (:active-nodes s)))
+    (check (str "Total running = " n-tenants " (got " tr ")")
+           (= n-tenants tr))
+    (check "Victim running processors"
+           (pos? (:running (node-status victim-port))))))
 
 (defn scenario-7 []
-  (header "Scenario 7: Scale down to one")
-  (info "Stopping node-b gracefully...")
-  (eval-on node-b-port
+  (header "Scenario 7: Scale down to fewer nodes")
+  (info (str "Stopping " victim-service " gracefully..."))
+  (eval-on victim-port
     "(ai.obney.grain.control-plane.interface/stop (:control-plane @app/app))")
-  (Thread/sleep 10000)
-  (let [sa (node-status node-a-port)]
-    (check "A sees 1 active node" (= 1 (:active-nodes sa)))
-    (check "A owns all 4 leases" (= 4 (:leases sa)))
-    (check "A running all 4 processors" (= 4 (:running sa)))))
-
-;; -------------------------------- ;;
-;; Scenarios 8-12: Adversarial      ;;
-;; -------------------------------- ;;
+  (Thread/sleep 12000)
+  (let [s (node-status primary-port)
+        expected-active (dec n-nodes)]
+    (check (str expected-active " active nodes (got " (:active-nodes s) ")")
+           (= expected-active (:active-nodes s)))
+    (check (str "All " n-tenants " leases (got " (:leases s) ")")
+           (= n-tenants (:leases s)))
+    (let [tr (total-running)]
+      (check (str "Total running = " n-tenants " (got " tr ")")
+             (= n-tenants tr)))))
 
 (defn scenario-8 []
   (header "Scenario 8: Postgres restart")
-  ;; Restore node-b first
-  (restart-node-b!)
+  (restart-victim!)
   (Thread/sleep 4000)
-  (let [before-a (node-status node-a-port)]
-    (info (str "Before: A active=" (:active-nodes before-a) " running=" (:running before-a)))
-    (info "Restarting Postgres container...")
-    (compose "restart" "postgres")
-    (info "Waiting for Postgres to come back (10s)...")
-    (Thread/sleep 10000)
-    ;; Nodes may need time to reconnect and resume
-    (info "Waiting for recovery (15s)...")
-    (Thread/sleep 15000)
-    (let [a-ok (node-reachable? node-a-port)
-          b-ok (node-reachable? node-b-port)]
-      (check "Node A still reachable" a-ok)
-      (check "Node B still reachable" b-ok)
-      (when (and a-ok b-ok)
-        (let [sa (node-status node-a-port)]
-          (check "Leases still assigned after Postgres restart" (= 4 (:leases sa)))
-          (check "Processors still running" (pos? (:running sa))))))))
+  (info "Restarting Postgres container...")
+  (compose "restart" "postgres")
+  (info "Waiting for recovery (25s)...")
+  (Thread/sleep 25000)
+  (let [reachable (count (filter :reachable (all-statuses)))]
+    (check (str "At least " (dec n-nodes) " nodes reachable (got " reachable ")")
+           (>= reachable (dec n-nodes)))
+    (let [s (node-status primary-port)]
+      (check (str "Leases still " n-tenants " (got " (:leases s) ")")
+             (= n-tenants (:leases s))))))
 
 (defn scenario-9 []
-  (header "Scenario 9: Network partition (node-b loses Postgres)")
-  ;; Ensure both running
-  (restart-node-b!)
+  (header "Scenario 9: Network partition (victim loses Postgres)")
+  (restart-victim!)
   (Thread/sleep 4000)
-  (let [before (node-status node-a-port)]
-    (info (str "Before: A running=" (:running before) " B running=" (:running (node-status node-b-port)))))
-  (info "Disconnecting node-b from network...")
-  (docker "network" "disconnect" "grain_default" "grain-node-b-1")
+  (info (str "Disconnecting " victim-container " from network..."))
+  (docker "network" "disconnect" "grain_default" victim-container)
   (info "Waiting for staleness detection (12s)...")
   (Thread/sleep 12000)
-  (let [sa (node-status node-a-port)]
-    (check "A sees only 1 active node during partition" (= 1 (:active-nodes sa)))
-    (check "A owns all leases during partition" (= 4 (:leases sa)))
-    (check "A running all processors during partition" (= 4 (:running sa))))
-  ;; Restore connectivity
-  (info "Reconnecting node-b to network...")
-  (docker "network" "connect" "grain_default" "grain-node-b-1")
+  (let [s (node-status primary-port)]
+    (check (str "Primary sees " (dec n-nodes) " active during partition")
+           (= (dec n-nodes) (:active-nodes s)))
+    (let [tr (total-running)]
+      (check (str "Total running = " n-tenants " during partition (got " tr ")")
+             (= n-tenants tr))))
+  (info (str "Reconnecting " victim-container "..."))
+  (docker "network" "connect" "grain_default" victim-container)
   (info "Waiting for recovery (15s)...")
   (Thread/sleep 15000)
-  (let [b-ok (node-reachable? node-b-port)]
-    (if b-ok
-      (let [sa (node-status node-a-port)]
-        (check "Both nodes active after reconnect" (= 2 (:active-nodes sa)))
-        (check "Work rebalanced after reconnect" (< (:running sa) 4)))
-      (info "Node B not reachable after reconnect (may need container restart)"))))
+  (let [s (node-status primary-port)]
+    (check (str "All " n-nodes " nodes active after reconnect (got " (:active-nodes s) ")")
+           (= n-nodes (:active-nodes s)))))
 
 (defn scenario-10 []
   (header "Scenario 10: Rapid start/stop cycling")
-  ;; Ensure B is running
-  (restart-node-b!)
+  (restart-victim!)
   (Thread/sleep 4000)
-  (info "Cycling node-b 3 times (stop/start every 8s)...")
+  (info "Cycling victim 3 times...")
   (dotimes [i 3]
-    (info (str "Cycle " (inc i) "/3: killing node-b..."))
-    (kill-node-b!)
+    (info (str "Cycle " (inc i) "/3: killing..."))
+    (kill-victim!)
     (Thread/sleep 8000)
-    (info (str "Cycle " (inc i) "/3: restarting node-b..."))
-    (restart-node-b!)
+    (info (str "Cycle " (inc i) "/3: restarting..."))
+    (restart-victim!)
     (Thread/sleep 6000))
-  ;; After cycling, check stability
-  (let [sa (node-status node-a-port)
-        sb (node-status node-b-port)]
-    (check "Both nodes active after cycling" (= 2 (:active-nodes sa)))
-    (check "4 leases assigned after cycling" (= 4 (:leases sa)))
-    (check "Total processors = 4 after cycling"
-           (= 4 (+ (:running sa) (:running sb))))))
+  (let [s (node-status primary-port)
+        tr (total-running)]
+    (check (str "All " n-nodes " active after cycling (got " (:active-nodes s) ")")
+           (= n-nodes (:active-nodes s)))
+    (check (str n-tenants " leases after cycling (got " (:leases s) ")")
+           (= n-tenants (:leases s)))
+    (check (str "Total running = " n-tenants " (got " tr ")")
+           (= n-tenants tr))))
 
 (defn scenario-11 []
   (header "Scenario 11: High event throughput during failover")
-  ;; Both nodes should be running from scenario 10
   (let [t1 (first @tenant-ids)
-        before (processed-count node-a-port t1)]
+        before (processed-count primary-port t1)]
     (info (str "Tenant " t1 " has " before " processed events"))
-    ;; Rapid fire events
     (info "Appending 20 events rapidly...")
     (dotimes [_ 20]
-      (increment! node-a-port t1))
-    ;; Kill node-b mid-stream
-    (info "Killing node-b during event storm...")
-    (kill-node-b!)
-    ;; Wait for failover + processing
+      (increment! primary-port t1))
+    (info "Killing victim during event storm...")
+    (kill-victim!)
     (info "Waiting for failover + catch-up (15s)...")
     (Thread/sleep 15000)
-    (let [after (processed-count node-a-port t1)]
+    (let [after (processed-count primary-port t1)]
       (info (str "Processed events after: " after))
-      (check (str "All events processed (" after " > " before ")")
-             (> after before))
-      ;; Check no duplicates: processed count should equal incremented count
-      (let [all-events (eval-read node-a-port
-                         (format "(count (app/all-events @app/app (java.util.UUID/fromString \"%s\")))" t1))
-            processed after
-            increments (eval-read node-a-port
-                         (format "(count (filter (fn [e] (= :test/counter-incremented (:event/type e)))
-                                                 (app/all-events @app/app (java.util.UUID/fromString \"%s\"))))" t1))]
-        (info (str "Total events=" all-events " increments=" increments " processed=" processed))
-        (check "Every increment has exactly one processed event"
-               (= increments processed))))))
+      (check "All events processed" (> after before))
+      (let [increments (increment-count primary-port t1)]
+        (info (str "Increments=" increments " processed=" after))
+        (check "Every increment processed exactly once" (= increments after))))))
 
 (defn scenario-12 []
   (header "Scenario 12: Stale L1 cache after lease transfer")
-  ;; Restart B for a clean state
-  (restart-node-b!)
+  (restart-victim!)
   (Thread/sleep 6000)
-  ;; Find a tenant on A, transfer it to B by killing A and restarting
-  (let [sa-before (node-status node-a-port)
-        leases (lease-details node-a-port)
-        node-a-id (:node-id sa-before)
-        a-tenant (->> leases (filter #(= node-a-id (:owner %))) first :tenant)]
-    (if a-tenant
-      (let [before (processed-count node-a-port a-tenant)]
-        (info (str "Tenant " a-tenant " owned by A, processed=" before))
-        ;; Append an event while A owns it (populates A's cache)
-        (increment! node-a-port a-tenant)
+  ;; Find a tenant on primary, kill primary, verify victim processes it
+  (let [primary-tenant (find-tenant-owned-by primary-port primary-port)]
+    (if primary-tenant
+      (let [before (processed-count primary-port primary-tenant)]
+        (info (str "Tenant " primary-tenant " owned by primary, processed=" before))
+        (increment! primary-port primary-tenant)
         (Thread/sleep 2000)
-        ;; Now kill A — B takes over
-        (info "Killing node-a to force lease transfer to B...")
+        (info "Killing primary to force lease transfer...")
         (docker "kill" "grain-node-a-1")
         (Thread/sleep 12000)
-        ;; Append another event — B should process it
-        (info "Appending event after lease transfer to B...")
-        (increment! node-b-port a-tenant)
-        (Thread/sleep 5000)
-        (let [after (processed-count node-b-port a-tenant)]
+        ;; Query from victim instead
+        (let [after (processed-count victim-port primary-tenant)]
           (info (str "Processed after transfer: " after))
           (check "Events processed after lease transfer" (> after before)))
-        ;; Restart A for cleanup
-        (info "Restarting node-a...")
+        (info "Restarting primary...")
         (compose "restart" "node-a")
-        (wait-for-port node-a-port 60000)
+        (wait-for-port primary-port 60000)
         (Thread/sleep 8000)
-        (setup-node! node-a-port))
-      (fail "No tenants owned by node-a"))))
-
-;; =====================================
-;; Scenario 13: In-progress work during crash
-;; =====================================
-
-(defn diagnose-slow-work [port tenant-id]
-  (eval-read port
-    (format "(app/diagnose-slow-work @app/app (java.util.UUID/fromString \"%s\"))" tenant-id)))
-
-(defn submit-slow-work! [port tenant-id]
-  (eval-on port
-    (format "(app/submit-slow-work! @app/app (java.util.UUID/fromString \"%s\"))" tenant-id)))
+        (setup-node! primary-port))
+      (fail "No tenants owned by primary"))))
 
 (defn scenario-13 []
   (header "Scenario 13: In-progress work during node crash")
-  ;; Ensure both nodes are up
-  (restart-node-b!)
+  (restart-victim!)
   (Thread/sleep 4000)
-  ;; Find a tenant owned by node-b
-  (let [leases (lease-details node-a-port)
-        node-b-id (:node-id (node-status node-b-port))
-        b-tenant (->> leases
-                      (filter #(= node-b-id (:owner %)))
-                      first :tenant)]
-    (if b-tenant
+  (let [victim-tenant (find-tenant-owned-by primary-port victim-port)]
+    (if victim-tenant
       (do
-        (info (str "Tenant " b-tenant " slow-processor owned by node-b"))
-        ;; Submit 3 slow-work events (each takes 2s to process)
+        (info (str "Tenant " victim-tenant " owned by victim"))
         (info "Submitting 3 slow-work events...")
-        (dotimes [_ 3]
-          (submit-slow-work! node-a-port b-tenant))
-        ;; Wait just long enough for node-b to start processing the first one
-        ;; (poll interval 250ms + handler starts 2s sleep)
+        (eval-on primary-port
+          (format "(dotimes [_ 3] (app/submit-slow-work! @app/app (java.util.UUID/fromString \"%s\")))"
+                  victim-tenant))
         (info "Waiting 1s for processing to begin...")
         (Thread/sleep 1000)
-        ;; Kill node-b mid-processing
-        (info "Killing node-b mid-processing...")
-        (kill-node-b!)
-        ;; Diagnose from node-a before failover
-        (let [diag-before (diagnose-slow-work node-a-port b-tenant)]
-          (info (str "Before failover: " (pr-str diag-before))))
-        ;; Wait for failover — node-a takes over
+        (info "Killing victim mid-processing...")
+        (kill-victim!)
         (info "Waiting for failover + catch-up (20s)...")
         (Thread/sleep 20000)
-        ;; Diagnose after failover
-        (let [diag-after (diagnose-slow-work node-a-port b-tenant)]
-          (info (str "After failover:  " (pr-str diag-after)))
-          (info "")
-          (info "Analysis:")
-          (info (str "  Submitted: " (:submitted diag-after)))
-          (info (str "  Completed: " (:completed diag-after)))
-          (info (str "  Checkpointed: " (:checkpointed diag-after)))
-          (info (str "  Failures: " (:failures diag-after)))
-          (info (str "  By node: " (pr-str (:completed-by-node diag-after))))
-          (info (str "  Events by type: " (pr-str (:events-by-type diag-after))))
-          (info "")
-          ;; The key assertions:
-          ;; 1. All 3 events should eventually be processed (at-least-once)
-          (check (str "All submitted work completed (" (:completed diag-after) "/3)")
-                 (= 3 (:completed diag-after)))
-          ;; 2. All 3 should have checkpoints
-          (check (str "All work checkpointed (" (:checkpointed diag-after) "/3)")
-                 (>= (:checkpointed diag-after) 3))
-          ;; 3. Node-a should have picked up the remaining work
-          (check "Node A processed some work after failover"
-                 (some? (get (:completed-by-node diag-after)
-                             (:node-id (node-status node-a-port)))))))
-      (fail "No slow-processor tenant owned by node-b"))))
+        (let [diag (eval-read primary-port
+                     (format "(app/diagnose-slow-work @app/app (java.util.UUID/fromString \"%s\"))"
+                             victim-tenant))]
+          (info (str "Diagnosis: " (pr-str diag)))
+          (check (str "All slow work completed (" (:completed diag) "/3)")
+                 (= 3 (:completed diag)))))
+      (fail "No tenants owned by victim"))))
 
 ;; -------------------------------- ;;
 ;; Main runner                      ;;
@@ -512,7 +454,8 @@
 
 (defn run-all []
   (println "\n╔══════════════════════════════════════════╗")
-  (println "║  Grain Control Plane Live Test Suite     ║")
+  (println (str "║  Grain Control Plane Live Test Suite     ║"))
+  (println (str "║  " n-nodes " nodes, " n-tenants " tenants                       ║"))
   (println "╚══════════════════════════════════════════╝")
 
   (when-not (start-cluster!)
@@ -521,7 +464,6 @@
     (System/exit 1))
 
   (try
-    ;; Normal operations
     (scenario-1)
     (scenario-2)
     (scenario-3)
@@ -529,15 +471,11 @@
     (scenario-5)
     (scenario-6)
     (scenario-7)
-
-    ;; Adversarial
     (scenario-8)
     (scenario-9)
     (scenario-10)
     (scenario-11)
     (scenario-12)
-
-    ;; In-progress work
     (scenario-13)
 
     (catch Throwable t
@@ -545,7 +483,6 @@
       (println (str "\n  !! Unexpected error: " (.getMessage t)))
       (.printStackTrace t)))
 
-  ;; Report
   (let [{:keys [pass fail error]} @results
         total (+ pass fail error)]
     (println "\n╔══════════════════════════════════════════╗")
@@ -560,11 +497,8 @@
 ;; Entry point
 (let [cmd (first *command-line-args*)]
   (case cmd
-    "check-status" (do (setup-node! node-a-port)
-                       (try (setup-node! node-b-port) (catch Exception _))
+    "check-status" (do (doseq [p all-ports] (setup-node! p))
                        (header "Status check")
-                       (try (info (str "Node A: " (pr-str (node-status node-a-port))))
-                            (catch Exception e (info (str "Node A: unreachable"))))
-                       (try (info (str "Node B: " (pr-str (node-status node-b-port))))
-                            (catch Exception e (info (str "Node B: unreachable")))))
+                       (doseq [s (all-statuses)]
+                         (info (str "Port " (:port s) ": " (pr-str (dissoc s :port))))))
     (run-all)))

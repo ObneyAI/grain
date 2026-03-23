@@ -80,7 +80,9 @@
                               USING (tenant_id = current_setting('app.tenant_id', true)::uuid)
                               WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
                           END IF;
-                         END $$;"]]
+                         END $$;"
+
+                        "ALTER TABLE grain.tenants ADD COLUMN IF NOT EXISTS last_event_id UUID;"]]
 
        (jdbc/execute! conn [statement])))))
 
@@ -307,8 +309,11 @@
       ;; Per-tenant advisory lock
       (jdbc/execute! conn ["SET LOCAL lock_timeout = '5000ms'"])
       (jdbc/execute! conn ["SELECT pg_advisory_xact_lock(?)" (tenant-lock-key tenant-id)])
-      ;; Auto-register tenant
-      (jdbc/execute! conn ["INSERT INTO grain.tenants (id) VALUES (?) ON CONFLICT DO NOTHING" tenant-id])
+      ;; Auto-register tenant + update watermark
+      (let [max-event-id (:event/id (last events*))]
+        (jdbc/execute! conn ["INSERT INTO grain.tenants (id, last_event_id) VALUES (?, ?)
+                              ON CONFLICT (id) DO UPDATE SET last_event_id = ?"
+                             tenant-id max-event-id max-event-id]))
       ;; CAS check + insert
       (if cas
         (let [{:keys [where-sql params]} (build-single-query-sql

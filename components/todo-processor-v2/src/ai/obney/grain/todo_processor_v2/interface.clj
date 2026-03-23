@@ -22,3 +22,11 @@
 (defn stop-polling
   [polling-processor]
   (core/stop-polling polling-processor))
+
+(defn start-tenant-poller
+  [config]
+  (core/start-tenant-poller config))
+
+(defn stop-tenant-poller
+  [poller]
+  (core/stop-tenant-poller poller))

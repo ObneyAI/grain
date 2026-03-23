@@ -220,6 +220,54 @@
   [system]
   (control-plane/running-processors (:control-plane system)))
 
+(defn reactor-diagnostics
+  "Detailed diagnostic state of the control plane reactor."
+  [system]
+  (let [cp (:control-plane system)
+        poller-atom (:poller-atom cp)
+        poller (when poller-atom @poller-atom)
+        node-id (str (:node-id cp))
+        raw-leases (leases system)
+        raw-active (active-nodes system)]
+    {:node-id node-id
+     :poller-nil? (nil? poller)
+     :poller-running? (when poller @(:running poller))
+     :poller-tenant-count (when poller
+                            (when-let [a (:tenant-ids-atom poller)]
+                              (count @a)))
+     :poller-tenants (when poller
+                       (when-let [a (:tenant-ids-atom poller)]
+                         (mapv str @a)))
+     :lease-count (count raw-leases)
+     :leases-by-owner (frequencies (map str (vals raw-leases)))
+     :active-node-count (count raw-active)
+     :active-node-ids (mapv str (keys raw-active))
+     :departure-events (let [all (into []
+                                  (filter #(= :grain.control/node-departed (:event/type %)))
+                                  (es/read (:event-store system)
+                                    {:tenant-id ai.obney.grain.control-plane.events/control-plane-tenant-id}))]
+                          (mapv (fn [e] {:node (str (:node/id e))
+                                         :id (str (:event/id e))}) all))
+     :node-b-heartbeats-after-departure
+     (let [all-events (into []
+                        (remove #(= :grain/tx (:event/type %)))
+                        (es/read (:event-store system)
+                          {:tenant-id ai.obney.grain.control-plane.events/control-plane-tenant-id}))
+           departures (filter #(= :grain.control/node-departed (:event/type %)) all-events)
+           departure-ids (set (map :event/id departures))]
+       ;; Find heartbeats from any departed node that come AFTER its departure event
+       (let [departed-nodes (set (map :node/id departures))]
+         (->> all-events
+              (filter #(and (= :grain.control/node-heartbeat (:event/type %))
+                            (contains? departed-nodes (:node/id %))))
+              (filter (fn [hb]
+                        (some (fn [dep]
+                                (and (= (:node/id hb) (:node/id dep))
+                                     (pos? (compare (str (:event/id hb))
+                                                    (str (:event/id dep))))))
+                              departures)))
+              (mapv (fn [e] {:node (str (:node/id e))
+                              :id (str (:event/id e))})))))}))
 (defn diagnose-tenant
   "Full diagnostic for a tenant: which events were incremented, which were
    processed, which are missing, which are duplicated."

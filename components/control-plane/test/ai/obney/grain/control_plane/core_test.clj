@@ -99,11 +99,9 @@
     (let [dir (str "/tmp/cp-reactor-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
           cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
-          ps (pubsub/start {:type :core-async :topic-fn :event/type})
           tenant-1 (uuid/v4)
           processed (atom [])]
       (try
-        ;; Register a processor so the control plane can start it
         (let [prev-registry @tp/processor-registry*]
           (try
             (tp/register-processor!
@@ -112,34 +110,28 @@
               :handler-fn (fn [{:keys [event]}]
                             (swap! processed conj (:event/id event))
                             {})})
-            ;; Create a domain tenant with an event
+            ;; Create a domain tenant with events
             (es/append store {:tenant-id tenant-1
                               :events [(es/->event {:type :test/lifecycle-event :body {}})]})
-            ;; Start the control plane with reactor enabled
+            ;; Start the control plane — poller will pick up the event
             (let [cp-instance (cp/start {:event-store store
                                          :cache cache
-                                         :event-pubsub ps
-                                                                                  :heartbeat-interval-ms 200
+                                         :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
               (try
-                ;; Wait for heartbeat + assignment + reactor to start processor
+                ;; Wait for heartbeat + assignment + poller to process
+                (Thread/sleep 2000)
+                ;; Append another event — poller should process it
+                (es/append store {:tenant-id tenant-1
+                                  :events [(es/->event {:type :test/lifecycle-event :body {}})]})
                 (Thread/sleep 1000)
-                ;; Publish an event through pubsub — the reactor-started processor should pick it up
-                (let [event (es/->event {:type :test/lifecycle-event :body {}})]
-                  (es/append store {:tenant-id tenant-1 :events [event]})
-                  ;; The pubsub publish happens inside event-store append (if event-pubsub is configured)
-                  ;; But our store doesn't have pubsub configured, so publish manually
-                  (pubsub/pub ps {:message (assoc event :grain/tenant-id tenant-1)})
-                  (Thread/sleep 500)
-                  ;; The processor should have processed the event
-                  (is (pos? (count @processed))
-                      "Reactor-started processor should process events"))
+                (is (pos? (count @processed))
+                    "Reactor-started poller should process events")
                 (finally
                   (cp/stop cp-instance))))
             (finally
               (reset! tp/processor-registry* prev-registry))))
         (finally
-          (pubsub/stop ps)
           (kv/stop cache)
           (es/stop store)
           (delete-dir-recursively dir))))))
@@ -149,7 +141,6 @@
     (let [dir (str "/tmp/cp-reactor-stop-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
           cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
-          ps (pubsub/start {:type :core-async :topic-fn :event/type})
           tenant-1 (uuid/v4)]
       (try
         (let [prev-registry @tp/processor-registry*]
@@ -162,23 +153,21 @@
                               :events [(es/->event {:type :test/lifecycle-event :body {}})]})
             (let [cp-instance (cp/start {:event-store store
                                          :cache cache
-                                         :event-pubsub ps
-                                                                                  :heartbeat-interval-ms 200
+                                         :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
-              ;; Wait for reactor to start processors
-              (Thread/sleep 1000)
-              ;; Verify processors are running
-              (is (pos? (count (cp/running-processors cp-instance)))
+              ;; Wait for reactor to start poller
+              (Thread/sleep 2000)
+              ;; Verify tenants are being processed
+              (is (pos? (count (or (cp/running-processors cp-instance) #{})))
                   "Should have running processors before stop")
               ;; Stop the control plane
               (cp/stop cp-instance)
-              ;; Verify processors were stopped
-              (is (zero? (count (cp/running-processors cp-instance)))
+              ;; Verify poller was stopped
+              (is (nil? (cp/running-processors cp-instance))
                   "Should have no running processors after stop"))
             (finally
               (reset! tp/processor-registry* prev-registry))))
         (finally
-          (pubsub/stop ps)
           (kv/stop cache)
           (es/stop store)
           (delete-dir-recursively dir))))))
