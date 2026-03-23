@@ -448,6 +448,62 @@
                  (= 3 (:completed diag)))))
       (fail "No tenants owned by victim"))))
 
+(defn scenario-14 []
+  (header "Scenario 14: Periodic task CAS deduplication")
+  ;; Ensure all nodes are up
+  (restart-victim!)
+  (Thread/sleep 6000)
+  ;; All 3 nodes attempt to append billing triggers to all tenants
+  ;; CAS ensures only one succeeds per tenant per period
+  (info "All 3 nodes appending billing triggers with CAS...")
+  (let [period "2026-03-23-live-test"
+        tids @tenant-ids]
+    ;; Each node tries to append triggers for all tenants
+    (let [futures (mapv (fn [port]
+                          (future
+                            (eval-on port
+                              (format
+                                "(let [s @app/app
+                                       tids %s
+                                       period \"%s\"]
+                                   (doseq [tid-str tids]
+                                     (let [tid (java.util.UUID/fromString tid-str)]
+                                       (ai.obney.grain.event-store-v3.interface/append
+                                         (:event-store s)
+                                         {:tenant-id tid
+                                          :events [(ai.obney.grain.event-store-v3.interface/->event
+                                                     {:type :test/billing-trigger
+                                                      :body {:period period}})]
+                                          :cas {:types #{:test/billing-trigger}
+                                                :predicate-fn (fn [existing]
+                                                                (not (some (fn [e] (= period (:period e)))
+                                                                           (into [] existing))))}})))
+                                   :done)"
+                                (pr-str tids) period))))
+                        all-ports)]
+      (doseq [f futures] @f))
+    ;; Wait for processors to handle the triggers
+    (info "Waiting for processing (5s)...")
+    (Thread/sleep 5000)
+    ;; Verify: each tenant has exactly 1 trigger and 1 billing result
+    ;; Check from primary node
+    (let [result (eval-read primary-port
+                   (format
+                     "(let [s @app/app
+                            tids %s]
+                        (mapv (fn [tid-str]
+                                (let [tid (java.util.UUID/fromString tid-str)
+                                      all (app/all-events s tid)
+                                      triggers (count (filter (fn [e] (= :test/billing-trigger (:event/type e))) all))
+                                      results (count (filter (fn [e] (= :test/counter-processed (:event/type e))) all))]
+                                  {:tid tid-str :triggers triggers}))
+                              tids))"
+                     (pr-str tids)))]
+      (let [trigger-counts (map :triggers result)]
+        (info (str "Triggers per tenant: " (pr-str (frequencies trigger-counts))))
+        (check "Every tenant has exactly 1 trigger (CAS deduped across 3 nodes)"
+               (every? #(= 1 %) trigger-counts))))))
+
 ;; -------------------------------- ;;
 ;; Main runner                      ;;
 ;; -------------------------------- ;;
@@ -477,6 +533,7 @@
     (scenario-11)
     (scenario-12)
     (scenario-13)
+    (scenario-14)
 
     (catch Throwable t
       (swap! results update :error inc)

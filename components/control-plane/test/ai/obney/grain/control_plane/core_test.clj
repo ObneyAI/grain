@@ -171,3 +171,107 @@
           (kv/stop cache)
           (es/stop store)
           (delete-dir-recursively dir))))))
+
+;; =====================================
+;; PT-CAS3: Periodic task deduplication
+;; =====================================
+
+(defschemas pt-cas3-schemas
+  {:test/billing-trigger [:map [:period :string]]
+   :test/billing-done [:map [:period :string]]})
+
+(deftest pt-cas3-periodic-trigger-deduplication
+  (testing "PT-CAS3: Two instances both run periodic trigger, CAS deduplicates, processor runs once"
+    (let [dir-a (str "/tmp/cp-ptcas3-a-" (uuid/v4))
+          dir-b (str "/tmp/cp-ptcas3-b-" (uuid/v4))
+          store (es/start {:conn {:type :in-memory}})
+          cache-a (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir-a :db-name "test"}))
+          cache-b (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir-b :db-name "test"}))
+          tenant-1 (uuid/v4)
+          tenant-2 (uuid/v4)
+          cycle-count (atom 0)]
+      (try
+        (let [prev-registry @tp/processor-registry*]
+          (try
+            ;; Register a billing processor
+            (tp/register-processor! :test/billing-proc
+              {:topics [:test/billing-trigger]
+               :handler-fn (fn [{:keys [event]}]
+                             {:result/events
+                              [(es/->event {:type :test/billing-done
+                                            :body {:period (:period event)}})]})})
+            ;; Create tenants
+            (es/append store {:tenant-id tenant-1
+                              :events [(es/->event {:type :test/lifecycle-event :body {}})]})
+            (es/append store {:tenant-id tenant-2
+                              :events [(es/->event {:type :test/lifecycle-event :body {}})]})
+            ;; Start two control plane instances
+            (let [cp-a (cp/start {:event-store store :cache cache-a
+                                  :heartbeat-interval-ms 200
+                                  :staleness-threshold-ms 1000})
+                  _ (Thread/sleep 100)
+                  cp-b (cp/start {:event-store store :cache cache-b
+                                  :heartbeat-interval-ms 200
+                                  :staleness-threshold-ms 1000})]
+              (try
+                ;; Wait for assignment
+                (Thread/sleep 2000)
+                ;; Both "nodes" try to append billing triggers with CAS
+                ;; Simulate 3 periodic cycles
+                (dotimes [i 3]
+                  (let [period (str "2026-03-23-cycle-" i)]
+                    ;; Node A tries
+                    (es/append store
+                      {:tenant-id tenant-1
+                       :events [(es/->event {:type :test/billing-trigger :body {:period period}})]
+                       :cas {:types #{:test/billing-trigger}
+                             :predicate-fn (fn [existing]
+                                             (not (some #(= period (:period %))
+                                                        (into [] existing))))}})
+                    ;; Node B tries the same
+                    (es/append store
+                      {:tenant-id tenant-1
+                       :events [(es/->event {:type :test/billing-trigger :body {:period period}})]
+                       :cas {:types #{:test/billing-trigger}
+                             :predicate-fn (fn [existing]
+                                             (not (some #(= period (:period %))
+                                                        (into [] existing))))}})
+                    ;; Same for tenant-2
+                    (es/append store
+                      {:tenant-id tenant-2
+                       :events [(es/->event {:type :test/billing-trigger :body {:period period}})]
+                       :cas {:types #{:test/billing-trigger}
+                             :predicate-fn (fn [existing]
+                                             (not (some #(= period (:period %))
+                                                        (into [] existing))))}})
+                    (es/append store
+                      {:tenant-id tenant-2
+                       :events [(es/->event {:type :test/billing-trigger :body {:period period}})]
+                       :cas {:types #{:test/billing-trigger}
+                             :predicate-fn (fn [existing]
+                                             (not (some #(= period (:period %))
+                                                        (into [] existing))))}})))
+                ;; Wait for processing
+                (Thread/sleep 3000)
+                ;; Verify: each tenant has exactly 3 triggers (one per cycle, CAS deduped)
+                (doseq [tid [tenant-1 tenant-2]]
+                  (let [all (into []
+                              (remove #(= :grain/tx (:event/type %)))
+                              (es/read store {:tenant-id tid}))
+                        triggers (filter #(= :test/billing-trigger (:event/type %)) all)
+                        results (filter #(= :test/billing-done (:event/type %)) all)]
+                    (is (= 3 (count triggers))
+                        (str "Tenant should have 3 triggers, got " (count triggers)))
+                    (is (= 3 (count results))
+                        (str "Tenant should have 3 billing results, got " (count results)))))
+                (finally
+                  (cp/stop cp-a)
+                  (cp/stop cp-b))))
+            (finally
+              (reset! tp/processor-registry* prev-registry))))
+        (finally
+          (kv/stop cache-a)
+          (kv/stop cache-b)
+          (es/stop store)
+          (delete-dir-recursively dir-a)
+          (delete-dir-recursively dir-b))))))

@@ -31,6 +31,8 @@
                          [:processed-by/event-id :uuid]
                          [:processing-time-ms :int]]
    :test/slow-work-failed [:map [:msg :string]]
+   :test/billing-trigger [:map [:period :string]]
+   :test/billing-done [:map [:period :string]]
    :grain/todo-processor-effect-failure [:map
                                          [:processor/name :keyword]
                                          [:triggered-by :uuid]

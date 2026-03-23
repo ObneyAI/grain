@@ -20,7 +20,9 @@
    :test/event-3 [:map [:num :int]]
    :test/cas-event [:map [:n :int]]
    :test/effect-succeeded [:map [:msg :string]]
-   :test/effect-failed [:map [:msg :string]]})
+   :test/effect-failed [:map [:msg :string]]
+   :test/billing-trigger [:map [:period :string]]
+   :test/billing-done [:map [:period :string] [:billed-by :uuid]]})
 
 ;; Test Fixtures
 
@@ -866,3 +868,66 @@
                 (core/stop-tenant-poller poller))))
           (finally
             (reset! core/processor-registry* prev)))))))
+
+;; 14. CAS-based periodic task deduplication
+
+(deftest pt-cas1-duplicate-trigger-cas-conflict
+  (testing "PT-CAS1: Two appends of the same trigger — first wins, second conflicts"
+    (let [tenant-id (random-uuid)
+          period "2026-03-23"
+          trigger-event (fn [] (es/->event {:type :test/billing-trigger
+                                            :body {:period period}}))
+          cas-predicate {:types #{:test/billing-trigger}
+                         :predicate-fn (fn [existing]
+                                         (not (reduce
+                                               (fn [_ evt]
+                                                 (if (= period (:period evt))
+                                                   (reduced true)
+                                                   false))
+                                               false
+                                               existing)))}]
+      ;; First append — should succeed
+      (let [result-1 (es/append *event-store*
+                       {:tenant-id tenant-id
+                        :events [(trigger-event)]
+                        :cas cas-predicate})]
+        (is (not (::anom/category result-1)) "First trigger should succeed"))
+      ;; Second append — same period, should conflict
+      (let [result-2 (es/append *event-store*
+                       {:tenant-id tenant-id
+                        :events [(trigger-event)]
+                        :cas cas-predicate})]
+        (is (= ::anom/conflict (::anom/category result-2)) "Second trigger should conflict"))
+      ;; Only one trigger event in the store
+      (let [triggers (into []
+                       (filter #(= :test/billing-trigger (:event/type %)))
+                       (es/read *event-store* {:tenant-id tenant-id}))]
+        (is (= 1 (count triggers)) "Exactly one trigger in store")))))
+
+(deftest pt-cas2-processor-handles-trigger-exactly-once
+  (testing "PT-CAS2: Two processors process same trigger — only one checkpoints"
+    (let [tenant-id (random-uuid)
+          trigger (es/->event {:type :test/billing-trigger
+                               :body {:period "2026-03-23"}})
+          billed (atom 0)
+          handler (fn [{:keys [event]}]
+                    (swap! billed inc)
+                    {:result/events
+                     [(es/->event {:type :test/billing-done
+                                   :body {:period (:period event)
+                                          :billed-by (random-uuid)}})]})]
+      ;; Append the trigger
+      (es/append *event-store* {:tenant-id tenant-id :events [trigger]})
+      ;; Two "processors" try to handle it
+      (core/process-event {:event trigger :handler-fn handler :event-store *event-store*
+                           :tenant-id tenant-id :processor-name :test/billing-proc})
+      (core/process-event {:event trigger :handler-fn handler :event-store *event-store*
+                           :tenant-id tenant-id :processor-name :test/billing-proc})
+      ;; Handler ran twice (at-least-once) but only one checkpoint + result
+      (let [all (into []
+                  (remove #(= :grain/tx (:event/type %)))
+                  (es/read *event-store* {:tenant-id tenant-id}))
+            billing-results (filter #(= :test/billing-done (:event/type %)) all)
+            checkpoints (filter #(= :grain/todo-processor-checkpoint (:event/type %)) all)]
+        (is (= 1 (count billing-results)) "Exactly one billing result")
+        (is (= 1 (count checkpoints)) "Exactly one checkpoint")))))
