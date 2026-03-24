@@ -5,6 +5,8 @@
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [ai.obney.grain.pubsub.interface :as pubsub]
+            [ai.obney.grain.periodic-task.interface :as pt]
+            [ai.obney.grain.periodic-task.core :as pt-core]
             [cognitect.anomalies :as anom]
             [clj-uuid :as uuid]))
 
@@ -22,7 +24,8 @@
    :test/effect-succeeded [:map [:msg :string]]
    :test/effect-failed [:map [:msg :string]]
    :test/billing-trigger [:map [:period :string]]
-   :test/billing-done [:map [:period :string] [:billed-by :uuid]]})
+   :test/billing-done [:map [:period :string] [:billed-by :uuid]]
+   :test/periodic-trigger [:map [:period :string]]})
 
 ;; Test Fixtures
 
@@ -969,3 +972,123 @@
                 (core/stop-tenant-poller poller))))
           (finally
             (reset! core/processor-registry* prev)))))))
+
+;; 16. defprocessor macro
+
+(deftest dp1-defprocessor-registers-and-creates-fn
+  (testing "DP1: defprocessor creates a function and registers it in the registry"
+    (let [prev @core/processor-registry*]
+      (try
+        (tp/defprocessor :test dp1-handler
+          {:topics #{:test/event-1}}
+          "Test processor for DP1."
+          [context]
+          {:result/events
+           [(es/->event {:type :test/event-processed
+                         :body {:event-id (:event/id (:event context))
+                                :status "processed"}})]})
+        ;; Function should exist
+        (is (fn? test-dp1-handler) "defprocessor should create a function")
+        ;; Should be in registry
+        (is (contains? @core/processor-registry* :test/dp1-handler)
+            "defprocessor should register the processor")
+        (let [entry (get @core/processor-registry* :test/dp1-handler)]
+          (is (= #{:test/event-1} (:topics entry)) "Topics should be registered")
+          (is (some? (:handler-fn entry)) "Handler fn should be registered"))
+        (finally
+          (reset! core/processor-registry* prev))))))
+
+(deftest dp2-defprocessor-works-with-poller
+  (testing "DP2: A defprocessor-registered processor works with the coalesced poller"
+    (let [prev @core/processor-registry*
+          processed (atom [])]
+      (try
+        (tp/defprocessor :test dp2-handler
+          {:topics #{:test/event-1}}
+          [context]
+          (swap! processed conj (:event/id (:event context)))
+          {})
+        (let [tenant-id (random-uuid)]
+          (es/append *event-store* {:tenant-id tenant-id
+                                    :events [(make-event :test/event-1 :body {:num 1})]})
+          (let [poller (core/start-tenant-poller
+                         {:event-store *event-store*
+                          :tenant-ids #{tenant-id}
+                          :poll-interval-ms 100
+                          :batch-size 100})]
+            (try
+              (Thread/sleep 2000)
+              (is (pos? (count @processed))
+                  (str "Processor should have processed events, got " (count @processed)))
+              (finally
+                (core/stop-tenant-poller poller)))))
+        (finally
+          (reset! core/processor-registry* prev))))))
+
+;; 17. defperiodic macro
+
+(deftest dp-p1-defperiodic-registers-trigger
+  (testing "DP-P1: defperiodic creates a function and registers it in the trigger registry"
+    (let [prev-trig @pt-core/periodic-trigger-registry*]
+      (try
+        (pt/defperiodic :test periodic-billing
+          {:schedule {:every 1 :duration :seconds}}
+          "Test periodic billing trigger."
+          [tenant-id time]
+          (let [period (.toString (.toLocalDate time))]
+            {:result/events
+             [(es/->event {:type :test/periodic-trigger
+                           :body {:period period}})]
+             :result/cas
+             {:types #{:test/periodic-trigger}
+              :predicate-fn (fn [existing]
+                              (not (some #(= period (:period %))
+                                         (into [] existing))))}}))
+        ;; Function should exist
+        (is (fn? test-periodic-billing) "defperiodic should create a function")
+        ;; Should be in trigger registry
+        (is (contains? @pt-core/periodic-trigger-registry* :test/periodic-billing)
+            "defperiodic should register the trigger")
+        (let [entry (get @pt-core/periodic-trigger-registry* :test/periodic-billing)]
+          (is (some? (:schedule entry)) "Schedule should be registered")
+          (is (some? (:handler-fn entry)) "Handler fn should be registered"))
+        (finally
+          (reset! pt-core/periodic-trigger-registry* prev-trig))))))
+
+(deftest dp-p2-start-periodic-triggers-appends-events
+  (testing "DP-P2: start-periodic-triggers! calls handler and appends CAS-deduplicated events"
+    (let [prev-trig @pt-core/periodic-trigger-registry*
+          tenant-id (random-uuid)]
+      (try
+        ;; Register a trigger via the macro
+        (pt/defperiodic :test dp-p2-billing
+          {:schedule {:every 1 :duration :seconds}}
+          [tid time]
+          {:result/events
+           [(es/->event {:type :test/periodic-trigger
+                         :body {:period "2026-03-23"}})]
+           :result/cas
+           {:types #{:test/periodic-trigger}
+            :predicate-fn (fn [existing]
+                            (not (some #(= "2026-03-23" (:period %))
+                                       (into [] existing))))}})
+        ;; Create a tenant
+        (es/append *event-store* {:tenant-id tenant-id
+                                  :events [(make-event :test/event-1 :body {:num 1})]})
+        ;; Start triggers
+        (let [triggers (pt-core/start-periodic-triggers!
+                        {:append-fn (partial es/append *event-store*)
+                         :tenant-ids-fn #(es/tenant-ids *event-store*)})]
+          (try
+            ;; Wait for at least one tick
+            (Thread/sleep 2000)
+            ;; Should have exactly 1 trigger event (CAS deduped even if multiple ticks)
+            (let [all (into []
+                        (filter #(= :test/periodic-trigger (:event/type %)))
+                        (es/read *event-store* {:tenant-id tenant-id}))]
+              (is (= 1 (count all))
+                  (str "Expected 1 trigger event, got " (count all))))
+            (finally
+              (pt-core/stop-periodic-triggers! triggers))))
+        (finally
+          (reset! pt-core/periodic-trigger-registry* prev-trig))))))

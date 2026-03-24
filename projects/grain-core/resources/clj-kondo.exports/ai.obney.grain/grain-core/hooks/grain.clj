@@ -52,6 +52,12 @@
 (defn defreadmodel [ctx]
   (def-handler-macro ctx 'ai.obney.grain.read-model-processor.interface/defreadmodel))
 
+(defn defprocessor [ctx]
+  (def-handler-macro ctx 'ai.obney.grain.todo-processor-v2.interface/defprocessor))
+
+(defn defperiodic [ctx]
+  (def-handler-macro ctx 'ai.obney.grain.periodic-task.interface/defperiodic))
+
 (defn defschemas
   "Hook for defschemas macro.
    Transforms (defschemas name schema-map) into (def name schema-map) for linting."

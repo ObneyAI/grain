@@ -8,6 +8,7 @@
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.control-plane.interface :as control-plane]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
+            [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
@@ -33,6 +34,8 @@
    :test/slow-work-failed [:map [:msg :string]]
    :test/billing-trigger [:map [:period :string]]
    :test/billing-done [:map [:period :string]]
+   :test/scheduled-trigger [:map [:period :string]]
+   :test/scheduled-done [:map [:period :string] [:processed-by/node-id :uuid]]
    :grain/todo-processor-effect-failure [:map
                                          [:processor/name :keyword]
                                          [:triggered-by :uuid]
@@ -80,6 +83,30 @@
   {:topics [:test/slow-work]
    :handler-fn #'slow-work-handler})
 
+;; Periodic trigger — runs on every node, CAS deduplicates
+(pt/defperiodic :test scheduled-trigger
+  {:schedule {:every 3 :duration :seconds}}
+  [tenant-id time]
+  (let [period (str (.toEpochMilli time))]
+    {:result/events
+     [(es/->event {:type :test/scheduled-trigger
+                   :body {:period period}})]
+     :result/cas
+     {:types #{:test/scheduled-trigger}
+      :predicate-fn (fn [existing]
+                      (not (some #(= period (:period %))
+                                 (into [] existing))))}}))
+
+;; Processor that handles the trigger
+(tp/defprocessor :test scheduled-handler
+  {:topics #{:test/scheduled-trigger}}
+  [context]
+  (let [node-id @node-id-atom]
+    {:result/events
+     [(es/->event {:type :test/scheduled-done
+                   :body {:period (:period (:event context))
+                          :processed-by/node-id node-id}})]}))
+
 ;; ------------------- ;;
 ;; System              ;;
 ;; ------------------- ;;
@@ -114,6 +141,11 @@
                                  :heartbeat-interval-ms 2000
                                  :staleness-threshold-ms 6000})
 
+        ;; Periodic triggers — every node runs these, CAS deduplicates
+        periodic-triggers (pt/start-periodic-triggers!
+                            {:append-fn (partial es/append event-store)
+                             :tenant-ids-fn #(es/tenant-ids event-store)})
+
         ;; nREPL for live interaction
         nrepl-server (nrepl/start-server :bind "0.0.0.0" :port nrepl-port)]
 
@@ -128,6 +160,7 @@
      :cache cache
      :cache-dir cache-dir
      :control-plane cp
+     :periodic-triggers periodic-triggers
      :nrepl-server nrepl-server
      :console-stop console-stop
      :ctx {:event-store event-store
@@ -136,7 +169,8 @@
 
 (defn stop
   "Stop the test app."
-  [{:keys [control-plane nrepl-server event-pubsub event-store cache console-stop]}]
+  [{:keys [control-plane periodic-triggers nrepl-server event-pubsub event-store cache console-stop]}]
+  (pt/stop-periodic-triggers! periodic-triggers)
   (control-plane/stop control-plane)
   (nrepl/stop-server nrepl-server)
   (pubsub/stop event-pubsub)
@@ -216,6 +250,18 @@
   (into []
     (remove #(= :grain/tx (:event/type %)))
     (es/read (:event-store system) {:tenant-id tenant-id})))
+
+(defn scheduled-trigger-summary
+  "Summary of scheduled triggers and their processing for a tenant."
+  [system tenant-id]
+  (let [all (into []
+              (remove #(= :grain/tx (:event/type %)))
+              (es/read (:event-store system) {:tenant-id tenant-id}))
+        triggers (filter #(= :test/scheduled-trigger (:event/type %)) all)
+        done (filter #(= :test/scheduled-done (:event/type %)) all)]
+    {:triggers (count triggers)
+     :processed (count done)
+     :by-node (frequencies (map #(str (:processed-by/node-id %)) done))}))
 
 (defn running-processors
   "Show running processors on this node."

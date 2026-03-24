@@ -18,10 +18,16 @@
   "Global registry of todo processors. Maps processor-name keyword to config map."
   (atom {}))
 
+
 (defn register-processor!
-  "Register a processor so the control plane can discover it."
-  [processor-name config]
-  (swap! processor-registry* assoc processor-name config))
+  "Register a processor so the control plane can discover it.
+   Two arities:
+     (register-processor! name handler-fn opts)  — used by defprocessor macro
+     (register-processor! name config)           — legacy, config has :handler-fn + :topics"
+  ([processor-name handler-fn opts]
+   (swap! processor-registry* assoc processor-name (merge {:handler-fn handler-fn} opts)))
+  ([processor-name config]
+   (swap! processor-registry* assoc processor-name config)))
 
 ;; ------------------- ;;
 ;; Checkpoint Support  ;;

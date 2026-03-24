@@ -1,9 +1,13 @@
 {:hooks {:analyze-call {ai.obney.grain.command-processor.interface/defcommand hooks.grain/defcommand
                         ai.obney.grain.query-processor.interface/defquery hooks.grain/defquery
                         ai.obney.grain.read-model-processor.interface/defreadmodel hooks.grain/defreadmodel
+                        ai.obney.grain.todo-processor-v2.interface/defprocessor hooks.grain/defprocessor
+                        ai.obney.grain.periodic-task.interface/defperiodic hooks.grain/defperiodic
                         ai.obney.grain.schema-util.interface/defschemas hooks.grain/defschemas}}
  :linters {:clojure-lsp/unused-public-var
            {:exclude-when-defined-by [ai.obney.grain.command-processor.interface/defcommand
                                       ai.obney.grain.query-processor.interface/defquery
                                       ai.obney.grain.read-model-processor.interface/defreadmodel
+                                      ai.obney.grain.todo-processor-v2.interface/defprocessor
+                                      ai.obney.grain.periodic-task.interface/defperiodic
                                       ai.obney.grain.schema-util.interface/defschemas]}}}

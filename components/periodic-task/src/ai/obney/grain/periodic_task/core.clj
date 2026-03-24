@@ -54,6 +54,59 @@
   (u/log ::stopping-periodic-task ::args args)
   (.close task))
 
+;; --------------------------------- ;;
+;; Periodic trigger registry         ;;
+;; --------------------------------- ;;
+
+(def periodic-trigger-registry*
+  "Global registry of periodic triggers. Maps trigger-name keyword to
+   {:schedule config, :handler-fn fn}."
+  (atom {}))
+
+(defn register-periodic-trigger!
+  "Register a periodic trigger."
+  [trigger-name handler-fn opts]
+  (swap! periodic-trigger-registry* assoc trigger-name
+         (merge {:handler-fn handler-fn} opts)))
+
+(defn start-periodic-triggers!
+  "Start all registered periodic triggers. Each trigger runs on a chime schedule.
+   On each tick, the handler is called for each tenant with (tenant-id, time).
+   The handler returns {:result/events [...] :result/cas {...}}.
+   The framework appends the events with the CAS predicate.
+
+   event-store-fns: {:append-fn (fn [args] ...)
+                     :tenant-ids-fn (fn [] ...)}
+
+   Returns a map of {trigger-name -> chime-task} that can be stopped."
+  [{:keys [append-fn tenant-ids-fn]}]
+  (let [registry @periodic-trigger-registry*
+        control-plane-tid #uuid "00000000-0000-0000-0000-000000000001"]
+    (into {}
+      (for [[trigger-name config] registry]
+        (let [sseq (schedule-seq (:schedule config))
+              handler-fn (:handler-fn config)
+              task (chime/chime-at sseq
+                     (fn [time]
+                       (try
+                         (let [domain-tenants (disj (tenant-ids-fn) control-plane-tid)]
+                           (doseq [tid domain-tenants]
+                             (let [result (handler-fn tid time)]
+                               (when-let [events (:result/events result)]
+                                 (append-fn
+                                   (cond-> {:tenant-id tid :events events}
+                                     (:result/cas result) (assoc :cas (:result/cas result))))))))
+                         (catch Throwable t
+                           (u/log ::periodic-trigger-error :trigger trigger-name :exception t)))))]
+          [trigger-name task])))))
+
+(defn stop-periodic-triggers!
+  "Stop all running periodic triggers."
+  [triggers]
+  (doseq [[trigger-name task] triggers]
+    (u/log ::stopping-periodic-trigger :trigger trigger-name)
+    (.close task)))
+
 
 (comment
 
