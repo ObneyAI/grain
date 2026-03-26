@@ -15,7 +15,10 @@
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [com.brunobonacci.mulog :as u]
             [nrepl.server :as nrepl]
-            [clj-uuid :as uuid]))
+            [clj-uuid :as uuid]
+            [io.pedestal.http :as http]
+            [io.pedestal.http.route :as route]
+            [clojure.data.json :as json]))
 
 ;; ------------------- ;;
 ;; Schemas             ;;
@@ -108,6 +111,51 @@
                           :processed-by/node-id node-id}})]}))
 
 ;; ------------------- ;;
+;; HTTP Server         ;;
+;; ------------------- ;;
+
+(defn- health-handler [_request]
+  {:status 200
+   :headers {"Content-Type" "application/json"}
+   :body (json/write-str {:status "ok"})})
+
+(defn- whoami-handler [request]
+  (let [node-id @node-id-atom]
+    {:status 200
+     :headers {"Content-Type" "application/json"}
+     :body (json/write-str {:node-id (str node-id)
+                            :routed "local"})}))
+
+(defn- make-routes [routing-interceptor]
+  #{["/health" :get [health-handler] :route-name ::health]
+    ["/api/whoami" :get [routing-interceptor whoami-handler] :route-name ::whoami]})
+
+(defn start-http-server [system]
+  (let [cp (:control-plane system)
+        http-port (Integer/parseInt (or (System/getenv "HTTP_PORT") "8080"))
+        routing-interceptor (control-plane/tenant-routing-interceptor
+                              {:extract-tenant-id (fn [ctx]
+                                                    (when-let [tid-str (get-in ctx [:request :headers "x-tenant-id"])]
+                                                      (try (java.util.UUID/fromString tid-str)
+                                                           (catch Exception _ nil))))
+                               :this-node-id (:node-id cp)
+                               :ctx (:ctx system)
+                               :staleness-threshold-ms 6000})
+        routes (make-routes routing-interceptor)
+        server (-> {::http/port http-port
+                    ::http/host "0.0.0.0"
+                    ::http/type :jetty
+                    ::http/join? false
+                    ::http/routes #(route/expand-routes routes)}
+                   http/create-server
+                   http/start)]
+    (println (str "HTTP server on port " http-port))
+    server))
+
+(defn stop-http-server [server]
+  (when server (http/stop server)))
+
+;; ------------------- ;;
 ;; System              ;;
 ;; ------------------- ;;
 
@@ -124,6 +172,8 @@
   (u/set-global-context! {:app-name "control-plane-test"})
   (let [console-stop (u/start-publisher! {:type :console-json :pretty? true})
         nrepl-port (Integer/parseInt (or (System/getenv "NREPL_PORT") "7888"))
+        http-port (Integer/parseInt (or (System/getenv "HTTP_PORT") "8080"))
+        node-hostname (or (System/getenv "NODE_HOSTNAME") "localhost")
         cache-dir (str "/tmp/grain-cp-test-" (uuid/v4))
 
         ;; Core infrastructure
@@ -132,12 +182,11 @@
                                :event-pubsub event-pubsub})
         cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir cache-dir :db-name "cp-test"}))
 
-        ;; Control plane
+        ;; Control plane — include address in node metadata for routing
         cp (control-plane/start {:event-store event-store
                                  :cache cache
                                  :event-pubsub event-pubsub
-                                 ;; No processor-names needed — control plane assigns tenants,
-                                 ;; reactor starts all registered processors per tenant
+                                 :node-metadata {:address (str node-hostname ":" http-port)}
                                  :heartbeat-interval-ms 2000
                                  :staleness-threshold-ms 6000})
 
@@ -147,29 +196,35 @@
                              :tenant-ids-fn #(es/tenant-ids event-store)})
 
         ;; nREPL for live interaction
-        nrepl-server (nrepl/start-server :bind "0.0.0.0" :port nrepl-port)]
+        nrepl-server (nrepl/start-server :bind "0.0.0.0" :port nrepl-port)
+
+        system {:event-store event-store
+                :event-pubsub event-pubsub
+                :cache cache
+                :cache-dir cache-dir
+                :control-plane cp
+                :periodic-triggers periodic-triggers
+                :nrepl-server nrepl-server
+                :console-stop console-stop
+                :ctx {:event-store event-store
+                      :cache cache
+                      :tenant-id ai.obney.grain.control-plane.events/control-plane-tenant-id}}
+
+        ;; HTTP server with routing interceptor
+        http-server (start-http-server system)]
 
     ;; Store node-id for the processor handler
     (reset! node-id-atom (:node-id cp))
 
-    (u/log ::started :node-id (:node-id cp) :nrepl-port nrepl-port)
-    (println (str "Node " (:node-id cp) " started. nREPL on port " nrepl-port))
+    (u/log ::started :node-id (:node-id cp) :nrepl-port nrepl-port :http-port http-port)
+    (println (str "Node " (:node-id cp) " started. nREPL on port " nrepl-port ", HTTP on port " http-port))
 
-    {:event-store event-store
-     :event-pubsub event-pubsub
-     :cache cache
-     :cache-dir cache-dir
-     :control-plane cp
-     :periodic-triggers periodic-triggers
-     :nrepl-server nrepl-server
-     :console-stop console-stop
-     :ctx {:event-store event-store
-           :cache cache
-           :tenant-id ai.obney.grain.control-plane.events/control-plane-tenant-id}}))
+    (assoc system :http-server http-server)))
 
 (defn stop
   "Stop the test app."
-  [{:keys [control-plane periodic-triggers nrepl-server event-pubsub event-store cache console-stop]}]
+  [{:keys [control-plane periodic-triggers nrepl-server http-server event-pubsub event-store cache console-stop]}]
+  (stop-http-server http-server)
   (pt/stop-periodic-triggers! periodic-triggers)
   (control-plane/stop control-plane)
   (nrepl/stop-server nrepl-server)
@@ -267,6 +322,16 @@
   "Show running processors on this node."
   [system]
   (control-plane/running-processors (:control-plane system)))
+
+(defn route-for-tenant-check
+  "Check routing decision for a tenant from this node's perspective."
+  [system tenant-id]
+  (rmp/l1-clear!)
+  (let [cp (:control-plane system)
+        ctx (:ctx system)
+        leases (control-plane/project-lease-ownership ctx)
+        active (control-plane/project-active-nodes ctx 6000)]
+    (control-plane/route-for-tenant leases active (:node-id cp) tenant-id)))
 
 (defn reactor-diagnostics
   "Detailed diagnostic state of the control plane reactor."

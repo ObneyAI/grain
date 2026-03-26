@@ -2,6 +2,7 @@
   (:require [ai.obney.grain.control-plane.events :as events]
             [ai.obney.grain.control-plane.assignment :as assignment]
             [ai.obney.grain.control-plane.core :as core]
+            [ai.obney.grain.control-plane.routing :as routing]
             [ai.obney.grain.control-plane.read-models]
             [ai.obney.grain.control-plane.schemas]))
 
@@ -29,3 +30,13 @@
 
 (defn project-lease-ownership [ctx]
   (core/project-lease-ownership ctx))
+
+(defn route-for-tenant
+  "Pure routing decision. See routing/route-for-tenant."
+  [lease-ownership active-nodes this-node-id tenant-id]
+  (routing/route-for-tenant lease-ownership active-nodes this-node-id tenant-id))
+
+(defn tenant-routing-interceptor
+  "Pedestal interceptor for tenant-aware routing. See routing/tenant-routing-interceptor."
+  [opts]
+  (routing/tenant-routing-interceptor opts))

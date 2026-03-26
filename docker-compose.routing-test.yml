@@ -28,6 +28,7 @@ services:
       NODE_HOSTNAME: node-a
     ports:
       - "7890:7890"
+      - "8090:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -48,6 +49,7 @@ services:
       START_DELAY_MS: "3000"
     ports:
       - "7891:7891"
+      - "8091:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,6 +70,19 @@ services:
       START_DELAY_MS: "6000"
     ports:
       - "7892:7892"
+      - "8092:8080"
     depends_on:
       postgres:
         condition: service_healthy
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "8080:8080"
+      - "8404:8404"
+    depends_on:
+      - node-a
+      - node-b
+      - node-c

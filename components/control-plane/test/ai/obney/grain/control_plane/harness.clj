@@ -38,8 +38,10 @@
   (kv/stop cache)
   (delete-dir-recursively cache-dir))
 
-(defn emit-heartbeat! [{:keys [ctx node-id]}]
-  (cp/emit-heartbeat! ctx node-id {}))
+(defn emit-heartbeat!
+  ([instance] (emit-heartbeat! instance {}))
+  ([{:keys [ctx node-id]} metadata]
+   (cp/emit-heartbeat! ctx node-id metadata)))
 
 (defn emit-departed! [{:keys [ctx node-id]}]
   (cp/emit-node-departed! ctx node-id))

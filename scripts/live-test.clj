@@ -522,6 +522,66 @@
       (check (str "All slow work eventually completed (" slow-done "/3)")
              (= 3 slow-done)))))
 
+(defn scenario-16 []
+  (header "Scenario 16: Tenant routing decisions across nodes")
+  ;; Ensure all nodes are up
+  (restart-victim!)
+  (Thread/sleep 6000)
+  ;; For each tenant, ask every node for its routing decision
+  (let [tids @tenant-ids
+        all-decisions
+        (doall
+          (for [tid tids]
+            {:tenant tid
+             :decisions
+             (doall
+               (for [port all-ports]
+                 (eval-read port
+                   (format "(let [d (app/route-for-tenant-check @app/app
+                                      (java.util.UUID/fromString \"%s\"))]
+                              {:port %d
+                               :decision (:route/decision d)
+                               :reason (:route/reason d)
+                               :owner (when (:route/owner d) (str (:route/owner d)))
+                               :address (:route/address d)})"
+                           tid port))))}))]
+    ;; Check: for each tenant, exactly one node says :local with :owner
+    (doseq [{:keys [tenant decisions]} all-decisions]
+      (let [local-owners (filter #(and (= :local (:decision %))
+                                       (= :owner (:reason %)))
+                                 decisions)
+            remotes (filter #(= :remote (:decision %)) decisions)]
+        (check (str "Tenant " (subs tenant 0 8) ": exactly 1 local owner (got " (count local-owners) ")")
+               (= 1 (count local-owners)))
+        (check (str "Tenant " (subs tenant 0 8) ": " (count remotes) " remote decisions")
+               (= (dec n-nodes) (count remotes)))))
+    ;; Check: all remote decisions have address metadata
+    (let [all-remotes (mapcat (fn [{:keys [decisions]}]
+                                (filter #(= :remote (:decision %)) decisions))
+                              all-decisions)]
+      (check "All remote decisions include address"
+             (every? #(some? (:address %)) all-remotes))))
+  ;; Now kill victim and verify routing updates
+  (kill-victim!)
+  (info "Waiting for reassignment (12s)...")
+  (Thread/sleep 12000)
+  (let [survivor-ports (remove #(= victim-port %) all-ports)
+        tids @tenant-ids]
+    ;; All tenants should now be :local on one of the survivors
+    (doseq [tid tids]
+      (let [decisions (doall
+                        (for [port survivor-ports]
+                          (eval-read port
+                            (format "(let [d (app/route-for-tenant-check @app/app
+                                              (java.util.UUID/fromString \"%s\"))]
+                                      {:port %d :decision (:route/decision d) :reason (:route/reason d)})"
+                                    tid port))))
+            local-owners (filter #(and (= :local (:decision %))
+                                       (= :owner (:reason %)))
+                                 decisions)]
+        (check (str "Post-failover tenant " (subs tid 0 8) ": has local owner among survivors")
+               (= 1 (count local-owners)))))))
+
 ;; -------------------------------- ;;
 ;; Main runner                      ;;
 
@@ -552,6 +612,7 @@
     (scenario-13)
     (scenario-14)
     (scenario-15)
+    (scenario-16)
 
     (catch Throwable t
       (swap! results update :error inc)
