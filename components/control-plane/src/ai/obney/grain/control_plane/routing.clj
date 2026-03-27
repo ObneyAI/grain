@@ -3,7 +3,8 @@
 
    Provides a pure routing decision function and a Pedestal interceptor
    that ensures requests are served by the node holding the tenant's lease."
-  (:require [ai.obney.grain.control-plane.core :as cp]))
+  (:require [ai.obney.grain.control-plane.core :as cp]
+            [com.brunobonacci.mulog :as u]))
 
 (defn route-for-tenant
   "Pure routing decision. Given lease ownership, active nodes, this node's ID,
@@ -75,17 +76,25 @@
                decision       (route-for-tenant lease-ownership active-nodes
                                                 this-node-id tenant-id)]
            (if (= :local (:route/decision decision))
-             (assoc pedestal-context
-                    ::routing-decision decision
-                    ::tenant-id tenant-id)
-             (assoc pedestal-context
-                    :response
-                    {:status retry-status
-                     :headers (cond-> {"Retry-After" (str retry-after-secs)
-                                       "Content-Type" "application/json"}
-                                (:route/address decision)
-                                (assoc "X-Grain-Owner" (:route/address decision)))
-                     :body "{\"error\":\"wrong-node\",\"retry\":true}"}))))))
+             (do
+               (case (:route/reason decision)
+                 :owner       (u/log :metric/metric :metric/name "RoutingLocal" :metric/value 1 :metric/resolution :high)
+                 (:no-owner
+                  :owner-stale) (u/log :metric/metric :metric/name "RoutingDegradation" :metric/value 1 :metric/resolution :high)
+                 nil)
+               (assoc pedestal-context
+                      ::routing-decision decision
+                      ::tenant-id tenant-id))
+             (do
+               (u/log :metric/metric :metric/name "RoutingRemote" :metric/value 1 :metric/resolution :high)
+               (assoc pedestal-context
+                      :response
+                      {:status retry-status
+                       :headers (cond-> {"Retry-After" (str retry-after-secs)
+                                         "Content-Type" "application/json"}
+                                  (:route/address decision)
+                                  (assoc "X-Grain-Owner" (:route/address decision)))
+                       :body "{\"error\":\"wrong-node\",\"retry\":true}"})))))))
 
    :leave
    (fn [pedestal-context]

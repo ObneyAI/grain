@@ -173,6 +173,120 @@
           (delete-dir-recursively dir))))))
 
 ;; =====================================
+;; DR1: No departure before drain
+;; =====================================
+
+(deftest dr1-departure-after-drain
+  (testing "DR1: departure event is emitted only after in-flight work has drained"
+    (let [dir (str "/tmp/cp-dr1-test-" (uuid/v4))
+          store (es/start {:conn {:type :in-memory}})
+          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          tenant-1 (uuid/v4)
+          effect-started (promise)
+          effect-gate (promise)]
+      (try
+        (let [prev-registry @tp/processor-registry*]
+          (try
+            ;; Register a processor with a blocking effect — we control when it finishes
+            (tp/register-processor!
+             :test/dr1-slow-proc
+             {:topics [:test/lifecycle-event]
+              :handler-fn (fn [{:keys [event]}]
+                            {:result/effect (fn []
+                                              (deliver effect-started true)
+                                              ;; Block until test releases the gate
+                                              (deref effect-gate 10000 :timeout))
+                             :result/checkpoint :after
+                             :result/on-success []})})
+            ;; Create tenant and event
+            (es/append store {:tenant-id tenant-1
+                              :events [(es/->event {:type :test/lifecycle-event :body {}})]})
+            ;; Start control plane — will assign tenant and start processing
+            (let [cp-instance (cp/start {:event-store store
+                                         :cache cache
+                                         :heartbeat-interval-ms 200
+                                         :staleness-threshold-ms 1000})]
+              ;; Wait for assignment + processing to begin
+              (Thread/sleep 2000)
+              ;; Wait for the effect to start (proves the processor picked up the event)
+              (deref effect-started 5000 :timeout)
+              ;; Now stop the control plane in a separate thread
+              (let [stop-future (future (cp/stop cp-instance))]
+                ;; Give stop a moment to begin draining
+                (Thread/sleep 500)
+                ;; Check: departure event should NOT exist yet (drain still in progress)
+                (rmp/l1-clear!)
+                (let [all-events (into []
+                                   (remove #(= :grain/tx (:event/type %)))
+                                   (es/read store {:tenant-id events/control-plane-tenant-id}))
+                      departures (filter #(= :grain.control/node-departed (:event/type %)) all-events)]
+                  (is (empty? departures)
+                      "Departure event must not exist while drain is in progress"))
+                ;; Release the gate — allow the effect to complete
+                (deliver effect-gate :done)
+                ;; Wait for stop to finish
+                (deref stop-future 10000 :timeout)
+                ;; Now departure should exist
+                (rmp/l1-clear!)
+                (let [all-events (into []
+                                   (remove #(= :grain/tx (:event/type %)))
+                                   (es/read store {:tenant-id events/control-plane-tenant-id}))
+                      departures (filter #(= :grain.control/node-departed (:event/type %)) all-events)]
+                  (is (= 1 (count departures))
+                      "Departure event should exist after drain completes"))))
+            (finally
+              (reset! tp/processor-registry* prev-registry))))
+        (finally
+          (kv/stop cache)
+          (es/stop store)
+          (delete-dir-recursively dir))))))
+
+;; =====================================
+;; DR2: Heartbeat stops before drain
+;; =====================================
+
+(deftest dr2-heartbeat-stops-before-drain
+  (testing "DR2: no heartbeat events appear after stop begins"
+    (let [dir (str "/tmp/cp-dr2-test-" (uuid/v4))
+          store (es/start {:conn {:type :in-memory}})
+          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+      (try
+        (let [cp-instance (cp/start {:event-store store
+                                     :cache cache
+                                     :heartbeat-interval-ms 200
+                                     :staleness-threshold-ms 1000})]
+          ;; Wait for several heartbeats
+          (Thread/sleep 800)
+          ;; Record the last heartbeat ID before stopping
+          (rmp/l1-clear!)
+          (let [ctx {:event-store store :cache cache
+                     :tenant-id events/control-plane-tenant-id}
+                all-before (into []
+                             (remove #(= :grain/tx (:event/type %)))
+                             (es/read store {:tenant-id events/control-plane-tenant-id}))
+                heartbeats-before (filter #(= :grain.control/node-heartbeat (:event/type %)) all-before)
+                last-hb-before (last heartbeats-before)]
+            ;; Stop the control plane
+            (cp/stop cp-instance)
+            ;; Wait long enough that another heartbeat would have fired if not stopped
+            (Thread/sleep 500)
+            ;; Count heartbeats after the last one before stop
+            (let [all-after (into []
+                              (remove #(= :grain/tx (:event/type %)))
+                              (es/read store {:tenant-id events/control-plane-tenant-id}))
+                  heartbeats-after (filter #(= :grain.control/node-heartbeat (:event/type %)) all-after)
+                  new-heartbeats (filter (fn [hb]
+                                           (pos? (compare (str (:event/id hb))
+                                                          (str (:event/id last-hb-before)))))
+                                         heartbeats-after)]
+              (is (empty? new-heartbeats)
+                  "No new heartbeats should appear after stop begins"))))
+        (finally
+          (kv/stop cache)
+          (es/stop store)
+          (delete-dir-recursively dir))))))
+
+;; =====================================
 ;; PT-CAS3: Periodic task deduplication
 ;; =====================================
 
