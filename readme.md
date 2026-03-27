@@ -438,7 +438,7 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :sha "3f0d07e1a97b864f21b0d102fbc216510ff02aa7"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -451,7 +451,7 @@ Add the control plane package:
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :sha "3f0d07e1a97b864f21b0d102fbc216510ff02aa7"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -488,7 +488,7 @@ Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 proc
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :sha "3f0d07e1a97b864f21b0d102fbc216510ff02aa7"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -499,7 +499,7 @@ Distributed coordination for multi-instance deployments. Coordinator election, t
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :sha "3f0d07e1a97b864f21b0d102fbc216510ff02aa7"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -512,7 +512,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :sha "3f0d07e1a97b864f21b0d102fbc216510ff02aa7"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -525,7 +525,7 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :sha "3f0d07e1a97b864f21b0d102fbc216510ff02aa7"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
@@ -536,7 +536,7 @@ obneyai/grain-event-store-postgres-v3
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :sha "3f0d07e1a97b864f21b0d102fbc216510ff02aa7"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
