@@ -1,12 +1,14 @@
 # Grain
 
-An Event-Sourced framework for building multi-tenant systems in Clojure.
+Opinionated building blocks for AI-native information systems in Clojure.
 
 ## What is Grain?
 
-Grain is a framework for building Event-Sourced systems using CQRS (Command Query Responsibility Segregation). It provides composable components that snap together like Lego bricks—start with an in-memory event store for quick iteration, then swap in Postgres with a single line change when you're ready.
+Grain is a set of composable building blocks for building event-sourced information systems using CQRS (Command Query Responsibility Segregation). The event store is the single source of truth — humans, application code, and AI agents all read from and write to the same immutable log of facts.
 
-Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks.
+Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks. Start with an in-memory event store for quick iteration, then swap in Postgres with a single line change.
+
+For multi-instance deployments, an opt-in control plane coordinates tenant assignment across nodes using event-sourced leases — no external coordination service required.
 
 ## Architecture
 
@@ -36,7 +38,7 @@ Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-i
                                                 (async)
 ```
 
-**Commands** are the only path to state change—they validate business rules and emit events. **Events** are immutable facts stored in the event store. **Queries** read from projections (read models) built from events. **Todo Processors** react to events asynchronously, enabling event-driven workflows.
+**Commands** are the only path to state change — they validate business rules and emit events. **Events** are immutable facts stored in the event store. **Queries** read from projections (read models) built from events. **Todo Processors** react to events asynchronously, enabling event-driven workflows.
 
 ## Core Concepts
 
@@ -109,6 +111,64 @@ Commands and queries support an `:authorized?` predicate in their registry opts.
 ```
 
 Authorization is enforced at the adapter level (request handlers, Datastar) before the command or query processor runs. The behavior is **deny by default**: if `:authorized?` is missing or returns a non-`true` value, the request is rejected. Every command and query must have an `:authorized?` predicate to be executable via an adapter.
+
+### Todo Processors
+
+Todo processors react to events asynchronously. They subscribe to event types and run whenever matching events are appended:
+
+```clojure
+(defprocessor :billing charge-membership
+  {:topics #{:billing/membership-due}}
+  "Charges a member's payment method when their membership is due."
+  [context]
+  (let [event (:event context)
+        member-id (:member-id event)]
+    {:result/effect (fn [] (stripe/charge! member-id))
+     :result/checkpoint :after
+     :result/on-success [(es/->event {:type :billing/membership-charged
+                                       :body {:member-id member-id}})]}))
+```
+
+The handler receives a context with `:event`, `:event-store`, and `:tenant-id`. Return one of:
+
+| Return map | Semantics | Checkpointing |
+| --- | --- | --- |
+| `{:result/events [...]}` | Pure — no side effects | Batch checkpointed (one checkpoint per poll cycle) |
+| `{:result/effect fn, :result/checkpoint :before}` | At-most-once — checkpoint first, then run effect | Per-event |
+| `{:result/effect fn, :result/checkpoint :after}` | At-least-once — run effect first, then checkpoint | Per-event |
+| `{}` | No-op — acknowledge and move on | Per-event |
+
+Checkpointing uses CAS (Compare-and-Swap) on the event store, so the same event is never processed twice even across lease transfers between nodes.
+
+### Periodic Tasks
+
+Periodic tasks run on a schedule and emit trigger events for each tenant. CAS deduplication ensures only one trigger per schedule tick across all nodes:
+
+```clojure
+(defperiodic :billing daily-membership-check
+  {:schedule {:cron "0 0 * * *"}}
+  "Emits a billing trigger for each tenant once per day."
+  [tenant-id time]
+  (let [period (.toString (.toLocalDate time))]
+    {:result/events
+     [(es/->event {:type :billing/membership-due
+                   :body {:period period}})]
+     :result/cas
+     {:types #{:billing/membership-due}
+      :predicate-fn (fn [existing]
+                      (not (some #(= period (:period %))
+                                 (into [] existing))))}}))
+```
+
+Every node runs the schedule independently. The CAS predicate ensures only the first node to append wins — others get a silent conflict. A separate `defprocessor` handles the trigger events (see the billing example above).
+
+Schedule options:
+
+```clojure
+{:schedule {:cron "0 0 * * *"}}                    ; UNIX cron
+{:schedule {:every 30 :duration :seconds}}          ; interval
+{:schedule {:every 5 :duration :minutes}}
+```
 
 ### Read Models / Projections
 
@@ -289,6 +349,88 @@ This creates paired routes for each annotated query — an HTML page route and a
   (signals)         └───────────────────────────────────────────┘
 ```
 
+## Distributed Coordination
+
+For multi-instance deployments, the `grain-control-plane` package provides distributed coordination using Grain's own event-sourcing primitives. No external coordination service (ZooKeeper, etcd, Consul) is required — the control plane is itself event-sourced, storing its state in a dedicated tenant on the shared event store.
+
+### How It Works
+
+```
+  ┌──────────┐     ┌──────────┐     ┌──────────┐
+  │  Node A  │     │  Node B  │     │  Node C  │
+  │          │     │          │     │          │
+  │ Poller   │     │ Poller   │     │ Poller   │
+  │ T1,T2    │     │ T3,T4    │     │ T5,T6    │
+  └────┬─────┘     └────┬─────┘     └────┬─────┘
+       │                │                │
+       │   heartbeat    │   heartbeat    │   heartbeat
+       ▼                ▼                ▼
+  ┌──────────────────────────────────────────────┐
+  │              Event Store (Postgres)           │
+  │                                              │
+  │  Control plane tenant:                       │
+  │    heartbeats, departures, lease events      │
+  │                                              │
+  │  Domain tenants:                             │
+  │    T1, T2, T3, T4, T5, T6, ...              │
+  └──────────────────────────────────────────────┘
+```
+
+1. **Heartbeats** — Each node periodically appends heartbeat events. Nodes that stop heartbeating are considered stale after a configurable threshold.
+2. **Coordinator election** — The active node with the lexicographically smallest UUID v7 becomes coordinator. Deterministic, no voting protocol.
+3. **Tenant assignment** — The coordinator projects active nodes and domain tenants, computes a round-robin assignment, and emits lease-acquired/lease-released events.
+4. **Reconciliation** — Each node projects the lease-ownership read model and starts/stops its tenant poller to match its assigned tenants.
+5. **Graceful shutdown** — On stop, the node drains in-flight work, then emits a departure event. The coordinator reassigns immediately.
+
+### Starting the Control Plane
+
+```clojure
+(require '[ai.obney.grain.control-plane.interface :as control-plane])
+
+(def cp (control-plane/start
+          {:event-store event-store
+           :cache cache                          ; LMDB KV store for read model L2
+           :node-metadata {:address "node-a:8080"} ; included in heartbeats
+           :heartbeat-interval-ms 2000
+           :staleness-threshold-ms 6000
+           :strategy :round-robin}))             ; or a custom (fn [active-nodes tenant-ids leases] ...)
+
+;; On shutdown:
+(control-plane/stop cp)
+```
+
+Register processors with `defprocessor` before starting the control plane. The control plane discovers them from the global registry and starts polling for assigned tenants automatically.
+
+### Tenant-Aware Routing
+
+In a multi-instance deployment behind a load balancer, HTTP requests and SSE connections should be served by the node that holds the tenant's lease (warm L2 cache, in-process pub/sub for SSE push).
+
+Grain provides a Pedestal interceptor that implements retry-until-correct-node routing with sticky cookies:
+
+```clojure
+(def routing-interceptor
+  (control-plane/tenant-routing-interceptor
+    {:extract-tenant-id (fn [ctx]
+                          (get-in ctx [:grain/additional-context :auth-claims :tenant-id]))
+     :this-node-id      (:node-id cp)
+     :ctx               (:ctx cp)
+     :staleness-threshold-ms 6000}))
+
+;; Add to your Pedestal routes after the auth interceptor:
+#{["/api/counters" :get [auth-interceptor routing-interceptor counters-handler]]}
+```
+
+When a request hits the wrong node, the interceptor returns `503` with `Retry-After`. The load balancer (ALB, HAProxy) retries on another backend. When the correct node serves the request, it sets a sticky cookie — subsequent requests from that client are locked to that node. Self-healing on lease migration: the old node stops setting the cookie, the client bounces, and finds the new owner.
+
+For custom routing logic without the interceptor:
+
+```clojure
+(control-plane/route-for-tenant lease-ownership active-nodes this-node-id tenant-id)
+;; => {:route/decision :local,  :route/reason :owner}
+;; => {:route/decision :remote, :route/owner node-id, :route/address "10.0.1.2:8080"}
+;; => {:route/decision :local,  :route/reason :no-owner}   ; graceful degradation
+```
+
 ## Getting Started
 
 Add to your `deps.edn`:
@@ -296,17 +438,42 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0028071f79f5fed8ce1cb0677c4f2d0c2e40f76c"
+ :sha "155920e9b904eac94510156f62c9f8e465e25637"
  :deps/root "projects/grain-core-v2"}
 ```
 
 See `bases/example-base` and `components/example-service` for a complete example application. Run `development/src/example_app_demo.clj` to start and interact with the example system.
+
+### Scaling to Multiple Instances
+
+Add the control plane package:
+
+```clojure
+obneyai/grain-control-plane
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :deps/root "projects/grain-control-plane"}
+```
+
+Then start the control plane alongside your event store:
+
+```clojure
+(require '[ai.obney.grain.control-plane.interface :as cp])
+
+(def control-plane
+  (cp/start {:event-store event-store
+             :cache cache
+             :node-metadata {:address (str hostname ":" port)}}))
+```
+
+That's it. The control plane discovers registered processors, assigns tenants via leases, and starts polling. Each node processes only its assigned tenants.
 
 ## Available Packages
 
 | Package | Summary |
 | --- | --- |
 | **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store |
+| **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
 | **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE |
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
@@ -321,9 +488,22 @@ Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 proc
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0028071f79f5fed8ce1cb0677c4f2d0c2e40f76c"
+ :sha "155920e9b904eac94510156f62c9f8e465e25637"
  :deps/root "projects/grain-core-v2"}
 ```
+
+### grain-control-plane
+
+Distributed coordination for multi-instance deployments. Coordinator election, tenant lease management, pull-based polling with batch checkpointing, periodic task scheduling with CAS deduplication, and tenant-aware load balancer routing:
+
+```clojure
+obneyai/grain-control-plane
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "155920e9b904eac94510156f62c9f8e465e25637"
+ :deps/root "projects/grain-control-plane"}
+```
+
+Includes the core CQRS components (event store, read model processor, todo processor, periodic task, pub/sub).
 
 ### grain-datastar
 
@@ -332,7 +512,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0028071f79f5fed8ce1cb0677c4f2d0c2e40f76c"
+ :sha "155920e9b904eac94510156f62c9f8e465e25637"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -345,7 +525,7 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0028071f79f5fed8ce1cb0677c4f2d0c2e40f76c"
+ :sha "155920e9b904eac94510156f62c9f8e465e25637"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
@@ -356,7 +536,7 @@ obneyai/grain-event-store-postgres-v3
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0028071f79f5fed8ce1cb0677c4f2d0c2e40f76c"
+ :sha "155920e9b904eac94510156f62c9f8e465e25637"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
@@ -383,7 +563,7 @@ We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and
 
 ## Status
 
-Grain is MIT licensed. We use it in production, but it's actively evolving. The core CQRS/Event Sourcing components are stable.
+Grain is MIT licensed. We use it in production, but it's actively evolving. The core CQRS/Event Sourcing components are stable. The control plane is new and under active development.
 
 ## More Information
 
