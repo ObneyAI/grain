@@ -429,10 +429,11 @@
    config keys:
      :event-store      - the event store instance
      :tenant-ids       - set of tenant UUIDs this poller is responsible for (atom or set)
+     :context          - optional app context map merged into each handler's context
      :poll-interval-ms - poll frequency (default 250)
      :batch-size       - max events per tenant per cycle (default 100)
      :thread-pool-size - handler dispatch pool size (default 32)"
-  [{:keys [event-store tenant-ids poll-interval-ms batch-size thread-pool-size]
+  [{:keys [event-store tenant-ids context poll-interval-ms batch-size thread-pool-size]
     :or {poll-interval-ms 250
          batch-size 100
          thread-pool-size 32}}]
@@ -486,10 +487,11 @@
                                      ;; Process events sequentially within this tenant
                                      (doseq [event events]
                                        (when @running
-                                         (let [ctx {:event event
-                                                    :handler-fn handler-fn
-                                                    :event-store event-store
-                                                    :tenant-id tid}
+                                         (let [ctx (merge context
+                                                          {:event event
+                                                           :handler-fn handler-fn
+                                                           :event-store event-store
+                                                           :tenant-id tid})
                                                result (or (handler-fn ctx) {})]
                                            (if (:result/effect result)
                                              (process-event (assoc ctx :processor-name proc-name))
