@@ -1,10 +1,17 @@
 {:deps {org.clojure/clojure {:mvn/version "1.12.0"}
         pgesv3/event-store-postgres-v3 {:local/root "../../components/event-store-postgres-v3"}
         pgesv3/event-store-v3 {:local/root "../../components/event-store-v3"}
+        pgesv3/control-plane {:local/root "../../components/control-plane"}
+        pgesv3/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        pgesv3/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
         pgesv3/pubsub {:local/root "../../components/pubsub"}
+        pgesv3/kv-store {:local/root "../../components/kv-store"}
+        pgesv3/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}
         pgesv3/anomalies {:local/root "../../components/anomalies"}
         pgesv3/schema-util {:local/root "../../components/schema-util"}
-        pgesv3/time {:local/root "../../components/time"}}
+        pgesv3/time {:local/root "../../components/time"}
+        pgesv3/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}
+        pgesv3/periodic-task {:local/root "../../components/periodic-task"}}
 
- :aliases {:test {:extra-paths []
+ :aliases {:test {:extra-paths ["test"]
                   :extra-deps  {}}}}

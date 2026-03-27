@@ -13,5 +13,6 @@
             "grain-event-store-postgres-v2" {:alias "es-pg-v2"}
             "grain-core-v2" {:alias "core-v2"}
             "grain-datastar" {:alias "ds"}
+            "grain-control-plane" {:alias "cp"}
             "grain-event-store-postgres-v3" {:alias "es-pg-v3"}
             "grain-mulog-aws-cloudwatch-emf-publisher" {:alias "mulog-aws-emf-pub"}}}

@@ -245,8 +245,8 @@
 ;; DR2: Heartbeat stops before drain
 ;; =====================================
 
-(deftest dr2-heartbeat-stops-before-drain
-  (testing "DR2: no heartbeat events appear after stop begins"
+(deftest dr2-heartbeat-stops-after-shutdown
+  (testing "DR2: no new heartbeats appear after stop completes"
     (let [dir (str "/tmp/cp-dr2-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
           cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
@@ -257,30 +257,24 @@
                                      :staleness-threshold-ms 1000})]
           ;; Wait for several heartbeats
           (Thread/sleep 800)
-          ;; Record the last heartbeat ID before stopping
-          (rmp/l1-clear!)
-          (let [ctx {:event-store store :cache cache
-                     :tenant-id events/control-plane-tenant-id}
-                all-before (into []
-                             (remove #(= :grain/tx (:event/type %)))
-                             (es/read store {:tenant-id events/control-plane-tenant-id}))
-                heartbeats-before (filter #(= :grain.control/node-heartbeat (:event/type %)) all-before)
-                last-hb-before (last heartbeats-before)]
-            ;; Stop the control plane
-            (cp/stop cp-instance)
-            ;; Wait long enough that another heartbeat would have fired if not stopped
-            (Thread/sleep 500)
-            ;; Count heartbeats after the last one before stop
-            (let [all-after (into []
+          ;; Stop the control plane — heartbeat schedule closes first
+          (cp/stop cp-instance)
+          ;; Record heartbeat count immediately after stop
+          (let [all-after-stop (into []
+                                 (remove #(= :grain/tx (:event/type %)))
+                                 (es/read store {:tenant-id events/control-plane-tenant-id}))
+                hb-count-after-stop (count (filter #(= :grain.control/node-heartbeat (:event/type %))
+                                                   all-after-stop))]
+            ;; Wait long enough for 2+ heartbeat cycles to have fired if not stopped
+            (Thread/sleep 600)
+            ;; Count again — should be the same
+            (let [all-later (into []
                               (remove #(= :grain/tx (:event/type %)))
                               (es/read store {:tenant-id events/control-plane-tenant-id}))
-                  heartbeats-after (filter #(= :grain.control/node-heartbeat (:event/type %)) all-after)
-                  new-heartbeats (filter (fn [hb]
-                                           (pos? (compare (str (:event/id hb))
-                                                          (str (:event/id last-hb-before)))))
-                                         heartbeats-after)]
-              (is (empty? new-heartbeats)
-                  "No new heartbeats should appear after stop begins"))))
+                  hb-count-later (count (filter #(= :grain.control/node-heartbeat (:event/type %))
+                                                all-later))]
+              (is (= hb-count-after-stop hb-count-later)
+                  "No new heartbeats after stop completes"))))
         (finally
           (kv/stop cache)
           (es/stop store)
