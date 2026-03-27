@@ -2,20 +2,20 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
 
         ;; Control plane
-        poly/control-plane {:local/root "../../components/control-plane"}
+        control-plane/control-plane {:local/root "../../components/control-plane"}
 
         ;; Dependencies
-        poly/event-store-v3 {:local/root "../../components/event-store-v3"}
-        poly/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
-        poly/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
-        poly/periodic-task {:local/root "../../components/periodic-task"}
-        poly/pubsub {:local/root "../../components/pubsub"}
-        poly/kv-store {:local/root "../../components/kv-store"}
-        poly/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}
-        poly/anomalies {:local/root "../../components/anomalies"}
-        poly/schema-util {:local/root "../../components/schema-util"}
-        poly/time {:local/root "../../components/time"}
-        poly/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}}
+        control-plane/event-store-v3 {:local/root "../../components/event-store-v3"}
+        control-plane/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        control-plane/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
+        control-plane/periodic-task {:local/root "../../components/periodic-task"}
+        control-plane/pubsub {:local/root "../../components/pubsub"}
+        control-plane/kv-store {:local/root "../../components/kv-store"}
+        control-plane/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}
+        control-plane/anomalies {:local/root "../../components/anomalies"}
+        control-plane/schema-util {:local/root "../../components/schema-util"}
+        control-plane/time {:local/root "../../components/time"}
+        control-plane/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}}
 
  :aliases {:test {:extra-paths []
                   :extra-deps  {}}}}
