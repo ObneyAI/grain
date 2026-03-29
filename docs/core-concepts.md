@@ -44,6 +44,8 @@ Events are immutable facts about what happened:
  :name "My Counter"}                    ; directly into the event
 ```
 
+**Always use `->event` to construct events.** It generates UUID v7 IDs (time-ordered) required by the event store for correct ordering and deduplication. Never construct event maps manually with `java.util.UUID/randomUUID` — events with v4 UUIDs will be silently misordered or lost.
+
 ## Queries (Read Side)
 
 Queries read from projections without causing state changes:

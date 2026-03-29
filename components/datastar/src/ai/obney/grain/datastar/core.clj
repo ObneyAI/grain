@@ -42,8 +42,8 @@
    `routes` scans the query registry for entries with `:datastar/path` metadata
    and auto-generates three Pedestal routes per query:
      1. **Shim** (GET `/path`) — HTML shell that boots Datastar JS
-     2. **Stream GET** (`/path/stream`) — SSE (reuses existing session if nonce matches)
-     3. **Stream POST** (`/path/stream`) — Signal updates on existing SSE
+     2. **Stream GET** (`/path/__stream`) — SSE (reuses existing session if nonce matches)
+     3. **Stream POST** (`/path/__stream`) — Signal updates on existing SSE
 
    ## Auth and gate interceptors
 
@@ -114,7 +114,11 @@
   [raw-query]
   (let [query-name (:query/name raw-query)
         query-schema (try (when query-name (mc/schema query-name))
-                          (catch Exception _ nil))
+                          (catch Exception e
+                            (u/log ::missing-query-schema
+                                   :query-name query-name
+                                   :error (.getMessage e))
+                            nil))
         decoded (if query-schema
                   (mc/decode query-schema raw-query (mt/json-transformer))
                   raw-query)]
@@ -235,9 +239,12 @@
           (when-let [hiccup (:datastar/hiccup result)]
             {:event (patch-elements (render-html hiccup) {})
              :result query-data})))
-      {:event (patch-signals {:error "Unauthorized"} {})
-       :result prev-result
-       :stop? true})))
+      (do
+        (when-not authorized?
+          (u/log ::missing-authorized-predicate :query-name query-name))
+        {:event (patch-signals {:error "Unauthorized"} {})
+         :result prev-result
+         :stop? true}))))
 
 ;; ------------------------ ;;
 ;; Interceptor Factories    ;;
@@ -526,14 +533,21 @@
   (let [{:keys [title stream-path body head datastar-url html-attrs stream-method]
          :or {title "Grain App" datastar-url default-datastar-url stream-method "get"}} opts
         query-string (get-in context [:request :query-string])
+        ;; Resolve path params (e.g. :event-id → actual UUID) in the stream URL
+        path-params (get-in context [:request :path-params])
+        resolved-stream-path (if (and stream-path (seq path-params))
+                               (reduce-kv (fn [p k v]
+                                            (string/replace p (str ":" (name k)) (str v)))
+                                          stream-path path-params)
+                               stream-path)
         ;; Generate a unique nonce per page load so each tab/navigation gets its own SSE.
         ;; Emitted as a signal so Datastar includes it in every request automatically.
         ;; Also appended to the stream URL as a query param for the initial connection.
         nonce (str (random-uuid))
-        effective-stream-path (when stream-path
+        effective-stream-path (when resolved-stream-path
                                 (let [base (if (and query-string (seq query-string))
-                                             (str stream-path "?" query-string)
-                                             stream-path)
+                                             (str resolved-stream-path "?" query-string)
+                                             resolved-stream-path)
                                       separator (if (string/includes? base "?") "&" "?")]
                                   (str base separator "dsNonce=" nonce)))
         page-html (str "<!DOCTYPE html>"
@@ -597,7 +611,10 @@
 
           (:command/result result)
           (patch-signals (:command/result result) {})))
-      (patch-signals {:error "Unauthorized"} {}))))
+      (do
+        (when-not authorized?
+          (u/log ::missing-authorized-predicate :command-name (:command/name command)))
+        (patch-signals {:error "Unauthorized"} {})))))
 
 (defn- action-handler-enter
   "Enter fn for action-handler interceptor."
@@ -685,7 +702,7 @@
    defaults is an optional map with :datastar/shim-opts and :datastar/auth-redirect."
   [context query-name entry defaults]
   (when-let [path (:datastar/path entry)]
-    (let [stream-path (str path "/stream")
+    (let [stream-path (if (= path "/") "/__stream" (str path "/__stream"))
           title (or (:datastar/title entry) "Grain App")
           fps (:datastar/fps entry 30)
           explicit-interceptors (or (:datastar/interceptors entry) [])

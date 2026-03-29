@@ -122,9 +122,9 @@
   "Scan the query registry for entries with `:datastar/path` metadata and generate
    Pedestal routes. Each query produces three routes:
 
-     1. GET  `/path`        — Shim page (HTML shell that boots Datastar)
-     2. GET  `/path/stream` — SSE connection (reuses existing session if nonce matches)
-     3. POST `/path/stream` — Signal updates on existing SSE (Datastar's `@post`)
+     1. GET  `/path`           — Shim page (HTML shell that boots Datastar)
+     2. GET  `/path/__stream` — SSE connection (reuses existing session if nonce matches)
+     3. POST `/path/__stream` — Signal updates on existing SSE (Datastar's `@post`)
 
    Optional `overrides` map merges additional metadata per query-name, e.g.:
      {::my-query {:datastar/fps 2 :datastar/interceptors [auth-interceptor]}}

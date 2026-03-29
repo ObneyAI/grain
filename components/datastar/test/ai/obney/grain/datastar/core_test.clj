@@ -344,6 +344,21 @@
       (is (str/includes? body "data-signals"))
       (is (str/includes? body "dsNonce")))))
 
+(deftest shim-page-resolves-path-params-test
+  (let [interceptor (ds/shim-page {:stream-path "/items/:item-id/__stream"})
+        result ((:enter interceptor) {:request {:path-params {:item-id "abc-123"}}})
+        body (get-in result [:response :body])]
+    (testing "path params are resolved in stream URL"
+      (is (str/includes? body "/items/abc-123/__stream"))
+      (is (not (str/includes? body ":item-id"))))))
+
+(deftest shim-page-no-path-params-unchanged-test
+  (let [interceptor (ds/shim-page {:stream-path "/items/__stream"})
+        result ((:enter interceptor) {})
+        body (get-in result [:response :body])]
+    (testing "static paths are unchanged"
+      (is (str/includes? body "/items/__stream")))))
+
 ;; =========================== ;;
 ;; Malli Coercion Tests         ;;
 ;; =========================== ;;
@@ -620,19 +635,22 @@
         auth-interceptor (inject-auth-interceptor)
         event-types #{:test/counter-incremented}
         stream-opts {:event-types event-types :debounce-ms 50}
-        manual-routes #{["/counters" :get [(ds/shim-page {:stream-path "/counters/stream"})]
+        manual-routes #{["/counters" :get [(ds/shim-page {:stream-path "/counters/__stream"})]
                          :route-name ::counters-page]
-                        ["/counters/stream" :get [(ds/stream-view context :test/counters {:fps 10})]
+                        ["/counters/__stream" :get [(ds/stream-view context :test/counters {:fps 10})]
                          :route-name ::counters-stream]
                         ["/ds/command" :post [(ds/action-handler context {})]
                          :route-name ::ds-command]
                         ;; POST-testable event-driven stream with auth + signal parsing
-                        ["/filterable/stream" :get [ds/parse-datastar-signals auth-interceptor
+                        ["/filterable/__stream" :get [ds/parse-datastar-signals auth-interceptor
                                                     (ds/stream-view context :test/filterable-counters stream-opts)]
                          :route-name ::filterable-stream-get]
-                        ["/filterable/stream" :post [ds/parse-datastar-signals auth-interceptor
+                        ["/filterable/__stream" :post [ds/parse-datastar-signals auth-interceptor
                                                      (ds/stream-view context :test/filterable-counters stream-opts)]
-                         :route-name ::filterable-stream-post]}
+                         :route-name ::filterable-stream-post]
+                        ;; Path-param shim page for E2E path resolution test
+                        ["/detail/:id" :get [(ds/shim-page {:stream-path "/detail/:id/__stream" :title "Detail"})]
+                         :route-name ::detail-page]}
         ;; Auto-routes without auth-redirect (existing behavior).
         ;; Exclude queries that have manually-wired routes to avoid duplicates.
         manual-query-keys #{:test/owner-only-page :test/public-page}
@@ -690,12 +708,12 @@
     (is (str/includes? body "<script"))
     (is (str/includes? body "datastar"))
     ;; hiccup2 escapes ' to &apos; in attributes
-    (is (str/includes? body "@get(&apos;/counters/stream?dsNonce="))))
+    (is (str/includes? body "@get(&apos;/counters/__stream?dsNonce="))))
 
 (deftest e2e-sse-stream-test
   (let [client (HttpClient/newHttpClient)
         request (-> (HttpRequest/newBuilder)
-                    (.uri (URI/create (str "http://localhost:" *port* "/counters/stream")))
+                    (.uri (URI/create (str "http://localhost:" *port* "/counters/__stream")))
                     (.GET)
                     .build)
         response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
@@ -723,7 +741,7 @@
   (let [client (HttpClient/newHttpClient)
         ;; Connect to stream
         stream-request (-> (HttpRequest/newBuilder)
-                           (.uri (URI/create (str "http://localhost:" *port* "/counters/stream")))
+                           (.uri (URI/create (str "http://localhost:" *port* "/counters/__stream")))
                            (.GET)
                            .build)
         stream-response (.send client stream-request (HttpResponse$BodyHandlers/ofInputStream))
@@ -749,7 +767,7 @@
 (deftest e2e-query-params-test
   (let [client (HttpClient/newHttpClient)
         request (-> (HttpRequest/newBuilder)
-                    (.uri (URI/create (str "http://localhost:" *port* "/counters/stream?filter=active")))
+                    (.uri (URI/create (str "http://localhost:" *port* "/counters/__stream?filter=active")))
                     (.GET)
                     .build)
         response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
@@ -785,12 +803,12 @@
       (is (= :ai.obney.grain.datastar.core/test-my-page-page
              (last shim-route)))
       ;; GET Stream route
-      (is (= "/my-page/stream" (first stream-route)))
+      (is (= "/my-page/__stream" (first stream-route)))
       (is (= :get (second stream-route)))
       (is (= :ai.obney.grain.datastar.core/test-my-page-stream
              (last stream-route)))
       ;; POST Stream route
-      (is (= "/my-page/stream" (first post-stream-route)))
+      (is (= "/my-page/__stream" (first post-stream-route)))
       (is (= :post (second post-stream-route)))
       (is (= :ai.obney.grain.datastar.core/test-my-page-stream-post
              (last post-stream-route)))))
@@ -814,7 +832,7 @@
     (testing "queries without :datastar/path are excluded"
       (let [paths (set (map first generated))]
         (is (contains? paths "/with-path"))
-        (is (contains? paths "/with-path/stream"))
+        (is (contains? paths "/with-path/__stream"))
         (is (not (some #(str/includes? % "no-path") paths)))))
 
     (testing "route names are unique"
@@ -827,7 +845,7 @@
                                                    :datastar/path "/defaults"}}}
         generated (ds/routes context)
         shim-route (first (filter #(= "/defaults" (first %)) generated))
-        stream-route (first (filter #(= "/defaults/stream" (first %)) generated))
+        stream-route (first (filter #(= "/defaults/__stream" (first %)) generated))
         shim-interceptor (last (nth shim-route 2))
         shim-result ((:enter shim-interceptor) {})]
     (testing "default title is 'Grain App'"
@@ -934,9 +952,9 @@
                                                   :datastar/interceptors [my-interceptor]}}}
         generated (ds/routes context)
         shim-route (first (filter #(= "/guarded" (first %)) generated))
-        get-stream-route (first (filter #(and (= "/guarded/stream" (first %))
+        get-stream-route (first (filter #(and (= "/guarded/__stream" (first %))
                                                (= :get (second %))) generated))
-        post-stream-route (first (filter #(and (= "/guarded/stream" (first %))
+        post-stream-route (first (filter #(and (= "/guarded/__stream" (first %))
                                                 (= :post (second %))) generated))
         shim-interceptors (nth shim-route 2)
         get-stream-interceptors (nth get-stream-route 2)
@@ -1072,6 +1090,37 @@
       (is (= ::ds/parse-datastar-signals (:name (first interceptors))))
       (is (= :ai.obney.grain.datastar.core/shim-page (:name (second interceptors)))))))
 
+;; ============================================ ;;
+;; Route — Stream Path Tests                     ;;
+;; ============================================ ;;
+
+(deftest stream-path-uses-double-underscore-test
+  (let [context {:query-registry {:test/list {:handler-fn identity
+                                               :authorized? (constantly true)
+                                               :datastar/path "/items"}
+                                   :test/detail {:handler-fn identity
+                                                  :authorized? (constantly true)
+                                                  :datastar/path "/items/:item-id"}}}
+        generated (ds/routes context {} {})
+        paths (set (map first generated))]
+    (testing "stream paths use /__stream suffix"
+      (is (contains? paths "/items/__stream"))
+      (is (contains? paths "/items/:item-id/__stream")))
+    (testing "no bare /stream in any generated path"
+      (is (not (some #(and (str/includes? % "/stream")
+                           (not (str/includes? % "/__stream")))
+                      paths))))))
+
+(deftest query->route-pair-root-path-test
+  (let [entry {:handler-fn identity
+               :authorized? (constantly true)
+               :datastar/path "/"}
+        [shim-route stream-route] (#'ds/query->route-pair {} :test/root entry {})]
+    (testing "root path shim route"
+      (is (= "/" (first shim-route))))
+    (testing "root path stream route is /__stream (not //__stream)"
+      (is (= "/__stream" (first stream-route))))))
+
 ;; =========================== ;;
 ;; E2E Auto-Routes Test         ;;
 ;; =========================== ;;
@@ -1089,11 +1138,11 @@
         (is (str/includes? body "<script"))
         (is (str/includes? body "datastar"))
         (is (str/includes? body "Auto Counters"))
-        (is (str/includes? body "@get(&apos;/auto-counters/stream?dsNonce="))))
+        (is (str/includes? body "@get(&apos;/auto-counters/__stream?dsNonce="))))
 
     (testing "SSE stream works at auto-generated path"
       (let [request (-> (HttpRequest/newBuilder)
-                        (.uri (URI/create (str "http://localhost:" *port* "/auto-counters/stream")))
+                        (.uri (URI/create (str "http://localhost:" *port* "/auto-counters/__stream")))
                         (.GET)
                         .build)
             response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
@@ -1137,7 +1186,7 @@
 (deftest e2e-event-driven-initial-render-test
   (let [client (HttpClient/newHttpClient)
         request (-> (HttpRequest/newBuilder)
-                    (.uri (URI/create (str "http://localhost:" *port* "/event-counters/stream")))
+                    (.uri (URI/create (str "http://localhost:" *port* "/event-counters/__stream")))
                     (.GET)
                     .build)
         response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
@@ -1151,7 +1200,7 @@
     (let [client (HttpClient/newHttpClient)
           body (json/write-str {:datastar {}})
           request (-> (HttpRequest/newBuilder)
-                      (.uri (URI/create (str "http://localhost:" *port* "/event-counters/stream")))
+                      (.uri (URI/create (str "http://localhost:" *port* "/event-counters/__stream")))
                       (.header "Content-Type" "application/json")
                       (.POST (HttpRequest$BodyPublishers/ofString body))
                       .build)
@@ -1165,7 +1214,7 @@
   (let [client (HttpClient/newHttpClient)
         ;; Connect to event-driven stream
         stream-request (-> (HttpRequest/newBuilder)
-                           (.uri (URI/create (str "http://localhost:" *port* "/event-counters/stream")))
+                           (.uri (URI/create (str "http://localhost:" *port* "/event-counters/__stream")))
                            (.GET)
                            .build)
         stream-response (.send client stream-request (HttpResponse$BodyHandlers/ofInputStream))
@@ -1188,7 +1237,7 @@
   (let [client (HttpClient/newHttpClient)
         ;; Connect to event-driven stream
         stream-request (-> (HttpRequest/newBuilder)
-                           (.uri (URI/create (str "http://localhost:" *port* "/event-counters/stream")))
+                           (.uri (URI/create (str "http://localhost:" *port* "/event-counters/__stream")))
                            (.GET)
                            .build)
         stream-response (.send client stream-request (HttpResponse$BodyHandlers/ofInputStream))
@@ -1219,7 +1268,7 @@
         body (.body response)]
     (is (= 200 (.statusCode response)))
     (is (str/includes? body "Event Counters"))
-    (is (str/includes? body "@get(&apos;/event-counters/stream?dsNonce="))))
+    (is (str/includes? body "@get(&apos;/event-counters/__stream?dsNonce="))))
 
 ;; ====================================== ;;
 ;; resolve-event-tags Unit Tests           ;;
@@ -1277,7 +1326,7 @@
         counter-id "00000000-0000-0000-0000-000000000001"
         stream-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/tagged-counters/" counter-id "/stream")))
+                                                  "/tagged-counters/" counter-id "/__stream")))
                            (.GET)
                            .build)
         stream-response (.send client stream-request (HttpResponse$BodyHandlers/ofInputStream))
@@ -1300,7 +1349,7 @@
     (let [client (HttpClient/newHttpClient)
           body (json/write-str {:datastar {}})
           request (-> (HttpRequest/newBuilder)
-                      (.uri (URI/create (str "http://localhost:" *port* "/auto-counters/stream")))
+                      (.uri (URI/create (str "http://localhost:" *port* "/auto-counters/__stream")))
                       (.header "Content-Type" "application/json")
                       (.POST (HttpRequest$BodyPublishers/ofString body))
                       .build)
@@ -1314,7 +1363,7 @@
   (testing "POST with empty body still returns initial render"
     (let [client (HttpClient/newHttpClient)
           request (-> (HttpRequest/newBuilder)
-                      (.uri (URI/create (str "http://localhost:" *port* "/auto-counters/stream")))
+                      (.uri (URI/create (str "http://localhost:" *port* "/auto-counters/__stream")))
                       (.header "Content-Type" "application/json")
                       (.POST (HttpRequest$BodyPublishers/ofString ""))
                       .build)
@@ -1328,7 +1377,7 @@
         counter-id "00000000-0000-0000-0000-000000000001"
         stream-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/tagged-counters/" counter-id "/stream")))
+                                                  "/tagged-counters/" counter-id "/__stream")))
                            (.GET)
                            .build)
         stream-response (.send client stream-request (HttpResponse$BodyHandlers/ofInputStream))
@@ -1352,7 +1401,7 @@
     (let [client (HttpClient/newHttpClient)
           ;; 1. Open GET SSE stream (event-driven, with auth)
           get-request (-> (HttpRequest/newBuilder)
-                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/__stream")))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
@@ -1364,7 +1413,7 @@
           ;; 2. POST with filter param — should update existing SSE's context, not start new SSE
           post-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?filter=active")))
+                                                  "/filterable/__stream?filter=active")))
                            (.header "Content-Type" "application/json")
                            (.header "X-Test-User-Id" (str test-user-id-a))
                            (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -1386,7 +1435,7 @@
           ;; POST without a prior GET — should start a fresh SSE
           post-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?filter=new")))
+                                                  "/filterable/__stream?filter=new")))
                            (.header "Content-Type" "application/json")
                            (.header "X-Test-User-Id" (str unique-user-id))
                            (.POST (HttpRequest$BodyPublishers/ofString (json/write-str {:datastar {}})))
@@ -1403,7 +1452,7 @@
     (let [client (HttpClient/newHttpClient)
           ;; 1. Open GET SSE stream
           get-request (-> (HttpRequest/newBuilder)
-                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/__stream")))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
@@ -1414,7 +1463,7 @@
           ;; 2. POST to update filter signal
           post-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?filter=vip")))
+                                                  "/filterable/__stream?filter=vip")))
                            (.header "Content-Type" "application/json")
                            (.header "X-Test-User-Id" (str test-user-id-a))
                            (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -1440,7 +1489,7 @@
     (let [client (HttpClient/newHttpClient)
           ;; 1. User A opens GET SSE stream
           get-a (-> (HttpRequest/newBuilder)
-                    (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                    (.uri (URI/create (str "http://localhost:" *port* "/filterable/__stream")))
                     (.header "X-Test-User-Id" (str test-user-id-a))
                     (.GET)
                     .build)
@@ -1450,7 +1499,7 @@
           _ (Thread/sleep 300)
           ;; 2. User B opens GET SSE stream
           get-b (-> (HttpRequest/newBuilder)
-                    (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                    (.uri (URI/create (str "http://localhost:" *port* "/filterable/__stream")))
                     (.header "X-Test-User-Id" (str test-user-id-b))
                     (.GET)
                     .build)
@@ -1461,7 +1510,7 @@
           ;; 3. POST as User A — should only update User A's stream
           post-a (-> (HttpRequest/newBuilder)
                      (.uri (URI/create (str "http://localhost:" *port*
-                                            "/filterable/stream?filter=user-a-only")))
+                                            "/filterable/__stream?filter=user-a-only")))
                      (.header "Content-Type" "application/json")
                      (.header "X-Test-User-Id" (str test-user-id-a))
                      (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -1492,7 +1541,7 @@
               ;; POST should detect closed signal-ch and start fresh
               post-request (-> (HttpRequest/newBuilder)
                                (.uri (URI/create (str "http://localhost:" *port*
-                                                      "/filterable/stream?filter=after-stale")))
+                                                      "/filterable/__stream?filter=after-stale")))
                                (.header "Content-Type" "application/json")
                                (.header "X-Test-User-Id" (str stale-user-id))
                                (.POST (HttpRequest$BodyPublishers/ofString (json/write-str {:datastar {}})))
@@ -1523,7 +1572,7 @@
         (let [client (HttpClient/newHttpClient)
               post-request (-> (HttpRequest/newBuilder)
                                (.uri (URI/create (str "http://localhost:" *port*
-                                                      "/filterable/stream?filter=after-dead-conn")))
+                                                      "/filterable/__stream?filter=after-dead-conn")))
                                (.header "Content-Type" "application/json")
                                (.header "X-Test-User-Id" (str stale-user-id))
                                (.POST (HttpRequest$BodyPublishers/ofString (json/write-str {:datastar {}})))
@@ -1544,7 +1593,7 @@
     (let [client (HttpClient/newHttpClient)
           ;; 1. Open GET SSE stream
           get-request (-> (HttpRequest/newBuilder)
-                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/stream")))
+                          (.uri (URI/create (str "http://localhost:" *port* "/filterable/__stream")))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
@@ -1555,7 +1604,7 @@
           ;; 2. First POST — filter=first
           post-1 (-> (HttpRequest/newBuilder)
                      (.uri (URI/create (str "http://localhost:" *port*
-                                            "/filterable/stream?filter=first")))
+                                            "/filterable/__stream?filter=first")))
                      (.header "Content-Type" "application/json")
                      (.header "X-Test-User-Id" (str test-user-id-a))
                      (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -1566,7 +1615,7 @@
           ;; 3. Second POST — filter=second (overwrites first)
           post-2 (-> (HttpRequest/newBuilder)
                      (.uri (URI/create (str "http://localhost:" *port*
-                                            "/filterable/stream?filter=second")))
+                                            "/filterable/__stream?filter=second")))
                      (.header "Content-Type" "application/json")
                      (.header "X-Test-User-Id" (str test-user-id-a))
                      (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -1593,7 +1642,7 @@
           ;; Tab A: GET with nonce-a
           get-a (-> (HttpRequest/newBuilder)
                     (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?dsNonce=" nonce-a)))
+                                          "/filterable/__stream?dsNonce=" nonce-a)))
                     (.header "X-Test-User-Id" (str test-user-id-a))
                     (.GET)
                     .build)
@@ -1604,7 +1653,7 @@
           ;; Tab B: GET with nonce-b (same user)
           get-b (-> (HttpRequest/newBuilder)
                     (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?dsNonce=" nonce-b)))
+                                          "/filterable/__stream?dsNonce=" nonce-b)))
                     (.header "X-Test-User-Id" (str test-user-id-a))
                     (.GET)
                     .build)
@@ -1615,7 +1664,7 @@
           ;; POST to Tab A's nonce — should only update Tab A
           post-a (-> (HttpRequest/newBuilder)
                      (.uri (URI/create (str "http://localhost:" *port*
-                                            "/filterable/stream?filter=tab-a-only&dsNonce=" nonce-a)))
+                                            "/filterable/__stream?filter=tab-a-only&dsNonce=" nonce-a)))
                      (.header "Content-Type" "application/json")
                      (.header "X-Test-User-Id" (str test-user-id-a))
                      (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -1647,7 +1696,7 @@
         ;; POST with new nonce — should NOT find the old nonce's entry, starts fresh
         (let [post-request (-> (HttpRequest/newBuilder)
                                (.uri (URI/create (str "http://localhost:" *port*
-                                                      "/filterable/stream?filter=fresh-page&dsNonce=" new-nonce)))
+                                                      "/filterable/__stream?filter=fresh-page&dsNonce=" new-nonce)))
                                (.header "Content-Type" "application/json")
                                (.header "X-Test-User-Id" (str user-id))
                                (.POST (HttpRequest$BodyPublishers/ofString (json/write-str {:datastar {}})))
@@ -1672,7 +1721,7 @@
           ;; 1. GET SSE with nonce in URL (simulates data-init)
           get-request (-> (HttpRequest/newBuilder)
                           (.uri (URI/create (str "http://localhost:" *port*
-                                                "/filterable/stream?dsNonce=" nonce)))
+                                                "/filterable/__stream?dsNonce=" nonce)))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
@@ -1683,7 +1732,7 @@
           ;; 2. POST with nonce in URL (simulates view-rendered @post path)
           post-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?filter=url-nonce&dsNonce=" nonce)))
+                                                  "/filterable/__stream?filter=url-nonce&dsNonce=" nonce)))
                            (.header "Content-Type" "application/json")
                            (.header "X-Test-User-Id" (str test-user-id-a))
                            (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -1706,7 +1755,7 @@
           ;; 1. Open GET SSE stream (event-driven, with auth + nonce)
           get-request (-> (HttpRequest/newBuilder)
                           (.uri (URI/create (str "http://localhost:" *port*
-                                                "/filterable/stream?dsNonce=" nonce)))
+                                                "/filterable/__stream?dsNonce=" nonce)))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
@@ -1719,7 +1768,7 @@
           ds-signals (json/write-str {:filter "active" :dsNonce nonce})
           get2-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?datastar="
+                                                  "/filterable/__stream?datastar="
                                                   (java.net.URLEncoder/encode ds-signals "UTF-8"))))
                            (.header "X-Test-User-Id" (str test-user-id-a))
                            (.GET)
@@ -1742,7 +1791,7 @@
           ds-signals (json/write-str {:filter "new" :dsNonce nonce})
           get-request (-> (HttpRequest/newBuilder)
                           (.uri (URI/create (str "http://localhost:" *port*
-                                                "/filterable/stream?datastar="
+                                                "/filterable/__stream?datastar="
                                                 (java.net.URLEncoder/encode ds-signals "UTF-8"))))
                           (.header "X-Test-User-Id" (str unique-user-id))
                           (.GET)
@@ -1761,7 +1810,7 @@
           ;; 1. Open GET SSE stream
           get-request (-> (HttpRequest/newBuilder)
                           (.uri (URI/create (str "http://localhost:" *port*
-                                                "/filterable/stream?dsNonce=" nonce)))
+                                                "/filterable/__stream?dsNonce=" nonce)))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
@@ -1773,7 +1822,7 @@
           ds-signals (json/write-str {:filter "vip" :dsNonce nonce})
           get2-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?datastar="
+                                                  "/filterable/__stream?datastar="
                                                   (java.net.URLEncoder/encode ds-signals "UTF-8"))))
                            (.header "X-Test-User-Id" (str test-user-id-a))
                            (.GET)
@@ -1802,7 +1851,7 @@
           ;; 1. User A opens GET SSE stream
           get-a (-> (HttpRequest/newBuilder)
                     (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?dsNonce=" nonce-a)))
+                                          "/filterable/__stream?dsNonce=" nonce-a)))
                     (.header "X-Test-User-Id" (str test-user-id-a))
                     (.GET)
                     .build)
@@ -1812,7 +1861,7 @@
           ;; 2. User B opens GET SSE stream
           get-b (-> (HttpRequest/newBuilder)
                     (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?dsNonce=" nonce-b)))
+                                          "/filterable/__stream?dsNonce=" nonce-b)))
                     (.header "X-Test-User-Id" (str test-user-id-b))
                     (.GET)
                     .build)
@@ -1823,7 +1872,7 @@
           ds-signals (json/write-str {:filter "user-a-only" :dsNonce nonce-a})
           get2-a (-> (HttpRequest/newBuilder)
                      (.uri (URI/create (str "http://localhost:" *port*
-                                            "/filterable/stream?datastar="
+                                            "/filterable/__stream?datastar="
                                             (java.net.URLEncoder/encode ds-signals "UTF-8"))))
                      (.header "X-Test-User-Id" (str test-user-id-a))
                      (.GET)
@@ -1852,7 +1901,7 @@
               ds-signals (json/write-str {:filter "after-stale" :dsNonce nonce})
               get-request (-> (HttpRequest/newBuilder)
                               (.uri (URI/create (str "http://localhost:" *port*
-                                                    "/filterable/stream?datastar="
+                                                    "/filterable/__stream?datastar="
                                                     (java.net.URLEncoder/encode ds-signals "UTF-8"))))
                               (.header "X-Test-User-Id" (str stale-user-id))
                               (.GET)
@@ -1879,7 +1928,7 @@
               ds-signals (json/write-str {:filter "after-dead-conn" :dsNonce nonce})
               get-request (-> (HttpRequest/newBuilder)
                               (.uri (URI/create (str "http://localhost:" *port*
-                                                    "/filterable/stream?datastar="
+                                                    "/filterable/__stream?datastar="
                                                     (java.net.URLEncoder/encode ds-signals "UTF-8"))))
                               (.header "X-Test-User-Id" (str stale-user-id))
                               (.GET)
@@ -1901,7 +1950,7 @@
           ;; 1. Open GET SSE stream
           get-request (-> (HttpRequest/newBuilder)
                           (.uri (URI/create (str "http://localhost:" *port*
-                                                "/filterable/stream?dsNonce=" nonce)))
+                                                "/filterable/__stream?dsNonce=" nonce)))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
@@ -1913,7 +1962,7 @@
           ds-signals-1 (json/write-str {:filter "first" :dsNonce nonce})
           get2 (-> (HttpRequest/newBuilder)
                    (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?datastar="
+                                          "/filterable/__stream?datastar="
                                           (java.net.URLEncoder/encode ds-signals-1 "UTF-8"))))
                    (.header "X-Test-User-Id" (str test-user-id-a))
                    (.GET)
@@ -1924,7 +1973,7 @@
           ds-signals-2 (json/write-str {:filter "second" :dsNonce nonce})
           get3 (-> (HttpRequest/newBuilder)
                    (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?datastar="
+                                          "/filterable/__stream?datastar="
                                           (java.net.URLEncoder/encode ds-signals-2 "UTF-8"))))
                    (.header "X-Test-User-Id" (str test-user-id-a))
                    (.GET)
@@ -1947,7 +1996,7 @@
           ;; Tab A
           get-a (-> (HttpRequest/newBuilder)
                     (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?dsNonce=" nonce-a)))
+                                          "/filterable/__stream?dsNonce=" nonce-a)))
                     (.header "X-Test-User-Id" (str test-user-id-a))
                     (.GET)
                     .build)
@@ -1957,7 +2006,7 @@
           ;; Tab B (same user, different nonce)
           get-b (-> (HttpRequest/newBuilder)
                     (.uri (URI/create (str "http://localhost:" *port*
-                                          "/filterable/stream?dsNonce=" nonce-b)))
+                                          "/filterable/__stream?dsNonce=" nonce-b)))
                     (.header "X-Test-User-Id" (str test-user-id-a))
                     (.GET)
                     .build)
@@ -1968,7 +2017,7 @@
           ds-signals (json/write-str {:filter "tab-a-only" :dsNonce nonce-a})
           get2-a (-> (HttpRequest/newBuilder)
                      (.uri (URI/create (str "http://localhost:" *port*
-                                            "/filterable/stream?datastar="
+                                            "/filterable/__stream?datastar="
                                             (java.net.URLEncoder/encode ds-signals "UTF-8"))))
                      (.header "X-Test-User-Id" (str test-user-id-a))
                      (.GET)
@@ -1990,7 +2039,7 @@
           ;; 1. Open GET SSE stream
           get-request (-> (HttpRequest/newBuilder)
                           (.uri (URI/create (str "http://localhost:" *port*
-                                                "/filterable/stream?dsNonce=" nonce)))
+                                                "/filterable/__stream?dsNonce=" nonce)))
                           (.header "X-Test-User-Id" (str test-user-id-a))
                           (.GET)
                           .build)
@@ -2001,7 +2050,7 @@
           ;; 2. POST with filter=post-value
           post-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?filter=post-value&dsNonce=" nonce)))
+                                                  "/filterable/__stream?filter=post-value&dsNonce=" nonce)))
                            (.header "Content-Type" "application/json")
                            (.header "X-Test-User-Id" (str test-user-id-a))
                            (.POST (HttpRequest$BodyPublishers/ofString ""))
@@ -2012,7 +2061,7 @@
           ds-signals (json/write-str {:filter "get-value" :dsNonce nonce})
           get2-request (-> (HttpRequest/newBuilder)
                            (.uri (URI/create (str "http://localhost:" *port*
-                                                  "/filterable/stream?datastar="
+                                                  "/filterable/__stream?datastar="
                                                   (java.net.URLEncoder/encode ds-signals "UTF-8"))))
                            (.header "X-Test-User-Id" (str test-user-id-a))
                            (.GET)
@@ -2026,6 +2075,24 @@
       (is (str/includes? (:data (second stream-events)) "filter:post-value"))
       ;; After GET — same session, different method
       (is (str/includes? (:data (nth stream-events 2)) "filter:get-value")))))
+
+;; ============================================ ;;
+;; E2E Path Param Resolution Test                ;;
+;; ============================================ ;;
+
+(deftest e2e-shim-page-resolves-path-params-test
+  (let [client (HttpClient/newHttpClient)
+        request (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create (str "http://localhost:" *port* "/detail/test-uuid-123")))
+                    (.GET)
+                    .build)
+        response (.send client request (HttpResponse$BodyHandlers/ofString))
+        body (.body response)]
+    (is (= 200 (.statusCode response)))
+    (is (str/includes? body "Detail"))
+    ;; Stream URL should have the resolved path param, not the literal :id
+    (is (str/includes? body "/detail/test-uuid-123/__stream"))
+    (is (not (str/includes? body ":id/__stream")))))
 
 ;; ============================================ ;;
 ;; E2E Auth-Redirect Tests                       ;;

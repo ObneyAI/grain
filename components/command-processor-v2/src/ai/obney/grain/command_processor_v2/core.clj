@@ -33,10 +33,9 @@
             result
             (do
               (u/log ::error-storing-events :anomaly event-store-result)
-              (if (= ::anom/conflict (::anom/category event-store-result))
-                event-store-result
-                {::anom/category ::anom/fault
-                 ::anom/message "Error storing events."})))))
+              ;; Pass through the event-store anomaly — includes :error/explain
+              ;; with Malli validation details when events fail schema checks.
+              event-store-result))))
       result)))
 
 (defn process-command [{:keys [command command-registry] :as context}]
