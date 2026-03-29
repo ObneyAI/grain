@@ -26,7 +26,7 @@ Includes the core CQRS components (event store, read model processor, todo proce
 
 ## grain-datastar
 
-Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hiccup-rendered HTML over SSE, with event-driven re-rendering, Malli-based JSON coercion, and automatic Pedestal route generation:
+Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hiccup-rendered HTML over SSE, with event-driven re-rendering, SSE connection reuse, auto-generated auth redirects, context-dependent gate interceptors, Malli-based JSON coercion, and automatic Pedestal route generation:
 
 ```clojure
 obneyai/grain-datastar

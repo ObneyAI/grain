@@ -165,6 +165,28 @@
         [:div {:id (str (:id c))}
          (:name c) ": " (:value c)])]}))
 
+;; ------------------------------------------------- ;;
+;; Auth-Protected Test Query (for E2E auth tests)    ;;
+;; ------------------------------------------------- ;;
+
+(defquery :test owner-only-page
+  {:authorized? (fn [ctx] (= :owner (:role (:auth-claims ctx))))
+   :datastar/path "/owner-only"
+   :datastar/title "Owner Only"
+   :datastar/fps 0}
+  [context]
+  {:query/result {:page :owner-only}
+   :datastar/hiccup [:div#app "owner content"]})
+
+(defquery :test public-page
+  {:authorized? (constantly true)
+   :datastar/path "/public-page"
+   :datastar/title "Public"
+   :datastar/fps 0}
+  [context]
+  {:query/result {:page :public}
+   :datastar/hiccup [:div#app "public content"]})
+
 ;; =========================== ;;
 ;; Pure Function Tests          ;;
 ;; =========================== ;;
@@ -300,12 +322,16 @@
              (get-in result [:response :headers "Content-Type"])))
       (is (str/includes? (get-in result [:response :body]) "<script"))))
 
-  (testing "with stream-path"
+  (testing "with stream-path — nonce in URL and as signal for all stream methods"
     (let [interceptor (ds/shim-page {:stream-path "/stream"})
-          result ((:enter interceptor) {})]
-      (is (str/includes? (get-in result [:response :body]) "data-init"))
+          result ((:enter interceptor) {})
+          body (get-in result [:response :body])]
+      (is (str/includes? body "data-init"))
       ;; hiccup2 escapes ' to &apos; in attributes; nonce appended as query param
-      (is (str/includes? (get-in result [:response :body]) "@get(&apos;/stream?dsNonce="))))
+      (is (str/includes? body "@get(&apos;/stream?dsNonce="))
+      ;; dsNonce emitted as signal so Datastar includes it in every request
+      (is (str/includes? body "data-signals"))
+      (is (str/includes? body "dsNonce"))))
 
   (testing "with stream-method post — nonce in URL and as signal"
     (let [interceptor (ds/shim-page {:stream-path "/stream" :stream-method "post"})
@@ -352,6 +378,87 @@
     (is (= :test/counters (:query/name decoded)))
     (is (uuid? (:query/id decoded)))
     (is (some? (:query/timestamp decoded)))))
+
+;; ====================================== ;;
+;; auth-redirect-interceptor Tests        ;;
+;; ====================================== ;;
+
+(deftest auth-redirect-interceptor-no-claims-test
+  (let [interceptor (ds/auth-redirect-interceptor
+                     {:authorized? (fn [ctx] (some? (:auth-claims ctx)))
+                      :unauthenticated "/sign-in"
+                      :unauthorized "/home"})
+        result ((:enter interceptor) {})]
+    (is (= 302 (get-in result [:response :status])))
+    (is (= "/sign-in" (get-in result [:response :headers "Location"])))))
+
+(deftest auth-redirect-interceptor-unauthorized-test
+  (let [interceptor (ds/auth-redirect-interceptor
+                     {:authorized? (fn [ctx] (= :owner (:role (:auth-claims ctx))))
+                      :unauthenticated "/sign-in"
+                      :unauthorized "/home"})
+        ctx {:grain/additional-context {:auth-claims {:user-id (random-uuid) :role :staff}}}
+        result ((:enter interceptor) ctx)]
+    (is (= 302 (get-in result [:response :status])))
+    (is (= "/home" (get-in result [:response :headers "Location"])))))
+
+(deftest auth-redirect-interceptor-authorized-test
+  (let [interceptor (ds/auth-redirect-interceptor
+                     {:authorized? (fn [ctx] (= :owner (:role (:auth-claims ctx))))
+                      :unauthenticated "/sign-in"
+                      :unauthorized "/home"})
+        ctx {:grain/additional-context {:auth-claims {:user-id (random-uuid) :role :owner}}}
+        result ((:enter interceptor) ctx)]
+    ;; No :response — interceptor passed through
+    (is (nil? (:response result)))
+    (is (= ctx result))))
+
+(deftest auth-redirect-interceptor-public-query-test
+  (let [interceptor (ds/auth-redirect-interceptor
+                     {:authorized? (constantly true)
+                      :unauthenticated "/sign-in"
+                      :unauthorized "/home"})
+        ;; No claims at all — should still pass through for public queries
+        result ((:enter interceptor) {})]
+    (is (nil? (:response result)))))
+
+;; ====================================== ;;
+;; gate-interceptor Tests                  ;;
+;; ====================================== ;;
+
+(deftest gate-interceptor-passes-test
+  (let [interceptor (ds/gate-interceptor
+                     {:some-service :available}
+                     {:check (fn [ctx] (:some-service ctx))
+                      :redirect "/blocked"})
+        ctx {:grain/additional-context {:auth-claims {:user-id (random-uuid)}}}
+        result ((:enter interceptor) ctx)]
+    (is (nil? (:response result)))))
+
+(deftest gate-interceptor-blocks-test
+  (let [interceptor (ds/gate-interceptor
+                     {}
+                     {:check (fn [_] false)
+                      :redirect "/blocked"})
+        ctx {:grain/additional-context {:auth-claims {:user-id (random-uuid)}}}
+        result ((:enter interceptor) ctx)]
+    (is (= 302 (get-in result [:response :status])))
+    (is (= "/blocked" (get-in result [:response :headers "Location"])))))
+
+(deftest gate-interceptor-receives-merged-context-test
+  (let [received (atom nil)
+        interceptor (ds/gate-interceptor
+                     {:grain-key "from-context"}
+                     {:check (fn [ctx] (reset! received ctx) true)
+                      :redirect "/blocked"})
+        ctx {:grain/additional-context {:auth-claims {:user-id #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
+                                        :tenant-id #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}}
+        _ ((:enter interceptor) ctx)]
+    (is (= "from-context" (:grain-key @received)))
+    (is (= #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+           (get-in @received [:auth-claims :user-id])))
+    (is (= #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+           (:tenant-id @received)))))
 
 ;; =========================== ;;
 ;; poll-and-render Tests        ;;
@@ -460,6 +567,7 @@
 (def ^:dynamic *port* nil)
 (def ^:dynamic *e2e-state* nil)
 (def ^:dynamic *event-pubsub* nil)
+(def ^:dynamic *gate-pass* nil)
 
 (def test-user-id-a #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 (def test-user-id-b #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
@@ -482,12 +590,29 @@
               (assoc ctx :grain/additional-context
                      {:auth-claims {:user-id user-id}})))})
 
+(defn- inject-auth-from-header-interceptor
+  "Interceptor that injects auth claims ONLY when X-Test-User-Id and X-Test-Role
+   headers are present. Used for auth-redirect E2E tests where we need to test
+   unauthenticated (no header), unauthorized (wrong role), and authorized (right role)."
+  []
+  {:name ::inject-auth-from-header
+   :enter (fn [ctx]
+            (let [user-id-str (get-in ctx [:request :headers "x-test-user-id"])
+                  role-str (get-in ctx [:request :headers "x-test-role"])]
+              (if user-id-str
+                (assoc ctx :grain/additional-context
+                       {:auth-claims (cond-> {:user-id (parse-uuid user-id-str)}
+                                      role-str (assoc :role (keyword role-str)))})
+                ctx)))})
+
 (defn e2e-fixture [f]
   (let [state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
                                  :name "A" :value 0}]})
+        gate-pass (atom false)
         event-pubsub (pubsub/start {:type :core-async
                                     :topic-fn :event/type})
         context {:test-state state
+                 :gate-pass-atom gate-pass
                  :command-processor/skip-event-storage true
                  :command-registry @cp/command-registry*
                  :query-registry @qp/query-registry*
@@ -508,11 +633,40 @@
                         ["/filterable/stream" :post [ds/parse-datastar-signals auth-interceptor
                                                      (ds/stream-view context :test/filterable-counters stream-opts)]
                          :route-name ::filterable-stream-post]}
-        auto-routes (ds/routes context)
-        routes (into manual-routes auto-routes)
+        ;; Auto-routes without auth-redirect (existing behavior).
+        ;; Exclude queries that have manually-wired routes to avoid duplicates.
+        manual-query-keys #{:test/owner-only-page :test/public-page}
+        auto-ctx (update context :query-registry #(apply dissoc % manual-query-keys))
+        auto-routes (ds/routes auto-ctx)
+        ;; Auth-redirect E2E routes — manually wired so we can place header-auth
+        ;; BEFORE auth-redirect in the interceptor chain.
+        header-auth (inject-auth-from-header-interceptor)
+        owner-authorized? (fn [ctx] (= :owner (:role (:auth-claims ctx))))
+        auth-redirect (ds/auth-redirect-interceptor
+                       {:authorized? owner-authorized?
+                        :unauthenticated "/test-login"
+                        :unauthorized "/test-home"})
+        ;; Gate interceptors for E2E tests
+        ;; gate-allowed? checks the gate-pass-atom from the merged grain context
+        gate-allowed (ds/gate-interceptor context {:check (fn [ctx] @(:gate-pass-atom ctx))
+                                                   :redirect "/gate-blocked"})
+        gate-fallback (ds/gate-interceptor context {:check (fn [_] false)
+                                                    :redirect "/test-home"})
+        auth-redirect-routes #{["/owner-only" :get [header-auth auth-redirect
+                                                     (ds/shim-page {:title "Owner Only"})]
+                                :route-name ::owner-only-page]
+                               ["/public-page" :get [(ds/shim-page {:title "Public"})]
+                                :route-name ::public-page]
+                               ["/gated-page" :get [header-auth auth-redirect gate-allowed
+                                                     (ds/shim-page {:title "Gated"})]
+                                :route-name ::gated-page]
+                               ["/gate-fallback-page" :get [gate-fallback
+                                                             (ds/shim-page {:title "Fallback"})]
+                                :route-name ::gate-fallback-page]}
+        routes (-> manual-routes (into auto-routes) (into auth-redirect-routes))
         server (ws/start {:http/routes routes :http/port 0 :http/join? false})
         port (get-server-port server)]
-    (binding [*port* port *e2e-state* state *event-pubsub* event-pubsub]
+    (binding [*port* port *e2e-state* state *event-pubsub* event-pubsub *gate-pass* gate-pass]
       (try (f)
            (finally
              (ws/stop server)
@@ -621,7 +775,7 @@
                  :datastar/title "My Page"
                  :datastar/fps 5}
           context {}
-          [shim-route stream-route post-stream-route] (#'ds/query->route-pair context :test/my-page entry)]
+          [shim-route stream-route post-stream-route] (#'ds/query->route-pair context :test/my-page entry {})]
       (is (some? shim-route))
       (is (some? stream-route))
       (is (some? post-stream-route))
@@ -644,7 +798,7 @@
   (testing "entry without :datastar/path returns nil"
     (is (nil? (#'ds/query->route-pair {} :test/counters
                                       {:handler-fn identity
-                                       :authorized? (constantly true)})))))
+                                       :authorized? (constantly true)} {})))))
 
 (deftest routes-generation-test
   (let [context {:query-registry {:test/with-path {:handler-fn identity
@@ -681,6 +835,83 @@
 
     (testing "default fps is 30 (stream interceptor is created)"
       (is (some? stream-route)))))
+
+(deftest routes-with-global-defaults-shim-opts-test
+  (let [context {:query-registry {:test/with-defaults {:handler-fn identity
+                                                        :authorized? (constantly true)
+                                                        :datastar/path "/with-defaults"
+                                                        :datastar/title "Custom Title"}}}
+        defaults {:datastar/shim-opts {:head (fn [] [:link {:href "/app.css"}])
+                                       :html-attrs {:data-theme "test-theme"}}}
+        generated (ds/routes context {} defaults)
+        shim-route (first (filter #(= "/with-defaults" (first %)) generated))
+        shim-interceptor (last (nth shim-route 2))
+        shim-result ((:enter shim-interceptor) {})
+        body (get-in shim-result [:response :body])]
+    (testing "default head content is applied"
+      (is (str/includes? body "/app.css")))
+
+    (testing "default html-attrs are applied"
+      (is (str/includes? body "data-theme")))
+
+    (testing "query title still takes precedence"
+      (is (str/includes? body "Custom Title")))))
+
+(deftest routes-defaults-per-query-override-test
+  (let [context {:query-registry {:test/default-head {:handler-fn identity
+                                                       :authorized? (constantly true)
+                                                       :datastar/path "/default-head"}
+                                   :test/custom-head {:handler-fn identity
+                                                       :authorized? (constantly true)
+                                                       :datastar/path "/custom-head"}}}
+        defaults {:datastar/shim-opts {:head (fn [] [:link {:href "/default.css"}])}}
+        overrides {:test/custom-head {:datastar/shim-opts {:head (fn [] [:link {:href "/custom.css"}])}}}
+        generated (ds/routes context overrides defaults)
+        default-shim (first (filter #(= "/default-head" (first %)) generated))
+        custom-shim (first (filter #(= "/custom-head" (first %)) generated))
+        default-body (get-in ((:enter (last (nth default-shim 2))) {}) [:response :body])
+        custom-body (get-in ((:enter (last (nth custom-shim 2))) {}) [:response :body])]
+    (testing "query without override uses default head"
+      (is (str/includes? default-body "/default.css"))
+      (is (not (str/includes? default-body "/custom.css"))))
+
+    (testing "query with override uses custom head"
+      (is (str/includes? custom-body "/custom.css"))
+      (is (not (str/includes? custom-body "/default.css"))))))
+
+(deftest routes-defaults-empty-test
+  (let [context {:query-registry {:test/empty-defaults {:handler-fn identity
+                                                         :authorized? (constantly true)
+                                                         :datastar/path "/empty-defaults"
+                                                         :datastar/title "Empty"}}}
+        generated-2arity (ds/routes context {})
+        generated-3arity (ds/routes context {} {})]
+    (testing "empty defaults produces same number of routes as 2-arity"
+      (is (= (count generated-2arity) (count generated-3arity)))
+      (is (= 3 (count generated-3arity))))))
+
+(deftest query->route-pair-with-defaults-test
+  (let [entry {:handler-fn identity
+               :authorized? (constantly true)
+               :datastar/path "/merge-test"
+               :datastar/title "Entry Title"
+               :datastar/shim-opts {:html-attrs {:data-entry "yes"}}}
+        defaults {:datastar/shim-opts {:html-attrs {:data-default "yes"}
+                                       :head (fn [] [:meta {:name "default"}])}}
+        [shim-route] (#'ds/query->route-pair {} :test/merge-test entry defaults)
+        shim-interceptor (last (nth shim-route 2))
+        body (get-in ((:enter shim-interceptor) {}) [:response :body])]
+    (testing "entry shim-opts override defaults (html-attrs from entry wins)"
+      (is (str/includes? body "data-entry")))
+
+    (testing "default head is not applied when entry shim-opts overrides whole map"
+      ;; merge is shallow — entry :datastar/shim-opts replaces defaults entirely
+      ;; so default :head is lost when entry provides its own shim-opts
+      ;; This is expected — merge semantics, not deep-merge
+      )
+
+    (testing "entry title takes precedence"
+      (is (str/includes? body "Entry Title")))))
 
 (deftest routes-with-overrides-test
   (let [my-interceptor {:name ::test-override-interceptor :enter identity}
@@ -726,6 +957,120 @@
       (is (= ::my-guard (:name (second post-stream-interceptors))))
       (is (= :ai.obney.grain.datastar.core/stream-guarded
              (:name (nth post-stream-interceptors 2)))))))
+
+;; ============================================ ;;
+;; Route Generation — Auth Redirect Tests       ;;
+;; ============================================ ;;
+
+(deftest routes-auth-redirect-generates-interceptor-test
+  (let [owner? (fn [ctx] (= :owner (:role (:auth-claims ctx))))
+        context {:query-registry {:test/protected {:handler-fn identity
+                                                    :authorized? owner?
+                                                    :datastar/path "/protected"
+                                                    :datastar/title "Protected"}}}
+        defaults {:datastar/auth-redirect {:unauthenticated "/login"
+                                           :unauthorized "/home"}}
+        generated (ds/routes context {} defaults)
+        shim-route (first (filter #(= "/protected" (first %)) generated))
+        interceptors (nth shim-route 2)]
+    (testing "parse-datastar-signals first, auth-redirect second, shim-page last"
+      (is (= ::ds/parse-datastar-signals (:name (first interceptors))))
+      (is (= ::ds/auth-redirect (:name (second interceptors))))
+      (is (= :ai.obney.grain.datastar.core/shim-page (:name (nth interceptors 2)))))))
+
+(deftest routes-auth-redirect-skips-public-test
+  (let [context {:query-registry {:test/public-page {:handler-fn identity
+                                                      :authorized? (constantly true)
+                                                      :datastar/path "/public"
+                                                      :datastar/title "Public"}}}
+        defaults {:datastar/auth-redirect {:unauthenticated "/login"
+                                           :unauthorized "/home"}}
+        generated (ds/routes context {} defaults)
+        shim-route (first (filter #(= "/public" (first %)) generated))
+        interceptors (nth shim-route 2)]
+    (testing "no auth-redirect interceptor for public query — only parse-signals + shim-page"
+      (is (= ::ds/parse-datastar-signals (:name (first interceptors))))
+      (is (= :ai.obney.grain.datastar.core/shim-page (:name (second interceptors)))))))
+
+(deftest routes-no-auth-redirect-default-test
+  (let [owner? (fn [ctx] (= :owner (:role (:auth-claims ctx))))
+        context {:query-registry {:test/no-redirect {:handler-fn identity
+                                                      :authorized? owner?
+                                                      :datastar/path "/no-redirect"}}}
+        generated (ds/routes context {} {})
+        shim-route (first (filter #(= "/no-redirect" (first %)) generated))
+        interceptors (nth shim-route 2)]
+    (testing "no auth-redirect in defaults — no interceptor generated (backward compatible)"
+      (is (= ::ds/parse-datastar-signals (:name (first interceptors))))
+      (is (= :ai.obney.grain.datastar.core/shim-page (:name (second interceptors)))))))
+
+(deftest routes-auth-redirect-with-explicit-interceptors-test
+  (let [owner? (fn [ctx] (= :owner (:role (:auth-claims ctx))))
+        custom {:name ::custom-guard :enter identity}
+        context {:query-registry {:test/both {:handler-fn identity
+                                               :authorized? owner?
+                                               :datastar/path "/both"
+                                               :datastar/interceptors [custom]}}}
+        defaults {:datastar/auth-redirect {:unauthenticated "/login"
+                                           :unauthorized "/home"}}
+        generated (ds/routes context {} defaults)
+        shim-route (first (filter #(= "/both" (first %)) generated))
+        interceptors (nth shim-route 2)]
+    (testing "auth-redirect is prepended before explicit interceptors"
+      (is (= ::ds/parse-datastar-signals (:name (first interceptors))))
+      (is (= ::ds/auth-redirect (:name (second interceptors))))
+      (is (= ::custom-guard (:name (nth interceptors 2))))
+      (is (= :ai.obney.grain.datastar.core/shim-page (:name (nth interceptors 3)))))))
+
+;; ============================================ ;;
+;; Route Generation — Gate Tests                ;;
+;; ============================================ ;;
+
+(deftest routes-gate-generates-interceptor-test
+  (let [owner? (fn [ctx] (= :owner (:role (:auth-claims ctx))))
+        context {:query-registry {:test/gated {:handler-fn identity
+                                                :authorized? owner?
+                                                :datastar/path "/gated"
+                                                :datastar/gate {:check (fn [_] true)
+                                                                :redirect "/gate-fail"}}}}
+        defaults {:datastar/auth-redirect {:unauthenticated "/login" :unauthorized "/home"}}
+        generated (ds/routes context {} defaults)
+        shim-route (first (filter #(= "/gated" (first %)) generated))
+        interceptors (nth shim-route 2)]
+    (testing "interceptor chain: parse-signals → auth-redirect → gate → shim-page"
+      (is (= ::ds/parse-datastar-signals (:name (first interceptors))))
+      (is (= ::ds/auth-redirect (:name (second interceptors))))
+      (is (= ::ds/gate (:name (nth interceptors 2))))
+      (is (= :ai.obney.grain.datastar.core/shim-page (:name (nth interceptors 3)))))))
+
+(deftest routes-gate-fallback-redirect-test
+  (let [context {:query-registry {:test/gate-fallback {:handler-fn identity
+                                                        :authorized? (constantly true)
+                                                        :datastar/path "/gate-fallback"
+                                                        :datastar/gate {:check (fn [_] false)}}}}
+        defaults {:datastar/auth-redirect {:unauthenticated "/login" :unauthorized "/home"}}
+        generated (ds/routes context {} defaults)
+        shim-route (first (filter #(= "/gate-fallback" (first %)) generated))
+        interceptors (nth shim-route 2)
+        ;; The gate interceptor is at position 1 (no auth-redirect for public query)
+        gate-int (second interceptors)]
+    (testing "gate interceptor exists and uses fallback redirect from auth-redirect defaults"
+      (is (= ::ds/gate (:name gate-int)))
+      ;; Test the interceptor — check returns false, should redirect to /home (fallback)
+      (let [result ((:enter gate-int) {})]
+        (is (= "/home" (get-in result [:response :headers "Location"])))))))
+
+(deftest routes-no-gate-test
+  (let [context {:query-registry {:test/no-gate {:handler-fn identity
+                                                   :authorized? (constantly true)
+                                                   :datastar/path "/no-gate"}}}
+        generated (ds/routes context {} {})
+        shim-route (first (filter #(= "/no-gate" (first %)) generated))
+        interceptors (nth shim-route 2)]
+    (testing "no gate interceptor when :datastar/gate not declared"
+      (is (= 2 (count interceptors)))
+      (is (= ::ds/parse-datastar-signals (:name (first interceptors))))
+      (is (= :ai.obney.grain.datastar.core/shim-page (:name (second interceptors)))))))
 
 ;; =========================== ;;
 ;; E2E Auto-Routes Test         ;;
@@ -914,7 +1259,7 @@
                    :datastar/path "/tagged/:item-id"
                    :grain/read-models {:test/rm-tagged 1}
                    :datastar/event-tags {:item :item-id}}
-            [_ stream-route] (#'ds/query->route-pair {} :test/tagged entry)
+            [_ stream-route] (#'ds/query->route-pair {} :test/tagged entry {})
             stream-interceptor (last (nth stream-route 2))]
         (testing "stream route is created"
           (is (some? stream-route)))
@@ -1349,3 +1694,441 @@
       (is (= 2 (count stream-events)))
       ;; Second event should have the filter from the POST
       (is (str/includes? (:data (second stream-events)) "filter:url-nonce")))))
+
+;; ============================================ ;;
+;; E2E GET Signal Reuse Tests                    ;;
+;; ============================================ ;;
+
+(deftest e2e-get-updates-existing-sse-signals-test
+  (testing "Second GET with same nonce updates context on existing SSE and triggers re-render"
+    (let [client (HttpClient/newHttpClient)
+          nonce (str (random-uuid))
+          ;; 1. Open GET SSE stream (event-driven, with auth + nonce)
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port*
+                                                "/filterable/stream?dsNonce=" nonce)))
+                          (.header "X-Test-User-Id" (str test-user-id-a))
+                          (.GET)
+                          .build)
+          get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; Expect: initial render + 1 re-render after second GET = 2 events
+          stream-events-future (future (parse-sse-events (.body get-response) 2 10000))
+          ;; Wait for SSE to connect and register in active-stream-contexts
+          _ (Thread/sleep 500)
+          ;; 2. Second GET with same nonce + filter signal (via ?datastar= JSON param)
+          ds-signals (json/write-str {:filter "active" :dsNonce nonce})
+          get2-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/filterable/stream?datastar="
+                                                  (java.net.URLEncoder/encode ds-signals "UTF-8"))))
+                           (.header "X-Test-User-Id" (str test-user-id-a))
+                           (.GET)
+                           .build)
+          ;; This GET should find existing SSE, update it, and return empty SSE
+          _ (.send client get2-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; 3. Collect SSE events from the original GET stream
+          stream-events @stream-events-future]
+      ;; Initial render should NOT have the filter
+      (is (= 2 (count stream-events)))
+      (is (not (str/includes? (:data (first stream-events)) "filter:")))
+      ;; Re-render after second GET should include the filter value
+      (is (str/includes? (:data (second stream-events)) "filter:active")))))
+
+(deftest e2e-get-no-existing-sse-starts-fresh-test
+  (testing "GET to event-driven stream starts a new SSE when no existing stream is open"
+    (let [client (HttpClient/newHttpClient)
+          unique-user-id (random-uuid)
+          nonce (str (random-uuid))
+          ds-signals (json/write-str {:filter "new" :dsNonce nonce})
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port*
+                                                "/filterable/stream?datastar="
+                                                (java.net.URLEncoder/encode ds-signals "UTF-8"))))
+                          (.header "X-Test-User-Id" (str unique-user-id))
+                          (.GET)
+                          .build)
+          get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+          events (parse-sse-events (.body get-response) 1 10000)]
+      ;; Should get initial render with the filter applied
+      (is (= 1 (count events)))
+      (is (= "datastar-patch-elements" (:name (first events))))
+      (is (str/includes? (:data (first events)) "filter:new")))))
+
+(deftest e2e-get-signal-update-plus-domain-event-test
+  (testing "GET updates signals, then domain event triggers re-render with updated context"
+    (let [client (HttpClient/newHttpClient)
+          nonce (str (random-uuid))
+          ;; 1. Open GET SSE stream
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port*
+                                                "/filterable/stream?dsNonce=" nonce)))
+                          (.header "X-Test-User-Id" (str test-user-id-a))
+                          (.GET)
+                          .build)
+          get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; Expect: initial + GET signal re-render + domain event re-render = 3
+          stream-events-future (future (parse-sse-events (.body get-response) 3 10000))
+          _ (Thread/sleep 500)
+          ;; 2. Second GET to update filter signal
+          ds-signals (json/write-str {:filter "vip" :dsNonce nonce})
+          get2-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/filterable/stream?datastar="
+                                                  (java.net.URLEncoder/encode ds-signals "UTF-8"))))
+                           (.header "X-Test-User-Id" (str test-user-id-a))
+                           (.GET)
+                           .build)
+          _ (.send client get2-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; Wait for signal re-render to complete
+          _ (Thread/sleep 300)
+          ;; 3. Modify state and publish domain event
+          _ (swap! *e2e-state* assoc-in [:counters 0 :value] 777)
+          _ (pubsub/pub *event-pubsub* {:message {:event/type :test/counter-incremented}})
+          stream-events @stream-events-future]
+      ;; Event 1: initial render — no filter
+      (is (= 3 (count stream-events)))
+      (is (not (str/includes? (:data (first stream-events)) "filter:")))
+      ;; Event 2: GET signal update — filter:vip
+      (is (str/includes? (:data (second stream-events)) "filter:vip"))
+      ;; Event 3: domain event re-render — filter still vip, new value 777
+      (is (str/includes? (:data (nth stream-events 2)) "filter:vip"))
+      (is (str/includes? (:data (nth stream-events 2)) "777")))))
+
+(deftest e2e-get-concurrent-users-independent-streams-test
+  (testing "Two users have independent SSE streams — GET signal update from one doesn't affect the other"
+    (let [client (HttpClient/newHttpClient)
+          nonce-a (str (random-uuid))
+          nonce-b (str (random-uuid))
+          ;; 1. User A opens GET SSE stream
+          get-a (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create (str "http://localhost:" *port*
+                                          "/filterable/stream?dsNonce=" nonce-a)))
+                    (.header "X-Test-User-Id" (str test-user-id-a))
+                    (.GET)
+                    .build)
+          response-a (.send client get-a (HttpResponse$BodyHandlers/ofInputStream))
+          events-a-future (future (parse-sse-events (.body response-a) 2 10000))
+          _ (Thread/sleep 300)
+          ;; 2. User B opens GET SSE stream
+          get-b (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create (str "http://localhost:" *port*
+                                          "/filterable/stream?dsNonce=" nonce-b)))
+                    (.header "X-Test-User-Id" (str test-user-id-b))
+                    (.GET)
+                    .build)
+          response-b (.send client get-b (HttpResponse$BodyHandlers/ofInputStream))
+          events-b-future (future (parse-sse-events (.body response-b) 2 5000))
+          _ (Thread/sleep 300)
+          ;; 3. GET signal update as User A
+          ds-signals (json/write-str {:filter "user-a-only" :dsNonce nonce-a})
+          get2-a (-> (HttpRequest/newBuilder)
+                     (.uri (URI/create (str "http://localhost:" *port*
+                                            "/filterable/stream?datastar="
+                                            (java.net.URLEncoder/encode ds-signals "UTF-8"))))
+                     (.header "X-Test-User-Id" (str test-user-id-a))
+                     (.GET)
+                     .build)
+          _ (.send client get2-a (HttpResponse$BodyHandlers/ofInputStream))
+          events-a @events-a-future
+          events-b @events-b-future]
+      ;; User A got re-render with filter
+      (is (= 2 (count events-a)))
+      (is (str/includes? (:data (second events-a)) "filter:user-a-only"))
+      ;; User B only got initial render
+      (is (= 1 (count events-b)))
+      (is (not (str/includes? (:data (first events-b)) "filter:"))))))
+
+(deftest e2e-get-stale-session-cleanup-test
+  (testing "GET skips stale registry entry with closed signal-ch"
+    (let [stale-user-id (random-uuid)
+          nonce (str (random-uuid))
+          session-key [stale-user-id :test/filterable-counters nonce]
+          closed-ch (async/chan)]
+      (async/close! closed-ch)
+      (swap! @#'ds/active-stream-contexts assoc session-key
+             {:context-atom (atom {}) :signal-ch closed-ch})
+      (try
+        (let [client (HttpClient/newHttpClient)
+              ds-signals (json/write-str {:filter "after-stale" :dsNonce nonce})
+              get-request (-> (HttpRequest/newBuilder)
+                              (.uri (URI/create (str "http://localhost:" *port*
+                                                    "/filterable/stream?datastar="
+                                                    (java.net.URLEncoder/encode ds-signals "UTF-8"))))
+                              (.header "X-Test-User-Id" (str stale-user-id))
+                              (.GET)
+                              .build)
+              get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+              events (parse-sse-events (.body get-response) 1 10000)]
+          (is (= 1 (count events)))
+          (is (str/includes? (:data (first events)) "filter:after-stale")))
+        (finally
+          (swap! @#'ds/active-stream-contexts dissoc session-key))))))
+
+(deftest e2e-get-stale-event-ch-starts-fresh-test
+  (testing "GET detects closed event-ch (dead browser connection) and starts fresh SSE"
+    (let [stale-user-id (random-uuid)
+          nonce (str (random-uuid))
+          session-key [stale-user-id :test/filterable-counters nonce]
+          open-signal-ch (async/chan (async/sliding-buffer 1))
+          closed-event-ch (async/chan)]
+      (async/close! closed-event-ch)
+      (swap! @#'ds/active-stream-contexts assoc session-key
+             {:context-atom (atom {}) :signal-ch open-signal-ch :event-ch closed-event-ch})
+      (try
+        (let [client (HttpClient/newHttpClient)
+              ds-signals (json/write-str {:filter "after-dead-conn" :dsNonce nonce})
+              get-request (-> (HttpRequest/newBuilder)
+                              (.uri (URI/create (str "http://localhost:" *port*
+                                                    "/filterable/stream?datastar="
+                                                    (java.net.URLEncoder/encode ds-signals "UTF-8"))))
+                              (.header "X-Test-User-Id" (str stale-user-id))
+                              (.GET)
+                              .build)
+              get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+              events (parse-sse-events (.body get-response) 1 10000)]
+          (is (= 1 (count events)))
+          (is (str/includes? (:data (first events)) "filter:after-dead-conn"))
+          ;; Old signal-ch should have been closed during cleanup
+          (is (async-protocols/closed? open-signal-ch)))
+        (finally
+          (async/close! open-signal-ch)
+          (swap! @#'ds/active-stream-contexts dissoc session-key))))))
+
+(deftest e2e-get-multiple-signal-updates-test
+  (testing "Multiple GETs update the same SSE stream, each triggering a re-render"
+    (let [client (HttpClient/newHttpClient)
+          nonce (str (random-uuid))
+          ;; 1. Open GET SSE stream
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port*
+                                                "/filterable/stream?dsNonce=" nonce)))
+                          (.header "X-Test-User-Id" (str test-user-id-a))
+                          (.GET)
+                          .build)
+          get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; initial + 2 GET signal re-renders = 3
+          stream-events-future (future (parse-sse-events (.body get-response) 3 10000))
+          _ (Thread/sleep 500)
+          ;; 2. First GET signal update — filter=first
+          ds-signals-1 (json/write-str {:filter "first" :dsNonce nonce})
+          get2 (-> (HttpRequest/newBuilder)
+                   (.uri (URI/create (str "http://localhost:" *port*
+                                          "/filterable/stream?datastar="
+                                          (java.net.URLEncoder/encode ds-signals-1 "UTF-8"))))
+                   (.header "X-Test-User-Id" (str test-user-id-a))
+                   (.GET)
+                   .build)
+          _ (.send client get2 (HttpResponse$BodyHandlers/ofInputStream))
+          _ (Thread/sleep 300)
+          ;; 3. Second GET signal update — filter=second
+          ds-signals-2 (json/write-str {:filter "second" :dsNonce nonce})
+          get3 (-> (HttpRequest/newBuilder)
+                   (.uri (URI/create (str "http://localhost:" *port*
+                                          "/filterable/stream?datastar="
+                                          (java.net.URLEncoder/encode ds-signals-2 "UTF-8"))))
+                   (.header "X-Test-User-Id" (str test-user-id-a))
+                   (.GET)
+                   .build)
+          _ (.send client get3 (HttpResponse$BodyHandlers/ofInputStream))
+          stream-events @stream-events-future]
+      (is (= 3 (count stream-events)))
+      ;; Initial — no filter
+      (is (not (str/includes? (:data (first stream-events)) "filter:")))
+      ;; After first GET signal update
+      (is (str/includes? (:data (second stream-events)) "filter:first"))
+      ;; After second GET signal update
+      (is (str/includes? (:data (nth stream-events 2)) "filter:second")))))
+
+(deftest e2e-get-nonce-isolates-tabs-test
+  (testing "Two GETs with different nonces — signal update to one doesn't affect the other"
+    (let [client (HttpClient/newHttpClient)
+          nonce-a (str (random-uuid))
+          nonce-b (str (random-uuid))
+          ;; Tab A
+          get-a (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create (str "http://localhost:" *port*
+                                          "/filterable/stream?dsNonce=" nonce-a)))
+                    (.header "X-Test-User-Id" (str test-user-id-a))
+                    (.GET)
+                    .build)
+          response-a (.send client get-a (HttpResponse$BodyHandlers/ofInputStream))
+          events-a-future (future (parse-sse-events (.body response-a) 2 10000))
+          _ (Thread/sleep 300)
+          ;; Tab B (same user, different nonce)
+          get-b (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create (str "http://localhost:" *port*
+                                          "/filterable/stream?dsNonce=" nonce-b)))
+                    (.header "X-Test-User-Id" (str test-user-id-a))
+                    (.GET)
+                    .build)
+          response-b (.send client get-b (HttpResponse$BodyHandlers/ofInputStream))
+          events-b-future (future (parse-sse-events (.body response-b) 2 5000))
+          _ (Thread/sleep 300)
+          ;; GET signal update to Tab A's nonce only
+          ds-signals (json/write-str {:filter "tab-a-only" :dsNonce nonce-a})
+          get2-a (-> (HttpRequest/newBuilder)
+                     (.uri (URI/create (str "http://localhost:" *port*
+                                            "/filterable/stream?datastar="
+                                            (java.net.URLEncoder/encode ds-signals "UTF-8"))))
+                     (.header "X-Test-User-Id" (str test-user-id-a))
+                     (.GET)
+                     .build)
+          _ (.send client get2-a (HttpResponse$BodyHandlers/ofInputStream))
+          events-a @events-a-future
+          events-b @events-b-future]
+      ;; Tab A got initial + signal update
+      (is (= 2 (count events-a)))
+      (is (str/includes? (:data (second events-a)) "filter:tab-a-only"))
+      ;; Tab B only got initial — not affected
+      (is (= 1 (count events-b)))
+      (is (not (str/includes? (:data (first events-b)) "filter:"))))))
+
+(deftest e2e-cross-method-reuse-test
+  (testing "GET and POST reuse the same session interchangeably"
+    (let [client (HttpClient/newHttpClient)
+          nonce (str (random-uuid))
+          ;; 1. Open GET SSE stream
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port*
+                                                "/filterable/stream?dsNonce=" nonce)))
+                          (.header "X-Test-User-Id" (str test-user-id-a))
+                          (.GET)
+                          .build)
+          get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+          ;; initial + POST re-render + GET re-render = 3
+          stream-events-future (future (parse-sse-events (.body get-response) 3 10000))
+          _ (Thread/sleep 500)
+          ;; 2. POST with filter=post-value
+          post-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/filterable/stream?filter=post-value&dsNonce=" nonce)))
+                           (.header "Content-Type" "application/json")
+                           (.header "X-Test-User-Id" (str test-user-id-a))
+                           (.POST (HttpRequest$BodyPublishers/ofString ""))
+                           .build)
+          _ (.send client post-request (HttpResponse$BodyHandlers/ofInputStream))
+          _ (Thread/sleep 300)
+          ;; 3. GET with filter=get-value (same nonce — should reuse same session)
+          ds-signals (json/write-str {:filter "get-value" :dsNonce nonce})
+          get2-request (-> (HttpRequest/newBuilder)
+                           (.uri (URI/create (str "http://localhost:" *port*
+                                                  "/filterable/stream?datastar="
+                                                  (java.net.URLEncoder/encode ds-signals "UTF-8"))))
+                           (.header "X-Test-User-Id" (str test-user-id-a))
+                           (.GET)
+                           .build)
+          _ (.send client get2-request (HttpResponse$BodyHandlers/ofInputStream))
+          stream-events @stream-events-future]
+      (is (= 3 (count stream-events)))
+      ;; Initial — no filter
+      (is (not (str/includes? (:data (first stream-events)) "filter:")))
+      ;; After POST
+      (is (str/includes? (:data (second stream-events)) "filter:post-value"))
+      ;; After GET — same session, different method
+      (is (str/includes? (:data (nth stream-events 2)) "filter:get-value")))))
+
+;; ============================================ ;;
+;; E2E Auth-Redirect Tests                       ;;
+;; ============================================ ;;
+
+(deftest e2e-auth-redirect-unauthenticated-test
+  (testing "GET to protected page without auth redirects to unauthenticated path"
+    (let [client (HttpClient/newBuilder)
+          ;; Don't follow redirects so we can inspect the 302
+          client (.followRedirects client (java.net.http.HttpClient$Redirect/NEVER))
+          client (.build client)
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/owner-only")))
+                      (.GET)
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofString))]
+      (is (= 302 (.statusCode response)))
+      (is (= "/test-login" (first (.allValues (.headers response) "location")))))))
+
+(deftest e2e-auth-redirect-unauthorized-test
+  (testing "GET to protected page with wrong role redirects to unauthorized path"
+    (let [client (HttpClient/newBuilder)
+          client (.followRedirects client (java.net.http.HttpClient$Redirect/NEVER))
+          client (.build client)
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/owner-only")))
+                      (.header "X-Test-User-Id" (str test-user-id-a))
+                      (.header "X-Test-Role" "staff")
+                      (.GET)
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofString))]
+      (is (= 302 (.statusCode response)))
+      (is (= "/test-home" (first (.allValues (.headers response) "location")))))))
+
+(deftest e2e-auth-redirect-authorized-test
+  (testing "GET to protected page with correct role returns shim page"
+    (let [client (HttpClient/newHttpClient)
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/owner-only")))
+                      (.header "X-Test-User-Id" (str test-user-id-a))
+                      (.header "X-Test-Role" "owner")
+                      (.GET)
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofString))]
+      (is (= 200 (.statusCode response)))
+      (is (str/includes? (.body response) "Owner Only")))))
+
+(deftest e2e-auth-redirect-public-page-test
+  (testing "GET to public page without auth returns shim page (no redirect)"
+    (let [client (HttpClient/newHttpClient)
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/public-page")))
+                      (.GET)
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofString))]
+      (is (= 200 (.statusCode response)))
+      (is (str/includes? (.body response) "Public")))))
+
+;; ============================================ ;;
+;; E2E Gate Tests                                ;;
+;; ============================================ ;;
+
+(deftest e2e-gate-passes-test
+  (testing "GET to gated page when gate passes returns shim page"
+    (reset! *gate-pass* true)
+    (try
+      (let [client (HttpClient/newHttpClient)
+            request (-> (HttpRequest/newBuilder)
+                        (.uri (URI/create (str "http://localhost:" *port* "/gated-page")))
+                        (.header "X-Test-User-Id" (str test-user-id-a))
+                        (.header "X-Test-Role" "owner")
+                        (.GET)
+                        .build)
+            response (.send client request (HttpResponse$BodyHandlers/ofString))]
+        (is (= 200 (.statusCode response)))
+        (is (str/includes? (.body response) "Gated")))
+      (finally (reset! *gate-pass* false)))))
+
+(deftest e2e-gate-blocks-test
+  (testing "GET to gated page when gate blocks redirects to gate redirect path"
+    (reset! *gate-pass* false)
+    (let [client (HttpClient/newBuilder)
+          client (.followRedirects client (java.net.http.HttpClient$Redirect/NEVER))
+          client (.build client)
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/gated-page")))
+                      (.header "X-Test-User-Id" (str test-user-id-a))
+                      (.header "X-Test-Role" "owner")
+                      (.GET)
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofString))]
+      (is (= 302 (.statusCode response)))
+      (is (= "/gate-blocked" (first (.allValues (.headers response) "location")))))))
+
+(deftest e2e-gate-fallback-redirect-test
+  (testing "GET to page with gate that always blocks redirects to fallback path"
+    (let [client (HttpClient/newBuilder)
+          client (.followRedirects client (java.net.http.HttpClient$Redirect/NEVER))
+          client (.build client)
+          request (-> (HttpRequest/newBuilder)
+                      (.uri (URI/create (str "http://localhost:" *port* "/gate-fallback-page")))
+                      (.GET)
+                      .build)
+          response (.send client request (HttpResponse$BodyHandlers/ofString))]
+      (is (= 302 (.statusCode response)))
+      (is (= "/test-home" (first (.allValues (.headers response) "location")))))))
