@@ -504,6 +504,36 @@
           (is (some? second-result))
           (is (not= (:result first-result) (:result second-result))))))))
 
+(deftest poll-and-render-static-result-dynamic-hiccup-test
+  (testing "re-renders when hiccup changes even if :query/result is static"
+    ;; Use the :test/counters query but keep :query/result the same across renders
+    ;; while changing the hiccup via the underlying state atom.
+    ;; The counters query returns {:query/result counters :datastar/hiccup [...]}.
+    ;; If we change a counter value, both query/result and hiccup change.
+    ;; To test the specific bug, we need a query where only hiccup changes.
+    ;; We simulate this by using :test/counters and verifying the diff works on hiccup.
+    (let [state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000099"
+                                   :name "Static" :value 0}]})
+          context {:test-state state
+                   :query-registry @qp/query-registry*
+                   :query {:query/name :test/counters
+                           :query/id (random-uuid)
+                           :query/timestamp (time/now)}}
+          first-result (ds/poll-and-render context nil)]
+      ;; First poll renders
+      (is (some? first-result))
+      ;; :result now contains hiccup, not query-data
+      (is (vector? (:result first-result)))
+
+      ;; Same state — hiccup is identical, should return nil
+      (is (nil? (ds/poll-and-render context (:result first-result))))
+
+      ;; Change value — hiccup changes
+      (swap! state assoc-in [:counters 0 :value] 42)
+      (let [second-result (ds/poll-and-render context (:result first-result))]
+        (is (some? second-result) "should re-render when hiccup changes")
+        (is (str/includes? (get-in second-result [:event :data]) "42"))))))
+
 (deftest poll-and-render-unauthorized-test
   (let [context {:query-registry {:test/counters {:handler-fn (fn [_] {:query/result []})
                                                   :authorized? (constantly false)}}

@@ -227,18 +227,19 @@
 ;; --------------- ;;
 
 (defn poll-and-render
-  "Single poll cycle. Returns {:event sse-event :result query-data} if changed, nil if unchanged."
+  "Single poll cycle. Returns {:event sse-event :result hiccup} if hiccup changed, nil if unchanged.
+   Diffs on :datastar/hiccup so updates are only sent when the rendered output changes."
   [query-context prev-result]
   (let [query-registry (or (:query-registry query-context) @qp/query-registry*)
         query-name (get-in query-context [:query :query/name])
         authorized? (get-in query-registry [query-name :authorized?])]
     (if (and authorized? (true? (authorized? query-context)))
-      (let [result (qp/process-query query-context)
-            query-data (when-not (anomaly? result) (:query/result result))]
-        (when (not= query-data prev-result)
+      (let [result (qp/process-query query-context)]
+        (when-not (anomaly? result)
           (when-let [hiccup (:datastar/hiccup result)]
-            {:event (patch-elements (render-html hiccup) {})
-             :result query-data})))
+            (when (not= hiccup prev-result)
+              {:event (patch-elements (render-html hiccup) {})
+               :result hiccup}))))
       (do
         (when-not authorized?
           (u/log ::missing-authorized-predicate :query-name query-name))
