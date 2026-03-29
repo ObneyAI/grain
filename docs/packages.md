@@ -7,7 +7,7 @@ Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 proc
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0900cb22bf43121edbe5287b0e65ea66b729b091"
+ :sha "6fed1f5b37069e7005a2f086934e3f3f0f3f19f2"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -18,7 +18,7 @@ Distributed coordination for multi-instance deployments. Coordinator election, t
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0900cb22bf43121edbe5287b0e65ea66b729b091"
+ :sha "6fed1f5b37069e7005a2f086934e3f3f0f3f19f2"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -31,7 +31,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0900cb22bf43121edbe5287b0e65ea66b729b091"
+ :sha "6fed1f5b37069e7005a2f086934e3f3f0f3f19f2"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -44,7 +44,7 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0900cb22bf43121edbe5287b0e65ea66b729b091"
+ :sha "6fed1f5b37069e7005a2f086934e3f3f0f3f19f2"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
@@ -55,7 +55,7 @@ obneyai/grain-event-store-postgres-v3
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "0900cb22bf43121edbe5287b0e65ea66b729b091"
+ :sha "6fed1f5b37069e7005a2f086934e3f3f0f3f19f2"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 

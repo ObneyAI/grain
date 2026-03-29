@@ -38,7 +38,13 @@ Auto-generate Pedestal routes from query registry metadata:
 (ds/routes context overrides defaults) ;; global defaults for all routes
 ```
 
-Each annotated query produces three routes — an HTML shim page, a GET SSE stream, and a POST SSE stream.
+Each annotated query produces three routes:
+
+1. `GET /path` — Shim page (HTML shell that boots Datastar)
+2. `GET /path/__stream` — SSE connection
+3. `POST /path/__stream` — Signal updates on existing SSE
+
+The `/__stream` suffix prevents collisions with parameterized routes (e.g. `/events` and `/events/:id` can coexist safely). Path params in `:datastar/path` (e.g. `/events/:event-id`) are automatically resolved in the shim page's stream URL.
 
 ### Defaults
 
@@ -114,11 +120,19 @@ In event-driven mode, both `@get` and `@post` requests check for an existing SSE
   (signals)         └───────────────────────────────────────────┘
 ```
 
+## Error Surfacing
+
+The adapter logs warnings for common misconfigurations that would otherwise cause silent failures:
+
+- **Missing `:authorized?`** — If a query or command has no `:authorized?` predicate, it is rejected as unauthorized (default-deny). A `::missing-authorized-predicate` warning is logged so the developer knows to add one. Use `(constantly true)` for public queries.
+- **Missing query schema** — If a `defquery` has no corresponding `defschemas` entry, JSON coercion is skipped and a `::missing-query-schema` warning is logged. The query still runs but params won't be coerced from strings.
+- **Event schema validation** — When events fail Malli schema validation in the event store, the full `:error/explain` with validation details is passed through to the caller (not hidden behind a generic message).
+
 ## Query Metadata Reference
 
 | Key | Description | Default |
 | --- | --- | --- |
-| `:datastar/path` | Route path (required for route generation) | — |
+| `:datastar/path` | Route path, supports Pedestal path params (e.g. `/events/:event-id`) | — |
 | `:datastar/title` | HTML `<title>` in the shim page | `"Grain App"` |
 | `:datastar/fps` | Polling rate (ignored in event-driven mode) | `30` |
 | `:datastar/debounce-ms` | Debounce before re-render after event | `50` |

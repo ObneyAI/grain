@@ -35,12 +35,15 @@
    an SSE connection to `stream-path` via `@get` (or `@post`).
 
    Generates a unique nonce per page load so multiple tabs get independent SSE
-   streams. For `@get`, the nonce is appended as a query param; for `@post`, it's
-   emitted as a Datastar signal so it's included in every request body.
+   streams. The nonce is emitted as a Datastar signal so it's included in every
+   request automatically, and appended to the stream URL as a query param.
+
+   Path parameters in `:stream-path` (e.g., `:item-id` in `\"/items/:item-id/__stream\"`)
+   are automatically resolved from the request's `:path-params` map.
 
    opts keys:
      :title         — HTML <title> (default \"Grain App\")
-     :stream-path   — SSE endpoint path (e.g., \"/my-page/stream\")
+     :stream-path   — SSE endpoint path (e.g., \"/my-page/__stream\")
      :stream-method — \"get\" (default) or \"post\"
      :head          — extra <head> hiccup or (fn [] hiccup)
      :body          — extra <body> hiccup (rendered before the #app div)
