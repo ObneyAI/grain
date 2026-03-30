@@ -71,7 +71,7 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "6126ac1efbbf4c47c3612fc626f81839af83b837"
+ :sha "9839b54c1c7a2f778b03c801d7460e7fd3218ee1"
  :deps/root "projects/grain-core-v2"}
 ```
 
