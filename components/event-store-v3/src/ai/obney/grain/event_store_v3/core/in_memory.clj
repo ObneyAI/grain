@@ -23,11 +23,7 @@
 
 (defn- read-single
   [event-store {:keys [tenant-id tags types as-of after] :as args}]
-  (u/trace
-   ::read
-   [:args args
-    :metric/name "GrainReadEvents"]
-   (let [filtered-events (->> (-> event-store :state deref :events)
+  (let [filtered-events (->> (-> event-store :state deref :events)
                               (filter
                                (fn [event]
                                  (and
@@ -58,7 +54,7 @@
                 filtered-events)]
            (if (= reduced-result ::none)
              (f)
-             reduced-result)))))))
+             reduced-result))))))
 
 (defn- read-batch
   [event-store queries]

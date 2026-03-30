@@ -20,11 +20,7 @@
 
 #?(:clj (defn- read-single
           [event-store {:keys [tags types as-of after] :as args}]
-          (u/trace
-           ::read
-           [:args args
-            :metric/name "GrainReadEvents"]
-           (let [filtered-events (->> (-> event-store :state deref :events)
+          (let [filtered-events (->> (-> event-store :state deref :events)
                                       (filter
                                        (fn [event]
                                          (and
@@ -55,7 +51,7 @@
                         filtered-events)]
                    (if (= reduced-result ::none)
                      (f)  ; Empty collection case
-                     reduced-result)))))))
+                     reduced-result)))))
 
    :cljs (defn- read-single
            [event-store {:keys [tags types as-of after] :as _args}]
