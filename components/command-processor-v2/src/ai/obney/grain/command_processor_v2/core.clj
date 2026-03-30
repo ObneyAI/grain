@@ -47,10 +47,7 @@
      (if handler
        (if-let [_ (and (mc/validate command-name command)
                        (mc/validate ::command-schema/command command))]
-         (let [_ (u/log ::command-started :metric/name "CommandStarted" :metric/value 1 :metric/resolution :high)
-               result (execute-command handler context)
-               _ (u/log ::command-finished :metric/name "CommandFinished" :metric/value 1 :metric/resolution :high)]
-           result)
+         (execute-command handler context)
          {::anom/category ::anom/incorrect
           ::anom/message "Invalid Command: Failed Schema Validation"
           :error/explain (me/humanize (or (mc/explain command-name command)

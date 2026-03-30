@@ -161,17 +161,13 @@
   (if (and lease-check-fn
            (not (lease-check-fn tenant-id processor-name)))
     (u/log ::lease-check-skipped :tenant-id tenant-id :processor-name processor-name)
-    (do
-      (u/log ::process-event :event event)
-      (u/trace
-       ::processing-event
-       [:event event :metric/name "TodoProcessed" :metric/resolution :high]
-       (try
-         (let [_ (u/log :metric/metric :metric/name "TodoStarted" :metric/value 1 :metric/resolution :high)
-               result (or (handler-fn context)
-                          {::anom/category ::anom/fault
-                           ::anom/message  "Todo Processor returned nil: %s"})
-               _ (u/log :metric/metric :metric/name "TodoFinished" :metric/value 1 :metric/resolution :high)]
+    (u/trace
+     ::processing-event
+     [:event event :metric/name "TodoProcessed" :metric/resolution :high]
+     (try
+       (let [result (or (handler-fn context)
+                        {::anom/category ::anom/fault
+                         ::anom/message  "Todo Processor returned nil: %s"})]
            (if (anomaly? result)
              (do (u/log ::anomaly-in-todo-processor :anomaly result)
                  (when (and processor-name (not retry-on-error?))
@@ -186,7 +182,7 @@
            (u/log ::uncaught-exception-in-todo-processor :exception t)
            (when (and processor-name (not retry-on-error?))
              (append-with-checkpoint event-store tenant-id processor-name
-                                     (:event/id event) []))))))))
+                                     (:event/id event) [])))))))
 
 ;; ------------------- ;;
 ;; Catch-up            ;;

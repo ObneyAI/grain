@@ -51,7 +51,7 @@
                         filtered-events)]
                    (if (= reduced-result ::none)
                      (f)  ; Empty collection case
-                     reduced-result)))))
+                     reduced-result))))))
 
    :cljs (defn- read-single
            [event-store {:keys [tags types as-of after] :as _args}]
