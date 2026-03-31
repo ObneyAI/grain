@@ -9,13 +9,22 @@
   "Default LMDB map size: 10 MB"
   10485760)
 
+(def default-max-readers
+  "Default LMDB max concurrent reader slots. Each unique thread that opens a
+   read transaction claims a slot that persists until the thread dies AND
+   readersCheck() is called. Applications using futures or thread pools
+   (e.g., ORC node execution, GEPA optimization) create many short-lived
+   threads. The lmdbjava default of 126 is too low for these workloads."
+  1024)
+
 (defn start
-  [{{:keys [storage-dir db-name map-size]} :config
+  [{{:keys [storage-dir db-name map-size max-readers]} :config
     :as kv-store}]
   (let [file (File. storage-dir)
         _ (.mkdirs file)
         env (.. (Env/create)
                 (setMapSize (long (or map-size default-map-size)))
+                (setMaxReaders (int (or max-readers default-max-readers)))
                 (setMaxDbs 1)
                 (open file nil))
         dbi (.openDbi env db-name (into-array DbiFlags [DbiFlags/MDB_CREATE]))]
@@ -26,8 +35,9 @@
   (.close db)
   (.close env))
 
-(defn get!
-  [{:keys [env db] :as _cache} {:keys [k]}]
+(defn- get!*
+  "Internal: read a value from LMDB within a read transaction."
+  [^Env env db k]
   (with-open [txn (.txnRead env)]
     (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
           _ (.. k-buf (put k) flip)
@@ -37,6 +47,16 @@
               arr (byte-array (.remaining val-buf))]
           (.get val-buf arr)
           arr)))))
+
+(defn get!
+  "Read a value from LMDB. On ReadersFullException, reclaims stale reader
+   slots from dead threads via readersCheck() and retries once."
+  [{:keys [env db] :as _cache} {:keys [k]}]
+  (try
+    (get!* env db k)
+    (catch org.lmdbjava.Env$ReadersFullException _
+      (.readersCheck ^Env env)
+      (get!* env db k))))
 
 (defn put!
   [{:keys [env db] :as _cache} {:keys [k v]}]
@@ -64,4 +84,3 @@
   (get! [this args] (get! this args))
   (put! [this args] (put! this args))
   (put-batch! [this args] (put-batch! this args)))
-

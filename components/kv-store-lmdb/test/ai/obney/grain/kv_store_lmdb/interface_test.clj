@@ -70,3 +70,31 @@
 (deftest put-batch-empty-entries
   (kv/put-batch! *cache* {:entries []})
   (is (nil? (kv/get! *cache* {:k (.getBytes "nothing")}))))
+
+;; ---------------------------------------------------------------------------
+;; Max readers
+;; ---------------------------------------------------------------------------
+
+(deftest concurrent-readers-across-threads
+  (testing "200 concurrent thread readers succeed (would fail with old default of 126)"
+    (kv/put! *cache* {:k (.getBytes "shared") :v (.getBytes "value")})
+    (let [results (doall
+                    (pmap (fn [_]
+                            (try
+                              (String. (kv/get! *cache* {:k (.getBytes "shared")}))
+                              (catch Exception e (.getMessage e))))
+                          (range 200)))]
+      (is (every? #(= "value" %) results)))))
+
+(deftest custom-max-readers-config
+  (testing "max-readers config is respected"
+    (let [dir (str "/tmp/kv-lmdb-maxreaders-" (random-uuid))
+          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir
+                                                   :db-name "test"
+                                                   :max-readers 256}))]
+      (try
+        (kv/put! cache {:k (.getBytes "k") :v (.getBytes "v")})
+        (is (= "v" (String. (kv/get! cache {:k (.getBytes "k")}))))
+        (finally
+          (kv/stop cache)
+          (delete-dir-recursively dir))))))
