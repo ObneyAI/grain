@@ -92,10 +92,31 @@
 ;; A. Lifecycle (3 tests)   ;;
 ;; ======================== ;;
 
+(defn pg-config-with-auth []
+  {:conn {:type          :postgres
+          :server-name   (or (System/getenv "PG_HOST") "localhost")
+          :port-number   (or (System/getenv "PG_PORT") "5432")
+          :database-name (or (System/getenv "PG_DATABASE") "obneyai")
+          :auth {:type     :password
+                 :username (or (System/getenv "PG_USER") "postgres")
+                 :password (or (System/getenv "PG_PASSWORD") "password")}}})
+
 (deftest start-and-stop-without-error
   (let [store (es/start (pg-config))]
     (try
       (is (some? store))
+      (finally
+        (es/stop store)))))
+
+(deftest start-and-stop-with-auth-password
+  (let [store (es/start (pg-config-with-auth))]
+    (try
+      (is (some? store))
+      (let [tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :tags #{} :body {:val 1}})]
+        (es/append store {:tenant-id tenant-id :events [event]})
+        (let [events (into [] (es/read store {:tenant-id tenant-id}))]
+          (is (pos? (count events)))))
       (finally
         (es/stop store)))))
 

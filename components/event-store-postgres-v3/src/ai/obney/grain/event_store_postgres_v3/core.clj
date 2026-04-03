@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
             [ai.obney.grain.event-store-v3.interface :refer [->event]]
+            [ai.obney.grain.event-store-postgres-v3.interface.datasource :as datasource]
             [next.jdbc :as jdbc]
             [com.brunobonacci.mulog :as u]
             [integrant.core :as ig]
@@ -91,13 +92,12 @@
 ;; --------------------------- ;;
 
 (defn start
-  [{::keys [_server-name _port-number _username _password _database-name] :as config}]
+  [config]
   (u/trace
    ::starting-event-store
    []
-   (let [config* (assoc config :adapter "postgresql")
-         system (ig/init
-                 {::config config*
+   (let [system (ig/init
+                 {::config config
                   ::connection-pool {::config (ig/ref ::config)}})]
      (init-idempotently system)
      system)))
@@ -118,7 +118,7 @@
 
 (defmethod ig/init-key ::connection-pool [_ {::keys [config]}]
   (try
-    (hikari/make-datasource config)
+    (datasource/make-datasource config)
     (catch Throwable t
       (u/log ::error-creating-connection-pool :error t)
       (throw t))))
