@@ -50,6 +50,10 @@
 
 (defonce node-id-atom (atom nil))
 
+;; Tracks how many times each slow-work effect actually executed (keyed by event-id).
+;; Used to detect duplicate effect firings that event-count-based verification misses.
+(defonce slow-work-effect-executions (atom {}))
+
 (defn counter-processor-handler
   "Processes :test/counter-incremented events by appending a
    :test/counter-processed event tagged with this node's ID."
@@ -64,17 +68,19 @@
 (defn slow-work-handler
   "Processes :test/slow-work events with a deliberate delay.
    Uses at-least-once effect path so we can observe what happens
-   when a node dies mid-processing."
+   when a node dies mid-processing. Tracks effect executions in an
+   atom so tests can detect duplicate firings."
   [{:keys [event event-store tenant-id]}]
   (let [node-id @node-id-atom
-        start-ms (System/currentTimeMillis)]
+        event-id (:event/id event)]
     {:result/effect (fn []
+                      (swap! slow-work-effect-executions update event-id (fnil inc 0))
                       ;; Simulate slow work (2 seconds)
                       (Thread/sleep 2000))
      :result/checkpoint :after
      :result/on-success [(es/->event {:type :test/slow-work-done
                                        :body {:processed-by/node-id node-id
-                                              :processed-by/event-id (:event/id event)
+                                              :processed-by/event-id event-id
                                               :processing-time-ms 2000}})]}))
 
 ;; Register processors so the control plane can discover them
@@ -282,7 +288,9 @@
 
 (defn diagnose-slow-work
   "Analyze slow-work processing for a tenant: how many submitted,
-   how many completed, how many checkpointed, which nodes processed them."
+   how many completed, how many checkpointed, which nodes processed them.
+   Includes :effect-executions — the actual number of times the effect fn
+   ran, which may exceed :completed if there are duplicate firings."
   [system tenant-id]
   (let [all (into []
               (remove #(= :grain/tx (:event/type %)))
@@ -291,13 +299,23 @@
         done (filter #(= :test/slow-work-done (:event/type %)) all)
         checkpoints (filter #(= :grain/todo-processor-checkpoint (:event/type %)) all)
         failures (filter #(= :grain/todo-processor-effect-failure (:event/type %)) all)
-        done-by-node (frequencies (map :processed-by/node-id done))]
+        done-by-node (frequencies (map :processed-by/node-id done))
+        effect-execs @slow-work-effect-executions
+        total-effect-runs (reduce + 0 (vals effect-execs))
+        duplicate-effects (into {} (filter #(> (val %) 1)) effect-execs)]
     {:submitted (count submitted)
      :completed (count done)
      :checkpointed (count checkpoints)
      :failures (count failures)
      :completed-by-node (into {} (map (fn [[k v]] [(str k) v])) done-by-node)
+     :effect-executions total-effect-runs
+     :duplicate-effects (count duplicate-effects)
      :events-by-type (frequencies (map :event/type all))}))
+
+(defn reset-slow-work-tracking!
+  "Reset the slow-work effect execution counter. Call before each test scenario."
+  []
+  (reset! slow-work-effect-executions {}))
 
 (defn all-events
   "Show all non-tx events for a tenant."

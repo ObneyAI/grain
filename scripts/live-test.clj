@@ -426,6 +426,8 @@
   (header "Scenario 13: In-progress work during node crash")
   (restart-victim!)
   (Thread/sleep 4000)
+  ;; Reset effect tracking on the primary node (where catch-up will run after failover)
+  (eval-on primary-port "(app/reset-slow-work-tracking!)")
   (let [victim-tenant (find-tenant-owned-by primary-port victim-port)]
     (if victim-tenant
       (do
@@ -445,7 +447,9 @@
                              victim-tenant))]
           (info (str "Diagnosis: " (pr-str diag)))
           (check (str "All slow work completed (" (:completed diag) "/3)")
-                 (= 3 (:completed diag)))))
+                 (= 3 (:completed diag)))
+          (check (str "No duplicate effect executions (" (:duplicate-effects diag) " duplicates)")
+                 (= 0 (:duplicate-effects diag)))))
       (fail "No tenants owned by victim"))))
 
 (defn scenario-14 []
@@ -496,7 +500,14 @@
   ;; and regular increments to the other 3
   (let [tids @tenant-ids
         slow-tids (take 3 tids)
-        fast-tids (drop 3 tids)]
+        fast-tids (drop 3 tids)
+        ;; Capture baseline completed counts before submitting new work
+        baseline (eval-read primary-port
+                   (format "(reduce + (map (fn [tid-str]
+                                             (:completed (app/diagnose-slow-work @app/app
+                                                           (java.util.UUID/fromString tid-str))))
+                                           %s))"
+                           (pr-str (vec slow-tids))))]
     (info (str "Submitting slow-work to " (count slow-tids) " tenants (2s sleep each)..."))
     (doseq [tid slow-tids]
       (eval-on primary-port
@@ -517,10 +528,11 @@
                                                 (:completed (app/diagnose-slow-work @app/app
                                                               (java.util.UUID/fromString tid-str))))
                                               %s))"
-                              (pr-str (vec slow-tids))))]
-      (info (str "Slow tenants completed after total wait: " slow-done))
-      (check (str "All slow work eventually completed (" slow-done "/3)")
-             (= 3 slow-done)))))
+                              (pr-str (vec slow-tids))))
+          new-completions (- slow-done (or baseline 0))]
+      (info (str "Slow tenants completed after total wait: " new-completions " new (total " slow-done ")"))
+      (check (str "All slow work eventually completed (" new-completions "/3)")
+             (= 3 new-completions)))))
 
 (defn scenario-16 []
   (header "Scenario 16: Tenant routing decisions across nodes")

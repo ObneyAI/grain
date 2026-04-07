@@ -636,6 +636,77 @@
       (core/process-event ctx)
       (is (= 1 @effect-count) "Effect must not run twice"))))
 
+(deftest effect-after-no-rerun-on-replay
+  (testing "At-least-once: replay does not re-run effect when checkpoint already exists"
+    (let [effect-count (atom 0)
+          handler (fn [_]
+                    {:result/effect (fn [] (swap! effect-count inc))
+                     :result/checkpoint :after})
+          event (make-event :test/event-1 :body {:num 1})
+          ctx (assoc (make-context event handler)
+                :processor-name :test/effect-after-replay)]
+      ;; First run — effect fires, checkpoint written
+      (core/process-event ctx)
+      (is (= 1 @effect-count))
+      ;; Replay — checkpoint already exists, effect must NOT run again
+      (core/process-event ctx)
+      (is (= 1 @effect-count) "Effect must not run twice for :after checkpoint"))))
+
+;; 11b. Catch-up idempotency after restart
+
+(deftest catch-up-does-not-replay-checkpointed-effects
+  (testing "Full catch-up path: effects don't re-fire after processor restart"
+    (let [effect-count (atom 0)
+          tenant-id (random-uuid)
+          handler (fn [_]
+                    {:result/effect (fn [] (swap! effect-count inc))
+                     :result/checkpoint :after})
+          ;; Seed 3 events before any processor runs
+          events (mapv (fn [i] (make-event :test/event-1 :body {:num i})) (range 3))]
+      (es/append *event-store* {:tenant-id tenant-id :events events})
+      ;; First catch-up — processes all 3 events, writes 3 checkpoints
+      (#'core/catch-up-tenant *event-store* tenant-id :test/catchup-restart
+                            [:test/event-1]
+                            {:event-store *event-store*}
+                            handler)
+      (is (= 3 @effect-count) "First catch-up should process all 3 events")
+      ;; Simulate restart — second catch-up on the same processor name
+      (#'core/catch-up-tenant *event-store* tenant-id :test/catchup-restart
+                            [:test/event-1]
+                            {:event-store *event-store*}
+                            handler)
+      (is (= 3 @effect-count) "Second catch-up must not re-fire effects"))))
+
+(deftest catch-up-with-nil-checkpoint-does-not-duplicate-effects
+  (testing "Catch-up replays from scratch but skips already-checkpointed events"
+    (let [effect-count (atom 0)
+          tenant-id (random-uuid)
+          handler (fn [_]
+                    {:result/effect (fn [] (swap! effect-count inc))
+                     :result/checkpoint :after})
+          events (mapv (fn [i] (make-event :test/event-1 :body {:num i})) (range 2))]
+      (es/append *event-store* {:tenant-id tenant-id :events events})
+      ;; First catch-up — processes both events, writes checkpoints
+      (#'core/catch-up-tenant *event-store* tenant-id :test/catchup-nil
+                            [:test/event-1]
+                            {:event-store *event-store*}
+                            handler)
+      (is (= 2 @effect-count) "First catch-up processes both")
+      ;; Simulate the scenario where get-last-processed-id returns nil
+      ;; (e.g., transient DB failure). Manually call catch-up with all
+      ;; events visible — the :after nil path reads from the beginning.
+      ;; Each event already has a checkpoint, so effects must not re-fire.
+      (let [all-events (into [] (es/read *event-store*
+                                  {:tenant-id tenant-id
+                                   :types #{:test/event-1}}))]
+        (doseq [event all-events]
+          (core/process-event {:event event
+                               :handler-fn handler
+                               :event-store *event-store*
+                               :tenant-id tenant-id
+                               :processor-name :test/catchup-nil})))
+      (is (= 2 @effect-count) "Replaying all events must not re-fire effects"))))
+
 ;; 12. Batch checkpointing
 
 (deftest bp1-batch-completeness

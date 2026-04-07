@@ -91,28 +91,44 @@
              :triggered-by triggering-event-id
              :error/message error-message}})))
 
+(defn- already-checkpointed?
+  "Returns true if a checkpoint already exists for this processor+event pair."
+  [event-store tenant-id processor-name triggering-id]
+  (let [proc-uuid (processor-name->uuid processor-name)]
+    (reduce (fn [_ evt]
+              (if (= triggering-id (:triggered-by evt))
+                (reduced true)
+                false))
+            false
+            (event-store/read event-store
+              {:tenant-id tenant-id
+               :types #{:grain/todo-processor-checkpoint}
+               :tags #{[:processor proc-uuid]}}))))
+
 (defn- process-effect-after
-  "At-least-once: run effect first, then append events + checkpoint."
+  "At-least-once: run effect first, then append events + checkpoint.
+   Skips the effect if a checkpoint already exists for this event (replay guard)."
   [{:keys [event-store tenant-id processor-name event]} result]
-  (let [triggering-id (:event/id event)
-        effect-fn (:result/effect result)]
-    (try
-      (effect-fn)
-      (append-with-checkpoint event-store tenant-id processor-name
-                              triggering-id (or (:result/on-success result) []))
-      (catch Throwable effect-ex
-        (u/log ::effect-failed :processor-name processor-name
-               :triggered-by triggering-id :exception effect-ex)
+  (let [triggering-id (:event/id event)]
+    (when-not (already-checkpointed? event-store tenant-id processor-name triggering-id)
+      (let [effect-fn (:result/effect result)]
         (try
+          (effect-fn)
           (append-with-checkpoint event-store tenant-id processor-name
-                                  triggering-id (or (:result/on-failure result) []))
-          (catch Throwable failure-ex
-            (u/log ::effect-failure-handler-failed :exception failure-ex)
-            (let [failure-event (make-effect-failure-event
-                                 processor-name triggering-id
-                                 (str (ex-message effect-ex)))]
+                                  triggering-id (or (:result/on-success result) []))
+          (catch Throwable effect-ex
+            (u/log ::effect-failed :processor-name processor-name
+                   :triggered-by triggering-id :exception effect-ex)
+            (try
               (append-with-checkpoint event-store tenant-id processor-name
-                                      triggering-id [failure-event]))))))))
+                                      triggering-id (or (:result/on-failure result) []))
+              (catch Throwable failure-ex
+                (u/log ::effect-failure-handler-failed :exception failure-ex)
+                (let [failure-event (make-effect-failure-event
+                                     processor-name triggering-id
+                                     (str (ex-message effect-ex)))]
+                  (append-with-checkpoint event-store tenant-id processor-name
+                                          triggering-id [failure-event]))))))))))
 
 (defn- process-effect-before
   "At-most-once: append events + checkpoint first, then run effect."
