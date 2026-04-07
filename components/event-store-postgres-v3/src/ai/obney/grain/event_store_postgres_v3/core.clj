@@ -9,8 +9,7 @@
             [hikari-cp.core :as hikari]
             [cognitect.anomalies :as anom]
             [clojure.string :as string]
-            [clojure.data.fressian :as fressian]
-            [clojure.walk :as walk])
+            [clojure.data.fressian :as fressian])
   (:import [java.io ByteArrayInputStream]))
 
 ;; --------------------- ;;
@@ -23,10 +22,42 @@
     (.get buf arr)
     arr))
 
+(defn- deep-clojurize
+  "Recursively convert Java collections to Clojure equivalents.
+   clojure.walk/postwalk doesn't recurse into Java collections (they fail coll?),
+   so nested structures like sets-of-vectors round-trip as sets-of-ArrayLists."
+  [x]
+  (cond
+    (and (instance? java.util.Map x) (not (map? x)))
+    (persistent!
+     (reduce (fn [m e] (assoc! m (deep-clojurize (.getKey e)) (deep-clojurize (.getValue e))))
+             (transient {}) x))
+
+    (and (instance? java.util.Set x) (not (set? x)))
+    (persistent!
+     (reduce (fn [s v] (conj! s (deep-clojurize v)))
+             (transient #{}) x))
+
+    (and (instance? java.util.List x) (not (vector? x)))
+    (mapv deep-clojurize x)
+
+    (map? x)
+    (persistent!
+     (reduce-kv (fn [m k v] (assoc! m (deep-clojurize k) (deep-clojurize v)))
+                (transient {}) x))
+
+    (set? x)
+    (persistent!
+     (reduce (fn [s v] (conj! s (deep-clojurize v)))
+             (transient #{}) x))
+
+    (vector? x)
+    (mapv deep-clojurize x)
+
+    :else x))
+
 (defn fressian-decode [bytes]
-  (walk/postwalk
-   (fn [x] (if (instance? java.util.Set x) (set x) x))
-   (fressian/read (ByteArrayInputStream. bytes))))
+  (deep-clojurize (fressian/read (ByteArrayInputStream. bytes))))
 
 ;; --------------------- ;;
 ;; Advisory Lock Mapping  ;;
