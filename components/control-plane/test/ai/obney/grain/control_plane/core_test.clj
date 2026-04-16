@@ -5,6 +5,7 @@
             [ai.obney.grain.control-plane.core :as cp]
             [ai.obney.grain.control-plane.events :as events]
             [ai.obney.grain.control-plane.assignment :as assignment]
+            [ai.obney.grain.control-plane.harness :as harness]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.pubsub.interface :as pubsub]
@@ -36,15 +37,14 @@
                                                                           :heartbeat-interval-ms 200
                                      :staleness-threshold-ms 1000})]
           (try
-            ;; Wait for a few heartbeat cycles
-            (Thread/sleep 700)
-            ;; Check that heartbeats were emitted
-            (rmp/l1-clear!)
             (let [ctx {:event-store store :cache cache
-                       :tenant-id events/control-plane-tenant-id}
-                  nodes (rmp/project ctx :grain.control/active-nodes)]
-              (is (= 1 (count nodes)))
-              (is (contains? nodes (:node-id cp-instance))))
+                       :tenant-id events/control-plane-tenant-id}]
+              (harness/wait-for
+               #(do (rmp/l1-clear!)
+                    (= 1 (count (rmp/project ctx :grain.control/active-nodes)))))
+              (let [nodes (rmp/project ctx :grain.control/active-nodes)]
+                (is (= 1 (count nodes)))
+                (is (contains? nodes (:node-id cp-instance)))))
             (finally
               (cp/stop cp-instance)))
           ;; After stop, departure event should exist
@@ -73,16 +73,15 @@
                                                                           :heartbeat-interval-ms 200
                                      :staleness-threshold-ms 1000})]
           (try
-            ;; Wait for heartbeat + coordinator cycle
-            (Thread/sleep 700)
-            ;; Check that leases were assigned
-            (rmp/l1-clear!)
             (let [ctx {:event-store store :cache cache
-                       :tenant-id events/control-plane-tenant-id}
-                  leases (rmp/project ctx :grain.control/lease-ownership)]
-              (is (= 1 (count leases)))
-              (is (= (:node-id cp-instance)
-                     (get leases tenant-1))))
+                       :tenant-id events/control-plane-tenant-id}]
+              (harness/wait-for
+               #(do (rmp/l1-clear!)
+                    (= 1 (count (rmp/project ctx :grain.control/lease-ownership)))))
+              (let [leases (rmp/project ctx :grain.control/lease-ownership)]
+                (is (= 1 (count leases)))
+                (is (= (:node-id cp-instance)
+                       (get leases tenant-1)))))
             (finally
               (cp/stop cp-instance))))
         (finally
@@ -119,12 +118,13 @@
                                          :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
               (try
-                ;; Wait for heartbeat + assignment + poller to process
-                (Thread/sleep 2000)
+                ;; Wait for reactor to start the poller for tenant-1
+                (harness/wait-for
+                 #(contains? (or (cp/running-processors cp-instance) #{}) tenant-1))
                 ;; Append another event — poller should process it
                 (es/append store {:tenant-id tenant-1
                                   :events [(es/->event {:type :test/lifecycle-event :body {}})]})
-                (Thread/sleep 1000)
+                (harness/wait-for #(pos? (count @processed)))
                 (is (pos? (count @processed))
                     "Reactor-started poller should process events")
                 (finally
@@ -155,9 +155,8 @@
                                          :cache cache
                                          :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
-              ;; Wait for reactor to start poller
-              (Thread/sleep 2000)
-              ;; Verify tenants are being processed
+              (harness/wait-for
+               #(pos? (count (or (cp/running-processors cp-instance) #{}))))
               (is (pos? (count (or (cp/running-processors cp-instance) #{})))
                   "Should have running processors before stop")
               ;; Stop the control plane
@@ -206,10 +205,8 @@
                                          :cache cache
                                          :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
-              ;; Wait for assignment + processing to begin
-              (Thread/sleep 2000)
-              ;; Wait for the effect to start (proves the processor picked up the event)
-              (deref effect-started 5000 :timeout)
+              ;; Wait for the effect to start (proves assignment fired, poller picked up the event, and the effect ran)
+              (deref effect-started 10000 :timeout)
               ;; Now stop the control plane in a separate thread
               (let [stop-future (future (cp/stop cp-instance))]
                 ;; Give stop a moment to begin draining
@@ -254,9 +251,15 @@
         (let [cp-instance (cp/start {:event-store store
                                      :cache cache
                                      :heartbeat-interval-ms 200
-                                     :staleness-threshold-ms 1000})]
-          ;; Wait for several heartbeats
-          (Thread/sleep 800)
+                                     :staleness-threshold-ms 1000})
+              hb-count (fn []
+                         (count (filter #(= :grain.control/node-heartbeat (:event/type %))
+                                        (into []
+                                              (remove #(= :grain/tx (:event/type %)))
+                                              (es/read store
+                                                       {:tenant-id events/control-plane-tenant-id})))))]
+          ;; Wait for at least 3 heartbeats (initial + 2 scheduled ticks)
+          (harness/wait-for #(>= (hb-count) 3))
           ;; Stop the control plane — heartbeat schedule closes first
           (cp/stop cp-instance)
           ;; Record heartbeat count immediately after stop
@@ -322,8 +325,12 @@
                                   :heartbeat-interval-ms 200
                                   :staleness-threshold-ms 1000})]
               (try
-                ;; Wait for assignment
-                (Thread/sleep 2000)
+                ;; Wait for assignment — each tenant gets a lease
+                (let [ctx {:event-store store :cache cache-a
+                           :tenant-id events/control-plane-tenant-id}]
+                  (harness/wait-for
+                   #(do (rmp/l1-clear!)
+                        (= 2 (count (rmp/project ctx :grain.control/lease-ownership))))))
                 ;; Both "nodes" try to append billing triggers with CAS
                 ;; Simulate 3 periodic cycles
                 (dotimes [i 3]
@@ -359,8 +366,15 @@
                              :predicate-fn (fn [existing]
                                              (not (some #(= period (:period %))
                                                         (into [] existing))))}})))
-                ;; Wait for processing
-                (Thread/sleep 3000)
+                ;; Wait until both tenants show 3 billing-done events each
+                (let [done-count (fn [tid]
+                                   (count (filter #(= :test/billing-done (:event/type %))
+                                                  (into []
+                                                        (remove #(= :grain/tx (:event/type %)))
+                                                        (es/read store {:tenant-id tid})))))]
+                  (harness/wait-for
+                   #(and (= 3 (done-count tenant-1)) (= 3 (done-count tenant-2)))
+                   {:timeout-ms 15000}))
                 ;; Verify: each tenant has exactly 3 triggers (one per cycle, CAS deduped)
                 (doseq [tid [tenant-1 tenant-2]]
                   (let [all (into []

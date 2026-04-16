@@ -63,3 +63,18 @@
   (let [active (project-active-nodes instance staleness-threshold-ms)
         coord (ai.obney.grain.control-plane.assignment/coordinator active)]
     (= coord (:node-id instance))))
+
+(defn wait-for
+  "Poll thunk until it returns truthy or timeout-ms elapses.
+   Returns the last value. Replaces fixed Thread/sleep+assert pairs with a
+   deadline-bounded wait that stays fast when the condition is already met."
+  ([thunk] (wait-for thunk {}))
+  ([thunk {:keys [timeout-ms interval-ms]
+           :or   {timeout-ms 10000 interval-ms 50}}]
+   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+     (loop []
+       (let [v (thunk)]
+         (cond
+           v v
+           (> (System/currentTimeMillis) deadline) v
+           :else (do (Thread/sleep interval-ms) (recur))))))))

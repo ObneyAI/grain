@@ -272,7 +272,7 @@
                                      :context {:event-store store}
                                      :processor-name processor-name})]
             (try
-              (Thread/sleep 500)
+              (harness/wait-for #(= 5 (count @processed-by-b)))
               (is (= [6 7 8 9 10] (sort @processed-by-b))
                   "New owner should process exactly the events after last checkpoint")
               (finally
