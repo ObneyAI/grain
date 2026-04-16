@@ -70,7 +70,23 @@
                      nil))]
       (if (or result (zero? attempts))
         result
-        (recur (dec attempts))))))
+        (recur (dec attempts)))))
+  ;; nREPL is opened inside (start) before (reset! app (start)) completes, so
+  ;; require-ing the namespace is not sufficient proof that the app is ready.
+  ;; Poll until @app/app has :control-plane with a :node-id.
+  (let [deadline (+ (System/currentTimeMillis) 60000)]
+    (loop []
+      (let [ready? (try
+                     (eval-read port
+                       "(let [s @app/app]
+                          (boolean (and s (:control-plane s) (:node-id (:control-plane s)))))")
+                     (catch Exception _ false))]
+        (cond
+          ready? :ok
+          (> (System/currentTimeMillis) deadline)
+          (binding [*out* *err*]
+            (println (str "Node on port " port " did not become ready within 60s")))
+          :else (do (Thread/sleep 500) (recur)))))))
 
 (defn node-status [port]
   (eval-read port
