@@ -100,7 +100,7 @@ jobs:
 
   scale-test:
     name: Scale (scale-test.clj)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -110,7 +110,7 @@ jobs:
 
   churn-test:
     name: Churn (churn-test.clj)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +120,7 @@ jobs:
 
   throughput-test:
     name: Throughput (throughput-test.clj)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
