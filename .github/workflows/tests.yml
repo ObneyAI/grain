@@ -1,0 +1,88 @@
+name: Tests
+
+on:
+  push:
+    branches: [ci-updates]
+  workflow_dispatch:
+
+jobs:
+  poly-tests:
+    name: Poly (unit + Postgres integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: grain_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_EVENT_STORE_TESTS: 'true'
+      PG_HOST: localhost
+      PG_PORT: '5432'
+      PG_USER: postgres
+      PG_PASSWORD: password
+      PG_DATABASE: grain_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run poly test :all
+        run: clojure -M:poly test :all
+
+  live-scenario:
+    name: Live scenario (live-test.clj)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run live-test
+        run: clojure -M:dev scripts/live-test.clj
+
+  routing-test:
+    name: Routing (routing-test.clj)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run routing-test
+        run: clojure -M:dev scripts/routing-test.clj
+
+  scale-test:
+    name: Scale (scale-test.clj)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run scale-test
+        run: clojure -M:dev scripts/scale-test.clj
+
+  churn-test:
+    name: Churn (churn-test.clj)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run churn-test
+        run: clojure -M:dev scripts/churn-test.clj
+
+  throughput-test:
+    name: Throughput (throughput-test.clj)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run throughput-test
+        run: clojure -M:dev scripts/throughput-test.clj
