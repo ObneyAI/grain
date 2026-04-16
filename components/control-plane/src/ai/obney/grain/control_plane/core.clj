@@ -140,7 +140,6 @@
            poller-atom]}]
   (fn [_time]
     (try
-      (rmp/l1-clear!)
       (let [active-nodes (project-active-nodes ctx staleness-threshold-ms)
             coordinator (assignment/coordinator active-nodes)]
         (when (= node-id coordinator)
