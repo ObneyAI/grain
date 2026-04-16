@@ -91,8 +91,8 @@
   (eval-read port
     "(let [s @app/app]
        (->> (app/leases s)
-            (map (fn [[[tid pname] owner]]
-                   {:tenant (str tid) :processor (str pname) :owner (str owner)}))
+            (map (fn [[tid owner]]
+                   {:tenant (str tid) :owner (str owner)}))
             vec))"))
 
 (defn create-tenants! [port n]
