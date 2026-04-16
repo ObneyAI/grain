@@ -6,17 +6,27 @@ on:
   workflow_dispatch:
 
 jobs:
-  poly-tests:
-    name: Poly (unit + Postgres integration)
+  poly-unit-tests:
+    name: Poly (unit + in-memory)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run poly test :all
+        run: clojure -M:poly test :all
+
+  pg-v2-integration:
+    name: Postgres v2 integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: pgvector/pgvector:0.8.0-pg17
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: password
-          POSTGRES_DB: grain_test
+          POSTGRES_DB: grain_test_v2
         ports:
           - 5432:5432
         options: >-
@@ -30,12 +40,43 @@ jobs:
       PG_PORT: '5432'
       PG_USER: postgres
       PG_PASSWORD: password
-      PG_DATABASE: grain_test
+      PG_DATABASE: grain_test_v2
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-clojure
-      - name: Run poly test :all
-        run: clojure -M:poly test :all
+      - name: Run v2 integration tests
+        run: clojure -M:poly test project:grain-event-store-postgres-v2
+
+  pg-v3-integration:
+    name: Postgres v3 integration (incl. control-plane)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: grain_test_v3
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_EVENT_STORE_TESTS: 'true'
+      PG_HOST: localhost
+      PG_PORT: '5432'
+      PG_USER: postgres
+      PG_PASSWORD: password
+      PG_DATABASE: grain_test_v3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run v3 integration tests
+        run: clojure -M:poly test project:grain-event-store-postgres-v3
 
   live-scenario:
     name: Live scenario (live-test.clj)
