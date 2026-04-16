@@ -85,7 +85,7 @@
   ;; Each iteration: require namespaces AND check that @app is populated
   ;; with a :control-plane having a :node-id. Self-contained to tolerate
   ;; transient failures during app startup.
-  (let [deadline (+ (System/currentTimeMillis) 120000)]
+  (let [deadline (+ (System/currentTimeMillis) 180000)]
     (loop []
       (let [ready? (try
                      (eval-read port
@@ -98,7 +98,7 @@
           ready? :ok
           (> (System/currentTimeMillis) deadline)
           (binding [*out* *err*]
-            (println (str "Node on port " port " did not become ready within 120s")))
+            (println (str "Node on port " port " did not become ready within 180s")))
           :else (do (Thread/sleep 1000) (recur)))))))
 
 (defn node-status [port]

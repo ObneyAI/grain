@@ -105,14 +105,14 @@
 
 (defn scenario-3 []
   (header "Scale 3: Bring 2 nodes back, verify rebalance")
-  (info "Restarting node-4 and node-5...")
+  (info "Restarting node-4...")
   (compose cf "restart" "node-4")
+  (wait-for-port (nth ports 3) 60000)
+  (setup-node! (nth ports 3))
+  (info "Restarting node-5...")
   (compose cf "restart" "node-5")
-  (doseq [p [(nth ports 3) (nth ports 4)]]
-    (wait-for-port p 60000))
-  (Thread/sleep 12000)
-  (doseq [p [(nth ports 3) (nth ports 4)]]
-    (setup-node! p))
+  (wait-for-port (nth ports 4) 60000)
+  (setup-node! (nth ports 4))
   (Thread/sleep 6000)
   (let [sa (node-status (first ports))
         total (all-nodes-lease-count (first ports))
