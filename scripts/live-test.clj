@@ -68,35 +68,26 @@
     (when v (read-string v))))
 
 (defn setup-node! [port]
-  (loop [attempts 5]
-    (let [result (try
-                   (eval-on port
-                     "(require '[ai.obney.grain.control-plane-test-base.core :as app])
-                      (require '[clj-uuid :as uuid])
-                      :ok")
-                   (catch Exception e
-                     (when (pos? attempts)
-                       (Thread/sleep 2000))
-                     nil))]
-      (if (or result (zero? attempts))
-        result
-        (recur (dec attempts)))))
   ;; nREPL is opened inside (start) before (reset! app (start)) completes, so
-  ;; require-ing the namespace is not sufficient proof that the app is ready.
-  ;; Poll until @app/app has :control-plane with a :node-id.
-  (let [deadline (+ (System/currentTimeMillis) 60000)]
+  ;; simply requiring the namespace is not proof that the app is ready.
+  ;; Each iteration: require namespaces AND check that @app is populated
+  ;; with a :control-plane having a :node-id. Self-contained to tolerate
+  ;; transient failures during app startup.
+  (let [deadline (+ (System/currentTimeMillis) 120000)]
     (loop []
       (let [ready? (try
                      (eval-read port
-                       "(let [s @app/app]
-                          (boolean (and s (:control-plane s) (:node-id (:control-plane s)))))")
+                       "(do (require '[ai.obney.grain.control-plane-test-base.core :as app])
+                            (require '[clj-uuid :as uuid])
+                            (let [s @app/app]
+                              (boolean (and s (:control-plane s) (:node-id (:control-plane s))))))")
                      (catch Exception _ false))]
         (cond
           ready? :ok
           (> (System/currentTimeMillis) deadline)
           (binding [*out* *err*]
-            (println (str "Node on port " port " did not become ready within 60s")))
-          :else (do (Thread/sleep 500) (recur)))))))
+            (println (str "Node on port " port " did not become ready within 120s")))
+          :else (do (Thread/sleep 1000) (recur)))))))
 
 (defn node-status [port]
   (eval-read port
