@@ -467,12 +467,6 @@
            (u/log ::tenant-poller-started :tenant-count (count (owned-tenants))
                   :poll-interval-ms poll-interval-ms :batch-size batch-size
                   :thread-pool-size thread-pool-size)
-           ;; Initialize watermarks from checkpoints
-           (let [registry (registry-snapshot)]
-             (doseq [tid (owned-tenants)
-                     [proc-name _] registry]
-               (when-let [last-id (get-last-processed-id event-store tid proc-name)]
-                 (swap! watermarks assoc-in [tid proc-name] last-id))))
            (while @running
              (try
                (let [tids (owned-tenants)
@@ -490,7 +484,13 @@
                                ^Runnable
                                (fn []
                                  (try
-                                   (let [wm (get-in @watermarks [tid proc-name])
+                                   (let [wm (or (get-in @watermarks [tid proc-name])
+                                                (let [db-wm (get-last-processed-id
+                                                             event-store tid proc-name)]
+                                                  (when db-wm
+                                                    (swap! watermarks assoc-in
+                                                           [tid proc-name] db-wm))
+                                                  db-wm))
                                          read-args (cond-> {:tenant-id tid
                                                              :types (set (:topics proc-config))}
                                                      wm (assoc :after wm))
