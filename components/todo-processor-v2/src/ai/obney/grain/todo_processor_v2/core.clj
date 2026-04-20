@@ -484,13 +484,14 @@
                                ^Runnable
                                (fn []
                                  (try
-                                   (let [wm (or (get-in @watermarks [tid proc-name])
-                                                (let [db-wm (get-last-processed-id
-                                                             event-store tid proc-name)]
-                                                  (when db-wm
-                                                    (swap! watermarks assoc-in
-                                                           [tid proc-name] db-wm))
-                                                  db-wm))
+                                   (let [wm-entry (get-in @watermarks [tid proc-name] ::uninit)
+                                         wm (if (identical? ::uninit wm-entry)
+                                              (let [db-wm (get-last-processed-id
+                                                           event-store tid proc-name)]
+                                                (swap! watermarks assoc-in
+                                                       [tid proc-name] db-wm)
+                                                db-wm)
+                                              wm-entry)
                                          read-args (cond-> {:tenant-id tid
                                                              :types (set (:topics proc-config))}
                                                      wm (assoc :after wm))

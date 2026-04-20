@@ -81,3 +81,44 @@
         (finally
           (swap! tp-core/processor-registry* dissoc proc-name)
           (es/stop event-store))))))
+
+(deftest watermark-lookup-memoized-for-uninitialized-pairs
+  (testing "get-last-processed-id must run at most once per (tenant,
+            processor) pair even when the tenant has no checkpoint yet,
+            otherwise every poll cycle re-queries the event store for
+            every uninitialized pair"
+    (let [event-store (es/start {:conn {:type :in-memory}
+                                 :event-pubsub nil
+                                 :logger nil})
+          proc-name :test/no-checkpoint-proc
+          tid (random-uuid)
+          lookup-calls (atom 0)
+          real-lookup @#'tp-core/get-last-processed-id]
+      (with-redefs [tp-core/get-last-processed-id
+                    (fn [& args]
+                      (swap! lookup-calls inc)
+                      (apply real-lookup args))]
+        (try
+          (swap! tp-core/processor-registry* assoc proc-name
+                 {:handler-fn (fn [_ctx] {})
+                  :topics #{:test/dynamic-replay-trigger}})
+
+          (let [poller (tp-core/start-tenant-poller
+                        {:event-store event-store
+                         :tenant-ids #{tid}
+                         :context {}
+                         :poll-interval-ms 50
+                         :batch-size 100})]
+            (try
+              (Thread/sleep 1000)
+              (is (= 1 @lookup-calls)
+                  (str "get-last-processed-id must be called exactly once "
+                       "per (tenant, processor) pair across many poll "
+                       "cycles, including when the tenant has no "
+                       "checkpoint yet; got " @lookup-calls " calls "
+                       "across ~20 poll cycles"))
+              (finally
+                (tp-core/stop-tenant-poller poller))))
+          (finally
+            (swap! tp-core/processor-registry* dissoc proc-name)
+            (es/stop event-store)))))))
