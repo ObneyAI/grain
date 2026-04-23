@@ -65,9 +65,9 @@
             (when event-pubsub
               (run! #(pubsub/pub event-pubsub {:message (assoc % :grain/tenant-id tenant-id)}) events))))))))
 
-(defn tenant-ids
+(defn tenants
   [event-store]
-  (p/tenant-ids event-store))
+  (p/tenants event-store))
 
 (defn read
   [event-store args]

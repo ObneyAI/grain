@@ -16,9 +16,9 @@
   [event-store]
   (core/stop event-store))
 
-(defn tenant-ids
+(defn tenants
   [event-store]
-  (core/tenant-ids event-store))
+  (core/tenants event-store))
 
 (defn append
   [event-store args]

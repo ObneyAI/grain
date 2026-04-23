@@ -32,9 +32,21 @@
 
        :predicate-fn - A function with signature [events] that returns true or false, deciding whether the events will be stored or not.")
 
-  (tenant-ids [this]
-    "Returns the set of tenant UUIDs known to this event store.
-     This is administrative metadata, not a cross-tenant event read.")
+  (tenants [this]
+    "Returns a map {tenant-id tenant-metadata} for every tenant known
+     to the store. The metadata map currently contains:
+
+       :tenant/last-event-id - UUID or nil. The durable high-watermark
+                               maintained on append (matches
+                               grain.tenants.last_event_id). nil when
+                               the tenant row exists but no events
+                               have been committed.
+
+     Additional keys may be added in the future. Callers must not
+     assume the set of keys is closed.
+
+     Administrative metadata, not a cross-tenant event read.
+     Must not require a transaction.")
 
   (read [this args]
     "Read an ordered stream of events from the event store.

@@ -85,8 +85,10 @@
     [:metric/name "AssignmentCycle" :metric/resolution :low :node-id node-id]
     (let [active-nodes (project-active-nodes ctx staleness-threshold-ms)
           current-leases (project-lease-ownership ctx)
-          tenant-ids (es/tenant-ids (:event-store ctx))
-          domain-tenants (disj tenant-ids events/control-plane-tenant-id)
+          domain-tenants (-> (es/tenants (:event-store ctx))
+                             keys
+                             set
+                             (disj events/control-plane-tenant-id))
           desired (assignment/assign active-nodes domain-tenants current-leases strategy)
           {:keys [release acquire]} (compute-lease-diff desired current-leases)]
       (when (or (seq release) (seq acquire))

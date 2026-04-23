@@ -199,7 +199,7 @@
         ;; Periodic triggers — every node runs these, CAS deduplicates
         periodic-triggers (pt/start-periodic-triggers!
                             {:append-fn (partial es/append event-store)
-                             :tenant-ids-fn #(es/tenant-ids event-store)})
+                             :tenant-ids-fn #(set (keys (es/tenants event-store)))})
 
         ;; nREPL for live interaction
         nrepl-server (nrepl/start-server :bind "0.0.0.0" :port nrepl-port)

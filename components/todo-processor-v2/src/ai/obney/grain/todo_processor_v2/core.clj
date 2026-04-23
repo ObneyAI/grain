@@ -236,7 +236,7 @@
 (defn- catch-up-all-tenants
   "Catches up all known tenants in parallel."
   [event-store processor-name topics context handler-fn]
-  (let [tenants (event-store/tenant-ids event-store)]
+  (let [tenants (keys (event-store/tenants event-store))]
     (when (seq tenants)
       (u/log ::catch-up-starting :processor-name processor-name
              :tenant-count (count tenants))
@@ -470,15 +470,37 @@
            (while @running
              (try
                (let [tids (owned-tenants)
-                     registry (registry-snapshot)]
-                 ;; Submit each tenant+processor as an independent unit to the pool
-                 ;; Skip if a previous task for the same (tenant, processor) is still running
+                     registry (registry-snapshot)
+                     ;; High-watermark probe: one query for all owned tenants.
+                     ;; Fail-closed: on probe failure, fall through to the
+                     ;; existing per-pair behavior for this tick.
+                     tenant-wms (try
+                                  (let [all-tenants (event-store/tenants event-store)]
+                                    (into {}
+                                          (keep (fn [tid]
+                                                  (when-let [m (get all-tenants tid)]
+                                                    [tid (:tenant/last-event-id m)])))
+                                          tids))
+                                  (catch Throwable t
+                                    (u/log ::tenant-watermark-probe-failed :exception t)
+                                    {}))]
+                 ;; Submit each tenant+processor as an independent unit to the pool.
+                 ;; Skip submitting when (a) the pair is caught up to the tenant's
+                 ;; high watermark (no work to do), or (b) a previous task for the
+                 ;; same (tenant, processor) is still running (dedup).
                  (doseq [tid tids]
                    (when @running
                      (doseq [[proc-name proc-config] registry]
                        (when @running
-                         (let [flight-key [tid proc-name]]
-                           (when-not (.containsKey in-flight flight-key)
+                         (let [flight-key [tid proc-name]
+                               wm-entry (get-in @watermarks [tid proc-name] ::uninit)
+                               tenant-wm (get tenant-wms tid)
+                               skip? (and (not (identical? ::uninit wm-entry))
+                                          (some? wm-entry)
+                                          (some? tenant-wm)
+                                          (uuid/= wm-entry tenant-wm))]
+                           (when (and (not skip?)
+                                      (not (.containsKey in-flight flight-key)))
                              (.put in-flight flight-key true)
                              (.submit pool
                                ^Runnable
@@ -499,7 +521,7 @@
                                                   (comp (remove #(= :grain/tx (:event/type %)))
                                                         (take batch-size))
                                                   (event-store/read event-store read-args))]
-                                     (when (seq events)
+                                     (if (seq events)
                                        (let [batch-result-events (atom [])
                                              handler-fn (:handler-fn proc-config)]
                                          ;; Process events sequentially within this tenant
@@ -520,7 +542,17 @@
                                            (append-with-checkpoint event-store tid proc-name
                                                                    last-event-id
                                                                    @batch-result-events)
-                                           (swap! watermarks assoc-in [tid proc-name] last-event-id)))))
+                                           (swap! watermarks assoc-in [tid proc-name] last-event-id)))
+                                       ;; Fallback read returned nothing. Advance pair_wm
+                                       ;; to the probed tenant_wm (only forward) so this
+                                       ;; pair becomes eligible to skip on subsequent ticks.
+                                       (when-let [tw tenant-wm]
+                                         (swap! watermarks update-in [tid proc-name]
+                                                (fn [cur]
+                                                  (cond
+                                                    (nil? cur) tw
+                                                    (uuid/< cur tw) tw
+                                                    :else cur))))))
                                    (catch Throwable t
                                      (u/log ::poller-handler-error :exception t))
                                    (finally

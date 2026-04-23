@@ -9,7 +9,7 @@
 
 (defn start
   [_config]
-  (ref {:events [] :tenants #{}}))
+  (ref {:events [] :tenants {}}))
 
 (defn stop
   [state]
@@ -111,22 +111,29 @@
               :body {:event-ids (set (mapv :event/id events))
                      :metadata tx-metadata}})]
      (dosync
-      (alter (:state event-store) update :tenants conj tenant-id)
       (if cas
         (let [events* (read event-store (assoc cas :tenant-id tenant-id))
               pred-result (predicate-fn events*)]
           (if pred-result
-            (alter (:state event-store) update :events into
-                   (tag-events-with-tenant tenant-id events))
+            (alter (:state event-store)
+                   (fn [s]
+                     (-> s
+                         (update :events into (tag-events-with-tenant tenant-id events))
+                         (assoc-in [:tenants tenant-id :tenant/last-event-id]
+                                   (:event/id (last events))))))
             (let [anomaly {::anom/category ::anom/conflict
                            ::anom/message "CAS failed"
                            :cas cas}]
               (u/log :grain/cas-failed :anomaly anomaly)
               anomaly)))
-        (alter (:state event-store) update :events into
-               (tag-events-with-tenant tenant-id (conj events tx))))))))
+        (alter (:state event-store)
+               (fn [s]
+                 (-> s
+                     (update :events into (tag-events-with-tenant tenant-id (conj events tx)))
+                     (assoc-in [:tenants tenant-id :tenant/last-event-id]
+                               (:event/id tx))))))))))
 
-(defn tenant-ids
+(defn tenants
   [event-store]
   (-> event-store :state deref :tenants))
 
@@ -140,8 +147,8 @@
     (stop (:state this))
     (dissoc this :state))
 
-  (tenant-ids [this]
-    (tenant-ids this))
+  (tenants [this]
+    (tenants this))
 
   (append [this args]
     (append this args))

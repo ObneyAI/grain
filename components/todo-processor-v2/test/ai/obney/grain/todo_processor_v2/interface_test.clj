@@ -1149,7 +1149,7 @@
         ;; Start triggers
         (let [triggers (pt-core/start-periodic-triggers!
                         {:append-fn (partial es/append *event-store*)
-                         :tenant-ids-fn #(es/tenant-ids *event-store*)})]
+                         :tenant-ids-fn #(set (keys (es/tenants *event-store*)))})]
           (try
             ;; Wait for at least one tick
             (Thread/sleep 2000)

@@ -332,7 +332,13 @@
                  (->event
                   {:type :grain/tx
                    :body (cond-> {:event-ids (set (mapv :event/id events))}
-                           tx-metadata (assoc :metadata tx-metadata))}))]
+                           tx-metadata (assoc :metadata tx-metadata))}))
+        max-event-id (:event/id (last events*))
+        upsert-tenant!
+        (fn [conn]
+          (jdbc/execute! conn ["INSERT INTO grain.tenants (id, last_event_id) VALUES (?, ?)
+                                ON CONFLICT (id) DO UPDATE SET last_event_id = ?"
+                               tenant-id max-event-id max-event-id]))]
     (jdbc/with-transaction
       [conn (get-in event-store [:state ::connection-pool])]
       ;; Set tenant context for RLS
@@ -340,12 +346,10 @@
       ;; Per-tenant advisory lock
       (jdbc/execute! conn ["SET LOCAL lock_timeout = '5000ms'"])
       (jdbc/execute! conn ["SELECT pg_advisory_xact_lock(?)" (tenant-lock-key tenant-id)])
-      ;; Auto-register tenant + update watermark
-      (let [max-event-id (:event/id (last events*))]
-        (jdbc/execute! conn ["INSERT INTO grain.tenants (id, last_event_id) VALUES (?, ?)
-                              ON CONFLICT (id) DO UPDATE SET last_event_id = ?"
-                             tenant-id max-event-id max-event-id]))
-      ;; CAS check + insert
+      ;; CAS check + insert. Tenant upsert (including last_event_id bump) runs
+      ;; only on the successful-insert branches so last_event_id strictly
+      ;; reflects events actually inserted; a CAS failure must not leave a
+      ;; phantom watermark.
       (if cas
         (let [{:keys [where-sql params]} (build-single-query-sql
                                           (assoc cas :tenant-id tenant-id))
@@ -365,19 +369,26 @@
                                             ::none plan)]
                                (if (= r ::none) (f) r))))]
           (if (predicate-fn cas-events)
-            (insert-events conn tenant-id events*)
+            (do
+              (upsert-tenant! conn)
+              (insert-events conn tenant-id events*))
             (let [anomaly  {::anom/category ::anom/conflict
                             ::anom/message "CAS failed"
                             ::cas cas}]
               (u/log ::cas-failed :anomaly anomaly)
               anomaly)))
-        (insert-events conn tenant-id events*)))))
+        (do
+          (upsert-tenant! conn)
+          (insert-events conn tenant-id events*))))))
 
-(defn tenant-ids
+(defn tenants
   [event-store]
   (let [conn (get-in event-store [:state ::connection-pool])
-        rows (jdbc/execute! conn ["SELECT id FROM grain.tenants"])]
-    (set (map :tenants/id rows))))
+        rows (jdbc/execute! conn ["SELECT id, last_event_id FROM grain.tenants"])]
+    (into {}
+          (map (fn [{:tenants/keys [id last_event_id]}]
+                 [id {:tenant/last-event-id last_event_id}]))
+          rows)))
 
 ;; ----------------- ;;
 ;; Record Definition ;;
@@ -393,8 +404,8 @@
     (stop (:state this))
     (dissoc this :state))
 
-  (tenant-ids [this]
-    (tenant-ids this))
+  (tenants [this]
+    (tenants this))
 
   (append [this args]
     (append this args))
