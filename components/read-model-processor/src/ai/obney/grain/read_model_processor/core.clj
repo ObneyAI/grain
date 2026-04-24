@@ -1,25 +1,8 @@
 (ns ai.obney.grain.read-model-processor.core
   (:require [ai.obney.grain.event-store-v2.interface :as es]
+            [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
-            [clojure.data.fressian :as fressian]
-            [clojure.walk :as walk]
-            [com.brunobonacci.mulog :as u])
-  (:import [java.io ByteArrayInputStream]))
-
-(defn fressian-encode [data]
-  (let [^java.nio.ByteBuffer buf (fressian/write data)
-        arr (byte-array (.remaining buf))]
-    (.get buf arr)
-    arr))
-
-(defn fressian-decode [bytes]
-  (walk/postwalk
-   (fn [x]
-     (cond
-       (instance? java.util.Set x) (set x)
-       (and (instance? java.util.List x) (not (vector? x))) (vec x)
-       :else x))
-   (fressian/read (ByteArrayInputStream. bytes))))
+            [com.brunobonacci.mulog :as u]))
 
 (defn format-key
   [n v]
@@ -63,13 +46,13 @@
        (u/trace
         ::cache-hit
         [:metric/name "ReadModelCacheHit" :metric/resolution :high]
-        (let [{:keys [data watermark]} (fressian-decode v)
+        (let [{:keys [data watermark]} (fressian-util/decode v)
               events (es/read event-store (add-watermark query watermark))
               {:keys [state event-count new-watermark]} (process-events data events f)
               _ (when (>= event-count 10)
                   (kv/put! cache
                            {:k cache-key
-                            :v (fressian-encode {:data state
+                            :v (fressian-util/encode {:data state
                                                 :watermark new-watermark})}))]
           state))
        (u/trace
@@ -79,7 +62,7 @@
               {:keys [state _event-count new-watermark]} (process-events {} events f)
               _ (kv/put! cache
                          {:k cache-key
-                          :v (fressian-encode {:data state
+                          :v (fressian-util/encode {:data state
                                               :watermark new-watermark})})]
           state))))))
 

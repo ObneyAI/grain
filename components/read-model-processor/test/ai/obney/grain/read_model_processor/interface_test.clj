@@ -3,6 +3,7 @@
             [ai.obney.grain.read-model-processor.interface :as rmp]
             [ai.obney.grain.read-model-processor.core :as core]
             [ai.obney.grain.event-store-v2.interface :as es]
+            [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
@@ -80,7 +81,7 @@
 
 (defn read-cached [name version]
   (some-> (kv/get! *cache* {:k (core/format-key name version)})
-          core/fressian-decode))
+          fressian-util/decode))
 
 ;; ---------------------------------------------------------------------------
 ;; A. Cache Miss

@@ -37,6 +37,7 @@
                                poly/datastar {:local/root "components/datastar"}
                                poly/kv-store {:local/root "components/kv-store"}
                                poly/kv-store-lmdb {:local/root "components/kv-store-lmdb"}
+                               poly/fressian-util {:local/root "components/fressian-util"}
 
                                ;; Examples
                                poly/example-base {:local/root "bases/example-base"}

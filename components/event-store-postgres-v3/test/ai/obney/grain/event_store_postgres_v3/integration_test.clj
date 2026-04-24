@@ -203,6 +203,23 @@
     (is (true? (:bool-true read)))
     (is (false? (:bool-false read)))))
 
+(deftest body-data-with-java-time-values
+  (let [odt (OffsetDateTime/now (java.time.ZoneOffset/of "-05:00"))
+        inst (java.time.Instant/now)
+        _event (append-event! :test/alpha #{}
+                 {:started-at odt
+                  :recorded-at inst
+                  :nested {:deadlines [odt odt]}})
+        read (first (non-tx-events (read-events {})))]
+    (is (instance? OffsetDateTime (:started-at read)))
+    (is (= odt (:started-at read)))
+    (is (= (.getOffset odt) (.getOffset ^OffsetDateTime (:started-at read)))
+        "Non-UTC offset is preserved, not normalized to UTC")
+    (is (instance? java.time.Instant (:recorded-at read)))
+    (is (= inst (:recorded-at read)))
+    (is (= [odt odt] (get-in read [:nested :deadlines]))
+        "java.time values round-trip inside nested Clojure collections too")))
+
 (deftest events-with-multiple-tags
   (let [id1 (uuid/v4)
         id2 (uuid/v4)

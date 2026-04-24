@@ -11,7 +11,8 @@
         pgesv3/schema-util {:local/root "../../components/schema-util"}
         pgesv3/time {:local/root "../../components/time"}
         pgesv3/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}
-        pgesv3/periodic-task {:local/root "../../components/periodic-task"}}
+        pgesv3/periodic-task {:local/root "../../components/periodic-task"}
+        pgesv3/fressian-util {:local/root "../../components/fressian-util"}}
 
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps  {}}}}

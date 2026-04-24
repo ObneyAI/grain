@@ -3,61 +3,13 @@
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
             [ai.obney.grain.event-store-v3.interface :refer [->event]]
             [ai.obney.grain.event-store-postgres-v3.interface.datasource :as datasource]
+            [ai.obney.grain.fressian-util.interface :as fressian-util]
             [next.jdbc :as jdbc]
             [com.brunobonacci.mulog :as u]
             [integrant.core :as ig]
             [hikari-cp.core :as hikari]
             [cognitect.anomalies :as anom]
-            [clojure.string :as string]
-            [clojure.data.fressian :as fressian])
-  (:import [java.io ByteArrayInputStream]))
-
-;; --------------------- ;;
-;; Fressian Serialization ;;
-;; --------------------- ;;
-
-(defn fressian-encode [data]
-  (let [^java.nio.ByteBuffer buf (fressian/write data)
-        arr (byte-array (.remaining buf))]
-    (.get buf arr)
-    arr))
-
-(defn- deep-clojurize
-  "Recursively convert Java collections to Clojure equivalents.
-   clojure.walk/postwalk doesn't recurse into Java collections (they fail coll?),
-   so nested structures like sets-of-vectors round-trip as sets-of-ArrayLists."
-  [x]
-  (cond
-    (and (instance? java.util.Map x) (not (map? x)))
-    (persistent!
-     (reduce (fn [m e] (assoc! m (deep-clojurize (.getKey e)) (deep-clojurize (.getValue e))))
-             (transient {}) x))
-
-    (and (instance? java.util.Set x) (not (set? x)))
-    (persistent!
-     (reduce (fn [s v] (conj! s (deep-clojurize v)))
-             (transient #{}) x))
-
-    (and (instance? java.util.List x) (not (vector? x)))
-    (mapv deep-clojurize x)
-
-    (map? x)
-    (persistent!
-     (reduce-kv (fn [m k v] (assoc! m (deep-clojurize k) (deep-clojurize v)))
-                (transient {}) x))
-
-    (set? x)
-    (persistent!
-     (reduce (fn [s v] (conj! s (deep-clojurize v)))
-             (transient #{}) x))
-
-    (vector? x)
-    (mapv deep-clojurize x)
-
-    :else x))
-
-(defn fressian-decode [bytes]
-  (deep-clojurize (fressian/read (ByteArrayInputStream. bytes))))
+            [clojure.string :as string]))
 
 ;; --------------------- ;;
 ;; Advisory Lock Mapping  ;;
@@ -189,7 +141,7 @@
   "Transform PostgreSQL row to event schema format"
   [{:keys [id time type tags data] :as row}]
   (try
-    (let [body-data (when data (fressian-decode data))
+    (let [body-data (when data (fressian-util/decode data))
           parsed-tags (parse-tags tags)]
       (merge
        {:event/id id
@@ -315,7 +267,7 @@
           (conj acc (str (key-fn k) ":" v)))
         []
         (:event/tags event)))
-      (fressian-encode
+      (fressian-util/encode
        (dissoc
         event
         :event/id

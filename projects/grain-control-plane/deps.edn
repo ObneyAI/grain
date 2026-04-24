@@ -15,7 +15,8 @@
         control-plane/anomalies {:local/root "../../components/anomalies"}
         control-plane/schema-util {:local/root "../../components/schema-util"}
         control-plane/time {:local/root "../../components/time"}
-        control-plane/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}}
+        control-plane/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}
+        control-plane/fressian-util {:local/root "../../components/fressian-util"}}
 
  :aliases {:test {:extra-paths []
                   :extra-deps  {}}}}

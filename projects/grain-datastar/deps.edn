@@ -11,7 +11,8 @@
         ds/webserver {:local/root "../../components/webserver"}
         ds/kv-store {:local/root "../../components/kv-store"}
         ds/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}
-        ds/query-schema {:local/root "../../components/query-schema"}}
+        ds/query-schema {:local/root "../../components/query-schema"}
+        ds/fressian-util {:local/root "../../components/fressian-util"}}
 
  :aliases {:test {:extra-paths []
                   :extra-deps  {}}}}

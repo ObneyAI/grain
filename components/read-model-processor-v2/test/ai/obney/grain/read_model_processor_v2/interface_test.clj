@@ -3,11 +3,13 @@
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.read-model-processor-v2.core :as core]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [clojure.java.io :as io]
-            [clojure.set :as set]))
+            [clojure.set :as set])
+  (:import [java.time OffsetDateTime]))
 
 (def test-tenant-id (random-uuid))
 
@@ -89,7 +91,7 @@
   ([name version] (read-cached name version test-tenant-id))
   ([name version tenant-id]
    (some-> (kv/get! *cache* {:k (core/format-scoped-key name version tenant-id)})
-           core/fressian-decode)))
+           fressian-util/decode)))
 
 ;; ---------------------------------------------------------------------------
 ;; A. Cache Miss
@@ -130,6 +132,28 @@
     (is (= #{:data :watermark} (set (keys cached))))
     (is (= {:count 13} (:data cached)))
     (is (= last-id (:watermark cached)))))
+
+(deftest reducer-state-round-trips-offset-date-time-through-lmdb
+  (testing "A reducer that returns OffsetDateTime in state survives the LMDB Fressian cache"
+    (append-test-events! 1)
+    (let [events (into [] (es/read *event-store*
+                                   {:tenant-id test-tenant-id
+                                    :types #{:test/counter-incremented}}))
+          expected-ts (:event/timestamp (first events))
+          timestamp-reducer (fn [state event]
+                              (assoc state :last-at (:event/timestamp event)))
+          args (make-args {:f timestamp-reducer :name :test/ts-counter})]
+      ;; First projection — L2 miss writes the reducer state to LMDB via fressian-util/encode.
+      (rmp/p (make-context) args)
+      ;; Direct cache inspection confirms the encode side wrote a decodable OffsetDateTime.
+      (let [{:keys [data]} (read-cached :test/ts-counter 1)]
+        (is (instance? OffsetDateTime (:last-at data)))
+        (is (= expected-ts (:last-at data))))
+      ;; End-to-end: dropping L1 forces the next p call to read from LMDB and decode.
+      (rmp/l1-clear!)
+      (let [result (rmp/p (make-context) args)]
+        (is (instance? OffsetDateTime (:last-at result)))
+        (is (= expected-ts (:last-at result)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; B. Cache Hit Threshold
@@ -484,7 +508,7 @@
   "Read raw bytes from LMDB at a cache key, decode to Clojure data."
   [name version tenant-id]
   (some-> (kv/get! *cache* {:k (core/format-scoped-key name version tenant-id)})
-          core/fressian-decode))
+          fressian-util/decode))
 
 (defn read-segment
   "Read a single segment from LMDB."
@@ -495,7 +519,7 @@
                 (System/arraycopy suffix 0 result (alength ^bytes base-key) (alength suffix))
                 result)]
     (some-> (kv/get! *cache* {:k seg-k})
-            core/fressian-decode)))
+            fressian-util/decode)))
 
 ;; H1
 (deftest segmented-cache-round-trip
@@ -751,7 +775,7 @@
     (rmp/p (make-context) (make-partitioned-args))
 
     (let [base-key (core/format-scoped-key "test-items" 1 test-tenant-id)
-          manifest (core/fressian-decode (kv/get! *cache* {:k base-key}))]
+          manifest (fressian-util/decode (kv/get! *cache* {:k base-key}))]
       ;; Manifest structure
       (is (true? (:partitioned manifest)))
       (is (= #{"x" "y" "z"} (:partition-keys manifest)))
@@ -759,13 +783,13 @@
 
       ;; Each partition readable
       (doseq [pk ["x" "y" "z"]]
-        (let [p-data (core/fressian-decode
+        (let [p-data (fressian-util/decode
                       (kv/get! *cache* {:k (core/partition-cache-key base-key pk)}))]
           (is (map? (:data p-data)))
           (is (uuid? (:watermark p-data)))))
 
       ;; Entity index stored for cross-partition move detection
-      (let [idx (core/fressian-decode
+      (let [idx (fressian-util/decode
                  (kv/get! *cache* {:k (core/suffix-key base-key ":eidx")}))]
         (is (= 60 (count idx)))
         (is (every? #(contains? #{"x" "y" "z"} (val %)) idx))))))
@@ -926,7 +950,7 @@
 
         ;; Verify manifest exists at the correct cache key
         (let [base-key (core/format-scoped-key "partitioned-items" 1 test-tenant-id)
-              manifest (core/fressian-decode (kv/get! *cache* {:k base-key}))]
+              manifest (fressian-util/decode (kv/get! *cache* {:k base-key}))]
           (is (true? (:partitioned manifest)))
           (is (= #{"a" "b"} (:partition-keys manifest))))
 

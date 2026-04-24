@@ -1,65 +1,9 @@
 (ns ai.obney.grain.read-model-processor-v2.core
   (:require [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]
-            [clojure.data.fressian :as fressian]
-            [com.brunobonacci.mulog :as u])
-  (:import [java.io ByteArrayInputStream]))
-
-;; ---------------------------------------------------------------------------
-;; Serialization
-;; ---------------------------------------------------------------------------
-
-(defn fressian-encode [data]
-  (let [^java.nio.ByteBuffer buf (fressian/write data)
-        arr (byte-array (.remaining buf))]
-    (.get buf arr)
-    arr))
-
-(defn- deep-clojurize
-  "Recursively convert Java collections to Clojure equivalents.
-   clojure.walk/postwalk doesn't recurse into Java collections (they fail coll?),
-   so nested structures like sets-of-vectors round-trip as sets-of-ArrayLists.
-   Only converts Java collection types; Clojure collections are recursed into
-   to find nested Java collections but are not themselves converted."
-  [x]
-  (cond
-    ;; Java Map (not Clojure) → convert to Clojure map, recurse values
-    (and (instance? java.util.Map x) (not (map? x)))
-    (persistent!
-     (reduce (fn [m e] (assoc! m (deep-clojurize (.getKey e)) (deep-clojurize (.getValue e))))
-             (transient {}) x))
-
-    ;; Java Set (not Clojure) → convert to Clojure set, recurse elements
-    (and (instance? java.util.Set x) (not (set? x)))
-    (persistent!
-     (reduce (fn [s v] (conj! s (deep-clojurize v)))
-             (transient #{}) x))
-
-    ;; Java List (not Clojure vector) → convert to vector, recurse elements
-    (and (instance? java.util.List x) (not (vector? x)))
-    (mapv deep-clojurize x)
-
-    ;; Clojure map — recurse to find nested Java collections
-    (map? x)
-    (persistent!
-     (reduce-kv (fn [m k v] (assoc! m (deep-clojurize k) (deep-clojurize v)))
-                (transient {}) x))
-
-    ;; Clojure set — recurse to find nested Java collections
-    (set? x)
-    (persistent!
-     (reduce (fn [s v] (conj! s (deep-clojurize v)))
-             (transient #{}) x))
-
-    ;; Clojure vector — recurse to find nested Java collections
-    (vector? x)
-    (mapv deep-clojurize x)
-
-    :else x))
-
-(defn fressian-decode [bytes]
-  (deep-clojurize (fressian/read (ByteArrayInputStream. bytes))))
+            [com.brunobonacci.mulog :as u]))
 
 ;; ---------------------------------------------------------------------------
 ;; Cache key helpers
@@ -172,14 +116,14 @@
   "Read from cache, handling both legacy monolithic and segmented formats."
   [cache base-key]
   (when-let [raw (kv/get! cache {:k base-key})]
-    (let [decoded (fressian-decode raw)]
+    (let [decoded (fressian-util/decode raw)]
       (if (:segmented decoded)
         ;; Segmented: read all segments and merge
         (let [{:keys [segment-count watermark checksums]} decoded
               state (reduce
                      (fn [acc idx]
                        (if-let [seg-bytes (kv/get! cache {:k (segment-key base-key idx)})]
-                         (merge acc (fressian-decode seg-bytes))
+                         (merge acc (fressian-util/decode seg-bytes))
                          acc))
                      {}
                      (range segment-count))]
@@ -195,7 +139,7 @@
   "Write state as a single cache entry (legacy format)."
   [cache base-key state watermark]
   (kv/put! cache {:k base-key
-                  :v (fressian-encode {:data state :watermark watermark})}))
+                  :v (fressian-util/encode {:data state :watermark watermark})}))
 
 (defn- write-segmented!
   "Write state as segmented cache entries with manifest."
@@ -205,7 +149,7 @@
                       (mapcat
                        (fn [[idx seg-data]]
                          [{:k (segment-key base-key idx)
-                           :v (fressian-encode seg-data)}]))
+                           :v (fressian-util/encode seg-data)}]))
                       segments)
         checksums (into {}
                         (map (fn [{:keys [k v]}]
@@ -219,7 +163,7 @@
                   :watermark watermark
                   :checksums checksums}
         all-entries (conj entries {:k base-key
-                                  :v (fressian-encode manifest)})]
+                                  :v (fressian-util/encode manifest)})]
     (kv/put-batch! cache {:entries all-entries})))
 
 (defn- write-changed-segments!
@@ -231,7 +175,7 @@
                                (fn [idx]
                                  (let [seg-data (get segments idx {})]
                                    [{:k (segment-key base-key idx)
-                                     :v (fressian-encode seg-data)}])))
+                                     :v (fressian-util/encode seg-data)}])))
                               changed-idxs)
         new-checksums (reduce
                        (fn [acc {:keys [k v]}]
@@ -246,7 +190,7 @@
                   :watermark watermark
                   :checksums new-checksums}
         all-entries (conj changed-entries {:k base-key
-                                          :v (fressian-encode manifest)})]
+                                          :v (fressian-util/encode manifest)})]
     (kv/put-batch! cache {:entries all-entries})))
 
 (defn- write-cache!
@@ -396,7 +340,7 @@
   "Read the partitioned manifest from cache. Returns nil if not found or not partitioned."
   [cache base-key]
   (when-let [raw (kv/get! cache {:k base-key})]
-    (let [decoded (fressian-decode raw)]
+    (let [decoded (fressian-util/decode raw)]
       (when (:partitioned decoded)
         decoded))))
 
@@ -404,7 +348,7 @@
   "Read one partition's cached state."
   [cache base-key partition-key]
   (when-let [raw (kv/get! cache {:k (partition-cache-key base-key partition-key)})]
-    (fressian-decode raw)))
+    (fressian-util/decode raw)))
 
 (defn- read-all-partitions
   "Read all partitions from cache, return {pk → state}."
@@ -421,13 +365,13 @@
   "Read the entity-to-partition index from cache. Returns {eid → pk} or nil."
   [cache base-key]
   (when-let [raw (kv/get! cache {:k (entity-index-cache-key base-key)})]
-    (fressian-decode raw)))
+    (fressian-util/decode raw)))
 
 (defn- write-entity-index!
   "Write the entity-to-partition index to cache."
   [cache base-key index]
   (kv/put! cache {:k (entity-index-cache-key base-key)
-                  :v (fressian-encode index)}))
+                  :v (fressian-util/encode index)}))
 
 (defn- build-entity-index
   "Build {eid → pk} from a partitions map {pk → {eid → entity}}."
@@ -453,14 +397,14 @@
                                 (mapcat
                                  (fn [pk]
                                    [{:k (partition-cache-key base-key pk)
-                                     :v (fressian-encode {:data (get partitions pk {})
+                                     :v (fressian-util/encode {:data (get partitions pk {})
                                                          :watermark global-watermark})}]))
                                 changed-pks)
         manifest {:partitioned true
                   :global-watermark global-watermark
                   :partition-keys (set all-partition-keys)}
         manifest-entry {:k base-key
-                        :v (fressian-encode manifest)}
+                        :v (fressian-util/encode manifest)}
         all-entries (conj partition-entries manifest-entry)]
     (kv/put-batch! cache {:entries all-entries})))
 
@@ -475,7 +419,7 @@
                            (let [existing (or (:data (read-single-partition cache base-key pk)) {})
                                  merged (merge existing entities)]
                              [{:k (partition-cache-key base-key pk)
-                               :v (fressian-encode {:data merged :watermark global-watermark})}])))
+                               :v (fressian-util/encode {:data merged :watermark global-watermark})}])))
                         evictions)]
       (kv/put-batch! cache {:entries entries}))))
 
@@ -509,7 +453,7 @@
                            (let [existing (or (:data (read-single-partition cache base-key pk)) {})
                                  cleaned (apply dissoc existing eids)]
                              [{:k (partition-cache-key base-key pk)
-                               :v (fressian-encode {:data cleaned :watermark global-watermark})}])))
+                               :v (fressian-util/encode {:data cleaned :watermark global-watermark})}])))
                         source-removals)]
       (kv/put-batch! cache {:entries entries}))))
 
