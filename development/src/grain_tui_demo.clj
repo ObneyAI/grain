@@ -81,8 +81,7 @@
   "Start the demo. Returns a handle suitable for `stop!`."
   []
   (reset! demo-state {:count 0 :last-tick "—"})
-  (let [pubsub (pubsub/start {:type   :core-async
-                              :config {:topic-fn :event/type}})
+  (let [pubsub (pubsub/start {:type :core-async :topic-fn :event/type})
         ;; Tick generator: emit a :demo/ticked event every 2 seconds.
         ticker (async/thread
                  (loop []
@@ -111,6 +110,16 @@
   (when pubsub (pubsub/stop pubsub))
   (reset! demo-state nil)
   :stopped)
+
+(defn -main
+  "Boot the demo, join the session loop thread, then clean up. Designed
+   for `clojure -M:dev -m grain-tui-demo`."
+  [& _args]
+  (let [handle (start!)
+        ^Thread loop-thread (:loop-thread @(:session handle))]
+    (.join loop-thread)
+    (stop! handle)
+    (System/exit 0)))
 
 (comment
   ;; Run from REPL:
