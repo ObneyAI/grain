@@ -35,6 +35,7 @@
                                poly/control-plane {:local/root "components/control-plane"}
                                poly/event-notifier-postgres {:local/root "components/event-notifier-postgres"}
                                poly/datastar {:local/root "components/datastar"}
+                               poly/tui-adapter {:local/root "components/tui-adapter"}
                                poly/kv-store {:local/root "components/kv-store"}
                                poly/kv-store-lmdb {:local/root "components/kv-store-lmdb"}
                                poly/fressian-util {:local/root "components/fressian-util"}
