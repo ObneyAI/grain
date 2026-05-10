@@ -30,6 +30,7 @@
   (:require [clojure.core.async :as async :refer [alts!! chan close! poll! timeout]]
             [com.brunobonacci.mulog :as u]
             [ai.obney.grain.tui-adapter.ansi :as ansi]
+            [ai.obney.grain.tui-adapter.builtins]   ; ensure built-in elements register
             [ai.obney.grain.tui-adapter.cells :as cells]
             [ai.obney.grain.tui-adapter.diff :as diff]
             [ai.obney.grain.tui-adapter.keymap :as keymap]
@@ -233,10 +234,18 @@
         (u/log ::query-failed :error e)
         {:query/error (.getMessage e)}))))
 
-(defn- error-hiccup [msg]
+(defn- error-hiccup [headline message]
   [:col
-   [:text {:fg :red :bold? true} (str "Query error: " msg)]
-   [:text {:dim? true} "Press <esc> to go back."]])
+   [:text {:fg :red :bold? true} (str headline)]
+   [:text (str message)]
+   [:text {:dim? true} "Press <esc> to go back, q to quit."]])
+
+(defn- anomaly?
+  "True when `result` carries a Cognitect anomaly category — the
+   convention queries use to signal failure without throwing."
+  [result]
+  (and (map? result)
+       (contains? result :cognitect.anomalies/category)))
 
 (defn- compute-screen-grid
   "Compute the screen's CellGrid for the current frame. Branches on
@@ -246,13 +255,27 @@
      :snapshot — runs `:tui/render` on the whole result and lays out via
                  `layout/render-element`.
 
+   Anomaly results (from a thrown query handler OR a returned Cognitect
+   anomaly) render an error frame. Otherwise the screen's `:tui/render`
+   is invoked on `(:query/result result)`.
+
    Returns `[grid new-stream-state-or-nil]`."
   [session viewport]
   (let [{:keys [current-screen stream-state]} @session
         result    (run-query session)]
     (cond
       (:query/error result)
-      [(layout/render-element (error-hiccup (:query/error result)) viewport) nil]
+      [(layout/render-element
+         (error-hiccup "Query error" (:query/error result))
+         viewport)
+       nil]
+
+      (anomaly? result)
+      [(layout/render-element
+         (error-hiccup (str "Query failed (" (:cognitect.anomalies/category result) ")")
+                       (:cognitect.anomalies/message result))
+         viewport)
+       nil]
 
       (= :stream (:tui/projection current-screen))
       (let [{:keys [state grid]}
@@ -422,12 +445,46 @@
 ;; Event loop
 ;; ─────────────────────────────────────────────────────────────────────
 
+(defn- safe-render-frame!
+  "Wrap `render-frame!` so a misbehaving renderer logs and produces an
+   error screen instead of silently killing the loop thread. The error
+   gets emitted both to mulog and to STDERR — JLine owns STDOUT, so any
+   `println` / mulog console publisher will trample the TUI."
+  [session]
+  (try
+    (render-frame! session)
+    (catch Throwable t
+      (u/log ::render-frame-failed :error t)
+      (binding [*out* *err*]
+        (println "[tui-adapter] render-frame! threw:" (.getMessage t))
+        (.printStackTrace t *err*))
+      ;; Best-effort error frame — render without going through the screen's
+      ;; render-fn. If even this throws, swallow.
+      (try
+        (let [{:keys [viewport on-output ansi-style terminal-caps render-model]} @session
+              g    (layout/render-element
+                     [:col
+                      [:text {:fg :red :bold? true} "TUI render failed:"]
+                      [:text (.getMessage t)]
+                      [:text {:dim? true} "Press 'q' to quit; see STDERR for stacktrace."]]
+                     viewport)
+              g    (let [base (cells/blank (:width viewport) (:height viewport))]
+                     (cells/overlay base g 0 0))
+              runs (diff/diff render-model g)
+              [out new-style] (ansi/emit runs (or terminal-caps {:color :truecolor})
+                                         (or ansi-style {}))]
+          (when (and on-output (seq out)) (on-output out))
+          (swap! session assoc :render-model g :ansi-style new-style))
+        (catch Throwable t2
+          (u/log ::error-frame-failed :error t2))))))
+
 (defn run-loop!
   "Run the session's render loop. Blocks. Should be called on a dedicated
    thread. Exits cleanly when `:running?` flips false or when channels
-   close."
+   close. Render exceptions are caught by `safe-render-frame!` so the
+   loop survives."
   [session]
-  (render-frame! session)
+  (safe-render-frame! session)
   (loop []
     (let [{:keys [sub-chan input-ch resize-ch running?]} @session]
       (when running?
@@ -443,21 +500,35 @@
             (= port resize-ch)
             (do (swap! session assoc :viewport (:size val))
                 (swap! session assoc :render-model nil) ; force full redraw
-                (render-frame! session)
+                (safe-render-frame! session)
                 (recur))
 
             ;; Input event
             (= port input-ch)
             (do
-              (when (= :key (:type val))
-                (dispatch-key! session val))
-              ;; Drain-both per the correctness comment at datastar/core.clj:405-411
+              ;; Dispatch the event we pulled, plus every other input
+              ;; event already buffered. Unlike the sub-chan path,
+              ;; input events are NOT idempotent — each keystroke must
+              ;; be delivered to the keymap or the user loses input.
+              (try (when (= :key (:type val))
+                     (dispatch-key! session val))
+                   (catch Throwable t
+                     (u/log ::dispatch-failed :error t)))
+              (loop []
+                (when-let [more (poll! input-ch)]
+                  (try (when (= :key (:type more))
+                         (dispatch-key! session more))
+                       (catch Throwable t
+                         (u/log ::dispatch-failed :error t)))
+                  (recur)))
+              ;; After draining input, also clear sub-chan — the upcoming
+              ;; render will reflect any pending domain events anyway, so
+              ;; coalescing them avoids redundant renders.
               (when-let [debounce (:debounce-ms @session)]
                 (when (pos? debounce) (Thread/sleep ^long debounce)))
-              (subscription/drain-channel input-ch)
               (when sub-chan (subscription/drain-channel sub-chan))
               (when (:running? @session)
-                (render-frame! session))
+                (safe-render-frame! session))
               (recur))
 
             ;; Subscription event
@@ -467,7 +538,7 @@
                 (when (pos? debounce) (Thread/sleep ^long debounce)))
               (subscription/drain-channel sub-chan)
               (subscription/drain-channel input-ch)
-              (render-frame! session)
+              (safe-render-frame! session)
               (recur))))))))
 
 ;; ─────────────────────────────────────────────────────────────────────
@@ -527,7 +598,10 @@
      :focus             nil
      :sequence-buffer   []
      :sub-chan          nil
-     :input-ch          (chan 32)
+     ;; Input channel sized for keyboard autorepeat — `>!!` from the
+     ;; JLine pump is blocking, so under-sizing this wedges input when
+     ;; the session loop falls behind on a long render.
+     :input-ch          (chan (async/sliding-buffer 1024))
      :resize-ch         (chan 8)
      :running?          true}))
 
