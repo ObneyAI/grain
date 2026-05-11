@@ -37,6 +37,19 @@ obneyai/grain-datastar
 
 Includes the core CQRS components (command/query/read-model processors, event store, pub/sub). See `components/datastar` for the full source.
 
+## grain-tui
+
+Terminal UIs over stdio. Renders `:tui/...` query metadata as alt-screen or main-screen sessions with snapshot or streaming projections, tagged-tuple keymaps, palette overlays, and an extension point (`defelement`) for custom cell-rendering primitives. Per-session pubsub subscriptions are auto-resolved from `:grain/read-models` — the same machinery the Datastar adapter uses, just with a different transport and rendering pipeline:
+
+```clojure
+obneyai/grain-tui
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "ddb91e512966f6a93d757e18ef5d39fbacf18f14"
+ :deps/root "projects/grain-tui"}
+```
+
+Includes the core CQRS components (command/query/read-model processors, event store, pub/sub). See [`docs/tui.md`](./tui.md) for architecture and [`docs/tui-manual.md`](./tui-manual.md) for a build-from-scratch walk-through. Working demo at `development/src/grain_tui_demo.clj`.
+
 ## grain-event-store-postgres-v3
 
 Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks, Fressian binary serialization, and tenant-scoped operations. All read and append operations require a tenant ID, ensuring structural data isolation:
