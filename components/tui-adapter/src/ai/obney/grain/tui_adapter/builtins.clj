@@ -426,6 +426,29 @@
     ;; §7.5 Input
     ;; ──────────────────────────────────────────────────────────────────
 
+    ;; ──────────────────────────────────────────────────────────────────
+    ;; Substrate-internal: pre-rendered cell embedding (v0.8 §7.6.8)
+    ;; ──────────────────────────────────────────────────────────────────
+    ;;
+    ;; `:cells` is the seam by which application-registered cell-rendering
+    ;; elements travel through a frame: the server resolves a custom
+    ;; element to its CellGrid, then wraps the grid in `[:cells {:grid g}]`
+    ;; so the rest of the pipeline (layout, serialization, client) treats
+    ;; it as a first-class hiccup leaf. Built-in elements never produce
+    ;; `:cells` directly; the frame serializer does.
+
+    (er/defelement :cells
+      {:doc            "Pre-rendered CellGrid embedded as a hiccup leaf. Used by the v0.8 frame serializer to ship application-registered elements over the wire as opaque cells."
+       :attrs          [:map [:grid :any]]
+       :preferred-size (fn [{:keys [grid]}]
+                         {:width  (:width  grid 0)
+                          :height (:height grid 0)})
+       :min-size       {:width 1 :height 1}
+       :stream-stable? true
+       :render
+       (fn [{:keys [grid]} box]
+         (cells/clip grid box))})
+
     (er/defelement :input
       {:doc   "Text input area. Attrs: {:value \"...\" :cursor n :placeholder?}."
        :attrs [:map

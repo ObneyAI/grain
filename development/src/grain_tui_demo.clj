@@ -111,7 +111,19 @@
 
 (defquery :demo counter
   {:authorized?       (constantly true)
-   :grain/read-models {:demo/counter-rm 1}}
+   :grain/read-models {:demo/counter-rm 1}
+   ;; v0.8 §5: queries declare their TUI metadata in their own metadata
+   ;; map. The stdio transport pulls these from the `counter-screen`
+   ;; below; the v0.8 HTTP transport pulls them from the query registry.
+   :tui/buffer        :alt
+   :tui/projection    :snapshot
+   :tui/keymap
+   {"q" [:session :quit]
+    "+" [:command :demo/change {:inputs {:demo/delta 1}}]
+    "=" [:command :demo/change {:inputs {:demo/delta 1}}]
+    "-" [:command :demo/change {:inputs {:demo/delta -1}}]
+    "*" [:command :demo/change {:inputs {:demo/delta 5}}]
+    "/" [:command :demo/change {:inputs {:demo/delta -5}}]}}
   [context]
   (let [raw   (rmp/project context :demo/counter-rm)
         state (merge {:count 0 :event-count 0} raw)]

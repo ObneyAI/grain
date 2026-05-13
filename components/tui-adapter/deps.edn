@@ -1,6 +1,7 @@
 {:paths ["src" "resources"]
  :deps  {org.jline/jline                        {:mvn/version "3.27.1"}
          org.clojure/core.async                 {:mvn/version "1.7.701"}
+         io.pedestal/pedestal.service           {:mvn/version "0.7.2"}
          metosin/malli                          {:mvn/version "0.17.0"}
          com.brunobonacci/mulog                 {:mvn/version "0.9.0"}
          com.cognitect/anomalies                {:mvn/version "0.1.12"}
@@ -9,4 +10,5 @@
          ai.obney/grain-read-model-processor-v2 {:local/root "../read-model-processor-v2"}
          ai.obney/grain-query-processor         {:local/root "../query-processor"}
          ai.obney/grain-command-processor-v2    {:local/root "../command-processor-v2"}}
- :aliases {:test {:extra-paths ["test"]}}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps  {ai.obney/grain-webserver {:local/root "../webserver"}}}}}

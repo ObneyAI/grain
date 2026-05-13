@@ -37,6 +37,7 @@
             [ai.obney.grain.tui-adapter.builtins]   ; ensure built-in elements register
             [ai.obney.grain.tui-adapter.cells :as cells]
             [ai.obney.grain.tui-adapter.diff :as diff]
+            [ai.obney.grain.tui-adapter.frame :as frame]
             [ai.obney.grain.tui-adapter.keymap :as keymap]
             [ai.obney.grain.tui-adapter.layout :as layout]
             [ai.obney.grain.tui-adapter.overlay :as overlay]
@@ -246,59 +247,57 @@
    [:text (str message)]
    [:text {:dim? true} "Press <esc> to go back, q to quit."]])
 
-(defn- anomaly?
-  "True when `result` carries a Cognitect anomaly category — the
-   convention queries use to signal failure without throwing."
-  [result]
-  (and (map? result)
-       (contains? result :cognitect.anomalies/category)))
+(defn- layout-frame-locally
+  "Local-topology rendering of a Frame to a CellGrid. Branches on the
+   frame's primary content — error, stream segments, regions (layout), or
+   snapshot hiccup. Reuses the same `layout/render-element` and
+   `stream/render-stream` pipeline as before; the v0.7 behavior is
+   preserved end-to-end, just routed through the Frame intermediate.
+
+   Returns `[grid new-stream-state-or-nil]`."
+  [frm session viewport]
+  (cond
+    (frame/error? frm)
+    [(layout/render-element
+       (error-hiccup (:headline (:error frm)) (:message (:error frm)))
+       viewport)
+     nil]
+
+    (frame/stream? frm)
+    (let [{:keys [stream-state]} @session
+          ;; The frame carries segments already extracted from the handler
+          ;; return at the `:items` path. Hand them back to render-stream
+          ;; via a synthetic result map keyed by ::segments, plus a
+          ;; matching segments-spec that points at that key.
+          spec  (-> frm :metadata :segments-spec)
+          synth-spec (assoc spec :items ::segments)
+          synth-res  {::segments (:segments frm)}
+          {:keys [state grid]}
+          (stream/render-stream (or stream-state (stream/empty-stream-state))
+                                synth-res
+                                synth-spec
+                                viewport)]
+      [grid state])
+
+    :else
+    (let [hiccup (:hiccup frm)]
+      (when (nil? hiccup)
+        (u/log ::missing-presentation :screen (-> frm :screen :query-id)))
+      [(layout/render-element (or hiccup [:text {:text ""}]) viewport) nil])))
 
 (defn- compute-screen-grid
-  "Compute the screen's CellGrid for the current frame. Branches on
-   `:tui/projection`:
-     :stream   — invokes `stream/render-stream` with the whole handler
-                 return; the substrate extracts segments and reads each
-                 segment's hiccup at the path declared by
-                 `:tui/segments :hiccup`.
-     :snapshot — reads `:tui/hiccup` from the handler return and lays out
-                 via `layout/render-element`.
-
-   Anomaly results (from a thrown query handler OR a returned Cognitect
-   anomaly) render an error frame. Per spec §6.4, a snapshot handler that
-   returns no `:tui/hiccup` produces an empty screen and logs a warning.
+  "Compute the screen's CellGrid for the current frame. Produces a Frame
+   via `frame/produce-frame` (the v0.8 unit of presentation), then lays
+   it out locally via `layout-frame-locally`. The Frame intermediate
+   makes it possible for the remote-topology HTTP+SSE transport (v0.8
+   §4.3) to consume the same presentation without re-running the query
+   pipeline.
 
    Returns `[grid new-stream-state-or-nil]`."
   [session viewport]
-  (let [{:keys [current-screen stream-state]} @session
-        result    (run-query session)]
-    (cond
-      (:query/error result)
-      [(layout/render-element
-         (error-hiccup "Query error" (:query/error result))
-         viewport)
-       nil]
-
-      (anomaly? result)
-      [(layout/render-element
-         (error-hiccup (str "Query failed (" (:cognitect.anomalies/category result) ")")
-                       (:cognitect.anomalies/message result))
-         viewport)
-       nil]
-
-      (= :stream (:tui/projection current-screen))
-      (let [{:keys [state grid]}
-            (stream/render-stream (or stream-state (stream/empty-stream-state))
-                                  result
-                                  (:tui/segments current-screen)
-                                  viewport)]
-        [grid state])
-
-      :else
-      (let [hiccup (:tui/hiccup result)]
-        (when (nil? hiccup)
-          (u/log ::missing-presentation
-                 :screen (:query-id current-screen)))
-        [(layout/render-element (or hiccup [:text {:text ""}]) viewport) nil]))))
+  (let [result (run-query session)
+        frm    (frame/produce-frame @session result)]
+    (layout-frame-locally frm session viewport)))
 
 (defn- overlay-hiccup
   "Translate an `:overlay` map into hiccup the layout engine can render.
