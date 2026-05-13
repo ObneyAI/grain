@@ -17,11 +17,12 @@
   (:require [clojure.core.async :as async]
             [clojure.edn :as edn]
             [com.brunobonacci.mulog :as u]
-            [ai.obney.grain.tui-adapter.keymap :as keymap]
-            [ai.obney.grain.tui-client.http     :as http]
-            [ai.obney.grain.tui-client.render   :as render]
-            [ai.obney.grain.tui-client.sse      :as sse]
-            [ai.obney.grain.tui-client.terminal :as term])
+            [ai.obney.grain.tui-adapter.input-area :as input-area]
+            [ai.obney.grain.tui-adapter.keymap     :as keymap]
+            [ai.obney.grain.tui-client.http        :as http]
+            [ai.obney.grain.tui-client.render      :as render]
+            [ai.obney.grain.tui-client.sse         :as sse]
+            [ai.obney.grain.tui-client.terminal    :as term])
   (:import (org.jline.terminal Terminal)))
 
 ;; ─────────────────────────────────────────────────────────────────────
@@ -89,18 +90,55 @@
       (catch Exception e
         (u/log ::command-post-failed :command cmd-name :error e)))))
 
+(defn- post-input-submission!
+  "On submit from the input area, POST the configured command with the
+   buffered text bound at the screen's `:tui/input :input-key` (default
+   `:text`)."
+  [{:keys [base-url http-client session-id]} input-cfg submission]
+  (let [cmd-name (:command input-cfg)
+        in-key   (or (:input-key input-cfg) :text)
+        cmd-ns   (namespace cmd-name)
+        cmd-nm   (name cmd-name)
+        url      (str base-url "/tui/command/" cmd-ns "/" cmd-nm)]
+    (try
+      (http/post-edn {:http-client http-client
+                      :url url
+                      :body {:inputs  {in-key submission}
+                             :session session-id}})
+      (catch Exception e
+        (u/log ::input-submit-post-failed :command cmd-name :error e)))))
+
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Main loop
 ;; ─────────────────────────────────────────────────────────────────────
 
+(defn- maybe-init-input-area
+  "If the incoming frame declares `:input` and the prior input-area
+   state is nil (or the frame's input config changed in a way that
+   should reset the buffer), return a fresh state. Otherwise return
+   the prior state.
+
+   For v1 we reset only when transitioning from `nil` (no input
+   declared) to non-nil (input declared); ongoing edits survive
+   frame updates that don't change the `:input` config."
+  [prior-input-area frame]
+  (let [cfg (:input frame)]
+    (cond
+      (nil? cfg)            nil
+      (nil? prior-input-area) (input-area/initial-state)
+      :else                 prior-input-area)))
+
 (defn- handle-sse-event
-  "Returns updated render-state given an SSE event. Frames are parsed
-   and painted; toasts/session events are deferred to a later phase."
+  "Returns updated [render-state last-frame] given an SSE event.
+   Frames are parsed, the input-area state is initialized/preserved
+   based on the frame's `:input` config, then painted."
   [render-state viewport on-output evt last-frame]
   (case (:name evt)
     "tui-frame"
-    (let [frm (edn/read-string (:data evt))
-          rs' (render/render-frame! render-state frm viewport on-output)]
+    (let [frm    (edn/read-string (:data evt))
+          ia'    (maybe-init-input-area (:input-area render-state) frm)
+          rs0    (assoc render-state :input-area ia')
+          rs'    (render/render-frame! rs0 frm viewport on-output)]
       [rs' frm])
 
     ;; Future: render toasts via overlay layer. For MVP, log.
@@ -207,33 +245,69 @@
                 (recur rs' last-frame vp' seq-buf))
 
               (= port input-ch)
-              (let [{:keys [state action buffer]} (handle-key last-frame v seq-buf)]
-                (case state
-                  :match
-                  (case (first action)
-                    :command
-                    (do (dispatch-command! {:base-url base-url
-                                            :http-client http-client
-                                            :session-id session-id}
-                                           action)
-                        (recur render-state last-frame viewport []))
+              (let [input-active? (and last-frame
+                                       (:input last-frame)
+                                       (nil? (:overlay last-frame)))
+                    ;; Step 1: if input area is active, run the key
+                    ;; through the input-area state machine first. It
+                    ;; either absorbs the key, submits, or
+                    ;; passthroughs to the keymap path.
+                    [rs1 absorbed? maybe-submission]
+                    (if input-active?
+                      (let [cfg  (:input last-frame)
+                            opts {:multiline?  (boolean (:multiline? cfg))
+                                  :history-max (or (:history-max cfg) 200)}
+                            {:keys [state submission passthrough?]}
+                            (input-area/handle-key (:input-area render-state) v opts)
+                            rs1 (assoc render-state :input-area state)
+                            ;; Re-render so the user sees their typing
+                            ;; immediately. (The server doesn't know
+                            ;; the buffer state; only the next frame
+                            ;; arriving will repaint it server-side.)
+                            rs1 (if last-frame
+                                  (render/render-frame! rs1 last-frame viewport on-output)
+                                  rs1)]
+                        [rs1 (not passthrough?) submission])
+                      [render-state false nil])]
+                (cond
+                  ;; Input area consumed the key (typing, editing, or
+                  ;; submission). On submission, POST the command.
+                  absorbed?
+                  (do (when maybe-submission
+                        (post-input-submission!
+                          {:base-url base-url :http-client http-client
+                           :session-id session-id}
+                          (:input last-frame)
+                          maybe-submission))
+                      (recur rs1 last-frame viewport []))
 
-                    :session
-                    (case (second action)
-                      :quit    (do (reset! running? false)
-                                   (recur render-state last-frame viewport []))
-                      ;; Other session actions: refresh/back/push/etc.
-                      ;; Future: open new SSE for push-screen, close on back.
-                      (do (u/log ::session-action-deferred :action action)
-                          (recur render-state last-frame viewport [])))
-                    ;; Unknown action tag
-                    (recur render-state last-frame viewport []))
+                  :else
+                  (let [{:keys [state action buffer]} (handle-key last-frame v seq-buf)]
+                    (case state
+                      :match
+                      (case (first action)
+                        :command
+                        (do (dispatch-command! {:base-url base-url
+                                                :http-client http-client
+                                                :session-id session-id}
+                                               action)
+                            (recur rs1 last-frame viewport []))
 
-                  :pending
-                  (recur render-state last-frame viewport buffer)
+                        :session
+                        (case (second action)
+                          :quit (do (reset! running? false)
+                                    (recur rs1 last-frame viewport []))
+                          ;; Other session actions: refresh/back/push/etc.
+                          (do (u/log ::session-action-deferred :action action)
+                              (recur rs1 last-frame viewport [])))
+                        ;; Unknown action tag
+                        (recur rs1 last-frame viewport []))
 
-                  ;; :no-match — drop key
-                  (recur render-state last-frame viewport [])))
+                      :pending
+                      (recur rs1 last-frame viewport buffer)
+
+                      ;; :no-match — drop key
+                      (recur rs1 last-frame viewport [])))))
 
               :else
               (recur render-state last-frame viewport seq-buf)))))

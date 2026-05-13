@@ -27,6 +27,33 @@
 (defn leave-alt-screen [] (str CSI "?1049l"))
 (defn hide-cursor [] (str CSI "?25l"))
 (defn show-cursor [] (str CSI "?25h"))
+
+;; DECSCUSR — cursor shape. 0/1 = default, 2 = steady block, 3 = blinking
+;; underline, 4 = steady underline, 5 = blinking bar, 6 = steady bar.
+(defn cursor-style-block         [] (str CSI "2 q"))
+(defn cursor-style-bar           [] (str CSI "6 q"))
+(defn cursor-style-default-reset [] (str CSI "0 q"))
+
+;; DECSTBM — set top and bottom margins (scroll region). Both 1-indexed
+;; per the spec. `\n` at the bottom of the region scrolls only within
+;; the region; rows below the region stay pinned. Used to keep the
+;; sticky input chrome fixed at the bottom while new stream segments
+;; scroll above.
+(defn set-scroll-region
+  "Set the terminal scroll region to rows `top..bottom` (both 0-indexed
+   here; emitted 1-indexed per the CSI convention)."
+  [top bottom]
+  (str CSI (inc top) ";" (inc bottom) "r"))
+
+(defn reset-scroll-region
+  "Reset the scroll region to the full screen."
+  []
+  (str CSI "r"))
+
+;; Line erase. `CSI K` (= `CSI 0 K`) clears from the cursor to the end
+;; of the line. Used when redrawing a row in place.
+(defn erase-line-to-eol [] (str CSI "K"))
+(defn erase-line        [] (str CSI "2K"))
 (defn reset-style [] (str CSI "0m"))
 (defn clear-screen [] (str CSI "2J"))
 
@@ -88,7 +115,8 @@
   (let [depth (:color caps :truecolor)]
     (cond
       (= color :default)
-      [(+ base 9)]                      ; 39 (fg-default) or 49 (bg-default)
+      ;; SGR 39 (fg-default) when base=38; SGR 49 (bg-default) when base=48.
+      [(+ base 1)]
 
       (= depth :mono)
       nil
@@ -189,3 +217,21 @@
                                   (.append sb (str (:char c " ")))
                                   (recur (rest cs) nx))))]
           (recur (rest rs) final-style))))))
+
+(defn emit-cells
+  "Emit a sequence of cells as ANSI styled text *without* any cursor
+   positioning. Used by the main-buffer append renderer where the
+   terminal cursor is already where we want to write. Threads
+   `current-style` across the cells and returns `[bytes new-style]`."
+  [cells caps current-style]
+  (let [sb (StringBuilder.)]
+    (loop [cs (seq cells)
+           st (or current-style default-style)]
+      (if (empty? cs)
+        [(.toString sb) st]
+        (let [c        (first cs)
+              target   (cell-style c)
+              [esc nx] (sgr-for st target caps)]
+          (when (seq esc) (.append sb esc))
+          (.append sb (str (:char c " ")))
+          (recur (rest cs) nx))))))

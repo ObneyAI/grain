@@ -27,10 +27,14 @@
 ;; Session ↔ Stream integration
 ;; ──────────────────────────────────────────────────────────────────────────
 
+;; This fixture tests the *alt-buffer* stream renderer (fixed-window
+;; rendering with segment caching). The main-buffer stream path uses
+;; append-at-cursor emission instead; that path has its own tests in
+;; `main_buffer_test.clj`.
 (def stream-screen
   {:query-id       :integration/stream
    :inputs         {}
-   :tui/buffer     :main
+   :tui/buffer     :alt
    :tui/projection :stream
    :tui/segments   {:items :messages :key :id :hiccup :tui/hiccup}})
 

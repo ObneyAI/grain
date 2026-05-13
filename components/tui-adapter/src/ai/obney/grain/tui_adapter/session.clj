@@ -38,6 +38,7 @@
             [ai.obney.grain.tui-adapter.cells :as cells]
             [ai.obney.grain.tui-adapter.diff :as diff]
             [ai.obney.grain.tui-adapter.frame :as frame]
+            [ai.obney.grain.tui-adapter.input-area :as input-area]
             [ai.obney.grain.tui-adapter.keymap :as keymap]
             [ai.obney.grain.tui-adapter.layout :as layout]
             [ai.obney.grain.tui-adapter.overlay :as overlay]
@@ -204,11 +205,24 @@
    v0.7 the screen carries no render function; hiccup comes from the
    handler return."
   [session new-screen]
-  (let [{:keys [sub-chan event-pubsub current-screen]} @session]
+  (let [{:keys [sub-chan event-pubsub current-screen on-output]} @session
+        old-buffer (or (:tui/buffer current-screen) :alt)
+        new-buffer (or (:tui/buffer new-screen)     :alt)]
     (when sub-chan (close! sub-chan))
     (when current-screen
       (fire-hook! :tui/on-exit current-screen session))
     (warn-if-periodic-refresh! new-screen)
+    ;; Buffer-mode transition (rare — most sessions stay in one
+    ;; buffer). When flipping, we ask the terminal to enter/leave its
+    ;; alt-screen so the new screen renders in the right canvas. The
+    ;; per-buffer setup (`enter-tui!` already happened at session
+    ;; start) doesn't need to be re-emitted in full — just the
+    ;; alt-screen toggle and a clear of the new canvas's render
+    ;; bookkeeping.
+    (when (and on-output current-screen (not= old-buffer new-buffer))
+      (on-output (case new-buffer
+                   :main (ansi/leave-alt-screen)
+                   (str (ansi/enter-alt-screen) (ansi/clear-screen)))))
     (let [new-sub (when event-pubsub
                     (subscription/subscribe-screen
                       event-pubsub
@@ -217,7 +231,10 @@
       (swap! session assoc
              :current-screen new-screen
              :sub-chan       new-sub
-             :stream-state   nil))   ; reset stream cache on screen change
+             :stream-state   nil    ; reset stream cache on screen change
+             :render-model   (when (= old-buffer new-buffer) (:render-model @session))
+             :input-area     (when (:tui/input new-screen)
+                               (input-area/initial-state))))
     (fire-hook! :tui/on-enter new-screen session)
     nil))
 
@@ -340,19 +357,221 @@
   (let [base (cells/blank width height)]
     (cells/overlay base grid 0 0)))
 
-(defn render-frame!
-  "Render the current screen + overlay, diff against :render-model, emit
-   bytes via :on-output. Returns the new render-model CellGrid."
+(defn- input-area-config
+  "Read the screen's `:tui/input` config map. nil when not declared."
   [session]
-  (let [{:keys [viewport overlay terminal-caps render-model ansi-style on-output]} @session
-        [screen-g new-stream-state] (compute-screen-grid session viewport)
-        screen-g  (pad-to-viewport screen-g viewport)
-        composed  (compose-overlay screen-g overlay viewport)
-        runs      (diff/diff render-model composed)
+  (-> @session :current-screen :tui/input))
+
+(defn- input-area-height
+  "How many rows the input area occupies for `session`'s current
+   screen, or 0 when not declared."
+  [session]
+  (if-let [cfg (input-area-config session)]
+    (input-area/preferred-height (:input-area @session) cfg)
+    0))
+
+(defn- render-input-area
+  "Render the session's input-area state into a CellGrid of
+   (viewport-width × input-area-height). Returns
+   `{:grid g :cursor-pos [col row]}` where cursor-pos is relative to
+   the input area's box.
+
+   Passes the full `:tui/input` config through so `:hint`, `:max-rows`,
+   etc. reach the renderer alongside the box dimensions."
+  [session viewport]
+  (let [s    @session
+        cfg  (input-area-config session)
+        h    (input-area-height session)
+        opts (merge cfg
+                    {:prompt     (or (:prompt cfg) "")
+                     :width      (:width viewport)
+                     :height     h
+                     :multiline? (boolean (:multiline? cfg))})]
+    (input-area/render (:input-area s) opts)))
+
+(defn- emit-grid-as-lines
+  "Emit each row of `grid` as sequential ANSI bytes followed by `\\n`.
+   Used by the main-buffer renderer to print the intro block (and the
+   chrome) into the terminal at the current cursor row, letting the
+   scroll region handle vertical positioning naturally."
+  [grid caps style]
+  (loop [rows  (:cells grid)
+         st    style
+         sb    (StringBuilder.)]
+    (if (empty? rows)
+      [(.toString sb) st]
+      (let [[row-bytes st'] (ansi/emit-cells (first rows) caps st)]
+        (.append sb row-bytes)
+        (.append sb "\n")
+        (recur (rest rows) st' sb)))))
+
+(defn- render-frame-main!
+  "Main-buffer + stream render path (spec §6.3 transcript pattern).
+
+   - On the first frame, sets the DECSTBM scroll region to (0,
+     chrome-top - 1), emits the screen's `:tui/hiccup` intro at the
+     current cursor row, then primes the cursor at the bottom of the
+     scroll region.
+   - On every frame, computes new segments via
+     `stream/render-stream-main` and emits them at the bottom row of
+     the scroll region. The `\\n` after each segment scrolls the
+     region; the chrome rows below stay pinned.
+   - After segments, redraws the input chrome at the bottom of the
+     viewport and positions the terminal cursor inside the prompt."
+  [session]
+  (let [s     @session
+        {:keys [viewport terminal-caps ansi-style on-output]} s
+        screen   (:current-screen s)
+        ia-cfg   (:tui/input screen)
+        ia-h     (if ia-cfg
+                   (input-area/preferred-height (:input-area s) ia-cfg)
+                   0)
+        H        (:height viewport)
+        W        (:width  viewport)
+        chrome-top  (- H ia-h)
+        emit-row    (max 0 (dec chrome-top)) ; last row of the scroll region
+        result      (run-query session)
+        stream-spec (:tui/segments screen)
+        prior-ss    (or (:stream-state s) (stream/empty-stream-state))
+        ;; First-frame setup: scroll region + intro emission.
+        first?      (not (:intro-printed? prior-ss))
+        [intro-bytes intro-style]
+        (if first?
+          (let [intro-hiccup (:tui/hiccup result)
+                ;; Compute intro at the scroll region's full width and a
+                ;; height matching the natural preferred-size; clip to
+                ;; the scroll region's height as a safety bound.
+                intro-grid   (when intro-hiccup
+                               (layout/render-element
+                                 intro-hiccup
+                                 {:width W :height (max 1 (- chrome-top 0))}))
+                [body-bytes body-style]
+                (if intro-grid
+                  (emit-grid-as-lines intro-grid
+                                      (or terminal-caps {:color :truecolor})
+                                      (or ansi-style {}))
+                  ["" (or ansi-style {})])]
+            ;; Sequence: set scroll region, position at top, hide cursor,
+            ;; emit intro lines, position at bottom row of scroll region
+            ;; so subsequent segments land in the right place.
+            [(str (ansi/set-scroll-region 0 (max 0 (dec chrome-top)))
+                  (ansi/cursor-position 0 0)
+                  (ansi/hide-cursor)
+                  body-bytes
+                  (ansi/cursor-position emit-row 0))
+             body-style])
+          ["" (or ansi-style {})])
+        ;; Segment append-emission.
+        {seg-bytes :bytes new-ss :state final-style :style}
+        (if stream-spec
+          (stream/render-stream-main prior-ss result stream-spec
+                                     {:width         W
+                                      :emission-row  emit-row
+                                      :terminal-caps (or terminal-caps {:color :truecolor})
+                                      :style         intro-style})
+          {:bytes "" :state prior-ss :style intro-style})
+        ;; Chrome redraw at the bottom of the viewport.
+        {ia-grid :grid ia-cur :cursor-pos}
+        (when (pos? ia-h) (render-input-area session viewport))
+        chrome-bytes
+        (if ia-grid
+          (let [[cb _] (emit-grid-as-lines
+                         ia-grid
+                         (or terminal-caps {:color :truecolor})
+                         final-style)]
+            (str (ansi/cursor-position chrome-top 0)
+                 cb))
+          "")
+        ;; Cursor: position inside the prompt area (if any) and show.
+        cursor-bytes
+        (if ia-cur
+          (let [[c-col c-row] ia-cur]
+            (str (ansi/cursor-style-block)
+                 (ansi/cursor-position (+ chrome-top c-row) c-col)
+                 (ansi/show-cursor)))
+          "")
+        out (str intro-bytes seg-bytes chrome-bytes cursor-bytes)]
+    (when (and on-output (seq out))
+      (on-output out))
+    (swap! session assoc
+           :ansi-style    final-style
+           :cursor-shown? (some? ia-cur)
+           :stream-state  (assoc new-ss :intro-printed? true))
+    nil))
+
+(declare render-frame-alt!)
+
+(defn render-frame!
+  "Render the current screen + overlay + (optional) input area, diff
+   against `:render-model`, emit bytes via `:on-output`. When the
+   current screen declares `:tui/input`, the bottom rows of the
+   viewport are reserved for the input area and the terminal cursor
+   is positioned inside it.
+
+   For `:main` + `:stream` screens (spec §6.3 transcript pattern),
+   routes to `render-frame-main!` which uses a DECSTBM scroll region
+   + append-at-cursor emission rather than viewport-bound diffing.
+
+   Returns the new render-model CellGrid (or nil for the main-buffer
+   path, which doesn't maintain a render model)."
+  [session]
+  (let [s      @session
+        screen (:current-screen s)]
+    (if (and (= :main   (:tui/buffer     screen))
+             (= :stream (:tui/projection screen)))
+      (render-frame-main! session)
+      (render-frame-alt! session)))
+  (:render-model @session))
+
+(defn- render-frame-alt!
+  "Original viewport-diff render path. Used by alt-buffer screens and
+   by main-buffer screens that aren't `:stream` (snapshot/regions in
+   main-buffer are deferred; they fall back here)."
+  [session]
+  (let [s              @session
+        {:keys [viewport overlay terminal-caps render-model ansi-style on-output]} s
+        ia-height      (input-area-height session)
+        screen-viewport (assoc viewport :height (max 1 (- (:height viewport) ia-height)))
+        [screen-g new-stream-state] (compute-screen-grid session screen-viewport)
+        screen-g       (pad-to-viewport screen-g screen-viewport)
+        ;; Compose screen content into a full-height canvas; if there's
+        ;; an input area, its grid is placed in the bottom `ia-height`
+        ;; rows.
+        canvas         (cells/blank (:width viewport) (:height viewport))
+        canvas         (cells/overlay canvas screen-g 0 0)
+        {ia-grid :grid ia-cur :cursor-pos}
+                       (when (pos? ia-height) (render-input-area session viewport))
+        canvas         (if ia-grid
+                         (cells/overlay canvas ia-grid 0 (- (:height viewport) ia-height))
+                         canvas)
+        composed       (compose-overlay canvas overlay viewport)
+        runs           (diff/diff render-model composed)
         [out new-style] (ansi/emit runs (or terminal-caps {:color :truecolor})
                                    (or ansi-style {}))]
     (when (and on-output (seq out))
       (on-output out))
+    ;; Cursor management: show + position in the input area when
+    ;; active and no overlay; hide otherwise. Emitted after the diff
+    ;; so the cursor sits at the final position.
+    (when on-output
+      (let [cursor-active? (and ia-cur (nil? overlay))
+            prior          (:cursor-shown? s false)
+            ia-top         (- (:height viewport) ia-height)
+            [c-col c-row]  (or ia-cur [0 0])
+            ;; ansi/cursor-position takes (row col) both 0-indexed and
+            ;; emits as 1-indexed CSI parameters.
+            move           (ansi/cursor-position (+ ia-top c-row) c-col)]
+        (cond
+          cursor-active?
+          ;; Block cursor (DECSCUSR 2) + show-cursor + positioning. The
+          ;; block style matches Claude Code's input affordance and
+          ;; makes the active-input row visually obvious. The shape
+          ;; gets reset on leave-tui.
+          (on-output (str (ansi/cursor-style-block) move (ansi/show-cursor)))
+
+          prior
+          (on-output (str (ansi/cursor-style-default-reset) (ansi/hide-cursor))))
+        (swap! session assoc :cursor-shown? cursor-active?)))
     (swap! session
            (fn [s]
              (cond-> s
@@ -427,27 +646,84 @@
       ;; nil — ignored
       nil)))
 
-(defn- dispatch-key!
-  "Resolve `key-event` against the keymap stack and dispatch.
-   When the active overlay is a palette, route via the palette's
-   substrate-owned handler instead."
+(defn- dispatch-keymap-key!
+  "Resolve `key-event` against the keymap stack and dispatch the
+   matching action (or buffer a chord prefix)."
   [session key-event]
-  (let [{:keys [overlay]} @session]
-    (if (= :palette (:type overlay))
+  (let [stack  (session-keymap-stack session)
+        buf    (:sequence-buffer @session [])
+        result (keymap/resolve-key stack buf (:key key-event))]
+    (case (:state result)
+      :match
+      (do (swap! session assoc :sequence-buffer [])
+          (dispatch-action! session (:action result)))
+
+      :pending
+      (swap! session assoc :sequence-buffer (:buffer result))
+
+      :no-match
+      (swap! session assoc :sequence-buffer []))))
+
+(defn- dispatch-input-area-submission!
+  "On submit from the input area, invoke `:process-command-fn` with the
+   buffered text bound at the screen's `:tui/input :input-key` (default
+   `:text`). The command's `:command/name` comes from the screen's
+   `:tui/input :command`."
+  [session submission]
+  (let [s        @session
+        screen   (:current-screen s)
+        cfg      (:tui/input screen)
+        cmd-name (:command cfg)
+        in-key   (or (:input-key cfg) :text)
+        run-cmd  (:process-command-fn s)]
+    (when (and cmd-name run-cmd)
+      (try
+        (run-cmd (merge (:base-context s)
+                        {:tenant-id (:tenant-id s)
+                         :user-id   (:user-id s)
+                         :command   {:command/name cmd-name
+                                     in-key        submission}}))
+        (catch Exception e
+          (u/log ::input-submit-command-failed
+                 :command cmd-name :error e))))))
+
+(defn- dispatch-input-area-key!
+  "Route a key event through the input-area state machine. Updates
+   `:input-area` in the session; on `:submission`, dispatches the
+   configured command; on `:passthrough?`, falls back to the keymap
+   resolver so screen-level bindings (like `<esc>`) remain reachable."
+  [session key-event]
+  (let [s      @session
+        screen (:current-screen s)
+        opts   {:multiline? (boolean (-> screen :tui/input :multiline?))
+                :history-max (or (-> screen :tui/input :history-max) 200)}
+        {:keys [state submission passthrough?]}
+        (input-area/handle-key (:input-area s) key-event opts)]
+    (swap! session assoc :input-area state)
+    (cond
+      submission     (dispatch-input-area-submission! session submission)
+      passthrough?   (dispatch-keymap-key! session key-event)
+      :else          nil)))
+
+(defn- dispatch-key!
+  "Resolve `key-event` and dispatch. Routing order:
+     1. Active palette overlay — substrate-owned handler.
+     2. Active input-area (screen has `:tui/input`, no overlay) — the
+        input-area state machine handles editing keys and on submit
+        dispatches the configured command. Unhandled keys passthrough
+        to (3).
+     3. Keymap stack — overlay/region/screen/session/global per §10.3."
+  [session key-event]
+  (let [{:keys [overlay current-screen]} @session]
+    (cond
+      (= :palette (:type overlay))
       (dispatch-palette-key! session key-event)
-      (let [stack  (session-keymap-stack session)
-            buf    (:sequence-buffer @session [])
-            result (keymap/resolve-key stack buf (:key key-event))]
-        (case (:state result)
-          :match
-          (do (swap! session assoc :sequence-buffer [])
-              (dispatch-action! session (:action result)))
 
-          :pending
-          (swap! session assoc :sequence-buffer (:buffer result))
+      (and (:tui/input current-screen) (nil? overlay))
+      (dispatch-input-area-key! session key-event)
 
-          :no-match
-          (swap! session assoc :sequence-buffer []))))))
+      :else
+      (dispatch-keymap-key! session key-event))))
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Event loop
@@ -604,6 +880,8 @@
      :render-model      nil
      :ansi-style        nil
      :focus             nil
+     :input-area        (when (:tui/input default-screen)
+                          (input-area/initial-state))
      :sequence-buffer   []
      :sub-chan          nil
      ;; Input channel sized for keyboard autorepeat — `>!!` from the

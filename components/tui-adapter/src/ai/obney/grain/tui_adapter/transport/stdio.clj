@@ -129,18 +129,47 @@
     t))
 
 (defn enter-tui!
-  "Issue ANSI sequences to enter alt-screen, hide cursor, and clear."
-  [on-output]
-  (on-output (str (ansi/enter-alt-screen)
-                  (ansi/hide-cursor)
-                  (ansi/clear-screen))))
+  "Issue the ANSI sequence needed to start a TUI session. Branches on
+   `buffer`:
+
+     :alt  — enter the alt-screen, hide cursor, clear. The user's
+             terminal contents are preserved and restored on leave.
+     :main — stay in the main buffer; just hide the cursor and emit a
+             newline so we start on a fresh row above the user's
+             existing scrollback. The substrate will write segments
+             into the main buffer with newlines, letting the terminal
+             scroll older content into its own scrollback (spec §6.3
+             transcript pattern).
+
+   Accepts either a buffer keyword or no argument (defaults to `:alt`
+   for backward compatibility with callers that don't yet thread the
+   screen's buffer mode through)."
+  ([on-output] (enter-tui! on-output :alt))
+  ([on-output buffer]
+   (on-output
+     (case buffer
+       :main (str (ansi/hide-cursor) "\n")
+       (str (ansi/enter-alt-screen)
+            (ansi/hide-cursor)
+            (ansi/clear-screen))))))
 
 (defn leave-tui!
-  "Restore the terminal: leave alt-screen, show cursor, reset style."
-  [on-output]
-  (on-output (str (ansi/reset-style)
+  "Restore the terminal. Mirror of `enter-tui!`: for `:alt` sessions
+   leaves the alt-screen (restoring prior contents); for `:main`
+   sessions just resets styles and shows the cursor so the next thing
+   the user types in their shell renders normally."
+  ([on-output] (leave-tui! on-output :alt))
+  ([on-output buffer]
+   (on-output
+     (case buffer
+       :main (str (ansi/reset-style)
+                  (ansi/cursor-style-default-reset)
                   (ansi/show-cursor)
-                  (ansi/leave-alt-screen))))
+                  "\n")
+       (str (ansi/reset-style)
+            (ansi/cursor-style-default-reset)
+            (ansi/show-cursor)
+            (ansi/leave-alt-screen))))))
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Top-level: start a session over stdio
@@ -165,6 +194,9 @@
         on-output    (make-output-sink terminal)
         user-id      ((:user-resolver opts (constantly nil)))
         tenant-id    ((:tenant-resolver opts (constantly (random-uuid))) user-id)
+        ;; The default-screen's :tui/buffer drives the initial
+        ;; terminal lifecycle. Defaults to :alt when not declared.
+        buffer       (or (-> opts :default-screen :tui/buffer) :alt)
         sess-opts    (-> opts
                          (dissoc :tenant-resolver :user-resolver)
                          (assoc :tenant-id tenant-id
@@ -175,12 +207,16 @@
         session      (session/make-session sess-opts)
         stop-pump    (start-input-pump! terminal (:input-ch @session))
         _            (install-winch-handler! terminal (:resize-ch @session))
-        _            (enter-tui! on-output)
+        _            (enter-tui! on-output buffer)
         _            (swap! session assoc :on-shutdown
                             (fn []
-                              (try (stop-pump)         (catch Exception _ nil))
-                              (try (leave-tui! on-output) (catch Exception _ nil))
-                              (try (.close terminal)   (catch Exception _ nil))))]
+                              (try (stop-pump)
+                                   (catch Exception _ nil))
+                              (try (leave-tui! on-output
+                                               (or (-> @session :current-screen :tui/buffer) :alt))
+                                   (catch Exception _ nil))
+                              (try (.close terminal)
+                                   (catch Exception _ nil))))]
     (session/start! session)
     {:session     session
      :terminal    terminal

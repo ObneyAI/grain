@@ -231,7 +231,13 @@
     ;; ──────────────────────────────────────────────────────────────────
 
     (er/defelement :list
-      {:doc   "Vertical list of pre-rendered hiccup items. Attrs: {:items [hiccup ...] :selected idx?}."
+      {:doc   "Vertical list of pre-rendered hiccup items. Attrs:
+              {:items [hiccup ...] :selected idx?}. Per spec §7.3 the
+              substrate handles scrolling, selection indicator, and
+              focus; items past the visible height are clipped from
+              the bottom (use `:main` + `:stream` for the
+              chat / transcript / log-tail pattern where new content
+              should flow into terminal scrollback instead)."
        :attrs [:map
                [:items    [:sequential :any]]
                [:selected {:optional true} [:maybe :int]]]

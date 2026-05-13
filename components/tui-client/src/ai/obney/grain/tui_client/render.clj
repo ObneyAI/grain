@@ -10,13 +10,20 @@
    pipeline is the same as the local-topology one. The only seam where
    client differs from server is that custom (application-registered)
    elements arrive as `[:cells {:grid ...}]` markers (resolved
-   server-side per §7.6.8); the client just paints them."
-  (:require [ai.obney.grain.tui-adapter.ansi    :as ansi]
+   server-side per §7.6.8); the client just paints them.
+
+   When a frame declares `:input` (sticky input area per spec §6.2),
+   the bottom rows of the viewport are reserved for it and the client
+   emits cursor-positioning ANSI to land the terminal cursor inside
+   the buffer. Input-area *state* lives in the client's main loop;
+   this namespace reads it from `render-state :input-area`."
+  (:require [ai.obney.grain.tui-adapter.ansi       :as ansi]
             [ai.obney.grain.tui-adapter.builtins]   ; register built-ins
-            [ai.obney.grain.tui-adapter.cells   :as cells]
-            [ai.obney.grain.tui-adapter.diff    :as diff]
-            [ai.obney.grain.tui-adapter.layout  :as layout]
-            [ai.obney.grain.tui-adapter.overlay :as overlay]))
+            [ai.obney.grain.tui-adapter.cells      :as cells]
+            [ai.obney.grain.tui-adapter.diff       :as diff]
+            [ai.obney.grain.tui-adapter.input-area :as input-area]
+            [ai.obney.grain.tui-adapter.layout     :as layout]
+            [ai.obney.grain.tui-adapter.overlay    :as overlay]))
 
 (defn- error-hiccup [headline message]
   [:col
@@ -72,32 +79,102 @@
       (cells/overlay screen-grid ovr-grid x y))
     screen-grid))
 
+(defn- input-area-height
+  "How many rows the input area should occupy given the frame's
+   `:input` config and the current input-area state. 0 when no input
+   area is declared on the frame."
+  [frame input-area-state]
+  (if (:input frame)
+    (input-area/preferred-height input-area-state (:input frame))
+    0))
+
+(defn- render-input-area
+  "Render the input area into a CellGrid sized to the viewport width
+   and the input-area height. Returns `{:grid g :cursor-pos [c r]}`
+   where cursor-pos is relative to the input area's box."
+  [frame input-area-state viewport ia-height]
+  (let [cfg (:input frame)]
+    (input-area/render input-area-state
+                       {:prompt     (or (:prompt cfg) "")
+                        :width      (:width viewport)
+                        :height     ia-height
+                        :multiline? (boolean (:multiline? cfg))})))
+
 (defn frame->grid
-  "Pure: frame + viewport → CellGrid (post-overlay composition)."
-  [frame viewport]
-  (let [screen (layout/render-element (screen-hiccup frame) viewport)
-        base   (cells/blank (:width viewport) (:height viewport))
-        ;; Pad screen onto a uniform-size base so the diff sees a
-        ;; consistent canvas every frame.
-        padded (cells/overlay base screen 0 0)]
-    (compose-overlay frame padded viewport)))
+  "Pure: frame + viewport + optional input-area state → CellGrid.
+
+   When the frame declares `:input`, the bottom `input-area-height`
+   rows are reserved for the input area; screen content gets the
+   remainder. Otherwise the screen fills the whole viewport.
+
+   2-arity overload keeps the namespace's earlier signature working
+   (used by tests that don't care about input)."
+  ([frame viewport]
+   (frame->grid frame viewport nil))
+  ([frame viewport input-area-state]
+   (let [ia-h     (input-area-height frame input-area-state)
+         screen-h (max 1 (- (:height viewport) ia-h))
+         screen-vp {:width (:width viewport) :height screen-h}
+         screen-g (layout/render-element (screen-hiccup frame) screen-vp)
+         base     (cells/blank (:width viewport) (:height viewport))
+         canvas   (cells/overlay base screen-g 0 0)
+         canvas   (if (pos? ia-h)
+                    (let [{ia-grid :grid} (render-input-area frame input-area-state viewport ia-h)]
+                      (cells/overlay canvas ia-grid 0 (- (:height viewport) ia-h)))
+                    canvas)]
+     (compose-overlay frame canvas viewport))))
+
+(defn- maybe-emit-cursor!
+  "Emit cursor-positioning + show/hide ANSI based on whether the input
+   area is active on this frame. Returns the new `:cursor-shown?`
+   bookkeeping value so the caller can persist idempotency state."
+  [state frame input-area-state viewport on-output]
+  (let [ia-h    (input-area-height frame input-area-state)
+        active? (and (pos? ia-h) (nil? (:overlay frame)))
+        prior   (boolean (:cursor-shown? state))]
+    (cond
+      active?
+      (let [{[c-col c-row] :cursor-pos} (render-input-area frame input-area-state viewport ia-h)
+            ia-top (- (:height viewport) ia-h)
+            ;; ansi/cursor-position takes 0-indexed (row, col).
+            move   (ansi/cursor-position (+ ia-top c-row) c-col)]
+        (when on-output
+          (on-output (str move (ansi/show-cursor))))
+        true)
+
+      prior
+      (do (when on-output (on-output (ansi/hide-cursor)))
+          false)
+
+      :else
+      false)))
 
 (defn render-frame!
   "Render a frame to ANSI bytes against the prior `render-model`. Calls
    `on-output` with the byte string when there's anything to emit.
-   Returns `{:render-model <new-grid> :ansi-style <new-style>}` so the
-   caller can persist it for the next cycle.
+   Returns the updated `state` map.
 
-   `state` is `{:render-model <grid-or-nil> :ansi-style <map-or-nil>
-                :terminal-caps <map>}`."
+   `state`:
+     :render-model   — prior CellGrid (nil on first frame).
+     :ansi-style     — prior ANSI style (nil on first frame).
+     :terminal-caps  — `{:color :truecolor|...}`.
+     :input-area     — the loop's input-area state (nil when frame has
+                       no `:tui/input` config).
+     :cursor-shown?  — internal bookkeeping for cursor idempotency.
+
+   Returns state with `:render-model`, `:ansi-style`, and
+   `:cursor-shown?` updated."
   [state frame viewport on-output]
-  (let [grid          (frame->grid frame viewport)
+  (let [ia-state      (:input-area state)
+        grid          (frame->grid frame viewport ia-state)
         runs          (diff/diff (:render-model state) grid)
         [out new-sty] (ansi/emit runs
                                  (or (:terminal-caps state) {:color :truecolor})
                                  (or (:ansi-style state) {}))]
     (when (and on-output (seq out))
       (on-output out))
-    (assoc state
-           :render-model grid
-           :ansi-style   new-sty)))
+    (let [shown? (maybe-emit-cursor! state frame ia-state viewport on-output)]
+      (assoc state
+             :render-model  grid
+             :ansi-style    new-sty
+             :cursor-shown? shown?))))

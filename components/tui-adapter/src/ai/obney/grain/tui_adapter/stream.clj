@@ -17,7 +17,9 @@
    This namespace is pure: given a `stream-state`, a query result, and a
    segments spec, it returns a new `stream-state`."
   (:require [com.brunobonacci.mulog :as u]
+            [ai.obney.grain.tui-adapter.ansi :as ansi]
             [ai.obney.grain.tui-adapter.cells :as cells]
+            [ai.obney.grain.tui-adapter.diff :as diff]
             [ai.obney.grain.tui-adapter.layout :as layout]))
 
 ;; ─────────────────────────────────────────────────────────────────────
@@ -29,7 +31,14 @@
    :visible-window []     ; vector of segment-keys, oldest→newest in slice
    :last-keys      []     ; ordered keys from prior result, for violation detection
    :tail-cursor   {:row 0 :col 0}
-   :input-area    {:value "" :cursor 0 :height 0}})
+   :input-area    {:value "" :cursor 0 :height 0}
+   ;; Main-buffer append mode (spec §6.3 transcript pattern):
+   ;;   :emitted-keys     — keys already written to scrollback; we only
+   ;;                       emit segments whose key is not in here.
+   ;;   :intro-printed?   — whether the screen's :tui/hiccup intro has
+   ;;                       been emitted yet (once per screen).
+   :emitted-keys   []
+   :intro-printed? false})
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Segment extraction
@@ -150,6 +159,93 @@
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Top-level: produce a frame's CellGrid for a stream screen
 ;; ─────────────────────────────────────────────────────────────────────
+
+;; ─────────────────────────────────────────────────────────────────────
+;; Main-buffer append-emission (spec §6.3 transcript pattern)
+;; ─────────────────────────────────────────────────────────────────────
+
+(defn- segment-ansi
+  "Render one segment's hiccup as a 1-row CellGrid and emit it as
+   sequential ANSI bytes (no cursor-positioning embedded — the caller
+   has already positioned the terminal cursor). Returns
+   `[bytes new-style]`."
+  [seg hiccup-path width terminal-caps style]
+  (let [hiccup (get seg hiccup-path)
+        grid   (layout/render-element
+                 (or hiccup [:text {:text ""}])
+                 {:width width :height 1})
+        row    (first (:cells grid))]
+    (ansi/emit-cells row
+                     (or terminal-caps {:color :truecolor})
+                     (or style {}))))
+
+(defn render-stream-main
+  "Append-emission renderer for `:main` + `:stream` screens. Given the
+   prior `stream-state` and the current handler `result`, returns
+   `{:state new-state :bytes <string> :style <new-ansi-style>}`.
+
+   For each segment whose `:key` isn't already in
+   `prior-state :emitted-keys`, emit:
+
+     cursor-position(emission-row, 0)
+     erase-line-to-eol
+     <segment ANSI bytes>
+     `\\n`
+
+   The caller is expected to have set a DECSTBM scroll region with the
+   bottom at `emission-row`. The `\\n` then scrolls the new segment
+   into the region's history while leaving the chrome rows below
+   untouched.
+
+   Append-only violations (a previously-emitted key is missing or
+   reordered) log `::main-stream-violation` and the function emits
+   nothing — we cannot un-scroll content the terminal has already
+   committed to its scrollback.
+
+   `opts`:
+     :width          — viewport width (segment box width).
+     :emission-row   — 0-indexed terminal row where new segments are
+                       written. Caller must have configured DECSTBM
+                       with this as the bottom of the scroll region.
+     :terminal-caps  — for ANSI color/style emission.
+     :style          — prior ANSI style state (threaded across calls
+                       so we don't re-emit redundant SGR sequences)."
+  [prior-state result {:keys [items key hiccup] :or {hiccup :tui/hiccup}}
+   {:keys [width emission-row terminal-caps style]}]
+  (let [segments     (extract-segments result {:items items})
+        keys-vec     (mapv #(segment-key {:key key} %) segments)
+        emitted      (vec (:emitted-keys prior-state))
+        ;; Append-only check: the prior emitted-keys must be a prefix
+        ;; of the new keys-vec.
+        prefix-ok?   (= emitted (vec (take (count emitted) keys-vec)))
+        new-keys     (when prefix-ok? (subvec keys-vec (count emitted)))
+        new-segments (when prefix-ok?
+                       (subvec segments (count emitted)))]
+    (cond
+      (not prefix-ok?)
+      (do (u/log ::main-stream-violation
+                 :prior-emitted emitted
+                 :current-keys  keys-vec)
+          {:state prior-state :bytes "" :style style})
+
+      (empty? new-segments)
+      {:state prior-state :bytes "" :style style}
+
+      :else
+      (let [position (ansi/cursor-position emission-row 0)
+            [bytes final-style]
+            (reduce (fn [[acc st] seg]
+                      (let [[seg-bytes st'] (segment-ansi seg hiccup width
+                                                          terminal-caps st)]
+                        [(str acc position (ansi/erase-line-to-eol)
+                              seg-bytes "\n")
+                         st']))
+                    ["" style]
+                    new-segments)
+            new-emitted (into emitted new-keys)]
+        {:state (assoc prior-state :emitted-keys new-emitted)
+         :bytes bytes
+         :style final-style}))))
 
 (defn render-stream
   "End-to-end: given the prior `stream-state`, a fresh handler `result`
