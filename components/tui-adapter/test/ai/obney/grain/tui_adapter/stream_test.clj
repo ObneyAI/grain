@@ -3,9 +3,11 @@
             [ai.obney.grain.tui-adapter.builtins]   ; loads :text etc.
             [ai.obney.grain.tui-adapter.stream :as stream]))
 
-;; A simple text-only renderer for segments. Each segment becomes one line.
-(defn- text-renderer [seg]
-  [:text {:text (str (:text seg))}])
+;; Per spec v0.7 each segment carries its own pre-rendered hiccup at
+;; `(:hiccup segments-spec)` (default `:tui/hiccup`). Test segments below
+;; build that field directly.
+(defn- mk-seg [m]
+  (assoc m :tui/hiccup [:text {:text (str (:text m))}]))
 
 ;; ──────────────────────────────────────────────────────────────────────────
 ;; extract-segments + segment-key
@@ -52,25 +54,25 @@
 ;; ──────────────────────────────────────────────────────────────────────────
 
 (deftest cache-reuses-when-hash-unchanged
-  (let [seg {:id 1 :text "a"}
+  (let [seg   (mk-seg {:id 1 :text "a"})
         pairs [[1 seg]]
-        c1 (stream/refresh-cache {} pairs text-renderer {:width 5})
-        c2 (stream/refresh-cache c1 pairs text-renderer {:width 5})]
+        c1 (stream/refresh-cache {} pairs :tui/hiccup {:width 5})
+        c2 (stream/refresh-cache c1 pairs :tui/hiccup {:width 5})]
     ;; Same map identity for entry on hash hit.
     (is (identical? (get c1 1) (get c2 1)))))
 
 (deftest cache-rerenders-on-hash-change
-  (let [pairs1 [[1 {:id 1 :text "a"}]]
-        pairs2 [[1 {:id 1 :text "b"}]]
-        c1 (stream/refresh-cache {} pairs1 text-renderer {:width 5})
-        c2 (stream/refresh-cache c1 pairs2 text-renderer {:width 5})]
+  (let [pairs1 [[1 (mk-seg {:id 1 :text "a"})]]
+        pairs2 [[1 (mk-seg {:id 1 :text "b"})]]
+        c1 (stream/refresh-cache {} pairs1 :tui/hiccup {:width 5})
+        c2 (stream/refresh-cache c1 pairs2 :tui/hiccup {:width 5})]
     (is (not (identical? (get c1 1) (get c2 1))))))
 
 (deftest cache-evicts-off-window-keys
-  (let [pairs1 [[1 {:id 1 :text "a"}] [2 {:id 2 :text "b"}]]
-        pairs2 [[2 {:id 2 :text "b"}]]
-        c1 (stream/refresh-cache {} pairs1 text-renderer {:width 5})
-        c2 (stream/refresh-cache c1 pairs2 text-renderer {:width 5})]
+  (let [pairs1 [[1 (mk-seg {:id 1 :text "a"})] [2 (mk-seg {:id 2 :text "b"})]]
+        pairs2 [[2 (mk-seg {:id 2 :text "b"})]]
+        c1 (stream/refresh-cache {} pairs1 :tui/hiccup {:width 5})
+        c2 (stream/refresh-cache c1 pairs2 :tui/hiccup {:width 5})]
     (is (contains? c1 1))
     (is (not (contains? c2 1)))
     (is (contains? c2 2))))
@@ -98,8 +100,8 @@
 ;; render-stream end-to-end
 ;; ──────────────────────────────────────────────────────────────────────────
 
-(def ^:private result-of (fn [items] {:items items}))
-(def ^:private spec      {:items :items :key :id})
+(def ^:private result-of (fn [items] {:items (mapv mk-seg items)}))
+(def ^:private spec      {:items :items :key :id :hiccup :tui/hiccup})
 
 (deftest render-stream-fills-from-empty-state
   (let [{:keys [state grid]}
@@ -107,7 +109,6 @@
                               (result-of [{:id 1 :text "a"}
                                           {:id 2 :text "b"}])
                               spec
-                              text-renderer
                               {:width 5 :height 4})]
     (is (= 5 (:width grid)))
     (is (= 4 (:height grid)))
@@ -117,10 +118,10 @@
 (deftest render-stream-keeps-cache-across-calls
   (let [s0 (stream/empty-stream-state)
         r1 (stream/render-stream s0 (result-of [{:id 1 :text "a"}])
-                                  spec text-renderer {:width 5 :height 4})
+                                  spec {:width 5 :height 4})
         r2 (stream/render-stream (:state r1)
                                   (result-of [{:id 1 :text "a"} {:id 2 :text "b"}])
-                                  spec text-renderer {:width 5 :height 4})]
+                                  spec {:width 5 :height 4})]
     ;; The first segment's cache entry should be reused (same hash).
     (is (identical? (get-in r1 [:state :segment-cache 1])
                     (get-in r2 [:state :segment-cache 1])))))
@@ -130,11 +131,11 @@
         ;; Two segments first, then a reordered second frame.
         r1 (stream/render-stream s0 (result-of [{:id 1 :text "a"}
                                                 {:id 2 :text "b"}])
-                                  spec text-renderer {:width 5 :height 4})
+                                  spec {:width 5 :height 4})
         r2 (stream/render-stream (:state r1)
                                   (result-of [{:id 1 :text "a"}
                                               {:id 2 :text "B"}])
-                                  spec text-renderer {:width 5 :height 4})]
+                                  spec {:width 5 :height 4})]
     ;; New segment :id 2 has different hash → cache miss; that's the
     ;; normal stream-stable cache-bust path. (Reorder requires actual
     ;; key reorder; this test exercises hash invalidation.)
@@ -147,7 +148,7 @@
         r  (stream/render-stream s0
                                   (result-of (mapv (fn [i] {:id i :text (str i)})
                                                    [1 2 3 4 5]))
-                                  spec text-renderer {:width 5 :height 3})]
+                                  spec {:width 5 :height 3})]
     (is (= [3 4 5] (:visible-window (:state r))))
     ;; Off-window segments not in cache.
     (is (not (contains? (get-in r [:state :segment-cache]) 1)))

@@ -28,13 +28,19 @@
         :process-query-fn (or process-query-fn
                               (fn [_ctx] {:query/result {}}))})}))
 
-;; A trivial screen that renders the query result's :text key.
+;; A trivial screen; hiccup comes from the handler return (spec v0.7).
 (def hello-screen
-  {:query-id    :test/hello
-   :inputs      {}
-   :tui/render  (fn [result]
-                  [:text {:text (or (:text result) "hi")}])
-   :tui/keymap  {"q" [:session :quit]}})
+  {:query-id   :test/hello
+   :inputs     {}
+   :tui/keymap {"q" [:session :quit]}})
+
+(defn- hello-result
+  "Build a handler return for hello-screen — `:query/result` carries the
+   data, `:tui/hiccup` carries the rendered presentation."
+  ([] (hello-result "hi"))
+  ([text]
+   {:query/result {:text text}
+    :tui/hiccup   [:text {:text text}]}))
 
 ;; ──────────────────────────────────────────────────────────────────────────
 ;; Initial render produces output
@@ -43,7 +49,7 @@
 (deftest initial-render-emits-bytes
   (let [{:keys [session out]} (make-test-session
                                 {:screen hello-screen
-                                 :process-query-fn (fn [_] {:query/result {:text "hi"}})})
+                                 :process-query-fn (fn [_] (hello-result))})
         _ (session/render-frame! session)]
     (is (pos? (count @out)))
     (is (some #(re-find #"hi" %) @out))))
@@ -55,7 +61,7 @@
 (deftest second-render-emits-no-bytes-when-unchanged
   (let [{:keys [session out]} (make-test-session
                                 {:screen hello-screen
-                                 :process-query-fn (fn [_] {:query/result {:text "hi"}})})
+                                 :process-query-fn (fn [_] (hello-result))})
         _ (session/render-frame! session)
         _ (reset! out [])
         _ (session/render-frame! session)]

@@ -53,7 +53,8 @@
      :captured-grids  — atom of CellGrids emitted (via the on-output side
                         we instrument render-frame!)"
   [{:keys [screen process-query-fn read-models event-pubsub]
-    :or   {process-query-fn (fn [_] {:query/result {}})}}]
+    :or   {process-query-fn (fn [_] {:query/result {}
+                                     :tui/hiccup   [:text {:text "hello"}]})}}]
   (let [out (atom [])
         s   (session/make-session
               {:tenant-id        (random-uuid)
@@ -75,15 +76,23 @@
 ;; ──────────────────────────────────────────────────────────────────────────
 
 (def hello-screen
-  {:query-id   :test/hello
-   :inputs     {}
-   :tui/render (fn [r] [:text {:text (str (:msg r "hello"))}])})
+  {:query-id :test/hello
+   :inputs   {}})
+
+(defn- hello-pq
+  "Build a process-query-fn that returns a handler map with
+   `:tui/hiccup` rendering the given msg."
+  [msg-fn]
+  (fn [_]
+    (let [msg (msg-fn)]
+      {:query/result {:msg msg}
+       :tui/hiccup   [:text {:text (str msg)}]})))
 
 (deftest snapshot-screen-renders-and-rerenders-on-input
   (let [{:keys [session out] :as h} (boot {:screen hello-screen
                                             :process-query-fn
                                             (let [n (atom 0)]
-                                              (fn [_] {:query/result {:msg (str "n=" (swap! n inc))}}))})]
+                                              (hello-pq #(str "n=" (swap! n inc))))})]
     (try
       (session/render-frame! session)
       (is (some #(re-find #"n=1" %) @out))
@@ -104,7 +113,7 @@
         (assoc hello-screen :tui/keymap {"q" [:session :quit]})
         {:keys [session] :as h}
         (boot {:screen screen-with-quit
-               :process-query-fn (fn [_] {:query/result {:msg "x"}})})]
+               :process-query-fn (hello-pq (constantly "x"))})]
     (try
       ;; Manually invoke the dispatch path that the loop would invoke.
       (session/handle-session-action session :quit {} {})

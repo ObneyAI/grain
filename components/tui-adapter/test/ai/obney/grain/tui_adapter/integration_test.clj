@@ -32,18 +32,22 @@
    :inputs         {}
    :tui/buffer     :main
    :tui/projection :stream
-   :tui/segments   {:items :messages :key :id}
-   :tui/render     (fn [seg]
-                     [:text {:text (str ">> " (:text seg))}])})
+   :tui/segments   {:items :messages :key :id :hiccup :tui/hiccup}})
+
+(defn- attach-hiccup [messages]
+  (mapv (fn [m]
+          (assoc m :tui/hiccup [:text {:text (str ">> " (:text m))}]))
+        messages))
 
 (deftest stream-screen-renders-via-stream-namespace
   (let [{:keys [session]} (make-session
                             {:screen stream-screen
                              :process-query-fn
                              (fn [_]
-                               {:query/result
-                                {:messages [{:id 1 :text "first"}
-                                            {:id 2 :text "second"}]}})})
+                               {:messages
+                                (attach-hiccup
+                                  [{:id 1 :text "first"}
+                                   {:id 2 :text "second"}])})})
         grid (session/render-frame! session)]
     ;; Stream state was initialized + populated; visible window holds both keys.
     (is (= [1 2] (:visible-window (:stream-state @session))))
@@ -60,8 +64,7 @@
                             {:screen stream-screen
                              :process-query-fn
                              (fn [_]
-                               {:query/result
-                                {:messages [{:id 1 :text "a"}]}})})]
+                               {:messages (attach-hiccup [{:id 1 :text "a"}])})})]
     (session/render-frame! session)
     (let [seg-1-before (get-in (:stream-state @session) [:segment-cache 1])]
       (session/render-frame! session)
@@ -73,20 +76,21 @@
 ;; ──────────────────────────────────────────────────────────────────────────
 
 (def hello-screen
-  {:query-id   :integration/hello
-   :inputs     {}
-   :tui/render (fn [_] [:text {:text "hello"}])})
+  {:query-id :integration/hello
+   :inputs   {}})
+
+(defn- hello-pq-fn [items-by-query]
+  (fn [ctx]
+    (let [name (-> ctx :query :query/name)]
+      (or (some-> (get items-by-query name) (#(do {:query/result %})))
+          {:query/result {} :tui/hiccup [:text {:text "hello"}]}))))
 
 (deftest open-palette-fetches-items-via-query
   (let [items [{:id 1 :name "Ada"} {:id 2 :name "Bob"}]
         {:keys [session]}
         (make-session
           {:screen hello-screen
-           :process-query-fn
-           (fn [ctx]
-             (case (-> ctx :query :query/name)
-               :sheets/all {:query/result items}
-               {:query/result {}}))})]
+           :process-query-fn (hello-pq-fn {:sheets/all items})})]
     (session/handle-session-action session :open-palette
                                    {:query-id   :sheets/all
                                     :item-key   :id
@@ -102,11 +106,7 @@
   (let [{:keys [session]}
         (make-session
           {:screen hello-screen
-           :process-query-fn
-           (fn [ctx]
-             (case (-> ctx :query :query/name)
-               :sheets/all {:query/result [{:id 1 :name "AdaSheet"}]}
-               {:query/result {}}))})]
+           :process-query-fn (hello-pq-fn {:sheets/all [{:id 1 :name "AdaSheet"}]})})]
     (session/handle-session-action session :open-palette
                                    {:query-id :sheets/all :item-key :id :item-label :name
                                     :on-select [:command :noop]}
@@ -228,7 +228,7 @@
   (let [{:keys [session]} (make-session
                             {:screen stream-screen
                              :process-query-fn
-                             (fn [_] {:query/result {:messages [{:id 1 :text "a"}]}})})]
+                             (fn [_] {:messages (attach-hiccup [{:id 1 :text "a"}])})})]
     (session/render-frame! session)
     (is (some? (:stream-state @session)))
     (session/change-screen! session hello-screen)

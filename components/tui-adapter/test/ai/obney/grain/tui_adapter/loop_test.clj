@@ -67,14 +67,14 @@
           calls     (atom 0)
           screen    {:query-id   :test/loop
                      :inputs     {}
-                     :tui/render (fn [_] [:text {:text "ok"}])
                      :tui/keymap {"a" [:command :test/bump]}}
           session   (session/make-session
                       {:tenant-id          (random-uuid)
                        :viewport           {:width 5 :height 1}
                        :on-output          (fn [_])
                        :default-screen     screen
-                       :process-query-fn   (fn [_] {:query/result {}})
+                       :process-query-fn   (fn [_] {:query/result {}
+                                                    :tui/hiccup [:text {:text "ok"}]})
                        :process-command-fn (fn [_]
                                              (swap! calls inc)
                                              {:command/result :ok})
@@ -101,22 +101,23 @@
 (deftest returned-anomaly-renders-error-frame
   (testing "A query handler that returns a Cognitect anomaly map (without
             throwing) must render the failure as an error frame, not as
-            a render-fn invocation against a nil result."
+            blank output keyed by a stray :tui/hiccup."
     (let [out     (atom [])
-          screen  {:query-id   :test/anom
-                   :inputs     {}
-                   :tui/render (fn [_]
-                                 ;; If this fn is reached the test fails
-                                 ;; — anomaly results must not call render.
-                                 [:text {:text "RENDER-CALLED-WHEN-IT-SHOULD-NOT-BE"}])}
+          screen  {:query-id :test/anom
+                   :inputs   {}}
           session (session/make-session
                     {:tenant-id        (random-uuid)
                      :viewport         {:width 60 :height 5}
                      :on-output        (fn [s] (swap! out conj s))
                      :default-screen   screen
                      :process-query-fn (fn [_]
+                                         ;; A handler returning an
+                                         ;; anomaly should bypass the
+                                         ;; hiccup path even if
+                                         ;; :tui/hiccup is present.
                                          {:cognitect.anomalies/category :cognitect.anomalies/fault
-                                          :cognitect.anomalies/message  "deliberate test failure"})
+                                          :cognitect.anomalies/message  "deliberate test failure"
+                                          :tui/hiccup [:text {:text "HICCUP-USED-WHEN-IT-SHOULD-NOT-BE"}]})
                      :debounce-ms      0})]
       (try
         (session/render-frame! session)
@@ -125,8 +126,8 @@
               "expected the error frame headline to surface in the output bytes")
           (is (str/includes? combined "deliberate test failure")
               "expected the anomaly's message to surface in the output bytes")
-          (is (not (str/includes? combined "RENDER-CALLED-WHEN-IT-SHOULD-NOT-BE"))
-              "render-fn must NOT be invoked when the query returned an anomaly"))
+          (is (not (str/includes? combined "HICCUP-USED-WHEN-IT-SHOULD-NOT-BE"))
+              ":tui/hiccup must NOT be rendered when the query returned an anomaly"))
         (finally
           (session/stop! session))))))
 
@@ -142,14 +143,14 @@
     (let [calls   (atom 0)
           screen  {:query-id   :test/burst
                    :inputs     {}
-                   :tui/render (fn [_] [:text {:text "ok"}])
                    :tui/keymap {"a" [:command :test/bump]}}
           session (session/make-session
                     {:tenant-id          (random-uuid)
                      :viewport           {:width 5 :height 1}
                      :on-output          (fn [_])
                      :default-screen     screen
-                     :process-query-fn   (fn [_] {:query/result {}})
+                     :process-query-fn   (fn [_] {:query/result {}
+                                                  :tui/hiccup [:text {:text "ok"}]})
                      :process-command-fn (fn [_]
                                            (swap! calls inc)
                                            {:command/result :ok})
@@ -188,7 +189,6 @@
     (let [calls   (atom 0)
           screen  {:query-id   :test/quit-burst
                    :inputs     {}
-                   :tui/render (fn [_] [:text {:text "ok"}])
                    :tui/keymap {"a" [:command :test/bump]
                                 "q" [:session :quit]}}
           session (session/make-session
@@ -196,7 +196,8 @@
                      :viewport           {:width 5 :height 1}
                      :on-output          (fn [_])
                      :default-screen     screen
-                     :process-query-fn   (fn [_] {:query/result {}})
+                     :process-query-fn   (fn [_] {:query/result {}
+                                                  :tui/hiccup [:text {:text "ok"}]})
                      :process-command-fn (fn [_]
                                            (swap! calls inc)
                                            {:command/result :ok})

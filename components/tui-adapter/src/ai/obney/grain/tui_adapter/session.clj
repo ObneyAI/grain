@@ -19,9 +19,13 @@
    per the load-bearing comment at datastar/core.clj:405-411), then
    re-renders the screen and emits the diff.
 
-   The render path:
-     1. (process-query-fn ctx) → query result
-     2. ((:tui/render screen) result) → hiccup (pure data)
+   The render path (spec v0.7):
+     1. (process-query-fn ctx) → handler return map
+     2. Read presentation from the return:
+          - snapshot: (:tui/hiccup result)
+          - stream:   segments at (:tui/segments :items), each carrying hiccup
+                      at the path declared by (:tui/segments :hiccup)
+                      (default :tui/hiccup)
      3. (layout/render-element hiccup viewport) → CellGrid
      4. compose with overlay via cells/overlay
      5. diff against :render-model → runs
@@ -153,8 +157,8 @@
 ;; ─────────────────────────────────────────────────────────────────────
 
 (defn- query-context-for-screen
-  "Build the context map passed to `:tui/render`'s upstream query
-   processor when resolving event tags or running queries."
+  "Build the context map passed to the query processor when running the
+   screen's query (for both rendering and event-tag resolution)."
   [session screen]
   (let [{:keys [tenant-id user-id]} @session]
     {:tenant-id tenant-id
@@ -194,8 +198,10 @@
    declared (deferred per v0 MVS).
 
    `new-screen` is a map with the query metadata (`:query-id`, `:inputs`,
-   `:grain/read-models`, `:tui/render`, `:tui/keymap`, etc.) — usually
-   derived from the query registry."
+   `:grain/read-models`, `:tui/buffer`, `:tui/projection`, `:tui/segments`,
+   `:tui/keymap`, etc.) — usually derived from the query registry. Per spec
+   v0.7 the screen carries no render function; hiccup comes from the
+   handler return."
   [session new-screen]
   (let [{:keys [sub-chan event-pubsub current-screen]} @session]
     (when sub-chan (close! sub-chan))
@@ -250,14 +256,16 @@
 (defn- compute-screen-grid
   "Compute the screen's CellGrid for the current frame. Branches on
    `:tui/projection`:
-     :stream   — invokes `stream/render-stream`, threading the per-session
-                 `:stream-state` (segment cache + visible window).
-     :snapshot — runs `:tui/render` on the whole result and lays out via
-                 `layout/render-element`.
+     :stream   — invokes `stream/render-stream` with the whole handler
+                 return; the substrate extracts segments and reads each
+                 segment's hiccup at the path declared by
+                 `:tui/segments :hiccup`.
+     :snapshot — reads `:tui/hiccup` from the handler return and lays out
+                 via `layout/render-element`.
 
    Anomaly results (from a thrown query handler OR a returned Cognitect
-   anomaly) render an error frame. Otherwise the screen's `:tui/render`
-   is invoked on `(:query/result result)`.
+   anomaly) render an error frame. Per spec §6.4, a snapshot handler that
+   returns no `:tui/hiccup` produces an empty screen and logs a warning.
 
    Returns `[grid new-stream-state-or-nil]`."
   [session viewport]
@@ -280,16 +288,17 @@
       (= :stream (:tui/projection current-screen))
       (let [{:keys [state grid]}
             (stream/render-stream (or stream-state (stream/empty-stream-state))
-                                  (:query/result result)
+                                  result
                                   (:tui/segments current-screen)
-                                  (:tui/render current-screen)
                                   viewport)]
         [grid state])
 
       :else
-      (let [hiccup ((:tui/render current-screen) (:query/result result))
-            grid   (layout/render-element hiccup viewport)]
-        [grid nil]))))
+      (let [hiccup (:tui/hiccup result)]
+        (when (nil? hiccup)
+          (u/log ::missing-presentation
+                 :screen (:query-id current-screen)))
+        [(layout/render-element (or hiccup [:text {:text ""}]) viewport) nil]))))
 
 (defn- overlay-hiccup
   "Translate an `:overlay` map into hiccup the layout engine can render.
@@ -458,8 +467,8 @@
       (binding [*out* *err*]
         (println "[tui-adapter] render-frame! threw:" (.getMessage t))
         (.printStackTrace t *err*))
-      ;; Best-effort error frame — render without going through the screen's
-      ;; render-fn. If even this throws, swallow.
+      ;; Best-effort error frame — render without going through the
+      ;; screen's hiccup. If even this throws, swallow.
       (try
         (let [{:keys [viewport on-output ansi-style terminal-caps render-model]} @session
               g    (layout/render-element

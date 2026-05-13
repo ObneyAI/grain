@@ -1,9 +1,12 @@
 (ns ai.obney.grain.tui-adapter.stream
   "Streaming-projection (`:tui/projection :stream`) machinery.
 
-   Per §6.3:
-     - Iterates segments via `(:items segments-spec)`.
-     - Each segment carries a stable `:key` for identity.
+   Per spec v0.7 §6.3 and §6.4:
+     - Iterates segments at `(:items segments-spec)` of the handler return.
+     - Each segment carries a stable identity at `(:key segments-spec)`
+       and pre-rendered hiccup at `(:hiccup segments-spec)` (default
+       `:tui/hiccup`). The handler builds the hiccup; the substrate reads
+       it. No render function is threaded through.
      - The substrate caches per-segment CellGrids keyed by the segment id
        and an attrs-hash; cache hit when stream-stable elements + same hash.
      - The visible window is 'last N segments that fit'; the substrate may
@@ -12,7 +15,7 @@
        warning and trigger a full visible-window re-render.
 
    This namespace is pure: given a `stream-state`, a query result, and a
-   segments spec + render fn, it returns a new `stream-state`."
+   segments spec, it returns a new `stream-state`."
   (:require [com.brunobonacci.mulog :as u]
             [ai.obney.grain.tui-adapter.cells :as cells]
             [ai.obney.grain.tui-adapter.layout :as layout]))
@@ -82,12 +85,18 @@
 (defn render-segment
   "Render a single segment: returns `{:hash h :grid CellGrid :height n}`.
 
-   `render-fn` is the screen's `:tui/render` (returns hiccup for the
-   segment). The grid is rendered into a box of the segment's preferred
-   height — for v0 we use `1` (matches the simple last-N policy)."
-  [render-fn segment {:keys [width]}]
-  (let [hiccup (render-fn segment)
-        grid   (layout/render-element hiccup {:width width :height 1})]
+   `hiccup-path` is the keyword at which the segment carries its
+   pre-rendered hiccup (declared by `(:hiccup segments-spec)`, defaults to
+   `:tui/hiccup`). A segment missing hiccup produces a blank row and logs
+   `::missing-segment-hiccup`. The grid is rendered into a box of the
+   segment's preferred height — for v0 we use `1` (matches the simple
+   last-N policy)."
+  [segment hiccup-path {:keys [width]}]
+  (let [hiccup (get segment hiccup-path)
+        _      (when (nil? hiccup)
+                 (u/log ::missing-segment-hiccup :segment-key (:id segment)))
+        grid   (layout/render-element (or hiccup [:text {:text ""}])
+                                      {:width width :height 1})]
     {:hash   (hash segment)
      :grid   grid
      :height (:height grid)}))
@@ -97,12 +106,12 @@
 ;; ─────────────────────────────────────────────────────────────────────
 
 (defn refresh-cache
-  "Given the prior cache, segments-with-keys (vec of `[key seg]`), and a
-   render-fn, return an updated cache that contains entries for every
-   segment in the visible window. Reuses cached entries when the
-   per-segment hash is unchanged. Evicts entries for keys not present in
-   the visible window."
-  [prior-cache visible-pairs render-fn box]
+  "Given the prior cache, segments-with-keys (vec of `[key seg]`), and the
+   `hiccup-path` keyword (where each segment carries its hiccup), return an
+   updated cache that contains entries for every segment in the visible
+   window. Reuses cached entries when the per-segment hash is unchanged.
+   Evicts entries for keys not present in the visible window."
+  [prior-cache visible-pairs hiccup-path box]
   (let [visible-keys (set (map first visible-pairs))
         kept         (select-keys prior-cache visible-keys)]
     (reduce
@@ -111,7 +120,7 @@
               h        (hash seg)]
           (if (and existing (= h (:hash existing)))
             cache
-            (assoc cache k (render-segment render-fn seg box)))))
+            (assoc cache k (render-segment seg hiccup-path box)))))
       kept
       visible-pairs)))
 
@@ -143,13 +152,20 @@
 ;; ─────────────────────────────────────────────────────────────────────
 
 (defn render-stream
-  "End-to-end: given the prior `stream-state`, a fresh query `result`,
-   the `:tui/segments` spec, the `:tui/render` fn, and a `box`
-   `{:width w :height h}`, return `{:state new-stream-state :grid CellGrid}`.
+  "End-to-end: given the prior `stream-state`, a fresh handler `result`
+   map, the `:tui/segments` spec, and a `box` `{:width w :height h}`,
+   return `{:state new-stream-state :grid CellGrid}`.
+
+   The `:tui/segments` spec declares `:items` (path to segment list in
+   the handler return), `:key` (segment identity), and `:hiccup` (path on
+   each segment carrying its pre-rendered hiccup; defaults to
+   `:tui/hiccup`).
 
    On contract violation (§13.5), logs a warning and returns a
    full-window re-render."
-  [prior-state result {:keys [items key]} render-fn {:keys [width height] :as box}]
+  [prior-state result {:keys [items key hiccup]
+                       :or   {hiccup :tui/hiccup}}
+   {:keys [width height] :as box}]
   (let [segments     (extract-segments result {:items items})
         keys-vec     (mapv #(segment-key {:key key} %) segments)
         violation    (detect-violation (:last-keys prior-state) keys-vec)
@@ -165,7 +181,7 @@
         cache-input  (if violation
                        (apply dissoc (:segment-cache prior-state) (map first visible))
                        (:segment-cache prior-state))
-        new-cache    (refresh-cache cache-input visible render-fn {:width width})
+        new-cache    (refresh-cache cache-input visible hiccup {:width width})
         ordered      (mapv (fn [[k _]] (:grid (get new-cache k))) visible)
         composed     (if (seq ordered)
                        (let [stacked (apply cells/stack ordered)

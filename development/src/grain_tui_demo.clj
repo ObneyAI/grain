@@ -116,13 +116,29 @@
   (let [raw   (rmp/project context :demo/counter-rm)
         state (merge {:count 0 :event-count 0} raw)]
     (if (m/validate :demo/counter-state state)
-      {:query/result (assoc state :last-query (str (time/now)))}
+      (let [{:keys [count event-count]} state
+            last-query (str (time/now))]
+        {:query/result (assoc state :last-query last-query)
+         :tui/hiccup
+         [:col
+          [:text {:bold? true :fg :cyan} "Grain TUI Demo — counter"]
+          [:line]
+          [:row
+           [:text "Count: "]
+           [:text {:bold? true :fg :yellow} (str count)]
+           [:text {:dim? true} (str "   (events projected: " event-count ")")]]
+          [:text {:dim? true} (str "(query last ran: " last-query ")")]
+          [:line]
+          [:text {:dim? true}
+           "[+] +1   [=] +1   [-] -1   [*] +5   [/] -5   [q] quit"]]})
       {:cognitect.anomalies/category :cognitect.anomalies/fault
        :cognitect.anomalies/message  "Read-model state failed schema validation"
        :error/explain                (m/explain :demo/counter-state state)})))
 
 ;; ─────────────────────────────────────────────────────────────────────
-;; Screen — TUI metadata that the adapter consumes
+;; Screen — TUI metadata that the adapter consumes. Per spec v0.7 the
+;; screen carries no render function; hiccup comes from the query
+;; handler's return value (see :demo/counter above).
 ;; ─────────────────────────────────────────────────────────────────────
 
 (def counter-screen
@@ -131,19 +147,6 @@
    :grain/read-models {:demo/counter-rm 1}
    :tui/buffer        :alt
    :tui/projection    :snapshot
-   :tui/render
-   (fn [{:keys [count event-count last-query]}]
-     [:col
-      [:text {:bold? true :fg :cyan} "Grain TUI Demo — counter"]
-      [:line]
-      [:row
-       [:text "Count: "]
-       [:text {:bold? true :fg :yellow} (str count)]
-       [:text {:dim? true} (str "   (events projected: " event-count ")")]]
-      [:text {:dim? true} (str "(query last ran: " last-query ")")]
-      [:line]
-      [:text {:dim? true}
-       "[+] +1   [=] +1   [-] -1   [*] +5   [/] -5   [q] quit"]])
    :tui/keymap
    {"q" [:session :quit]
     "+" [:command :demo/change {:inputs {:demo/delta 1}}]
