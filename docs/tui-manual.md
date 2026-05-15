@@ -128,27 +128,52 @@ Commands return events for the event store to persist. Persistence triggers a pu
 
 ## 5. The query
 
-The query projects the read model into the screen's view-data. Validating the projected state against your read-model schema catches reducer bugs early — without it, garbage state silently produces a garbage UI.
+The query does two jobs: it projects the read model into view-data **and returns the screen's presentation as hiccup** under `:tui/hiccup`. The adapter never calls a render function — it reads `:tui/hiccup` (snapshot screens) or per-segment hiccup (stream screens, §9) straight off the query handler's return map. Validating the projected state against your read-model schema catches reducer bugs early — without it, garbage state silently produces a garbage UI.
 
 ```clojure
 (defquery :counter state-query
   {:authorized?       (constantly true)
-   :grain/read-models {:counter/state 1}}
+   :grain/read-models {:counter/state 1}
+   ;; TUI behavior metadata lives in the query's own metadata map
+   ;; (the adapter also accepts it on the screen map — see §6).
+   :tui/buffer        :alt
+   :tui/projection    :snapshot
+   :tui/keymap
+   {"q" [:session :quit]
+    "+" [:command :counter/change {:inputs {:counter/delta 1}}]
+    "-" [:command :counter/change {:inputs {:counter/delta -1}}]
+    "*" [:command :counter/change {:inputs {:counter/delta 5}}]
+    "/" [:command :counter/change {:inputs {:counter/delta -5}}]}}
   [context]
   (let [raw   (rmp/project context :counter/state)
         state (merge {:count 0 :event-count 0} raw)]
     (if (m/validate :counter/state state)
-      {:query/result (assoc state :last-query (str (time/now)))}
+      (let [{:keys [count event-count]} state
+            last-query (str (time/now))]
+        {:query/result (assoc state :last-query last-query)
+         :tui/hiccup
+         [:col
+          [:text {:bold? true :fg :cyan} "Counter"]
+          [:line]
+          [:row
+           [:text "Count: "]
+           [:text {:bold? true :fg :yellow} (str count)]
+           [:text {:dim? true} (str "  (events: " event-count ")")]]
+          [:text {:dim? true} (str "(query last ran: " last-query ")")]
+          [:line]
+          [:text {:dim? true} "[+] +1   [-] -1   [*] +5   [/] -5   [q] quit"]]})
       {:cognitect.anomalies/category :cognitect.anomalies/fault
        :cognitect.anomalies/message  "Read-model state failed schema validation"
        :error/explain                (m/explain :counter/state state)})))
 ```
 
-`:grain/read-models {:counter/state 1}` is the load-bearing key — it tells the TUI adapter to subscribe the session to every event type the read model depends on (`#{:counter/changed}`). When events arrive, the session re-runs this query and re-renders.
+`:grain/read-models {:counter/state 1}` is the load-bearing key — it tells the TUI adapter to subscribe the session to every event type the read model depends on (`#{:counter/changed}`). When events arrive, the session re-runs this query and re-renders from the freshly returned `:tui/hiccup`.
+
+The hiccup must be computed **purely** from values already in hand — capture time/data in the handler body (as `last-query` does above) and render the captured value; never call `(time/now)` or do I/O from inside the hiccup tree. This matches `grain_tui_demo.clj`, which is the canonical correct example.
 
 ## 6. The screen
 
-A screen is a map describing the query to render and the user-facing behavior. The TUI adapter reads `:tui/...` metadata directly from the screen map — but you can also (and usually do) put it on the query itself, since screens are typically derived from queries.
+A screen is a small map naming the query to render plus its inputs. **It carries no render function** — presentation comes from the `:tui/hiccup` the query handler returns (§5). The adapter reads `:tui/...` behavior metadata (`:tui/buffer`, `:tui/projection`, `:tui/keymap`, `:tui/segments`, `:tui/input`, …) from the query metadata, the screen map, or both; the demo declares it on the query (§5) and the screen merely references the query.
 
 ```clojure
 (def counter-screen
@@ -157,18 +182,6 @@ A screen is a map describing the query to render and the user-facing behavior. T
    :grain/read-models {:counter/state 1}
    :tui/buffer        :alt
    :tui/projection    :snapshot
-   :tui/render
-   (fn [{:keys [count event-count last-query]}]
-     [:col
-      [:text {:bold? true :fg :cyan} "Counter"]
-      [:line]
-      [:row
-       [:text "Count: "]
-       [:text {:bold? true :fg :yellow} (str count)]
-       [:text {:dim? true} (str "  (events: " event-count ")")]]
-      [:text {:dim? true} (str "(query last ran: " last-query ")")]
-      [:line]
-      [:text {:dim? true} "[+] +1   [-] -1   [*] +5   [/] -5   [q] quit"]])
    :tui/keymap
    {"q" [:session :quit]
     "+" [:command :counter/change {:inputs {:counter/delta 1}}]
@@ -179,14 +192,22 @@ A screen is a map describing the query to render and the user-facing behavior. T
 
 A few things worth noting:
 
+- **There is no `:tui/render` key.** The adapter pulls hiccup from the query handler's return value (`:tui/hiccup`). A screen whose query returns no hiccup renders blank and logs `::missing-presentation` — no error is thrown. This is the single most common newcomer mistake; when in doubt, diff against `grain_tui_demo.clj`.
 - `:tui/buffer :alt` — claim the canvas; restore prior shell state on exit.
 - `:tui/projection :snapshot` — the whole result is rendered on each refresh; the diff renderer figures out which cells actually changed.
-- `:tui/render` is **pure** — it must be a function of its single argument with no I/O, no time, no closures over mutable state. Move all data fetching into the query.
+- Purity is a property of the **query handler's hiccup-building code**, not of a screen render fn: function of the query result only, no I/O or time inside the hiccup tree. Capture in the handler, render the captured value.
+- `:tui/*` behavior metadata may live on the query (§5) or be restated on the screen map (the demo does both verbatim for clarity).
 - Every keymap value is a tagged tuple: `[:command name opts?]` or `[:session action opts?]`. The `:inputs` map under `opts` becomes the command's payload (after merging with the base `:command/{name,id,timestamp}` fields).
 
 ## 7. Wiring with Integrant
 
-The adapter ships two Integrant keys (`::tui-system/tui-registry`, `::tui-system/tui-stdio-transport`). Compose them with your own keys for the Grain infrastructure:
+The adapter ships **three** Integrant keys:
+
+- `::tui-system/tui-registry` — the session registry.
+- `::tui-system/tui-stdio-transport` — the local terminal transport (used in this section).
+- `::tui-system/tui-http-routes` — the v0.8 remote HTTP+SSE transport consumed by the thin `tui-client`. It takes the same config as the stdio key plus a `:query-registry-fn` (so the server can resolve `:tui/*` metadata from the query registry); see `development/src/grain_tui_demo_remote.clj`.
+
+The remote topology is the *same app code* — you swap `::tui-stdio-transport` for `::tui-http-routes` behind a webserver and point `tui-client` at it; screens, queries, and commands are unchanged. This section wires the stdio transport. Compose the keys with your own for the Grain infrastructure:
 
 ```clojure
 ;; ── Grain infrastructure as ig keys ──────────────────────────────────
@@ -324,16 +345,29 @@ Note: starting from a REPL inside another terminal works, but JLine and the REPL
 
 ### Streaming screens
 
-For conversational agents, log tails, and REPL transcripts, use `:tui/projection :stream`. The render function is called once per segment, not once per result.
+For conversational agents, log tails, and REPL transcripts, use `:tui/projection :stream`. The query handler attaches a hiccup fragment to **each segment** (at the path named by `:tui/segments :hiccup`, default `:tui/hiccup`); the substrate caches and diffs per segment, not once per result. As in §5, there is no render function — the handler builds the hiccup.
 
 ```clojure
 (defquery :conversation by-id
   {:grain/read-models {:conversation/messages 1}
    :tui/event-tags    {:conversation-id [:query :conversation-id]}}
   [context]
-  {:query/result {:turns (rmp/project context :conversation/messages
-                                       {:tags #{[:conversation
-                                                 (get-in context [:query :conversation-id])]}})}})
+  (let [turns (rmp/project context :conversation/messages
+                           {:tags #{[:conversation
+                                     (get-in context [:query :conversation-id])]}})]
+    {:query/result
+     {:turns
+      (for [turn turns]
+        ;; Each segment carries its pre-rendered hiccup at :tui/hiccup
+        ;; (the default path; override via :tui/segments :hiccup).
+        (assoc turn :tui/hiccup
+               [:turn {:role (:role turn)}
+                (for [seg (:segments turn)]
+                  (case (:type seg)
+                    :text       [:text (:text seg)]
+                    :tool-call  [:fold {:summary (str "→ " (:tool seg))}
+                                 [:status {:state (:status seg) :label (:tool seg)}]
+                                 [:text (:result seg)]]))]))}}))
 
 (def conversation-screen
   {:query-id          :conversation/by-id
@@ -342,16 +376,7 @@ For conversational agents, log tails, and REPL transcripts, use `:tui/projection
    :tui/event-tags    {:conversation-id [:query :conversation-id]}
    :tui/buffer        :main
    :tui/projection    :stream
-   :tui/segments      {:items :turns :key :turn/id}
-   :tui/render
-   (fn [turn]
-     [:turn {:role (:role turn)}
-      (for [seg (:segments turn)]
-        (case (:type seg)
-          :text       [:text (:text seg)]
-          :tool-call  [:fold {:summary (str "→ " (:tool seg))}
-                       [:status {:state (:status seg) :label (:tool seg)}]
-                       [:text (:result seg)]]))])
+   :tui/segments      {:items :turns :key :turn/id :hiccup :tui/hiccup}
    :tui/input
    {:command   :conversation/append-user-message
     :prompt    "› "
@@ -361,7 +386,7 @@ For conversational agents, log tails, and REPL transcripts, use `:tui/projection
     "<esc>" [:session :back]}})
 ```
 
-The substrate iterates `(:turns result)`, calls `:tui/render` per turn, caches each turn's CellGrid keyed by `:turn/id`, and only re-renders turns whose data changed. With `:tui/buffer :main`, new turns append into scrollback like any other terminal output — the terminal owns history, the adapter does not try to manage it.
+(See `development/src/grain_input_demo.clj` for a working version of exactly this pattern.) The substrate iterates `(:turns result)`, reads each turn's pre-rendered hiccup at the `:hiccup` path, caches its CellGrid keyed by `:turn/id` (cache validity is the segment value's hash), and only re-renders turns whose data changed. With `:tui/buffer :main`, new turns append into scrollback like any other terminal output — the terminal owns history, the adapter does not try to manage it.
 
 `:tui/event-tags` filters the per-session subscription so only events tagged with the current conversation's id wake this screen.
 
@@ -381,7 +406,7 @@ A palette is a query-driven filterable list overlay, summoned at the call site:
    :on-select  [:command :sheet/execute {:inputs-from-selection :sheet-id}]}]}
 ```
 
-The substrate handles filter input, scrollable list rendering, arrow-key selection, `Enter` to dispatch `:on-select`, `Esc` to dismiss. On selection, the highlighted item's `:item-key` value is bound into the dispatched command via `:inputs-from-selection`.
+The substrate handles filter input, list rendering, arrow-key selection, `Enter` to dispatch `:on-select`, `Esc` to dismiss. On selection, the highlighted item's `:item-key` value is bound into the dispatched command via `:inputs-from-selection`. (The filtered list is clipped to the overlay height; it does not yet scroll-follow a selection past the visible window, so keep palette result sets modest or pre-filter the query.)
 
 The query referenced (`:sheets/all`) doesn't need any palette-specific metadata — palettes are summoned, not declared.
 
@@ -393,15 +418,17 @@ Push and pop screens to build navigable apps:
 :tui/keymap
 {"<enter>" [:session :push-screen
             {:query-id :invoice/detail
-             :inputs   {:inputs-from-selection :invoice-id}}]
+             :inputs   {:invoice-id #uuid "..."}}]
  "<esc>"   [:session :back]}
 ```
 
 Each push tears down the prior subscription and creates a new one for the new screen's read-models. Pop restores it. Sessions hold a stack of screens for back-navigation.
 
+`:push-screen` takes its `:inputs` **literally** — it does *not* resolve `:inputs-from-selection` (only `:command` actions and palette `:on-select` do that). For selection-driven drill-down, summon a palette whose `:on-select` is a command, or use a command that records the selection and then pushes.
+
 ### Lifecycle hooks
 
-`:tui/on-enter` and `:tui/on-exit` fire on screen change. They receive a session-state snapshot and are wrapped in try/catch — a hook exception cannot destabilize the session.
+`:tui/on-enter` and `:tui/on-exit` fire on screen change. They receive the session-state snapshot (`@session`) and are wrapped in try/catch — a hook *`Exception`* is logged (`::lifecycle-hook-failed`) and swallowed. The catch is `Exception`, not `Throwable`, so an `Error` (e.g. an `AssertionError`) thrown from a hook will still propagate; keep hooks defensive.
 
 ```clojure
 :tui/on-enter (fn [_session]
@@ -446,7 +473,7 @@ The constraints (§7.6.4 of the spec):
 - Cannot reach outside the bounding box — the substrate validates and clips.
 - Cannot define new buffers, projections, or event types.
 
-For animation that doesn't depend on segment changes, set `:stream-stable? false` so the per-segment cache doesn't pin the rendered cells. The substrate's built-in `:spinner` is the canonical example.
+> **Known gap (v0):** `:stream-stable?` is accepted on the registration map but is currently **inert** — the per-segment stream cache keys purely on each segment value's hash and never consults `:stream-stable?`. Relatedly, there is no substrate-driven animation tick: with `:tui/refresh {:periodic-ms}` deferred (§11), the built-in `:spinner` does not advance on its own — its `:phase` only changes when a domain event re-renders the screen. Don't rely on time-based animation in v0; advance any phase via the data the query returns.
 
 Composition over existing primitives by plain Clojure function is fine — registration is reserved for cases where new primitive cell output is genuinely needed.
 
@@ -479,12 +506,19 @@ For your own app, the same approach works:
   (let [calls (atom 0)
         {:keys [session]} (make-test-session
                             {:screen counter-screen
-                             :process-query-fn (fn [_] {:query/result {:count 0 :event-count 0}})
+                             ;; Stub query must return :tui/hiccup, same as
+                             ;; a real handler — otherwise the screen renders
+                             ;; blank (no render fn exists; see §5/§6).
+                             :process-query-fn
+                             (fn [_] {:query/result {:count 0 :event-count 0}
+                                      :tui/hiccup   [:text "Count: 0"]})
                              :process-command-fn (fn [_] (swap! calls inc) :ok)})]
     (session/render-frame! session)
     (#'session/dispatch-key! session {:type :key :key "+"})
     (is (= 1 @calls))))
 ```
+
+`:user-id` and `:event-pubsub` are accepted but optional — omit them in tests (no pubsub means no live re-render subscription, which is what you want for deterministic dispatch tests). The `make-session` source docstring currently lists them under "Required"; that's a stale label, not an enforced constraint.
 
 Two important rules:
 
@@ -516,9 +550,9 @@ Holding down a key under autorepeat is safe — the input channel uses a sliding
 
 Render exceptions are caught by `safe-render-frame!` — the loop survives, an error frame is painted with the failure message, and the stack trace goes to STDERR. Because JLine owns STDOUT, any `println` or mulog console publisher will trample the TUI; route diagnostics to STDERR or a log file instead.
 
-Query failures (thrown exceptions OR returned Cognitect anomalies) render an error frame with a "press <esc> to go back, q to quit" hint. The session is not terminated; users can recover.
+Query failures (thrown exceptions OR returned Cognitect anomalies) render an error frame with a `Press <esc> to go back, q to quit.` hint. The session is not terminated; users can recover.
 
-Command failures surface as a transient toast in the overlay layer (top-right by convention, auto-dismissing). Toasts persist across screen pushes, so a failure from screen A is still visible when the user navigates to screen B.
+Command failures are **not** auto-toasted. The substrate logs them via mulog (e.g. `::input-submit-command-failed`) and otherwise leaves the screen as-is. Toasts are an *opt-in* affordance you raise explicitly — `[:session :toast {:message "…" :level :error :ttl-ms 3000}]` — typically from the command's failure path. They render top-right, auto-dismiss after `:ttl-ms`, and (because a screen change does not clear the overlay) persist across screen pushes, so an explicitly-raised failure toast from screen A is still visible on screen B.
 
 ### Multi-tenancy
 
