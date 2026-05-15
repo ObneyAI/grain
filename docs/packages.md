@@ -48,6 +48,17 @@ obneyai/grain-event-store-postgres-v3
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
+## grain-event-store-sqlite-v3
+
+Embedded SQLite backend implementing the v3 event store protocol for single-process deployments where running Postgres is overkill. WAL mode with `BEGIN IMMEDIATE` per append, a tenant-scoped events table plus a normalized `event_tags` join table for indexed superset tag filtering, and Fressian binary serialization. Same tenant-scoped API as the Postgres backend — swap the `:conn` type to move between them:
+
+```clojure
+obneyai/grain-event-store-sqlite-v3
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "ddb91e512966f6a93d757e18ef5d39fbacf18f14"
+ :deps/root "projects/grain-event-store-sqlite-v3"}
+```
+
 ## grain-mulog-aws-cloudwatch-emf-publisher
 
 [mulog](https://github.com/BrunoBonacci/mulog) publisher for CloudWatch metrics:
