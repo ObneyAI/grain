@@ -4,9 +4,11 @@ Opinionated building blocks for AI-native information systems in Clojure.
 
 ## What is Grain?
 
-Grain is a set of composable building blocks for building event-sourced information systems using CQRS (Command Query Responsibility Segregation). The event store is the single source of truth — humans, application code, and AI agents all read from and write to the same immutable log of facts.
+Grain is a set of composable building blocks for building event-sourced information systems using CQRS (Command Query Responsibility Segregation). The event store is the single source of truth — humans, application code, and AI agents share one ledger of facts: same store, same constraints, same audit trail.
 
-Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks. Start with an in-memory event store for quick iteration, then swap in Postgres with a single line change.
+The constraints are deliberately *shallow*: a small set of foundational rules that bottom out at the storage layer. When natural language is the compiler — when an LLM is translating intent into code — the codebase it targets is what bounds the space of valid outputs. Grain narrows that space until drift becomes structurally impossible.
+
+Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks. Start with an in-memory event store for quick iteration, then swap in SQLite for embedded single-process deployments or Postgres for multi-instance — a single line change either way.
 
 For multi-instance deployments, an opt-in control plane coordinates tenant assignment across nodes using event-sourced leases — no external coordination service required.
 
@@ -71,7 +73,7 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "ddb91e512966f6a93d757e18ef5d39fbacf18f14"
+ :sha "87efa8f1bbb12c3cdc28905d5794eca38395756d"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -89,6 +91,7 @@ For multi-instance deployments, add the [control plane](docs/distributed-coordin
 | **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
 | **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE |
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
+| **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
 
 ## Why Grain?
@@ -105,5 +108,6 @@ Grain is MIT licensed. We use it in production, but it's actively evolving. The 
 
 - **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Packages](docs/packages.md)
 - **Examples**: `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
+- **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians
 - **Issues**: [GitHub Issues](https://github.com/ObneyAI/grain/issues)

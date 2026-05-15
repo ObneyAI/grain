@@ -7,7 +7,7 @@ Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 proc
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "ddb91e512966f6a93d757e18ef5d39fbacf18f14"
+ :sha "87efa8f1bbb12c3cdc28905d5794eca38395756d"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -18,7 +18,7 @@ Distributed coordination for multi-instance deployments. Coordinator election, t
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "ddb91e512966f6a93d757e18ef5d39fbacf18f14"
+ :sha "87efa8f1bbb12c3cdc28905d5794eca38395756d"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -31,7 +31,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "ddb91e512966f6a93d757e18ef5d39fbacf18f14"
+ :sha "87efa8f1bbb12c3cdc28905d5794eca38395756d"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -57,8 +57,19 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "ddb91e512966f6a93d757e18ef5d39fbacf18f14"
+ :sha "87efa8f1bbb12c3cdc28905d5794eca38395756d"
  :deps/root "projects/grain-event-store-postgres-v3"}
+```
+
+## grain-event-store-sqlite-v3
+
+Embedded SQLite backend implementing the v3 event store protocol for single-process deployments where running Postgres is overkill. WAL mode with `BEGIN IMMEDIATE` per append, a tenant-scoped events table plus a normalized `event_tags` join table for indexed superset tag filtering, and Fressian binary serialization. Same tenant-scoped API as the Postgres backend — swap the `:conn` type to move between them:
+
+```clojure
+obneyai/grain-event-store-sqlite-v3
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "87efa8f1bbb12c3cdc28905d5794eca38395756d"
+ :deps/root "projects/grain-event-store-sqlite-v3"}
 ```
 
 ## grain-mulog-aws-cloudwatch-emf-publisher
@@ -68,7 +79,7 @@ obneyai/grain-event-store-postgres-v3
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "ddb91e512966f6a93d757e18ef5d39fbacf18f14"
+ :sha "87efa8f1bbb12c3cdc28905d5794eca38395756d"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 

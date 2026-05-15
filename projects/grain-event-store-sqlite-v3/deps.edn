@@ -1,0 +1,18 @@
+{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        sqesv3/event-store-sqlite-v3 {:local/root "../../components/event-store-sqlite-v3"}
+        sqesv3/event-store-v3 {:local/root "../../components/event-store-v3"}
+        sqesv3/control-plane {:local/root "../../components/control-plane"}
+        sqesv3/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        sqesv3/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
+        sqesv3/pubsub {:local/root "../../components/pubsub"}
+        sqesv3/kv-store {:local/root "../../components/kv-store"}
+        sqesv3/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}
+        sqesv3/anomalies {:local/root "../../components/anomalies"}
+        sqesv3/schema-util {:local/root "../../components/schema-util"}
+        sqesv3/time {:local/root "../../components/time"}
+        sqesv3/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}
+        sqesv3/periodic-task {:local/root "../../components/periodic-task"}
+        sqesv3/fressian-util {:local/root "../../components/fressian-util"}}
+
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps  {}}}}

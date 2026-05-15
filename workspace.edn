@@ -16,4 +16,5 @@
             "grain-tui" {:alias "tui"}
             "grain-control-plane" {:alias "cp"}
             "grain-event-store-postgres-v3" {:alias "es-pg-v3"}
+            "grain-event-store-sqlite-v3" {:alias "es-sq-v3"}
             "grain-mulog-aws-cloudwatch-emf-publisher" {:alias "mulog-aws-emf-pub"}}}
