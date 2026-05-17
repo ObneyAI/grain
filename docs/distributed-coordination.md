@@ -1,6 +1,6 @@
 # Distributed Coordination
 
-For multi-instance deployments, the `grain-control-plane` package provides distributed coordination using Grain's own event-sourcing primitives. No external coordination service (ZooKeeper, etcd, Consul) is required — the control plane is itself event-sourced, storing its state in a dedicated tenant on the shared event store.
+For multi-instance deployments, the `grain-control-plane` package provides distributed coordination using Grain's own event-sourcing primitives. No external coordination service is required — the control plane is itself event-sourced, storing its state in a dedicated tenant on the shared event store.
 
 ## How It Works
 
