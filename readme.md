@@ -58,7 +58,7 @@ For multi-instance deployments, an opt-in control plane coordinates tenant assig
 
 > Full documentation: [docs/distributed-coordination.md](docs/distributed-coordination.md)
 
-The `grain-control-plane` package provides coordinator election, tenant lease management, and tenant-aware routing — all event-sourced on the shared Postgres event store. No ZooKeeper, etcd, or Consul required.
+The `grain-control-plane` package provides coordinator election, tenant lease management, and tenant-aware routing — all event-sourced on the shared Postgres event store. No external coordination service required.
 
 ## Datastar (Reactive UI)
 
