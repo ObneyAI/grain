@@ -1,5 +1,7 @@
 {:deps {org.clojure/clojure {:mvn/version "1.12.0"}
         ds/tui-adapter             {:local/root "../../components/tui-adapter"}
+        ds/tui-client              {:local/root "../../components/tui-client"}
+        ds/webserver               {:local/root "../../components/webserver"}
         ds/command-processor-v2    {:local/root "../../components/command-processor-v2"}
         ds/query-processor         {:local/root "../../components/query-processor"}
         ds/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
