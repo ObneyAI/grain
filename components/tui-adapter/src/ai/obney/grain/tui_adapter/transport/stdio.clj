@@ -16,6 +16,7 @@
    In MVS we open one stdio transport, which yields one session bound to
    the controlling terminal."
   (:require [clojure.core.async :as async]
+            [clojure.string]
             [com.brunobonacci.mulog :as u]
             [ai.obney.grain.tui-adapter.ansi :as ansi]
             [ai.obney.grain.tui-adapter.input :as input]
@@ -43,13 +44,43 @@
       :else
       :mono)))
 
+(defn env-color-override
+  "Operator knob: `GRAIN_TUI_COLOR=truecolor|c256|c16|mono` forces the
+   color depth regardless of TERM/COLORTERM. This is the escape hatch
+   for environments where COLORTERM lies (e.g. `truecolor` exported in a
+   shell profile while the actual emulator is 256-color) — detection
+   alone can't know the emulator is lying, so the operator overrides."
+  []
+  (some-> (System/getenv "GRAIN_TUI_COLOR")
+          clojure.string/trim
+          clojure.string/lower-case
+          keyword
+          #{:truecolor :c256 :c16 :mono}))
+
+(defn resolve-color-depth
+  "Pure color-depth decision. Precedence (most → least authoritative):
+     1. explicit `:color` in `override` (app/transport opt)
+     2. `GRAIN_TUI_COLOR` env (operator knob)
+     3. TERM/COLORTERM detection
+   Always returns one of `#{:truecolor :c256 :c16 :mono}`."
+  [override]
+  (or (:color override)
+      (env-color-override)
+      (detect-color-depth)))
+
 (defn negotiate-caps
-  "Build the `:terminal-caps` map for the given JLine Terminal."
-  [^Terminal terminal]
-  {:color       (detect-color-depth)
-   :alt-screen? true                ; assume modern terminal
-   :width       (max 1 (.getWidth terminal))
-   :height      (max 1 (.getHeight terminal))})
+  "Build the `:terminal-caps` map for `terminal`.
+
+   `override` may be a full caps map (any of `:color`, `:alt-screen?`,
+   `:width`, `:height`); its keys win on merge, with `:color` resolved
+   via `resolve-color-depth`. No override preserves historical behavior."
+  ([^Terminal terminal] (negotiate-caps terminal nil))
+  ([^Terminal terminal override]
+   (merge {:color       (resolve-color-depth override)
+           :alt-screen? true              ; assume modern terminal
+           :width       (max 1 (.getWidth terminal))
+           :height      (max 1 (.getHeight terminal))}
+          (dissoc override :color))))
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Output sink
@@ -190,7 +221,14 @@
      :base-context"
   [opts]
   (let [terminal     (open-terminal)
-        caps         (negotiate-caps terminal)
+        ;; Caps override (most → least authoritative):
+        ;;   :terminal-caps opt > :color opt > GRAIN_TUI_COLOR env >
+        ;;   TERM/COLORTERM detection. No override ⇒ historical behavior.
+        override     (cond
+                       (:terminal-caps opts) (:terminal-caps opts)
+                       (:color opts)         {:color (:color opts)}
+                       :else                 nil)
+        caps         (negotiate-caps terminal override)
         on-output    (make-output-sink terminal)
         user-id      ((:user-resolver opts (constantly nil)))
         tenant-id    ((:tenant-resolver opts (constantly (random-uuid))) user-id)
@@ -198,7 +236,7 @@
         ;; terminal lifecycle. Defaults to :alt when not declared.
         buffer       (or (-> opts :default-screen :tui/buffer) :alt)
         sess-opts    (-> opts
-                         (dissoc :tenant-resolver :user-resolver)
+                         (dissoc :tenant-resolver :user-resolver :color)
                          (assoc :tenant-id tenant-id
                                 :user-id   user-id
                                 :viewport  {:width (:width caps) :height (:height caps)}

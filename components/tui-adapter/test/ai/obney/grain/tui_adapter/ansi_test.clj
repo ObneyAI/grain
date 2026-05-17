@@ -65,6 +65,16 @@
                               c256-caps)]
     (is (re-find #"38;5;\d+m$" esc))))
 
+(deftest caps-without-color-defaults-conservatively
+  ;; No :color in caps ⇒ assume 256, NOT optimistic truecolor — so a
+  ;; consumer that forgot to set caps can't flood a 16-color terminal
+  ;; with 24-bit sequences.
+  (let [[esc _] (ansi/sgr-for default-style*
+                              (assoc default-style* :fg [:rgb 10 12 17])
+                              {})]
+    (is (re-find #"38;5;\d+m$" esc))
+    (is (not (re-find #"38;2;" esc)))))
+
 (deftest mono-drops-color
   (let [[esc _] (ansi/sgr-for default-style*
                               (assoc default-style* :fg :red)

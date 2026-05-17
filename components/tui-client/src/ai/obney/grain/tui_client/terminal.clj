@@ -8,6 +8,7 @@
   (:require [ai.obney.grain.tui-adapter.transport.stdio :as stdio]))
 
 (def open-terminal       stdio/open-terminal)
+(def negotiate-caps      stdio/negotiate-caps)
 (def make-output-sink    stdio/make-output-sink)
 (def enter-tui!          stdio/enter-tui!)
 (def leave-tui!          stdio/leave-tui!)

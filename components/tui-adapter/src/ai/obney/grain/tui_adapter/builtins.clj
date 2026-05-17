@@ -8,6 +8,7 @@
    block so REPL reloads are idempotent."
   (:require [ai.obney.grain.tui-adapter.cells :as cells]
             [ai.obney.grain.tui-adapter.element-registry :as er]
+            [ai.obney.grain.tui-adapter.input-slot :as input-slot]
             [ai.obney.grain.tui-adapter.layout :as layout]))
 
 ;; ─────────────────────────────────────────────────────────────────────
@@ -481,5 +482,26 @@
                    row      (assoc (first (:cells base)) cursor cur-cell)]
                (assoc base :cells [row]))
              base)))})
+
+    ;; ──────────────────────────────────────────────────────────────────
+    ;; Placeable input area marker (`:tui/input {:placement :slot}`)
+    ;; ──────────────────────────────────────────────────────────────────
+    ;;
+    ;; Fills its allocated box with sentinel cells. After the screen grid
+    ;; is composed, the compositor (`session/render-frame-alt!` locally,
+    ;; `tui-client.render` remotely) scans for them via
+    ;; `input-slot/find-slot-box`, overlays the real input area there, and
+    ;; strips the markers before diff. Sentinels are created at layout
+    ;; time and never serialized — the wire only carries `[:input-slot]`.
+
+    (er/defelement :input-slot
+      {:doc   "Marks where a :tui/input {:placement :slot} input area renders. Attrs: {:height n} — rows to reserve (default 1; size up for :multiline?). Width fills the allocated box."
+       :attrs [:map [:height {:optional true} :int]]
+       :preferred-size (fn [{:keys [height]}] {:width 0 :height (or height 1)})
+       :min-size       {:width 1 :height 1}
+       :stream-stable? true
+       :render
+       (fn [_attrs {:keys [width height]}]
+         (input-slot/sentinel-grid width height))})
 
     :registered))

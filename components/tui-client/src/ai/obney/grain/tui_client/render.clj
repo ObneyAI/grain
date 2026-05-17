@@ -22,6 +22,7 @@
             [ai.obney.grain.tui-adapter.cells      :as cells]
             [ai.obney.grain.tui-adapter.diff       :as diff]
             [ai.obney.grain.tui-adapter.input-area :as input-area]
+            [ai.obney.grain.tui-adapter.input-slot :as input-slot]
             [ai.obney.grain.tui-adapter.layout     :as layout]
             [ai.obney.grain.tui-adapter.overlay    :as overlay]))
 
@@ -100,44 +101,93 @@
                         :height     ia-height
                         :multiline? (boolean (:multiline? cfg))})))
 
+(defn- compose
+  "Pure: frame + viewport + input-area state →
+   `{:grid <CellGrid> :ia-origin [x y]|nil :ia-cursor [col row]|nil}`.
+
+   Mirrors `session/render-frame-alt!`. Default: the bottom
+   `input-area-height` rows are reserved for the input area. When the
+   frame's `:input` declares `{:placement :slot}` (B), the screen is
+   laid out at the full viewport and the input area is composited into
+   the `[:input-slot]` marker's box (sentinels stripped before diff).
+   `:ia-origin` is the absolute top-left of the input area for cursor
+   positioning."
+  [frame viewport ia-state]
+  (let [cfg       (:input frame)
+        slot?     (and cfg (= :slot (:placement cfg)))
+        ia-h      (if slot? 0 (input-area-height frame ia-state))
+        screen-h  (max 1 (- (:height viewport) ia-h))
+        screen-vp {:width (:width viewport) :height screen-h}
+        screen-g  (layout/render-element (screen-hiccup frame) screen-vp)
+        base      (cells/blank (:width viewport) (:height viewport))
+        canvas    (cells/overlay base screen-g 0 0)
+        slot-box  (when slot? (input-slot/find-slot-box canvas))
+        {ia-grid :grid ia-cur :cursor-pos}
+                  (cond
+                    slot-box
+                    (input-area/render
+                      ia-state
+                      {:prompt     (or (:prompt cfg) "")
+                       :width      (:w slot-box)
+                       :height     (:h slot-box)
+                       :multiline? (boolean (:multiline? cfg))})
+
+                    (and (not slot?) (pos? ia-h))
+                    (render-input-area frame ia-state viewport ia-h)
+
+                    :else nil)
+        [canvas ia-origin]
+                  (cond
+                    slot-box
+                    (let [{g :grid o :origin}
+                          (input-slot/place-input canvas slot-box ia-grid)]
+                      [g o])
+
+                    slot?
+                    ;; `:placement :slot` declared but no `[:input-slot]`
+                    ;; in the hiccup — strip stray sentinels, fall back.
+                    [(input-slot/strip-sentinels canvas) nil]
+
+                    ia-grid
+                    [(cells/overlay canvas ia-grid 0
+                                    (- (:height viewport) ia-h))
+                     [0 (- (:height viewport) ia-h)]]
+
+                    :else
+                    [canvas nil])]
+    {:grid      (compose-overlay frame canvas viewport)
+     :ia-origin ia-origin
+     :ia-cursor ia-cur}))
+
 (defn frame->grid
   "Pure: frame + viewport + optional input-area state → CellGrid.
 
    When the frame declares `:input`, the bottom `input-area-height`
-   rows are reserved for the input area; screen content gets the
-   remainder. Otherwise the screen fills the whole viewport.
+   rows are reserved for it (or the `[:input-slot]` box for
+   `{:placement :slot}`); screen content gets the remainder. Otherwise
+   the screen fills the whole viewport.
 
    2-arity overload keeps the namespace's earlier signature working
    (used by tests that don't care about input)."
   ([frame viewport]
    (frame->grid frame viewport nil))
   ([frame viewport input-area-state]
-   (let [ia-h     (input-area-height frame input-area-state)
-         screen-h (max 1 (- (:height viewport) ia-h))
-         screen-vp {:width (:width viewport) :height screen-h}
-         screen-g (layout/render-element (screen-hiccup frame) screen-vp)
-         base     (cells/blank (:width viewport) (:height viewport))
-         canvas   (cells/overlay base screen-g 0 0)
-         canvas   (if (pos? ia-h)
-                    (let [{ia-grid :grid} (render-input-area frame input-area-state viewport ia-h)]
-                      (cells/overlay canvas ia-grid 0 (- (:height viewport) ia-h)))
-                    canvas)]
-     (compose-overlay frame canvas viewport))))
+   (:grid (compose frame viewport input-area-state))))
 
 (defn- maybe-emit-cursor!
   "Emit cursor-positioning + show/hide ANSI based on whether the input
-   area is active on this frame. Returns the new `:cursor-shown?`
-   bookkeeping value so the caller can persist idempotency state."
-  [state frame input-area-state viewport on-output]
-  (let [ia-h    (input-area-height frame input-area-state)
-        active? (and (pos? ia-h) (nil? (:overlay frame)))
+   area is active on this frame. `ia-origin`/`ia-cursor` come from
+   `compose` (computed once per frame). Returns the new
+   `:cursor-shown?` bookkeeping value."
+  [state frame ia-origin ia-cursor on-output]
+  (let [active? (and ia-cursor ia-origin (nil? (:overlay frame)))
         prior   (boolean (:cursor-shown? state))]
     (cond
       active?
-      (let [{[c-col c-row] :cursor-pos} (render-input-area frame input-area-state viewport ia-h)
-            ia-top (- (:height viewport) ia-h)
+      (let [[ox oy]       ia-origin
+            [c-col c-row] ia-cursor
             ;; ansi/cursor-position takes 0-indexed (row, col).
-            move   (ansi/cursor-position (+ ia-top c-row) c-col)]
+            move   (ansi/cursor-position (+ oy c-row) (+ ox c-col))]
         (when on-output
           (on-output (str move (ansi/show-cursor))))
         true)
@@ -166,14 +216,14 @@
    `:cursor-shown?` updated."
   [state frame viewport on-output]
   (let [ia-state      (:input-area state)
-        grid          (frame->grid frame viewport ia-state)
+        {:keys [grid ia-origin ia-cursor]} (compose frame viewport ia-state)
         runs          (diff/diff (:render-model state) grid)
         [out new-sty] (ansi/emit runs
                                  (or (:terminal-caps state) {:color :truecolor})
                                  (or (:ansi-style state) {}))]
     (when (and on-output (seq out))
       (on-output out))
-    (let [shown? (maybe-emit-cursor! state frame ia-state viewport on-output)]
+    (let [shown? (maybe-emit-cursor! state frame ia-origin ia-cursor on-output)]
       (assoc state
              :render-model  grid
              :ansi-style    new-sty

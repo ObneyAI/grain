@@ -41,7 +41,8 @@
 (defmethod ig/init-key ::tui-stdio-transport
   [_ {:keys [registry default-screen process-query-fn process-command-fn
              event-pubsub base-context tenant-resolver user-resolver
-             debounce-ms session-keymap global-keymap]
+             debounce-ms session-keymap global-keymap
+             terminal-caps color]
       :as opts}]
   (let [handle  (stdio/start-stdio-session
                   {:default-screen     default-screen
@@ -53,7 +54,10 @@
                    :user-resolver      user-resolver
                    :debounce-ms        debounce-ms
                    :session-keymap     session-keymap
-                   :global-keymap      global-keymap})
+                   :global-keymap      global-keymap
+                   ;; Optional caps override (else env / detection).
+                   :terminal-caps      terminal-caps
+                   :color              color})
         session (:session handle)
         sid     (:session-id @session)]
     (swap! (:sessions-atom registry) assoc sid session)

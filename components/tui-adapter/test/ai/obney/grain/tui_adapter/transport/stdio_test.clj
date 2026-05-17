@@ -21,6 +21,24 @@
     (is (#{:truecolor :c256 :c16 :mono} d))))
 
 ;; ──────────────────────────────────────────────────────────────────────────
+;; Caps override precedence (terminal-theming composition)
+;; ──────────────────────────────────────────────────────────────────────────
+
+(deftest explicit-color-override-wins
+  ;; An explicit :color (transport/app opt) beats env + detection — the
+  ;; escape hatch for a lying COLORTERM.
+  (is (= :c16  (stdio/resolve-color-depth {:color :c16})))
+  (is (= :mono (stdio/resolve-color-depth {:color :mono})))
+  (is (= :c256 (stdio/resolve-color-depth {:color :c256}))))
+
+(deftest no-override-falls-back-to-env-or-detection
+  (let [d (stdio/resolve-color-depth nil)]
+    (is (#{:truecolor :c256 :c16 :mono} d)))
+  ;; env-color-override only ever yields a valid depth or nil.
+  (is (contains? #{:truecolor :c256 :c16 :mono nil}
+                 (stdio/env-color-override))))
+
+;; ──────────────────────────────────────────────────────────────────────────
 ;; ANSI lifecycle helpers — assert byte sequences are well-formed
 ;; ──────────────────────────────────────────────────────────────────────────
 

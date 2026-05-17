@@ -175,7 +175,7 @@
 
    Blocks until the loop terminates (via `[:session :quit]` or
    a fatal SSE error)."
-  [{:keys [base-url resume on-shutdown]}]
+  [{:keys [base-url resume on-shutdown terminal-caps color]}]
   (let [http-client     (sse/default-http-client)
         ;; 1. Open session.
         {:keys [session default-screen]}
@@ -186,8 +186,16 @@
                                :session session-id
                                :default-screen default-screen)
 
-        ;; 2. Open terminal.
+        ;; 2. Open terminal. Negotiate color caps from the *client's*
+        ;; terminal (env knob + detection), not a hardcoded assumption —
+        ;; the thin client must compose with the operator's terminal
+        ;; theme exactly like the local session does.
         ^Terminal term  (term/open-terminal)
+        caps            (term/negotiate-caps
+                          term
+                          (cond terminal-caps terminal-caps
+                                color         {:color color}
+                                :else         nil))
         on-output       (term/make-output-sink term)
         input-ch        (async/chan 1024)
         resize-ch       (async/chan (async/sliding-buffer 4))
@@ -214,7 +222,7 @@
     (try
       (loop [render-state {:render-model nil
                            :ansi-style   nil
-                           :terminal-caps {:color :truecolor}}
+                           :terminal-caps caps}
              last-frame   nil
              viewport     {:width (.getWidth term) :height (.getHeight term)}
              seq-buf      []]

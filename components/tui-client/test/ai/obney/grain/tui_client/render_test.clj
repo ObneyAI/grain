@@ -3,7 +3,16 @@
   (:require [clojure.test :refer [deftest is testing]]
             [ai.obney.grain.tui-adapter.builtins]
             [ai.obney.grain.tui-adapter.cells :as cells]
+            [ai.obney.grain.tui-adapter.frame :as frame]
+            [ai.obney.grain.tui-adapter.input-area :as input-area]
+            [ai.obney.grain.tui-adapter.session :as session]
             [ai.obney.grain.tui-client.render :as render]))
+
+(def ^:private slot-marker
+  :ai.obney.grain.tui-adapter.input-slot/sentinel)
+
+(defn- has-sentinel? [g]
+  (boolean (some (fn [row] (some #(get % slot-marker) row)) (:cells g))))
 
 (defn- chars-of [grid r]
   (apply str (mapv :char (get-in grid [:cells r]))))
@@ -99,3 +108,54 @@
         rendered    (render/frame->grid frame {:width 5 :height 1})]
     (is (= "a" (get-in rendered [:cells 0 0 :char])))
     (is (= :green (get-in rendered [:cells 0 0 :fg])))))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; :placement :slot client-side (B) + server/client parity (R3)
+;; ──────────────────────────────────────────────────────────────────────
+
+(def ^:private slot-hiccup
+  [:col [:text {:text "HEADER"}]
+        [:input-slot {:height 2}]
+        [:text {:text "FOOTER"}]])
+
+(deftest client-places-input-in-slot
+  (let [frame {:hiccup slot-hiccup
+               :input  {:prompt "> " :placement :slot}}
+        g     (render/frame->grid frame {:width 30 :height 6}
+                                  (input-area/initial-state))]
+    (is (re-find #"HEADER" (chars-of g 0)))
+    (is (re-find #"FOOTER" (chars-of g 3)))
+    (is (re-find #"^> "    (chars-of g 2)))
+    (is (not (has-sentinel? g)))))
+
+(deftest server-client-slot-parity
+  ;; The same screen + viewport + input-area state must produce an
+  ;; identical grid whether composited server-side
+  ;; (session/render-frame-alt!) or client-side (render/frame->grid from
+  ;; the produced Frame). This is the R3 guarantee.
+  (let [screen   {:query-id :p
+                  :inputs   {}
+                  :tui/input {:command :x :prompt "> " :placement :slot}}
+        result   {:tui/hiccup slot-hiccup}
+        vp       {:width 30 :height 6}
+        ;; server
+        out      (atom [])
+        sess     (session/make-session
+                   {:tenant-id        (random-uuid)
+                    :user-id          (random-uuid)
+                    :event-pubsub     nil
+                    :viewport         vp
+                    :on-output        (fn [s] (swap! out conj s))
+                    :default-screen   screen
+                    :process-query-fn (fn [_] result)
+                    :debounce-ms      0})
+        _        (session/render-frame! sess)
+        server-g (:render-model @sess)
+        ;; client
+        fr       (frame/produce-frame {:current-screen screen :overlay nil}
+                                      result)
+        client-g (render/frame->grid fr vp (input-area/initial-state))]
+    (is (not (has-sentinel? server-g)))
+    (is (not (has-sentinel? client-g)))
+    (is (= (:cells server-g) (:cells client-g))
+        "server and client must composite the slot identically")))

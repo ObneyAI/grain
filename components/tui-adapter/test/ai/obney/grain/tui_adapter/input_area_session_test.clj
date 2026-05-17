@@ -7,6 +7,15 @@
             [ai.obney.grain.tui-adapter.builtins]
             [ai.obney.grain.tui-adapter.session :as session]))
 
+(def ^:private slot-marker
+  :ai.obney.grain.tui-adapter.input-slot/sentinel)
+
+(defn- row-str [g r]
+  (apply str (map :char (get-in g [:cells r]))))
+
+(defn- has-sentinel? [g]
+  (boolean (some (fn [row] (some #(get % slot-marker) row)) (:cells g))))
+
 (defn- make-test-session
   [{:keys [screen process-query-fn process-command-fn debounce-ms]
     :or   {process-query-fn (fn [_] {:tui/hiccup [:text "screen"]})
@@ -202,3 +211,69 @@
     (let [combined (apply str @out)]
       ;; hide-cursor escape: CSI ?25l
       (is (re-find #"\[\?25l" combined)))))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; :placement :slot — input area composited inside the screen layout (B)
+;; ──────────────────────────────────────────────────────────────────────
+
+(def ^:private slot-screen
+  {:query-id   :test/slot
+   :inputs     {}
+   :tui/input  {:command :test/say :prompt "> " :placement :slot}
+   :tui/keymap {"<esc>" [:session :quit]}})
+
+(defn- slot-query [_]
+  ;; 1-row header, a 2-row input slot, 1-row footer. In a :col these are
+  ;; fixed-height children, so the slot lands at rows 1-2.
+  {:tui/hiccup [:col
+                [:text "HEADER"]
+                [:input-slot {:height 2}]
+                [:text "FOOTER"]]})
+
+(deftest slot-places-input-inside-the-layout
+  (let [{:keys [session]} (make-test-session
+                            {:screen slot-screen
+                             :process-query-fn slot-query})
+        _ (session/render-frame! session)
+        g (:render-model @session)]
+    ;; Header above the slot, footer below it — proves the input is
+    ;; *inside* the layout, not pinned to the viewport bottom.
+    (is (re-find #"HEADER" (row-str g 0)))
+    (is (re-find #"FOOTER" (row-str g 3)))
+    ;; Slot occupies rows 1-2: input-area renders rule (row 1) then the
+    ;; prompt (row 2).
+    (is (re-find #"^> " (row-str g 2)))
+    ;; R2: no sentinel marker survives into the render-model.
+    (is (not (has-sentinel? g)))))
+
+(deftest slot-typing-shows-in-the-slot
+  (let [{:keys [session]} (make-test-session
+                            {:screen slot-screen
+                             :process-query-fn slot-query})]
+    (press-keys! session "h" "i")
+    (session/render-frame! session)
+    (let [g (:render-model @session)]
+      (is (= "hi" (-> @session :input-area :value)))
+      (is (re-find #"^> hi" (row-str g 2)))
+      (is (not (has-sentinel? g))))))
+
+(deftest slot-missing-element-falls-back-without-sentinels
+  ;; :placement :slot declared but the hiccup has no [:input-slot].
+  (let [{:keys [session]} (make-test-session
+                            {:screen slot-screen
+                             :process-query-fn (fn [_] {:tui/hiccup [:text "no slot here"]})})]
+    (session/render-frame! session)
+    (let [g (:render-model @session)]
+      (is (re-find #"no slot here" (row-str g 0)))
+      (is (not (has-sentinel? g))))))
+
+(deftest default-placement-unchanged-and-sentinel-free
+  ;; Back-compat: a screen WITHOUT :placement still composites the input
+  ;; at the bottom strip and never contains a slot marker.
+  (let [{:keys [session]} (make-test-session {:screen input-screen})]
+    (session/render-frame! session)
+    (let [g (:render-model @session)
+          h (:height g)]
+      (is (not (has-sentinel? g)))
+      ;; Bottom-strip prompt "› " still present on the last rows.
+      (is (some #(re-find #"›" (row-str g %)) (range (- h 2) h))))))

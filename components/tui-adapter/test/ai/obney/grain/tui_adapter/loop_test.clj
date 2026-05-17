@@ -25,6 +25,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [ai.obney.grain.tui-adapter.builtins]
+            [ai.obney.grain.tui-adapter.input :as input]
             [ai.obney.grain.tui-adapter.session :as session]))
 
 ;; ──────────────────────────────────────────────────────────────────────────
@@ -214,3 +215,57 @@
                not quit"))
         (finally
           (stop-loop! session loop-t))))))
+
+;; ──────────────────────────────────────────────────────────────────────────
+;; Test 4 — resize through the live loop (regression: :size [w h] vector
+;; vs {:width :height} map mismatch NPE'd render-frame-alt!)
+;; ──────────────────────────────────────────────────────────────────────────
+
+(deftest resize-event-updates-viewport-and-rerenders
+  (testing "A real `input/resize-event` (carries :size [w h]) must
+            normalize to a {:width :height} viewport and re-render
+            without throwing — both for a plain screen and a
+            :placement :slot screen."
+    (doseq [screen [{:query-id :test/resize
+                     :inputs   {}
+                     :tui/hiccup-fn :plain}
+                    {:query-id  :test/resize-slot
+                     :inputs    {}
+                     :tui/input {:command :x :prompt "> " :placement :slot}
+                     :tui/hiccup-fn :slot}]]
+      (let [slot?   (= :slot (:tui/hiccup-fn screen))
+            session (session/make-session
+                      {:tenant-id          (random-uuid)
+                       :viewport           {:width 80 :height 24}
+                       :on-output          (fn [_])
+                       :default-screen     (dissoc screen :tui/hiccup-fn)
+                       :process-query-fn
+                       (fn [_]
+                         {:query/result {}
+                          :tui/hiccup   (if slot?
+                                          [:col [:text "head"]
+                                                [:input-slot {:height 2}]]
+                                          [:text {:text "ok"}])})
+                       :process-command-fn (fn [_] {:command/result :ok})
+                       :debounce-ms        0})
+            loop-t  (start-loop-thread! session)]
+        (try
+          ;; Valid resize → viewport normalized, full re-render happened.
+          (async/>!! (:resize-ch @session) (input/resize-event 120 40))
+          (is (await-condition!
+                #(= {:width 120 :height 40} (:viewport @session)) 3000)
+              "resize did not normalize :size [w h] → {:width :height}")
+          (is (await-condition!
+                #(let [rm (:render-model @session)]
+                   (and rm (= 120 (:width rm)) (= 40 (:height rm)))) 3000)
+              "render-frame! did not produce a 120x40 model after resize
+               (it threw — the :size/viewport shape mismatch regressed)")
+          ;; Malformed resize → ignored, prior viewport kept, loop alive.
+          (async/>!! (:resize-ch @session) {:type :resize :size nil})
+          (Thread/sleep 50)
+          (is (= {:width 120 :height 40} (:viewport @session))
+              "a malformed resize must not clobber the viewport")
+          (is (not (false? (:running? @session)))
+              "a malformed resize must not crash the loop")
+          (finally
+            (stop-loop! session loop-t)))))))

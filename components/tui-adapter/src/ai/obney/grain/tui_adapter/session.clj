@@ -39,6 +39,7 @@
             [ai.obney.grain.tui-adapter.diff :as diff]
             [ai.obney.grain.tui-adapter.frame :as frame]
             [ai.obney.grain.tui-adapter.input-area :as input-area]
+            [ai.obney.grain.tui-adapter.input-slot :as input-slot]
             [ai.obney.grain.tui-adapter.keymap :as keymap]
             [ai.obney.grain.tui-adapter.layout :as layout]
             [ai.obney.grain.tui-adapter.overlay :as overlay]
@@ -530,37 +531,74 @@
   [session]
   (let [s              @session
         {:keys [viewport overlay terminal-caps render-model ansi-style on-output]} s
-        ia-height      (input-area-height session)
+        cfg            (input-area-config session)
+        ;; `:placement :slot` (B): the input area renders *inside* the
+        ;; screen layout at an `[:input-slot]` marker rather than the
+        ;; bottom strip. Absent ⇒ the original path, byte-identical.
+        slot?          (and cfg (= :slot (:placement cfg)))
+        ia-height      (if slot? 0 (input-area-height session))
         screen-viewport (assoc viewport :height (max 1 (- (:height viewport) ia-height)))
         [screen-g new-stream-state] (compute-screen-grid session screen-viewport)
         screen-g       (pad-to-viewport screen-g screen-viewport)
         ;; Compose screen content into a full-height canvas; if there's
         ;; an input area, its grid is placed in the bottom `ia-height`
-        ;; rows.
+        ;; rows (non-slot) or into the located slot box (slot).
         canvas         (cells/blank (:width viewport) (:height viewport))
         canvas         (cells/overlay canvas screen-g 0 0)
+        slot-box       (when slot? (input-slot/find-slot-box canvas))
         {ia-grid :grid ia-cur :cursor-pos}
-                       (when (pos? ia-height) (render-input-area session viewport))
-        canvas         (if ia-grid
-                         (cells/overlay canvas ia-grid 0 (- (:height viewport) ia-height))
-                         canvas)
+                       (cond
+                         slot-box
+                         (input-area/render
+                           (:input-area s)
+                           {:prompt     (or (:prompt cfg) "")
+                            :width      (:w slot-box)
+                            :height     (:h slot-box)
+                            :multiline? (boolean (:multiline? cfg))})
+
+                         (and (not slot?) (pos? ia-height))
+                         (render-input-area session viewport)
+
+                         :else nil)
+        [canvas ia-origin]
+                       (cond
+                         slot-box
+                         (let [{g :grid o :origin}
+                               (input-slot/place-input canvas slot-box ia-grid)]
+                           [g o])
+
+                         slot?
+                         ;; `:placement :slot` declared but no
+                         ;; `[:input-slot]` in the hiccup — strip any
+                         ;; stray sentinels and fall back gracefully.
+                         (do (u/log ::input-slot-missing
+                                    :screen (:query-id (:current-screen s)))
+                             [(input-slot/strip-sentinels canvas) nil])
+
+                         ia-grid
+                         [(cells/overlay canvas ia-grid 0
+                                         (- (:height viewport) ia-height))
+                          [0 (- (:height viewport) ia-height)]]
+
+                         :else
+                         [canvas nil])
         composed       (compose-overlay canvas overlay viewport)
         runs           (diff/diff render-model composed)
         [out new-style] (ansi/emit runs (or terminal-caps {:color :truecolor})
                                    (or ansi-style {}))]
     (when (and on-output (seq out))
       (on-output out))
-    ;; Cursor management: show + position in the input area when
-    ;; active and no overlay; hide otherwise. Emitted after the diff
-    ;; so the cursor sits at the final position.
+    ;; Cursor management: show + position at the input area's absolute
+    ;; origin (`ia-origin`) when active and no overlay; hide otherwise.
+    ;; Emitted after the diff so the cursor sits at the final position.
     (when on-output
-      (let [cursor-active? (and ia-cur (nil? overlay))
+      (let [cursor-active? (and ia-cur ia-origin (nil? overlay))
             prior          (:cursor-shown? s false)
-            ia-top         (- (:height viewport) ia-height)
+            [ox oy]        (or ia-origin [0 0])
             [c-col c-row]  (or ia-cur [0 0])
             ;; ansi/cursor-position takes (row col) both 0-indexed and
             ;; emits as 1-indexed CSI parameters.
-            move           (ansi/cursor-position (+ ia-top c-row) c-col)]
+            move           (ansi/cursor-position (+ oy c-row) (+ ox c-col))]
         (cond
           cursor-active?
           ;; Block cursor (DECSCUSR 2) + show-cursor + positioning. The
@@ -780,12 +818,21 @@
             (nil? val)
             (recur)
 
-            ;; Resize
+            ;; Resize. `input/resize-event` carries `:size [w h]` (a
+            ;; vector); every renderer wants `{:width :height}`. Normalize
+            ;; here — the single consumer — and ignore malformed/zero
+            ;; sizes (keep the prior viewport) so a resize never feeds a
+            ;; nil width/height into the render path.
             (= port resize-ch)
-            (do (swap! session assoc :viewport (:size val))
-                (swap! session assoc :render-model nil) ; force full redraw
-                (safe-render-frame! session)
-                (recur))
+            (let [[w h] (:size val)
+                  vp    (when (and (number? w) (number? h))
+                          {:width (max 1 (long w)) :height (max 1 (long h))})]
+              (when vp
+                (swap! session assoc
+                       :viewport     vp
+                       :render-model nil) ; force full redraw
+                (safe-render-frame! session))
+              (recur))
 
             ;; Input event
             (= port input-ch)

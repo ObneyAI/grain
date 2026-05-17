@@ -176,6 +176,7 @@
     :list :table :scroll
     :turn :fold :status :progress :spinner
     :input
+    :input-slot
     :cells})
 
 (defn- node? [x]

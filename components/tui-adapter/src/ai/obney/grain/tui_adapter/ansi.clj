@@ -112,7 +112,9 @@
    capability. Returns `nil` when the color is `:default` and no override
    is needed (the caller will emit the corresponding `39`/`49` reset)."
   [color caps base bright-base]
-  (let [depth (:color caps :truecolor)]
+  ;; Conservative default: if caps carry no :color, assume 256 (widely
+  ;; supported, no truecolor flood) rather than optimistic truecolor.
+  (let [depth (:color caps :c256)]
     (cond
       (= color :default)
       ;; SGR 39 (fg-default) when base=38; SGR 49 (bg-default) when base=48.
