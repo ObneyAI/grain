@@ -1,76 +1,72 @@
 (ns ai.obney.grain.example-base.core
-  (:require [ai.obney.grain.command-request-handler.interface :as crh]
+  "Example grain app base, wired on the current macro stack.
+
+   Handlers are defined in components/example-service with the macro
+   system (`defcommand`, `defquery`, `defreadmodel`, `defprocessor`,
+   `defperiodic`) and register themselves in global registries when their
+   namespaces load — so this base only requires the example-service
+   interface namespaces and wires the runtime: an in-memory event-store-v3,
+   an LMDB read-model cache, the HTTP request handlers, a standalone tenant
+   poller for processors (no control plane), and the periodic triggers.
+
+   The app is single-tenant: every event-store append/read, projection,
+   poll, and periodic tick is scoped to `service-schemas/example-tenant-id`."
+  (:require [ai.obney.grain.command-request-handler-v2.interface :as crh]
             [ai.obney.grain.query-request-handler.interface :as qrh]
             [ai.obney.grain.periodic-task.interface :as pt]
-            [ai.obney.grain.event-store-v2.interface :as es]
-            [ai.obney.grain.event-store-postgres-v2.interface]
+            [ai.obney.grain.todo-processor-v2.interface :as tp]
+            [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.kv-store.interface :as kv]
+            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [ai.obney.grain.webserver.interface :as ws]
-            [ai.obney.grain.pubsub.interface :as ps]
-            [ai.obney.grain.todo-processor.interface :as tp]
-            [ai.obney.grain.control-plane.interface :as control-plane]
-            ;; event-notifier-postgres removed — todo processors poll the event store directly
             [ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface :as cloudwatch-emf]
             [clojure.set :as set]
             [com.brunobonacci.mulog :as u]
             [integrant.core :as ig]
             [nrepl.server :as nrepl]
 
+            ;; Requiring the example-service interface namespaces loads their
+            ;; core namespaces, whose def* macros register the handlers.
             [ai.obney.grain.example-service.interface
-             [commands :as commands]
-             [queries :as queries]
-             [todo-processors :as todo-processors]
-             [periodic-tasks :as periodic-tasks]
-             [schemas]]))
+             [commands]
+             [queries]
+             [todo-processors]
+             [periodic-tasks]
+             [schemas :as service-schemas]]))
 
 ;; --------------------- ;;
 ;; Service Configuration ;;
 ;; --------------------- ;;
 
-;;
-;; This will be deleted later, just for testing ;;
-;;
-
-
 (def system
   {::logger {}
-   ::event-store {:logger (ig/ref ::logger)
-                  :event-pubsub (ig/ref ::event-pubsub)
-                  :conn {:type :in-memory ;; change to :postgres to try Postgres
-                         ;; uncomment below to try Postgres
-                         #_#_#_#_#_#_#_#_#_#_:server-name "localhost"
-                         :port-number "5433"
+
+   ::event-store {:conn {:type :in-memory
+                         ;; To try Postgres instead, add a dep on
+                         ;; event-store-postgres-v3, require its interface
+                         ;; namespace, and use:
+                         #_#_#_#_#_#_#_#_#_#_:type :postgres
+                         :server-name "localhost"
+                         :port-number "5432"
                          :username "postgres"
                          :password "password"
                          :database-name "obneyai"}}
 
-   ::event-pubsub {:type :core-async
-                   :topic-fn :event/type}
-
-   ::example-periodic-task
-   {:handler-fn #'periodic-tasks/example-periodic-task
-    :schedule {:every 30 :duration :seconds}
-    :context (ig/ref ::context)
-    :task-name ::example-periodic-task}
-
-   ::calculate-average-counter-value-todo-processor
-   {:event-pubsub (ig/ref ::event-pubsub)
-    :topics [:example/counter-incremented :example/counter-decremented]
-    :handler-fn #'todo-processors/calculate-average-counter-value
-    :context (ig/ref ::context)}
+   ::cache {}
 
    ::context {:event-store (ig/ref ::event-store)
-              :command-registry commands/commands
-              :query-registry queries/queries
-              :event-pubsub (ig/ref ::event-pubsub)}
+              :cache (ig/ref ::cache)
+              :tenant-id service-schemas/example-tenant-id}
 
-   ;; Control plane — commented out by default (single-instance mode).
-   ;; Uncomment to enable multi-instance coordination.
-   #_#_
-   ::control-plane {:event-store (ig/ref ::event-store)
-                    :cache nil ;; provide a kv-store for L2 cache
-                    :heartbeat-interval-ms 5000
-                    :staleness-threshold-ms 15000
-                    :strategy :round-robin}
+   ;; Standalone tenant poller — runs every registered defprocessor for the
+   ;; single example tenant. No control plane / pubsub.
+   ::processors {:event-store (ig/ref ::event-store)
+                 :cache (ig/ref ::cache)
+                 :tenant-id service-schemas/example-tenant-id}
+
+   ;; Runs every registered defperiodic trigger on its schedule.
+   ::periodic-triggers {:event-store (ig/ref ::event-store)
+                        :tenant-id service-schemas/example-tenant-id}
 
    ::routes {:context (ig/ref ::context)}
 
@@ -79,8 +75,6 @@
                 :http/join? false}
 
    ::nrepl {:bind "0.0.0.0" :port 7888}})
-
-
 
 ;; -------------- ;;
 ;; Integrant Keys ;;
@@ -108,35 +102,37 @@
 (defmethod ig/halt-key! ::event-store [_ event-store]
   (es/stop event-store))
 
-(defmethod ig/init-key ::event-pubsub [_ config]
-  (ps/start config))
+(defmethod ig/init-key ::cache [_ _]
+  (kv/start
+   (lmdb/->KV-Store-LMDB {:storage-dir (str "/tmp/grain-example-" (random-uuid))
+                          :db-name "example"})))
 
-(defmethod ig/halt-key! ::event-pubsub [_ event-pubsub]
-  (ps/stop event-pubsub))
-
-(defmethod ig/init-key ::calculate-average-counter-value-todo-processor [_ config]
-  (tp/start config))
-
-(defmethod ig/halt-key! ::calculate-average-counter-value-todo-processor [_ todo-processor]
-  (tp/stop todo-processor))
-
-(defmethod ig/init-key ::example-periodic-task [_ config]
-  (pt/start
-   {:handler-fn (partial (:handler-fn config) (:context config))
-    :schedule (:schedule config)
-    :task-name (:task-name config)}))
-
-(defmethod ig/halt-key! ::example-periodic-task [_ task]
-  (pt/stop task))
-
-(defmethod ig/init-key ::control-plane [_ config]
-  (control-plane/start config))
-
-(defmethod ig/halt-key! ::control-plane [_ cp]
-  (control-plane/stop cp))
+(defmethod ig/halt-key! ::cache [_ cache]
+  (kv/stop cache))
 
 (defmethod ig/init-key ::context [_ context]
   context)
+
+(defmethod ig/init-key ::processors [_ {:keys [event-store cache tenant-id]}]
+  (tp/start-tenant-poller
+   {:event-store event-store
+    :tenant-ids #{tenant-id}
+    ;; Merged into each handler's context (the poller injects
+    ;; :event-store/:tenant-id/:event itself); :cache is needed so the
+    ;; processor's command can project the read model.
+    :context {:cache cache}
+    :poll-interval-ms 250}))
+
+(defmethod ig/halt-key! ::processors [_ poller]
+  (tp/stop-tenant-poller poller))
+
+(defmethod ig/init-key ::periodic-triggers [_ {:keys [event-store tenant-id]}]
+  (pt/start-periodic-triggers!
+   {:append-fn (partial es/append event-store)
+    :tenant-ids-fn (constantly #{tenant-id})}))
+
+(defmethod ig/halt-key! ::periodic-triggers [_ triggers]
+  (pt/stop-periodic-triggers! triggers))
 
 (defmethod ig/init-key ::routes [_ {:keys [context]}]
   (set/union
@@ -167,8 +163,8 @@
   (ig/init system))
 
 (defn stop
-  [rag-service]
-  (ig/halt! rag-service))
+  [app]
+  (ig/halt! app))
 
 ;; -------------- ;;
 ;; Runtime System ;;
@@ -186,9 +182,9 @@
                                 (stop @app)))))
 
 (comment
-  
+
   (def app (start))
-  
-  
-  
+
+  (stop app)
+
   "")

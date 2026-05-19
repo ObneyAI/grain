@@ -1,9 +1,8 @@
 (ns example-app-demo
   (:require [ai.obney.grain.example-base.core :as service]
-            [ai.obney.grain.command-processor.interface :as cp]
+            [ai.obney.grain.command-processor-v2.interface :as cp]
             [ai.obney.grain.query-processor.interface :as qp]
-            [ai.obney.grain.event-store-v2.interface :as es]
-            [ai.obney.grain.event-store-postgres-v2.interface]
+            [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.example-service.interface.read-models :as rm]
             [ai.obney.grain.time.interface :as time]
             [clj-http.client :as http]))
@@ -13,10 +12,13 @@
   ;;
   ;; Start Service
   ;;
+  ;; The service context already carries :event-store, :cache, and
+  ;; :tenant-id — everything the macro handlers / read models need.
   (do
     (def service (service/start))
     (def context (::service/context service))
-    (def event-store (:event-store context)))
+    (def event-store (:event-store context))
+    (def tenant-id (:tenant-id context)))
 
 
   ;;
@@ -30,7 +32,9 @@
 
 (comment
 
-  ;; Interact internally in the REPL with out HTTP
+  ;; Interact internally in the REPL without HTTP.
+  ;; cp/process-command and qp/process-query fall back to the global
+  ;; registries populated by the defcommand / defquery macros.
 
   (try
     (cp/process-command
@@ -41,7 +45,7 @@
                       :name "Counter A"}))
     (catch Exception e (ex-data e)))
 
-  (into [] (es/read event-store {}))
+  (into [] (es/read event-store {:tenant-id tenant-id}))
 
   (def counters
     (->> (qp/process-query
@@ -71,9 +75,12 @@
                     :counter-id (:counter/id counter)}))
 
 
+  ;; Projects the :example/counters read model (read-model-processor-v2).
   (rm/root context)
 
-  (into [] (es/read event-store {}))
+  ;; The :example/calculate-average-counter-value processor reacts to the
+  ;; increment above and appends an :example/average-calculated event.
+  (into [] (es/read event-store {:tenant-id tenant-id}))
 
 
   ""
@@ -104,7 +111,7 @@
          :form-params {:query {:query/name :example/counters}}}))
       (catch Exception e (ex-data e))))
 
-  
+
 
   ;; Increment first counter
 
@@ -131,10 +138,10 @@
     (catch Exception e (ex-data e)))
 
 
-  
 
-  
-  
+
+
+
 
   ""
   )

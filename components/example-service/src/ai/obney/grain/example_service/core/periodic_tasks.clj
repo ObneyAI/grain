@@ -1,14 +1,21 @@
 (ns ai.obney.grain.example-service.core.periodic-tasks
-  "The periodic tasks namespace in a grain service component is where
-   periodic task functions are defined. These functions accept a context,
-   which is wired up in the base for the grain app, and the time, provided 
-   by the periodic-task component implementation.
-   
-   Periodic tasks are less rigid than commands and todo-processors and generally
-   do not have a specific return value. So they use the various dependencies in the context
-   in order to perform their work with discretion."
-  (:require [com.brunobonacci.mulog :as u]))
+  "The core periodic-tasks namespace defines scheduled triggers using the
+   `defperiodic` macro. `defperiodic` registers the handler under
+   `:<ns>/<name>`; the base runs all registered triggers via
+   `periodic-task`'s `start-periodic-triggers!`.
 
-(defn example-periodic-task
-  [_context _time]
-  (u/trace ::example []))
+   On each schedule tick the handler is called once per tenant with
+   `[tenant-id time]` and returns `{:result/events [...] :result/cas {...}}`
+   (or `{}` for a no-op). The framework appends any returned events with
+   the optional CAS predicate.
+
+   This example trigger is a no-op heartbeat: it logs and returns `{}`."
+  (:require [ai.obney.grain.periodic-task.interface :refer [defperiodic]]
+            [com.brunobonacci.mulog :as u]))
+
+(defperiodic :example example-periodic-task
+  {:schedule {:every 30 :duration :seconds}}
+  "Example periodic task. Runs every 30s per tenant; no-op heartbeat."
+  [tenant-id _time]
+  (u/log ::example :tenant-id tenant-id)
+  {})
