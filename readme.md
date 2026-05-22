@@ -20,30 +20,28 @@ We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and
 
 ## Architecture
 
-```text
-                            ┌────────────────────────────────────────────────────────┐
-                            │                      Write Side                        │
-                            │                                                        │
-  POST /command ───────────▶│  Command Processor ──▶ Validate ──▶ Handler ──▶ Events │
-                            │         ▲                  ▲                      │    │
-                            └─────────│──────────────────│──────────────────────┼────┘
-                                      │                  │                      │
-                                      │                  │ read                 │ append
-                                      │        ┌─────────┴─────────┐            │
-                                      │        │                   │            ▼
-            Todo Processors ──────────┘        │    Read Model     │◀───┬───────────┐
-                   ▲                           │                   │    │   Event   │
-                   │                           └───────────────────┘    │   Store   │
-                   │                                     ▲         proj └───────────┘
-                   │        ┌────────────────────────────│─────────────┐      │
-                   │        │              Read Side     │             │      │ publish
-                   │        │                            │             │      ▼
-                   │        │  Query Processor ──────────┘             │ ┌─────────┐
-  POST /query ─────────────▶│                                          │ │ Pub/Sub │
-                   │        └──────────────────────────────────────────┘ └─────────┘
-                   │                                                          │
-                   └──────────────────────────────────────────────────────────┘
-                                                (async)
+```mermaid
+flowchart TB
+    cmd([POST /command]) --> CP
+    qry([POST /query]) --> QP
+
+    subgraph Write[Write Side]
+        direction LR
+        CP[Command Processor] --> V[Validate]
+        V --> H[Handler] --> E[Events]
+    end
+
+    subgraph Read[Read Side]
+        direction LR
+        QP[Query Processor] -- read --> RM[Read Model]
+    end
+
+    H -- read --> RM
+    E -- append --> ES[(Event Store)]
+    ES -- proj --> RM
+    ES -- publish --> PS[Pub/Sub]
+    PS -. async .-> TP[Todo Processors]
+    TP --> CP
 ```
 
 **Commands** are the only path to state change — they validate business rules and emit events. **Events** are immutable facts stored in the event store. **Queries** read from projections (read models) built from events. **Todo Processors** react to events asynchronously, enabling event-driven workflows.
