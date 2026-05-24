@@ -4,4 +4,5 @@
            ai.obney.grain.clj-dspy.core/defsignature clojure.core/def
            ai.obney.grain.clj-dspy.core/defmodel clojure.core/def}
 
- :config-paths ["../projects/grain-core/resources/clj-kondo.exports/ai.obney.grain/grain-core"]}
+ :config-paths ["../projects/grain-core/resources/clj-kondo.exports/ai.obney.grain/grain-core"
+                "../projects/grain-core-v2/resources/clj-kondo.exports/ai.obney.grain/grain-core-v2"]}
