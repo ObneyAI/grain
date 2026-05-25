@@ -8,6 +8,13 @@
    and event-store."
   (:require [ai.obney.grain.schema-util.interface :refer [defschemas]]))
 
+;; The example app is single-tenant. Every event-store append/read, read
+;; model projection, processor poll, and periodic trigger is scoped to this
+;; fixed tenant id. (Must not be the control-plane tenant id
+;; #uuid "00000000-0000-0000-0000-000000000001".)
+#_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
+(def example-tenant-id #uuid "11111111-1111-1111-1111-111111111111")
+
 #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
 (defschemas commands
   {:example/create-counter

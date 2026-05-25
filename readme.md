@@ -12,32 +12,36 @@ Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-i
 
 For multi-instance deployments, an opt-in control plane coordinates tenant assignment across nodes using event-sourced leases — no external coordination service required.
 
+## Why Grain?
+
+We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and-eventsourcing) to design [Simple](https://www.youtube.com/watch?v=SxdOUGdseq4) systems. Grain provides a single, composable toolkit for building multi-tenant, event-sourced applications in Clojure.
+
+[Polylith](https://polylith.gitbook.io/polylith) enables us to evolve components independently and publish standalone tools from a single repository.
+
 ## Architecture
 
-```
-                            ┌────────────────────────────────────────────────────────┐
-                            │                      Write Side                        │
-                            │                                                        │
-  POST /command ───────────▶│  Command Processor ──▶ Validate ──▶ Handler ──▶ Events │
-                            │         ▲                  ▲                      │    │
-                            └─────────│──────────────────│──────────────────────┼────┘
-                                      │                  │                      │
-                                      │                  │ read                 │ append
-                                      │        ┌─────────┴─────────┐            │
-                                      │        │                   │            ▼
-            Todo Processors ──────────┘        │    Read Model     │◀───┬───────────┐
-                   ▲                           │                   │    │   Event   │
-                   │                           └───────────────────┘    │   Store   │
-                   │                                     ▲         proj └───────────┘
-                   │        ┌────────────────────────────│─────────────┐      │
-                   │        │              Read Side     │             │      │ publish
-                   │        │                            │             │      ▼
-                   │        │  Query Processor ──────────┘             │ ┌─────────┐
-  POST /query ─────────────▶│                                          │ │ Pub/Sub │
-                   │        └──────────────────────────────────────────┘ └─────────┘
-                   │                                                          │
-                   └──────────────────────────────────────────────────────────┘
-                                                (async)
+```mermaid
+flowchart TB
+    cmd([POST /command]) --> CP
+    qry([POST /query]) --> QP
+
+    subgraph Write[Write Side]
+        direction LR
+        CP[Command Processor] --> V[Validate]
+        V --> H[Handler] --> E[Events]
+    end
+
+    subgraph Read[Read Side]
+        direction LR
+        QP[Query Processor] -- read --> RM[Read Model]
+    end
+
+    H -- read --> RM
+    E -- append --> ES[(Event Store)]
+    ES -- proj --> RM
+    ES -- publish --> PS[Pub/Sub]
+    PS -. async .-> TP[Todo Processors]
+    TP --> CP
 ```
 
 **Commands** are the only path to state change — they validate business rules and emit events. **Events** are immutable facts stored in the event store. **Queries** read from projections (read models) built from events. **Todo Processors** react to events asynchronously, enabling event-driven workflows.
@@ -73,7 +77,7 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "87efa8f1bbb12c3cdc28905d5794eca38395756d"
+ :sha "4a7093cafbf44d52babe572d7bdc4d6573d7b782"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -93,12 +97,6 @@ For multi-instance deployments, add the [control plane](docs/distributed-coordin
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
 | **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
-
-## Why Grain?
-
-We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and-eventsourcing) to design [Simple](https://www.youtube.com/watch?v=SxdOUGdseq4) systems. Grain provides a single, composable toolkit for building multi-tenant, event-sourced applications in Clojure.
-
-[Polylith](https://polylith.gitbook.io/polylith) enables us to evolve components independently and publish standalone tools from a single repository.
 
 ## Status
 

@@ -1,19 +1,31 @@
 (ns ai.obney.grain.example-service.core.todo-processors
-  "The core todo-processors namespace in a grain service is where todo-processor handler functions are defined.
-   These functions receive a context and have a specific return signature. They can return a cognitect anomaly,
-   a map with a `:result/events` key containing a sequence of valid events per the event-store event 
-   schema, or an empty map. Sometimes the todo-processor will just call a command through the commant-processor.
-   The wiring up of the context and the function occurs in the grain app base. The todo-processor subscribes to 
-   one or more events via pubsub and only ever processes a single event at a time, which is included in the context."
-  (:require [ai.obney.grain.command-processor.interface :as command-processor]
+  "The core todo-processors namespace defines async event processors using
+   the `defprocessor` macro. `defprocessor` registers the handler under
+   `:<ns>/<name>` in the global processor registry; the base runs it via
+   `todo-processor-v2`'s standalone tenant poller (no control plane needed).
+
+   The handler receives a context with `:event`, `:event-store`,
+   `:tenant-id` (plus anything merged from the poller's `:context`, e.g.
+   `:cache`). It subscribes to events via the `:topics` opt and processes
+   one event at a time. It must return `{:result/events [...]}`,
+   `{:result/effect fn ...}`, or `{}`.
+
+   This processor recomputes the average counter value by delegating to the
+   `:example/calculate-average-counter-value` command (which appends the
+   `:example/average-calculated` event itself), then returns `{}` so the
+   poller simply checkpoints the handled trigger event."
+  (:require [ai.obney.grain.todo-processor-v2.interface :refer [defprocessor]]
+            [ai.obney.grain.command-processor-v2.interface :as command-processor]
             [ai.obney.grain.time.interface :as time]))
 
-(defn calculate-average-counter-value
-  "Calculates the average value of the counter from the given todo items."
-  [{:keys [_event] :as context}]
+(defprocessor :example calculate-average-counter-value
+  {:topics #{:example/counter-incremented :example/counter-decremented}}
+  "Recomputes the average counter value whenever a counter changes."
+  [context]
   (command-processor/process-command
    (assoc context
           :command
           {:command/id (random-uuid)
            :command/timestamp (time/now)
-           :command/name :example/calculate-average-counter-value})))
+           :command/name :example/calculate-average-counter-value}))
+  {})

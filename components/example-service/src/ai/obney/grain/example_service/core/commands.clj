@@ -1,18 +1,26 @@
 (ns ai.obney.grain.example-service.core.commands
   "The core commands namespace in a grain service component implements
-   the command handlers and defines the command registry. Command functions
-   take a context that includes any necessary dependencies, to be injected
-   in the base for the service. Usually a command-request-handler or another 
-   type of adapter will call the command processor, which will access the command 
-   registry for the entire application in the context. Commands either return a cognitect 
-   anomaly or a map that optionally has a :command-result/events key containing a sequence of 
-   valid events per the event-store event schema and optionally :command/result which is some 
-   data that is meant to be returned to the caller, see command-request-handler for example."
+   the command handlers using the `defcommand` macro. Each `defcommand`
+   defines a handler function and registers it in the global command
+   registry under `:<ns>/<name>` — no manual registry map is needed.
+
+   Command handlers take a context that includes any necessary dependencies
+   wired in the base for the service (`:event-store`, `:cache`, `:tenant-id`).
+   A command-request-handler-v2 (HTTP) or a direct `process-command` call
+   (REPL) looks the handler up in the registry. Commands either return a
+   cognitect anomaly or a map that optionally has a `:command-result/events`
+   key containing a sequence of valid events per the event-store event
+   schema and optionally `:command/result` returned to the caller.
+
+   The `:authorized?` opt is required for the command to be reachable over
+   HTTP via command-request-handler-v2."
   (:require [ai.obney.grain.example-service.interface.read-models :as read-models]
-            [ai.obney.grain.event-store-v2.interface :refer [->event]]
+            [ai.obney.grain.command-processor-v2.interface :refer [defcommand]]
+            [ai.obney.grain.event-store-v3.interface :refer [->event]]
             [cognitect.anomalies :as anom]))
 
-(defn create-counter
+(defcommand :example create-counter
+  {:authorized? (constantly true)}
   "Creates a new counter. Counter name must be unique."
   [context]
   (let [counter-name (get-in context [:command :name])
@@ -30,7 +38,8 @@
                   :body {:counter-id counter-id
                          :name counter-name}})]})))
 
-(defn increment-counter
+(defcommand :example increment-counter
+  {:authorized? (constantly true)}
   "Increments an existing counter by 1."
   [{{:keys [counter-id]} :command :as context}]
   (let [state (read-models/root context)]
@@ -42,7 +51,8 @@
       {::anom/category ::anom/not-found
        ::anom/message (format "Counter with ID '%s' not found." counter-id)})))
 
-(defn decrement-counter
+(defcommand :example decrement-counter
+  {:authorized? (constantly true)}
   "Decrements an existing counter by 1."
   [{{:keys [counter-id]} :command :as context}]
   (let [state (read-models/root context)]
@@ -54,7 +64,8 @@
       {::anom/category ::anom/not-found
        ::anom/message (format "Counter with ID '%s' not found." counter-id)})))
 
-(defn calculate-average-counter-value
+(defcommand :example calculate-average-counter-value
+  {:authorized? (constantly true)}
   "Calculates the average value of all initialized counters."
   [context]
   (let [state (->> (read-models/root context)
@@ -68,9 +79,3 @@
                                       (map :counter/value)
                                       (reduce + 0)))
                          (double (count state)))}})]}))
-
-(def commands
-  {:example/create-counter {:handler-fn #'create-counter}
-   :example/increment-counter {:handler-fn #'increment-counter}
-   :example/decrement-counter {:handler-fn #'decrement-counter}
-   :example/calculate-average-counter-value {:handler-fn #'calculate-average-counter-value}})
