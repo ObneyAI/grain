@@ -1,11 +1,15 @@
 # Core Concepts
 
-Code samples in this doc use the following namespace aliases:
+Code samples in this doc assume the following requires are in scope:
 
-| Alias | Namespace |
-| --- | --- |
-| `es` | `ai.obney.grain.event-store-v3.interface` |
-| `rmp` | `ai.obney.grain.read-model-processor-v2.interface` |
+```clojure
+(require '[ai.obney.grain.command-processor-v2.interface  :refer [defcommand]]
+         '[ai.obney.grain.query-processor.interface       :refer [defquery]]
+         '[ai.obney.grain.todo-processor-v2.interface     :refer [defprocessor]]
+         '[ai.obney.grain.periodic-task.interface         :refer [defperiodic]]
+         '[ai.obney.grain.read-model-processor-v2.interface :as rmp :refer [defreadmodel]]
+         '[ai.obney.grain.event-store-v3.interface        :refer [->event]])
+```
 
 ## Multi-Tenancy
 
@@ -92,8 +96,8 @@ Todo processors react to events asynchronously. They subscribe to event types an
         member-id (:member-id event)]
     {:result/effect (fn [] (stripe/charge! member-id))
      :result/checkpoint :after
-     :result/on-success [(es/->event {:type :billing/membership-charged
-                                       :body {:member-id member-id}})]}))
+     :result/on-success [(->event {:type :billing/membership-charged
+                                   :body {:member-id member-id}})]}))
 ```
 
 The handler receives a context with `:event`, `:event-store`, and `:tenant-id`. Return one of:
@@ -118,8 +122,8 @@ Periodic tasks run on a schedule and emit trigger events for each tenant. CAS de
   [tenant-id time]
   (let [period (.toString (.toLocalDate time))]
     {:result/events
-     [(es/->event {:type :billing/membership-due
-                   :body {:period period}})]
+     [(->event {:type :billing/membership-due
+                :body {:period period}})]
      :result/cas
      {:types #{:billing/membership-due}
       :predicate-fn (fn [existing]
