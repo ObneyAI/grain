@@ -8,8 +8,7 @@
    wired in the base for the service (`:event-store`, `:cache`,
    `:tenant-id`). A query-request-handler (HTTP) or a direct `process-query`
    call (REPL) looks the handler up in the registry. Queries either return
-   a cognitect anomaly or a map with a `:query/result` returned to the
-   caller.
+   a cognitect anomaly or a map with a `:query/result`.
 
    The `:authorized?` opt is required for the query to be reachable over
    HTTP via query-request-handler."
