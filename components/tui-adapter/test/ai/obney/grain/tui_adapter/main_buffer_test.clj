@@ -166,6 +166,19 @@
     (is (not (str/includes? bytes ">> hello")))
     (is (not (str/includes? bytes ">> world")))))
 
+(deftest render-stream-main-emits-multiline-text-as-visual-rows
+  (let [prior  (ai.obney.grain.tui-adapter.stream/empty-stream-state)
+        result {:msgs [{:id 1 :tui/hiccup [:text "abc\ndefghijkl"]}]}
+        {:keys [state bytes]}
+        (ai.obney.grain.tui-adapter.stream/render-stream-main
+          prior result msgs-spec (assoc append-opts :width 8))]
+    (is (= [1] (:emitted-keys state)))
+    (is (str/includes? bytes "abc"))
+    (is (str/includes? bytes "defghijk"))
+    (is (str/includes? bytes "l"))
+    (is (= 3 (count (re-seq #"\n" bytes))))
+    (is (= 3 (count (re-seq #"\[6;1H" bytes))))))
+
 (deftest render-stream-main-no-new-segments-emits-nothing
   (let [prior (-> (ai.obney.grain.tui-adapter.stream/empty-stream-state)
                   (assoc :emitted-keys [1 2]))
@@ -304,6 +317,36 @@
       (is (str/includes? c "> h"))
       (is (not (str/includes? c ">> first"))
           "prior segments stay in scrollback; only chrome redraws"))))
+
+(deftest main-buffer-submit-repaints-sticky-input-without-stale-text
+  ;; Regression: the main-buffer renderer used to repaint bottom chrome
+  ;; with trailing newlines. In a terminal with DECSTBM set, that can
+  ;; move the physical cursor and leave a stale submitted input row
+  ;; visible beneath the sticky input.
+  (let [cmd-log (atom [])
+        screen  (assoc-in main-stream-screen [:tui/input :multiline?] true)
+        {:keys [session out]}
+        (make-session {:default-screen screen})]
+    (swap! session assoc
+           :process-query-fn (fn [_] {:tui/hiccup [:text "intro"]
+                                      :msgs       []})
+           :process-command-fn (fn [ctx]
+                                 (swap! cmd-log conj (:command ctx))
+                                 {:command/result :ok}))
+    (#'session/dispatch-key! session {:type :key :key "h"})
+    (#'session/dispatch-key! session {:type :key :key "i"})
+    (session/render-frame! session)
+    (reset! out [])
+    (#'session/dispatch-key! session {:type :key :key "C-d"})
+    (session/render-frame! session)
+    (let [c (combined out)]
+      (is (= "hi" (-> @cmd-log first :text)))
+      (is (= "" (-> @session :input-area :value)))
+      (is (str/includes? c "> "))
+      (is (not (str/includes? c "> hi"))
+          "submitted text should not remain in the sticky input repaint")
+      (is (not (str/includes? c "\n"))
+          "fixed chrome repaint should use absolute rows, not newlines"))))
 
 (deftest violation-recovers-on-next-append
   ;; If a key disappears (violation logged), the function emits

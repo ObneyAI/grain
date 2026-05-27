@@ -63,6 +63,20 @@
     (is (= 20 (:width grid)))
     (is (= 6  (:height grid)))))
 
+(deftest non-filterable-palette-renders-details-without-filter-input
+  (let [palette {:config {:item-label :n
+                          :filterable? false
+                          :details [{:label "Tool" :value "fs/list"}
+                                    {:label "Target" :value "."}]}
+                 :filter ""
+                 :selected 0
+                 :items [{:n "Yes"} {:n "No"}]}
+        hiccup  (overlay/palette-hiccup palette)
+        rendered (pr-str hiccup)]
+    (is (string? rendered))
+    (is (re-find #"fs/list" rendered))
+    (is (not (re-find #":input" rendered)))))
+
 ;; ──────────────────────────────────────────────────────────────────────────
 ;; handle-palette-key — navigation, filter, select, dismiss
 ;; ──────────────────────────────────────────────────────────────────────────
@@ -110,6 +124,11 @@
         p2 (-> (overlay/handle-palette-key p1 "<backspace>") :palette)]
     (is (= "" (:filter p2)))
     (is (= 3 (count (:items p2))))))
+
+(deftest non-filterable-palette-ignores-typing
+  (let [palette (assoc-in base-palette [:config :filterable?] false)]
+    (is (nil? (overlay/handle-palette-key palette "B")))
+    (is (nil? (overlay/handle-palette-key palette "<backspace>")))))
 
 (deftest unrecognised-key-ignored
   (is (nil? (overlay/handle-palette-key base-palette "<f7>"))))

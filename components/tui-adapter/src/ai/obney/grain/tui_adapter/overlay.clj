@@ -55,6 +55,8 @@
    this onto the screen via `cells/overlay` at a centered location."
   [{:keys [config filter selected items] :as _palette-state}]
   (let [item-label (:item-label config)
+        details    (:details config)
+        filterable? (not= false (:filterable? config))
         rows       (vec
                      (map-indexed
                        (fn [i it]
@@ -62,12 +64,21 @@
                                  :fg    (when (= i selected) :cyan)}
                                 (str (get it item-label ""))])
                        items))]
-    [:box {:title "Palette"}
-     [:col
-      [:row
-       [:text {:dim? true} "/ "]
-       [:input {:value filter :cursor (count filter)}]]
-      [:list {:items rows :selected selected}]]]))
+    [:box {:title (or (:title config) "Palette")}
+     (into [:col]
+           (concat
+            (mapv (fn [{:keys [label value style]}]
+                    [:row
+                     [:text {:dim? true} (format "%-7s" (str label))]
+                     [:text (or style {}) (str value)]])
+                  details)
+            (when filterable?
+              [[:row
+                [:text {:dim? true} "/ "]
+                [:input {:value filter :cursor (count filter)}]]])
+            [[:list {:items rows :selected selected}]
+             [:text {:dim? true}
+              (or (:help config) "Enter select   ↑/↓ move   Esc dismiss")]]))]))
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Palette key handling — returns updated palette state or :dismiss / :select
@@ -90,19 +101,29 @@
                :palette (update palette-state :selected
                                 #(min (max 0 (dec (count (:items palette-state)))) (inc %)))}
     "<backspace>"
-    (let [new-filter (subs (:filter palette-state)
-                           0
-                           (max 0 (dec (count (:filter palette-state)))))
-          new-items  (filter-items (:all-items palette-state)
-                                   (-> palette-state :config :item-label)
-                                   new-filter)]
-      {:state :update
-       :palette (assoc palette-state
-                       :filter   new-filter
-                       :items    new-items
-                       :selected 0)})
-    ;; Single printable character — append to filter
+    (when (not= false (-> palette-state :config :filterable?))
+      (let [new-filter (subs (:filter palette-state)
+                             0
+                             (max 0 (dec (count (:filter palette-state)))))
+            new-items  (filter-items (:all-items palette-state)
+                                     (-> palette-state :config :item-label)
+                                     new-filter)]
+        {:state :update
+         :palette (assoc palette-state
+                         :filter   new-filter
+                         :items    new-items
+                         :selected 0)}))
+    ;; Optional number shortcut — select the corresponding visible item.
+    (if (and (-> palette-state :config :number-shortcuts?)
+             (string? key)
+             (= 1 (count key))
+             (Character/isDigit (.charAt ^String key 0)))
+      (let [idx (dec (Long/parseLong key))]
+        (when (<= 0 idx (dec (count (:items palette-state))))
+          {:state :select :item (nth (:items palette-state) idx)}))
+      ;; Single printable character — append to filter
     (if (and (string? key) (= 1 (count key))
+             (not= false (-> palette-state :config :filterable?))
              (let [c (int (.charAt ^String key 0))]
                (and (>= c 32) (<= c 126))))
       (let [new-filter (str (:filter palette-state) key)
@@ -114,7 +135,7 @@
                          :filter   new-filter
                          :items    new-items
                          :selected 0)})
-      nil)))
+      nil))))
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Toast positioning convenience

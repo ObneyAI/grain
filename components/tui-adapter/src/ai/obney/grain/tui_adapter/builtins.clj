@@ -9,7 +9,8 @@
   (:require [ai.obney.grain.tui-adapter.cells :as cells]
             [ai.obney.grain.tui-adapter.element-registry :as er]
             [ai.obney.grain.tui-adapter.input-slot :as input-slot]
-            [ai.obney.grain.tui-adapter.layout :as layout]))
+            [ai.obney.grain.tui-adapter.layout :as layout]
+            [clojure.string :as string]))
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Helpers — string-aware preferred-size, character helpers
@@ -25,6 +26,27 @@
    padded/truncated to `width`."
   [width style-attrs s]
   (cells/text-row width style-attrs (or s "")))
+
+(defn- wrap-visual-line
+  [width s]
+  (if (or (zero? width) (empty? s))
+    [""]
+    (mapv #(apply str %) (partition-all width s))))
+
+(defn- text-visual-lines
+  [width s]
+  (->> (string/split (or s "") #"\n" -1)
+       (mapcat #(wrap-visual-line width %))
+       vec))
+
+(defn- styled-text-grid
+  [width height style-attrs s]
+  (let [lines (text-visual-lines width s)
+        rows (mapv #(styled-text-row width style-attrs %) lines)
+        grid (if (seq rows)
+               (apply cells/stack rows)
+               (cells/blank width 0))]
+    (cells/clip grid {:width width :height height})))
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; The registration block — defonce so reloading the namespace doesn't
@@ -56,10 +78,10 @@
        :min-size       {:width 1 :height 1}
        :stream-stable? true
        :render
-       (fn [attrs children {:keys [width]} _render-child]
+       (fn [attrs children {:keys [width height]} _render-child]
          (let [s (or (:text attrs)
                      (apply str (filter string? children)))]
-           (styled-text-row width (text-attrs->styles attrs) s)))})
+           (styled-text-grid width (or height 1) (text-attrs->styles attrs) s)))})
 
     (er/defelement :line
       {:doc   "Horizontal rule across the bounding box."

@@ -20,7 +20,8 @@
             [ai.obney.grain.tui-adapter.ansi :as ansi]
             [ai.obney.grain.tui-adapter.cells :as cells]
             [ai.obney.grain.tui-adapter.diff :as diff]
-            [ai.obney.grain.tui-adapter.layout :as layout]))
+            [ai.obney.grain.tui-adapter.layout :as layout]
+            [clojure.string :as string]))
 
 ;; ─────────────────────────────────────────────────────────────────────
 ;; State shape
@@ -87,6 +88,35 @@
           acc
           (recur (cons s acc) (- budget h) (rest remaining)))))))
 
+(defn- wrap-visual-line-count
+  [width s]
+  (if (or (zero? width) (empty? s))
+    1
+    (long (Math/ceil (/ (count s) (double width))))))
+
+(defn- text-content
+  [hiccup]
+  (when (and (vector? hiccup) (= :text (first hiccup)))
+    (let [[_ maybe-attrs & children] hiccup
+          attrs (when (map? maybe-attrs) maybe-attrs)
+          children (if attrs children (cons maybe-attrs children))]
+      (or (:text attrs)
+          (apply str (filter string? children))))))
+
+(defn- text-visual-height
+  [width s]
+  (->> (string/split (or s "") #"\n" -1)
+       (map #(wrap-visual-line-count width %))
+       (reduce + 0)
+       (max 1)))
+
+(defn- segment-height
+  [segment hiccup-path width]
+  (or (:height segment)
+      (when-let [s (text-content (get segment hiccup-path))]
+        (text-visual-height width s))
+      1))
+
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Per-segment cache
 ;; ─────────────────────────────────────────────────────────────────────
@@ -104,8 +134,9 @@
   (let [hiccup (get segment hiccup-path)
         _      (when (nil? hiccup)
                  (u/log ::missing-segment-hiccup :segment-key (:id segment)))
+        height (segment-height segment hiccup-path width)
         grid   (layout/render-element (or hiccup [:text {:text ""}])
-                                      {:width width :height 1})]
+                                      {:width width :height height})]
     {:hash   (hash segment)
      :grid   grid
      :height (:height grid)}))
@@ -165,19 +196,23 @@
 ;; ─────────────────────────────────────────────────────────────────────
 
 (defn- segment-ansi
-  "Render one segment's hiccup as a 1-row CellGrid and emit it as
+  "Render one segment's hiccup as a CellGrid and emit it as
    sequential ANSI bytes (no cursor-positioning embedded — the caller
    has already positioned the terminal cursor). Returns
    `[bytes new-style]`."
   [seg hiccup-path width terminal-caps style]
   (let [hiccup (get seg hiccup-path)
+        height (segment-height seg hiccup-path width)
         grid   (layout/render-element
                  (or hiccup [:text {:text ""}])
-                 {:width width :height 1})
-        row    (first (:cells grid))]
-    (ansi/emit-cells row
-                     (or terminal-caps {:color :truecolor})
-                     (or style {}))))
+                 {:width width :height height})]
+    (reduce (fn [[acc st] row]
+              (let [[row-bytes st'] (ansi/emit-cells row
+                                                     (or terminal-caps {:color :truecolor})
+                                                     (or st {}))]
+                [(str acc row-bytes "\n") st']))
+            ["" style]
+            (:cells grid))))
 
 (defn render-stream-main
   "Append-emission renderer for `:main` + `:stream` screens. Given the
@@ -236,9 +271,15 @@
             [bytes final-style]
             (reduce (fn [[acc st] seg]
                       (let [[seg-bytes st'] (segment-ansi seg hiccup width
-                                                          terminal-caps st)]
-                        [(str acc position (ansi/erase-line-to-eol)
-                              seg-bytes "\n")
+                                                          terminal-caps st)
+                            rows (butlast (string/split seg-bytes #"\n" -1))
+                            positioned (apply str
+                                              (map #(str position
+                                                         (ansi/erase-line-to-eol)
+                                                         %
+                                                         "\n")
+                                                   rows))]
+                        [(str acc positioned)
                          st']))
                     ["" style]
                     new-segments)
@@ -269,9 +310,11 @@
                        (u/log ::stream-projection-violation :kind violation))
         ;; Build [key seg] pairs aligned to the keys-vec.
         pairs        (mapv (fn [k s] [k s]) keys-vec segments)
-        ;; Visible window: last-N that fit in available height. We use a
-        ;; simple per-segment height of 1 for MVP.
-        visible      (compute-visible-window pairs height (constantly 1))
+        visible      (compute-visible-window
+                      pairs
+                      height
+                      (fn [[_ segment]]
+                        (segment-height segment hiccup width)))
         ;; If there was a violation, force re-render of the visible window
         ;; by clearing the prior cache for those keys.
         cache-input  (if violation

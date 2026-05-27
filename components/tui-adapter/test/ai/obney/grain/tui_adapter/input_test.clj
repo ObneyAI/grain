@@ -29,6 +29,9 @@
 (deftest tab-key
   (is (= [{:type :key :key "<tab>"}] (one [0x09]))))
 
+(deftest shift-tab-key
+  (is (= [{:type :key :key "<backtab>"}] (one [ESC 0x5B 0x5A]))))
+
 (deftest backspace-del
   (is (= [{:type :key :key "<backspace>"}] (one [0x7F]))))
 
@@ -111,8 +114,7 @@
 ;; ──────────────────────────────────────────────────────────────────────────
 
 (deftest unrecognised-csi-dropped
-  ;; ESC [ Z is shift-tab on some terminals; not in our table → dropped silently.
-  (let [evs (one [ESC 0x5B 0x5A])]
+  (let [evs (one [ESC 0x5B 0x51])]
     (is (= [] evs))))
 
 ;; ──────────────────────────────────────────────────────────────────────────

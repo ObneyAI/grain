@@ -112,6 +112,9 @@
                 ;; Arrow / nav
                 (csi-arrow b)
                 {:event {:type :key :key (csi-arrow b)} :consumed (- (inc i) start)}
+                ;; Backtab / Shift-Tab: most terminals emit ESC [ Z.
+                (and (= b (int \Z)) (= "" body))
+                {:event {:type :key :key "<backtab>"} :consumed (- (inc i) start)}
                 ;; Function keys F1-F4 via O-prefix variant handled separately
                 :else
                 {:event nil :consumed (- (inc i) start)}))

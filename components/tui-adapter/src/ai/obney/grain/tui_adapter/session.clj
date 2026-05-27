@@ -303,6 +303,27 @@
         (u/log ::missing-presentation :screen (-> frm :screen :query-id)))
       [(layout/render-element (or hiccup [:text {:text ""}]) viewport) nil])))
 
+(defn- effective-overlay
+  [session]
+  (let [{:keys [query-overlay overlay]} @session]
+    (or query-overlay overlay)))
+
+(defn- preserve-query-overlay-state
+  [prior next-overlay]
+  (if (and prior next-overlay (= (:id prior) (:id next-overlay)))
+    (merge next-overlay
+           (select-keys prior [:filter :selected]))
+    next-overlay))
+
+(defn- install-query-presentation!
+  [session result]
+  (let [overlay (:tui/overlay result)
+        input (:tui/input result)
+        prior (:query-overlay @session)]
+    (swap! session assoc
+           :query-overlay (preserve-query-overlay-state prior overlay)
+           :query-input input)))
+
 (defn- compute-screen-grid
   "Compute the screen's CellGrid for the current frame. Produces a Frame
    via `frame/produce-frame` (the v0.8 unit of presentation), then lays
@@ -314,7 +335,9 @@
    Returns `[grid new-stream-state-or-nil]`."
   [session viewport]
   (let [result (run-query session)
-        frm    (frame/produce-frame @session result)]
+        _      (install-query-presentation! session result)
+        frm    (frame/produce-frame (assoc @session :overlay (effective-overlay session))
+                                    result)]
     (layout-frame-locally frm session viewport)))
 
 (defn- overlay-hiccup
@@ -340,9 +363,12 @@
   (if-not overlay-state
     screen-grid
     (let [hiccup (overlay-hiccup overlay-state)
+          max-w (or (get-in overlay-state [:config :max-width])
+                    (- (:width viewport) 4))
+          layout-width (max 1 (min (max 1 (- (:width viewport) 4)) max-w))
           ovr-grid (when hiccup
                      (layout/render-element hiccup
-                                            {:width  (max 1 (- (:width viewport) 4))
+                                            {:width  layout-width
                                              :height (max 1 (- (:height viewport) 4))}))
           [x y] (when ovr-grid
                   (overlay-position (:type overlay-state) ovr-grid viewport))]
@@ -359,9 +385,19 @@
     (cells/overlay base grid 0 0)))
 
 (defn- input-area-config
-  "Read the screen's `:tui/input` config map. nil when not declared."
+  "Read the effective `:tui/input` config map. The screen owns behavior
+   such as submission command; query results may override render-only chrome
+   such as prompt/hint through `:query-input`."
   [session]
-  (-> @session :current-screen :tui/input))
+  (let [{:keys [current-screen query-input]} @session
+        screen-input (:tui/input current-screen)]
+    (when screen-input
+      (merge screen-input query-input))))
+
+(defn- effective-overlay-key
+  [session]
+  (when (effective-overlay session)
+    (if (:query-overlay @session) :query-overlay :overlay)))
 
 (defn- input-area-height
   "How many rows the input area occupies for `session`'s current
@@ -390,6 +426,20 @@
                      :multiline? (boolean (:multiline? cfg))})]
     (input-area/render (:input-area s) opts)))
 
+(defn- render-overlay-grid
+  [overlay-state viewport]
+  (when overlay-state
+    (let [hiccup (overlay-hiccup overlay-state)
+          max-w (or (get-in overlay-state [:config :max-width])
+                    (:width viewport))
+          overlay-width (max 1 (min (:width viewport) max-w))
+          height (min (:height viewport) 12)
+          grid (layout/render-element hiccup {:width overlay-width
+                                              :height height})
+          x (max 0 (min 2 (- (:width viewport) (:width grid))))
+          canvas (cells/blank (:width viewport) (:height grid))]
+      (cells/overlay canvas grid x 0))))
+
 (defn- emit-grid-as-lines
   "Emit each row of `grid` as sequential ANSI bytes followed by `\\n`.
    Used by the main-buffer renderer to print the intro block (and the
@@ -406,6 +456,24 @@
         (.append sb "\n")
         (recur (rest rows) st' sb)))))
 
+(defn- emit-grid-at-rows
+  "Emit each row of `grid` at an absolute terminal row, clearing the row
+   before writing it and never appending newlines. Used for fixed chrome
+   in the main-buffer renderer; newline output there can move the
+   terminal cursor and leave stale input behind."
+  [grid start-row caps style]
+  (loop [rows    (:cells grid)
+         row-idx 0
+         st      style
+         sb      (StringBuilder.)]
+    (if (empty? rows)
+      [(.toString sb) st]
+      (let [[row-bytes st'] (ansi/emit-cells (first rows) caps st)]
+        (.append sb (ansi/cursor-position (+ start-row row-idx) 0))
+        (.append sb (ansi/erase-line))
+        (.append sb row-bytes)
+        (recur (rest rows) (inc row-idx) st' sb)))))
+
 (defn- render-frame-main!
   "Main-buffer + stream render path (spec §6.3 transcript pattern).
 
@@ -420,18 +488,21 @@
    - After segments, redraws the input chrome at the bottom of the
      viewport and positions the terminal cursor inside the prompt."
   [session]
-  (let [s     @session
+  (let [result      (run-query session)
+        _           (install-query-presentation! session result)
+        s           @session
         {:keys [viewport terminal-caps ansi-style on-output]} s
-        screen   (:current-screen s)
-        ia-cfg   (:tui/input screen)
-        ia-h     (if ia-cfg
-                   (input-area/preferred-height (:input-area s) ia-cfg)
-                   0)
+        screen      (:current-screen s)
+        overlay     (effective-overlay session)
+        prior-overlay-height (:main-overlay-height s 0)
+        ia-cfg      (input-area-config session)
+        ia-h        (if ia-cfg
+                      (input-area/preferred-height (:input-area s) ia-cfg)
+                      0)
         H        (:height viewport)
         W        (:width  viewport)
         chrome-top  (- H ia-h)
         emit-row    (max 0 (dec chrome-top)) ; last row of the scroll region
-        result      (run-query session)
         stream-spec (:tui/segments screen)
         prior-ss    (or (:stream-state s) (stream/empty-stream-state))
         ;; First-frame setup: scroll region + intro emission.
@@ -476,27 +547,49 @@
         (when (pos? ia-h) (render-input-area session viewport))
         chrome-bytes
         (if ia-grid
-          (let [[cb _] (emit-grid-as-lines
+          (let [[cb _] (emit-grid-at-rows
                          ia-grid
+                         chrome-top
                          (or terminal-caps {:color :truecolor})
                          final-style)]
-            (str (ansi/cursor-position chrome-top 0)
-                 cb))
+            cb)
           "")
+        overlay-grid (render-overlay-grid overlay
+                                          {:width W :height (max 1 chrome-top)})
+        overlay-height (or (:height overlay-grid) 0)
+        overlay-top (max 0 (- chrome-top overlay-height))
+        clear-height (max prior-overlay-height overlay-height)
+        clear-grid (when (pos? clear-height)
+                     (cells/blank W clear-height))
+        [overlay-bytes _]
+        (cond
+          overlay-grid
+          (emit-grid-at-rows overlay-grid overlay-top
+                             (or terminal-caps {:color :truecolor})
+                             final-style)
+
+          (pos? prior-overlay-height)
+          (emit-grid-at-rows clear-grid
+                             (max 0 (- chrome-top prior-overlay-height))
+                             (or terminal-caps {:color :truecolor})
+                             final-style)
+
+          :else ["" final-style])
         ;; Cursor: position inside the prompt area (if any) and show.
         cursor-bytes
-        (if ia-cur
+        (if (and ia-cur (nil? overlay))
           (let [[c-col c-row] ia-cur]
             (str (ansi/cursor-style-block)
                  (ansi/cursor-position (+ chrome-top c-row) c-col)
                  (ansi/show-cursor)))
-          "")
-        out (str intro-bytes seg-bytes chrome-bytes cursor-bytes)]
+          (ansi/hide-cursor))
+        out (str intro-bytes seg-bytes chrome-bytes overlay-bytes cursor-bytes)]
     (when (and on-output (seq out))
       (on-output out))
     (swap! session assoc
            :ansi-style    final-style
-           :cursor-shown? (some? ia-cur)
+           :cursor-shown? (and (some? ia-cur) (nil? overlay))
+           :main-overlay-height overlay-height
            :stream-state  (assoc new-ss :intro-printed? true))
     nil))
 
@@ -509,19 +602,13 @@
    viewport are reserved for the input area and the terminal cursor
    is positioned inside it.
 
-   For `:main` + `:stream` screens (spec §6.3 transcript pattern),
-   routes to `render-frame-main!` which uses a DECSTBM scroll region
-   + append-at-cursor emission rather than viewport-bound diffing.
+   Main-buffer stream screens use the same viewport diff path as other
+   screens so refreshes, resizes, and terminal clears repaint from the
+   query result instead of relying on append-only scrollback emission.
 
-   Returns the new render-model CellGrid (or nil for the main-buffer
-   path, which doesn't maintain a render model)."
+   Returns the new render-model CellGrid."
   [session]
-  (let [s      @session
-        screen (:current-screen s)]
-    (if (and (= :main   (:tui/buffer     screen))
-             (= :stream (:tui/projection screen)))
-      (render-frame-main! session)
-      (render-frame-alt! session)))
+  (render-frame-alt! session)
   (:render-model @session))
 
 (defn- render-frame-alt!
@@ -530,7 +617,7 @@
    main-buffer are deferred; they fall back here)."
   [session]
   (let [s              @session
-        {:keys [viewport overlay terminal-caps render-model ansi-style on-output]} s
+        {:keys [viewport terminal-caps render-model ansi-style on-output]} s
         cfg            (input-area-config session)
         ;; `:placement :slot` (B): the input area renders *inside* the
         ;; screen layout at an `[:input-slot]` marker rather than the
@@ -539,6 +626,7 @@
         ia-height      (if slot? 0 (input-area-height session))
         screen-viewport (assoc viewport :height (max 1 (- (:height viewport) ia-height)))
         [screen-g new-stream-state] (compute-screen-grid session screen-viewport)
+        overlay        (effective-overlay session)
         screen-g       (pad-to-viewport screen-g screen-viewport)
         ;; Compose screen content into a full-height canvas; if there's
         ;; an input area, its grid is placed in the bottom `ia-height`
@@ -623,7 +711,8 @@
 
 (defn- session-keymap-stack
   [session]
-  (let [{:keys [overlay current-screen session-keymap focus regions global-keymap]} @session]
+  (let [{:keys [current-screen session-keymap focus regions global-keymap]} @session
+        overlay (effective-overlay session)]
     (keymap/build-stack
       {:overlay (when overlay (:keymap overlay))
        :region  (get regions focus)
@@ -660,11 +749,14 @@
    handler. Resolves :select → fires :on-select with `:inputs-from-selection`
    bound, dismisses on :select/:dismiss, updates state on :update."
   [session key-event]
-  (let [{:keys [overlay]} @session
+  (let [overlay (effective-overlay session)
+        overlay-key (effective-overlay-key session)
         result (overlay/handle-palette-key overlay (:key key-event))]
     (case (:state result)
       :dismiss
-      (swap! session assoc :overlay nil)
+      (let [on-dismiss (-> overlay :config :on-dismiss)]
+        (swap! session assoc overlay-key nil)
+        (when on-dismiss (dispatch-action! session on-dismiss)))
 
       :select
       ;; Bind the selected item's key-value into `:selection` on the session
@@ -675,11 +767,11 @@
             on-select         (:on-select config)
             item-key          (:item-key  config)
             sel-value         (when item (get item item-key))]
-        (swap! session assoc :overlay nil :selection sel-value)
+        (swap! session assoc overlay-key nil :selection sel-value)
         (when on-select (dispatch-action! session on-select)))
 
       :update
-      (swap! session assoc :overlay (:palette result))
+      (swap! session assoc overlay-key (:palette result))
 
       ;; nil — ignored
       nil)))
@@ -752,7 +844,8 @@
         to (3).
      3. Keymap stack — overlay/region/screen/session/global per §10.3."
   [session key-event]
-  (let [{:keys [overlay current-screen]} @session]
+  (let [{:keys [current-screen]} @session
+        overlay (effective-overlay session)]
     (cond
       (= :palette (:type overlay))
       (dispatch-palette-key! session key-event)
