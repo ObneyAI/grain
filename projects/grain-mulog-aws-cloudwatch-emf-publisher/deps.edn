@@ -1,4 +1,5 @@
-{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+{:paths []
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         poly/grain-mulog-aws-cloudwatch-emf-publisher {:local/root "../../components/mulog-aws-cloudwatch-emf-publisher"}}
 
  :aliases {:test {:extra-paths []

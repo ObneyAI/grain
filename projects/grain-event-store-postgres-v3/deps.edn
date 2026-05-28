@@ -1,4 +1,5 @@
-{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+{:paths []
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         pgesv3/event-store-postgres-v3 {:local/root "../../components/event-store-postgres-v3"}
         pgesv3/event-store-v3 {:local/root "../../components/event-store-v3"}
         pgesv3/control-plane {:local/root "../../components/control-plane"}

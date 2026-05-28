@@ -13,6 +13,7 @@
             "grain-event-store-postgres-v2" {:alias "es-pg-v2"}
             "grain-core-v2" {:alias "core-v2"}
             "grain-datastar" {:alias "ds"}
+            "grain-code-agent-tools" {:alias "cat"}
             "grain-control-plane" {:alias "cp"}
             "grain-event-store-postgres-v3" {:alias "es-pg-v3"}
             "grain-event-store-sqlite-v3" {:alias "es-sq-v3"}

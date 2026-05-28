@@ -70,6 +70,12 @@ The `grain-control-plane` package provides coordinator election, tenant lease ma
 
 Grain integrates with [Datastar](https://data-star.dev/) for reactive server-rendered UIs. Queries return hiccup that streams to the browser over SSE — the server re-renders when domain events fire and Datastar patches the DOM.
 
+## Code Agent Tools
+
+> Full documentation: [docs/code-agent-tools.md](docs/code-agent-tools.md)
+
+The `grain-code-agent-tools` package provides dev-only nREPL tools for coding agents working against a live Grain app. Agents can inspect registered commands, queries, read models, processors, periodic triggers, schemas, projections, events, and runtime diagnostics as plain EDN, then validate payloads against the schema registry before invoking commands or queries.
+
 ## Getting Started
 
 Add to your `deps.edn`:
@@ -94,6 +100,7 @@ For multi-instance deployments, add the [control plane](docs/distributed-coordin
 | **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store |
 | **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
 | **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE |
+| **grain-code-agent-tools** | Dev-only nREPL tools for coding agents working against live Grain apps |
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
 | **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
@@ -104,7 +111,7 @@ Grain is MIT licensed. We use it in production, but it's actively evolving. The 
 
 ## More Information
 
-- **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Packages](docs/packages.md)
+- **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
 - **Examples**: `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
 - **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians
