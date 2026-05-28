@@ -38,13 +38,19 @@ Auto-generate Pedestal routes from query registry metadata:
 (ds/routes context overrides defaults) ;; global defaults for all routes
 ```
 
-Each annotated query produces three routes:
+Each annotated query produces a shim route, primary stream routes, and legacy
+stream routes:
 
 1. `GET /path` — Shim page (HTML shell that boots Datastar)
-2. `GET /path/__stream` — SSE connection
-3. `POST /path/__stream` — Signal updates on existing SSE
+2. `GET /__stream/path` — SSE connection
+3. `POST /__stream/path` — Signal updates on existing SSE
+4. `GET/POST /path/__stream` — backward-compatible stream endpoints for
+   app-authored recompute triggers
 
-The `/__stream` suffix prevents collisions with parameterized routes (e.g. `/events` and `/events/:id` can coexist safely). Path params in `:datastar/path` (e.g. `/events/:event-id`) are automatically resolved in the shim page's stream URL.
+The `/__stream` prefix keeps stream routes outside app route prefixes, so
+`/events/__stream` cannot be captured by `/events/:id`. Path params in
+`:datastar/path` (e.g. `/events/:event-id`) are automatically resolved in the
+shim page's stream URL.
 
 ### Defaults
 

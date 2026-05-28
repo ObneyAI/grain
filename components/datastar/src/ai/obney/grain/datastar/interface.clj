@@ -38,12 +38,12 @@
    streams. The nonce is emitted as a Datastar signal so it's included in every
    request automatically, and appended to the stream URL as a query param.
 
-   Path parameters in `:stream-path` (e.g., `:item-id` in `\"/items/:item-id/__stream\"`)
+   Path parameters in `:stream-path` (e.g., `:item-id` in `\"/__stream/items/:item-id\"`)
    are automatically resolved from the request's `:path-params` map.
 
    opts keys:
      :title         — HTML <title> (default \"Grain App\")
-     :stream-path   — SSE endpoint path (e.g., \"/my-page/__stream\")
+     :stream-path   — SSE endpoint path (e.g., \"/__stream/my-page\")
      :stream-method — \"get\" (default) or \"post\"
      :head          — extra <head> hiccup or (fn [] hiccup)
      :body          — extra <body> hiccup (rendered before the #app div)
@@ -123,11 +123,13 @@
 
 (defn routes
   "Scan the query registry for entries with `:datastar/path` metadata and generate
-   Pedestal routes. Each query produces three routes:
+   Pedestal routes. Each query produces a shim route, primary stream routes, and
+   backward-compatible legacy stream routes:
 
      1. GET  `/path`           — Shim page (HTML shell that boots Datastar)
-     2. GET  `/path/__stream` — SSE connection (reuses existing session if nonce matches)
-     3. POST `/path/__stream` — Signal updates on existing SSE (Datastar's `@post`)
+     2. GET  `/__stream/path`  — SSE connection (reuses existing session if nonce matches)
+     3. POST `/__stream/path`  — Signal updates on existing SSE (Datastar's `@post`)
+     4. GET/POST `/path/__stream` — Legacy app-authored stream triggers
 
    Optional `overrides` map merges additional metadata per query-name, e.g.:
      {::my-query {:datastar/fps 2 :datastar/interceptors [auth-interceptor]}}

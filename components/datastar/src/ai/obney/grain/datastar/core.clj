@@ -40,10 +40,11 @@
    ## Route generation
 
    `routes` scans the query registry for entries with `:datastar/path` metadata
-   and auto-generates three Pedestal routes per query:
+   and auto-generates Pedestal routes per query:
      1. **Shim** (GET `/path`) — HTML shell that boots Datastar JS
-     2. **Stream GET** (`/path/__stream`) — SSE (reuses existing session if nonce matches)
-     3. **Stream POST** (`/path/__stream`) — Signal updates on existing SSE
+     2. **Stream GET** (`/__stream/path`) — SSE (reuses existing session if nonce matches)
+     3. **Stream POST** (`/__stream/path`) — Signal updates on existing SSE
+     4. **Legacy stream** (`/path/__stream`) — backward-compatible stream route
 
    ## Auth and gate interceptors
 
@@ -705,13 +706,30 @@
   (keyword "ai.obney.grain.datastar.core"
            (str (namespace query-name) "-" (name query-name))))
 
+(defn- path->stream-path
+  "Primary Datastar stream path. Keep streams under a reserved prefix so list
+   streams cannot be captured by sibling page params such as /items/:item-id."
+  [path]
+  (if (= path "/")
+    "/__stream"
+    (str "/__stream" path)))
+
+(defn- path->legacy-stream-path
+  "Backward-compatible Datastar stream path used by existing app-authored
+   @post('/path/__stream') recompute triggers."
+  [path]
+  (if (= path "/")
+    "/__stream"
+    (str path "/__stream")))
+
 (defn- query->route-pair
   "Given a query-name and its registry entry, returns [shim-route stream-route].
    Returns nil if the entry has no :datastar/path.
    defaults is an optional map with :datastar/shim-opts and :datastar/auth-redirect."
   [context query-name entry defaults]
   (when-let [path (:datastar/path entry)]
-    (let [stream-path (if (= path "/") "/__stream" (str path "/__stream"))
+    (let [stream-path (path->stream-path path)
+          legacy-stream-path (path->legacy-stream-path path)
           title (or (:datastar/title entry) "Grain App")
           fps (:datastar/fps entry 30)
           explicit-interceptors (or (:datastar/interceptors entry) [])
@@ -748,18 +766,27 @@
                         event-tags (assoc :event-tags event-tags))]
       (let [with-signals (fn [extra]
                           (into [parse-datastar-signals] (concat interceptors extra)))]
-        [;; Shim page route (GET)
-         [path :get (with-signals [(shim-page shim-opts)])
-          :route-name (keyword (namespace route-base)
-                               (str (name route-base) "-page"))]
-         ;; Stream route (GET — initial page load via @get)
-         [stream-path :get (with-signals [(stream-view context query-name stream-opts)])
-          :route-name (keyword (namespace route-base)
-                               (str (name route-base) "-stream"))]
-         ;; Stream route (POST — @post sends signals in body)
-         [stream-path :post (with-signals [(stream-view context query-name stream-opts)])
-          :route-name (keyword (namespace route-base)
-                               (str (name route-base) "-stream-post"))]]))))
+        (cond-> [;; Shim page route (GET)
+                 [path :get (with-signals [(shim-page shim-opts)])
+                  :route-name (keyword (namespace route-base)
+                                       (str (name route-base) "-page"))]
+                 ;; Stream route (GET — initial page load via @get)
+                 [stream-path :get (with-signals [(stream-view context query-name stream-opts)])
+                  :route-name (keyword (namespace route-base)
+                                       (str (name route-base) "-stream"))]
+                 ;; Stream route (POST — @post sends signals in body)
+                 [stream-path :post (with-signals [(stream-view context query-name stream-opts)])
+                  :route-name (keyword (namespace route-base)
+                                       (str (name route-base) "-stream-post"))]]
+          (not= stream-path legacy-stream-path)
+          (conj
+           ;; Legacy stream routes keep app-authored /path/__stream triggers working.
+           [legacy-stream-path :get (with-signals [(stream-view context query-name stream-opts)])
+            :route-name (keyword (namespace route-base)
+                                 (str (name route-base) "-legacy-stream"))]
+           [legacy-stream-path :post (with-signals [(stream-view context query-name stream-opts)])
+            :route-name (keyword (namespace route-base)
+                                 (str (name route-base) "-legacy-stream-post"))]))))))
 
 (defn routes
   "Scans the query registry for entries with :datastar/path and generates

@@ -27,6 +27,8 @@
 (defschemas test-schemas
   {:test/counters [:map]
    :test/auto-counters [:map]
+   :test/items-list [:map]
+   :test/item-detail [:map [:item-id :string]]
    :test/event-counters [:map]
    :test/tagged-counters [:map]
    :test/filterable-counters [:map [:filter {:optional true} :string]]
@@ -74,6 +76,24 @@
       (for [c counters]
         [:div {:id (str (:id c))}
          (:name c) ": " (:value c)])]}))
+
+(defquery :test items-list
+  {:authorized? (constantly true)
+   :datastar/path "/items"
+   :datastar/title "Items"
+   :datastar/fps 10}
+  [_context]
+  {:query/result {:page :items-list}
+   :datastar/hiccup [:div#app "items list"]})
+
+(defquery :test item-detail
+  {:authorized? (constantly true)
+   :datastar/path "/items/:item-id"
+   :datastar/title "Item Detail"
+   :datastar/fps 10}
+  [{{:keys [item-id]} :query}]
+  {:query/result {:page :item-detail :item-id item-id}
+   :datastar/hiccup [:div#app (str "item detail " item-id)]})
 
 (defcommand :test increment
   {:authorized? (constantly true)}
@@ -856,32 +876,38 @@
          (#'ds/query-name->route-name :test/counters))))
 
 (deftest query->route-pair-test
-  (testing "entry with :datastar/path produces three routes"
+  (testing "entry with :datastar/path produces shim, primary stream, and legacy stream routes"
     (let [entry {:handler-fn identity
                  :authorized? (constantly true)
                  :datastar/path "/my-page"
                  :datastar/title "My Page"
                  :datastar/fps 5}
           context {}
-          [shim-route stream-route post-stream-route] (#'ds/query->route-pair context :test/my-page entry {})]
+          [shim-route stream-route post-stream-route legacy-stream-route legacy-post-stream-route]
+          (#'ds/query->route-pair context :test/my-page entry {})]
       (is (some? shim-route))
       (is (some? stream-route))
       (is (some? post-stream-route))
+      (is (some? legacy-stream-route))
+      (is (some? legacy-post-stream-route))
       ;; Shim route
       (is (= "/my-page" (first shim-route)))
       (is (= :get (second shim-route)))
       (is (= :ai.obney.grain.datastar.core/test-my-page-page
              (last shim-route)))
       ;; GET Stream route
-      (is (= "/my-page/__stream" (first stream-route)))
+      (is (= "/__stream/my-page" (first stream-route)))
       (is (= :get (second stream-route)))
       (is (= :ai.obney.grain.datastar.core/test-my-page-stream
              (last stream-route)))
       ;; POST Stream route
-      (is (= "/my-page/__stream" (first post-stream-route)))
+      (is (= "/__stream/my-page" (first post-stream-route)))
       (is (= :post (second post-stream-route)))
       (is (= :ai.obney.grain.datastar.core/test-my-page-stream-post
-             (last post-stream-route)))))
+             (last post-stream-route)))
+      ;; Legacy stream routes
+      (is (= "/my-page/__stream" (first legacy-stream-route)))
+      (is (= "/my-page/__stream" (first legacy-post-stream-route)))))
 
   (testing "entry without :datastar/path returns nil"
     (is (nil? (#'ds/query->route-pair {} :test/counters
@@ -896,12 +922,13 @@
                                    :test/no-path {:handler-fn identity
                                                    :authorized? (constantly true)}}}
         generated (ds/routes context)]
-    (testing "correct number of routes (3 per annotated query: shim + GET stream + POST stream)"
-      (is (= 3 (count generated))))
+    (testing "correct number of routes (5 per annotated query: shim + primary/legacy GET+POST streams)"
+      (is (= 5 (count generated))))
 
     (testing "queries without :datastar/path are excluded"
       (let [paths (set (map first generated))]
         (is (contains? paths "/with-path"))
+        (is (contains? paths "/__stream/with-path"))
         (is (contains? paths "/with-path/__stream"))
         (is (not (some #(str/includes? % "no-path") paths)))))
 
@@ -915,7 +942,7 @@
                                                    :datastar/path "/defaults"}}}
         generated (ds/routes context)
         shim-route (first (filter #(= "/defaults" (first %)) generated))
-        stream-route (first (filter #(= "/defaults/__stream" (first %)) generated))
+        stream-route (first (filter #(= "/__stream/defaults" (first %)) generated))
         shim-interceptor (last (nth shim-route 2))
         shim-result ((:enter shim-interceptor) {})]
     (testing "default title is 'Grain App'"
@@ -976,7 +1003,7 @@
         generated-3arity (ds/routes context {} {})]
     (testing "empty defaults produces same number of routes as 2-arity"
       (is (= (count generated-2arity) (count generated-3arity)))
-      (is (= 3 (count generated-3arity))))))
+      (is (= 5 (count generated-3arity))))))
 
 (deftest query->route-pair-with-defaults-test
   (let [entry {:handler-fn identity
@@ -1022,9 +1049,9 @@
                                                   :datastar/interceptors [my-interceptor]}}}
         generated (ds/routes context)
         shim-route (first (filter #(= "/guarded" (first %)) generated))
-        get-stream-route (first (filter #(and (= "/guarded/__stream" (first %))
+        get-stream-route (first (filter #(and (= "/__stream/guarded" (first %))
                                                (= :get (second %))) generated))
-        post-stream-route (first (filter #(and (= "/guarded/__stream" (first %))
+        post-stream-route (first (filter #(and (= "/__stream/guarded" (first %))
                                                 (= :post (second %))) generated))
         shim-interceptors (nth shim-route 2)
         get-stream-interceptors (nth get-stream-route 2)
@@ -1173,13 +1200,28 @@
                                                   :datastar/path "/items/:item-id"}}}
         generated (ds/routes context {} {})
         paths (set (map first generated))]
-    (testing "stream paths use /__stream suffix"
+    (testing "stream paths use reserved /__stream prefix and keep legacy suffix routes"
+      (is (contains? paths "/__stream/items"))
+      (is (contains? paths "/__stream/items/:item-id"))
       (is (contains? paths "/items/__stream"))
       (is (contains? paths "/items/:item-id/__stream")))
     (testing "no bare /stream in any generated path"
       (is (not (some #(and (str/includes? % "/stream")
                            (not (str/includes? % "/__stream")))
                       paths))))))
+
+(deftest primary-stream-paths-use-reserved-prefix-test
+  (let [entry {:handler-fn identity
+               :authorized? (constantly true)
+               :datastar/path "/items/:item-id"}
+        [_shim-route stream-route post-stream-route legacy-stream-route legacy-post-stream-route]
+        (#'ds/query->route-pair {} :test/detail entry {})]
+    (testing "primary streams are outside the page route prefix"
+      (is (= "/__stream/items/:item-id" (first stream-route)))
+      (is (= "/__stream/items/:item-id" (first post-stream-route))))
+    (testing "legacy stream routes stay available for app-authored recompute triggers"
+      (is (= "/items/:item-id/__stream" (first legacy-stream-route)))
+      (is (= "/items/:item-id/__stream" (first legacy-post-stream-route))))))
 
 (deftest query->route-pair-root-path-test
   (let [entry {:handler-fn identity
@@ -1208,7 +1250,7 @@
         (is (str/includes? body "<script"))
         (is (str/includes? body "datastar"))
         (is (str/includes? body "Auto Counters"))
-        (is (str/includes? body "@get(&apos;/auto-counters/__stream?dsNonce="))))
+        (is (str/includes? body "@get(&apos;/__stream/auto-counters?dsNonce="))))
 
     (testing "SSE stream works at auto-generated path"
       (let [request (-> (HttpRequest/newBuilder)
@@ -1220,6 +1262,20 @@
         (is (= 1 (count events)))
         (is (= "datastar-patch-elements" (:name (first events))))
         (is (str/includes? (:data (first events)) "elements"))))))
+
+(deftest e2e-list-stream-is-not-captured-by-detail-route-test
+  (let [client (HttpClient/newHttpClient)
+        request (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create (str "http://localhost:" *port* "/__stream/items")))
+                    (.GET)
+                    .build)
+        response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
+        events (parse-sse-events (.body response) 1 5000)]
+    (is (= 200 (.statusCode response)))
+    (is (= 1 (count events)))
+    (is (= "datastar-patch-elements" (:name (first events))))
+    (is (str/includes? (:data (first events)) "items list"))
+    (is (not (str/includes? (:data (first events)) "item detail")))))
 
 ;; ====================================== ;;
 ;; resolve-events Unit Test                ;;
@@ -1338,7 +1394,7 @@
         body (.body response)]
     (is (= 200 (.statusCode response)))
     (is (str/includes? body "Event Counters"))
-    (is (str/includes? body "@get(&apos;/event-counters/__stream?dsNonce="))))
+    (is (str/includes? body "@get(&apos;/__stream/event-counters?dsNonce="))))
 
 ;; ====================================== ;;
 ;; resolve-event-tags Unit Tests           ;;
