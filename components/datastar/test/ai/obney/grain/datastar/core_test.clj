@@ -30,7 +30,18 @@
    :test/event-counters [:map]
    :test/tagged-counters [:map]
    :test/filterable-counters [:map [:filter {:optional true} :string]]
+   :test/typed-query [:map
+                      [:page :int]
+                      [:include-archived? :boolean]
+                      [:tab [:enum :active :archived]]]
    :test/increment [:map [:counter-id :uuid]]
+   :test/typed-command [:map
+                        [:entity-id :uuid]
+                        [:count :int]
+                        [:amount :double]
+                        [:enabled? :boolean]
+                        [:status [:enum :draft :published]]
+                        [:label :string]]
    :test/no-signals [:map]})
 
 ;; -------------------- ;;
@@ -385,14 +396,43 @@
       (is (= id (:counter-id decoded)))
       (is (nil? (:showModal decoded)))
       (is (nil? (:extra-field decoded)))
-      (is (nil? (:some-prefix-name decoded))))))
+      (is (nil? (:some-prefix-name decoded)))))
+
+  (testing "decodes common Datastar string values to canonical command types"
+    (let [id (random-uuid)
+          raw {:command/name ":test/typed-command"
+               :entity-id (str id)
+               :count "42"
+               :amount "12.34"
+               :enabled? "true"
+               :status "published"
+               :label "still a string"}
+          decoded (#'ds/decode-json-command raw)]
+      (is (= :test/typed-command (:command/name decoded)))
+      (is (= id (:entity-id decoded)))
+      (is (= 42 (:count decoded)))
+      (is (= 12.34 (:amount decoded)))
+      (is (= true (:enabled? decoded)))
+      (is (= :published (:status decoded)))
+      (is (= "still a string" (:label decoded))))))
 
 (deftest decode-json-query-test
   (let [raw {:query/name :test/counters}
         decoded (#'ds/decode-json-query raw)]
     (is (= :test/counters (:query/name decoded)))
     (is (uuid? (:query/id decoded)))
-    (is (some? (:query/timestamp decoded)))))
+    (is (some? (:query/timestamp decoded))))
+
+  (testing "decodes common Datastar string values to canonical query types"
+    (let [raw {:query/name :test/typed-query
+               :page "3"
+               :include-archived? "false"
+               :tab "archived"}
+          decoded (#'ds/decode-json-query raw)]
+      (is (= :test/typed-query (:query/name decoded)))
+      (is (= 3 (:page decoded)))
+      (is (= false (:include-archived? decoded)))
+      (is (= :archived (:tab decoded))))))
 
 ;; ====================================== ;;
 ;; auth-redirect-interceptor Tests        ;;
