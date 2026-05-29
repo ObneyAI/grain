@@ -1,10 +1,9 @@
 (ns ai.obney.grain.example-service.core.read-models
   "The core read-models namespace in a grain app is where projections are
-   created from events. With the macro system a read model is a pure
-   reducer `(state, event) -> state` defined via `defreadmodel`. The
-   read-model-processor-v2 engine handles reading the subscribed events
-   from the event store, two-tier caching, and incremental updates — the
-   reducer never touches the event store directly.
+   created from events. A read model is a pure reducer `(state, event) -> state`
+   defined via the `defreadmodel` macro. The read-model-processor-v2 engine handles
+   reading the subscribed events from the event store, two-tier caching, and
+   incremental updates — the reducer never touches the event store directly.
 
    `defreadmodel` registers the reducer under `:<ns>/<name>`; project it
    with `(rmp/project context :example/counters)` (see

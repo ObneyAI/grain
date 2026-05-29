@@ -39,13 +39,14 @@
                                  :logger nil})
           proc-name :test/dynamic-replay-proc
           tid (random-uuid)
-          handler-calls (atom 0)]
+          handler-calls (atom 0)
+          prev-registry @tp-core/processor-registry*]
       (try
-        (swap! tp-core/processor-registry* assoc proc-name
-               {:handler-fn (fn [_ctx]
-                              (swap! handler-calls inc)
-                              {})
-                :topics #{:test/dynamic-replay-trigger}})
+        (reset! tp-core/processor-registry*
+                {proc-name {:handler-fn (fn [_ctx]
+                                           (swap! handler-calls inc)
+                                           {})
+                            :topics #{:test/dynamic-replay-trigger}}})
 
         (let [evts (mapv (fn [i]
                            (->event {:type :test/dynamic-replay-trigger
@@ -79,7 +80,7 @@
             (finally
               (tp-core/stop-tenant-poller poller))))
         (finally
-          (swap! tp-core/processor-registry* dissoc proc-name)
+          (reset! tp-core/processor-registry* prev-registry)
           (es/stop event-store))))))
 
 (deftest watermark-lookup-memoized-for-uninitialized-pairs
@@ -93,15 +94,16 @@
           proc-name :test/no-checkpoint-proc
           tid (random-uuid)
           lookup-calls (atom 0)
-          real-lookup @#'tp-core/get-last-processed-id]
+          real-lookup @#'tp-core/get-last-processed-id
+          prev-registry @tp-core/processor-registry*]
       (with-redefs [tp-core/get-last-processed-id
                     (fn [& args]
                       (swap! lookup-calls inc)
                       (apply real-lookup args))]
         (try
-          (swap! tp-core/processor-registry* assoc proc-name
-                 {:handler-fn (fn [_ctx] {})
-                  :topics #{:test/dynamic-replay-trigger}})
+          (reset! tp-core/processor-registry*
+                  {proc-name {:handler-fn (fn [_ctx] {})
+                              :topics #{:test/dynamic-replay-trigger}}})
 
           (let [poller (tp-core/start-tenant-poller
                         {:event-store event-store
@@ -120,5 +122,5 @@
               (finally
                 (tp-core/stop-tenant-poller poller))))
           (finally
-            (swap! tp-core/processor-registry* dissoc proc-name)
+            (reset! tp-core/processor-registry* prev-registry)
             (es/stop event-store)))))))

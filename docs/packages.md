@@ -7,7 +7,7 @@ Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 proc
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "4a7093cafbf44d52babe572d7bdc4d6573d7b782"
+ :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -18,7 +18,7 @@ Distributed coordination for multi-instance deployments. Coordinator election, t
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "4a7093cafbf44d52babe572d7bdc4d6573d7b782"
+ :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -31,7 +31,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "4a7093cafbf44d52babe572d7bdc4d6573d7b782"
+ :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -50,6 +50,31 @@ obneyai/grain-tui
 
 Includes the core CQRS components (command/query/read-model processors, event store, pub/sub). See [`docs/tui.md`](./tui.md) for architecture and [`docs/tui-manual.md`](./tui-manual.md) for a build-from-scratch walk-through. Working demo at `development/src/grain_tui_demo.clj`.
 
+## grain-code-agent-tools
+
+Dev-only nREPL-facing tools for coding agents working against a live Grain app. Exposes registered commands, queries, read models, todo processors, periodic triggers, schemas, tenant-scoped event reads, projections, command/query invocation, validation, and runtime diagnostics as plain EDN:
+
+```clojure
+obneyai/grain-code-agent-tools
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
+ :deps/root "projects/grain-code-agent-tools"}
+```
+
+Install it after the app's Grain system starts:
+
+```clojure
+(require '[ai.obney.grain.code-agent-tools.interface :as code-agent-tools])
+
+(code-agent-tools/install! {:system app
+                            :context (::context app)
+                            :mode :dev})
+```
+
+Use it from nREPL to inspect the live catalog, validate command/query payloads
+against the schema registry, read events, inspect projections, and run runtime
+diagnostics. See [Code Agent Tools](code-agent-tools.md) for the full guide.
+
 ## grain-event-store-postgres-v3
 
 Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks, Fressian binary serialization, and tenant-scoped operations. All read and append operations require a tenant ID, ensuring structural data isolation:
@@ -57,7 +82,7 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "4a7093cafbf44d52babe572d7bdc4d6573d7b782"
+ :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
@@ -68,7 +93,7 @@ Embedded SQLite backend implementing the v3 event store protocol for single-proc
 ```clojure
 obneyai/grain-event-store-sqlite-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "4a7093cafbf44d52babe572d7bdc4d6573d7b782"
+ :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
  :deps/root "projects/grain-event-store-sqlite-v3"}
 ```
 
@@ -79,7 +104,7 @@ obneyai/grain-event-store-sqlite-v3
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "4a7093cafbf44d52babe572d7bdc4d6573d7b782"
+ :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 

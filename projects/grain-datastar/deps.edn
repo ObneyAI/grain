@@ -1,4 +1,5 @@
-{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
+{:paths []
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         ds/datastar {:local/root "../../components/datastar"}
         ds/command-processor-v2 {:local/root "../../components/command-processor-v2"}
         ds/query-processor {:local/root "../../components/query-processor"}

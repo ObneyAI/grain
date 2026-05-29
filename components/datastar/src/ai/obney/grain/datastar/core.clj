@@ -77,6 +77,16 @@
 ;; HTML Rendering  ;;
 ;; --------------- ;;
 
+(def datastar-transformer
+  (mt/transformer
+   (mt/string-transformer)
+   (mt/json-transformer)))
+
+(def datastar-command-transformer
+  (mt/transformer
+   datastar-transformer
+   (mt/strip-extra-keys-transformer)))
+
 (defn render-html [hiccup]
   (str (h/html hiccup)))
 
@@ -120,7 +130,7 @@
                                    :error (.getMessage e))
                             nil))
         decoded (if query-schema
-                  (mc/decode query-schema raw-query (mt/json-transformer))
+                  (mc/decode query-schema raw-query datastar-transformer)
                   raw-query)]
     (assoc decoded
            :query/name query-name
@@ -195,9 +205,7 @@
         command-schema (try (when command-name (mc/schema command-name))
                             (catch Exception _ nil))
         decoded (if command-schema
-                  (mc/decode command-schema raw-command
-                            (mt/transformer (mt/json-transformer)
-                                            (mt/strip-extra-keys-transformer)))
+                  (mc/decode command-schema raw-command datastar-command-transformer)
                   raw-command)]
     (assoc decoded
            :command/name command-name

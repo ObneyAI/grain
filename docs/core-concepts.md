@@ -1,5 +1,16 @@
 # Core Concepts
 
+Code samples in this doc assume the following requires are in scope:
+
+```clojure
+(require '[ai.obney.grain.command-processor-v2.interface  :refer [defcommand]]
+         '[ai.obney.grain.query-processor.interface       :refer [defquery]]
+         '[ai.obney.grain.todo-processor-v2.interface     :refer [defprocessor]]
+         '[ai.obney.grain.periodic-task.interface         :refer [defperiodic]]
+         '[ai.obney.grain.read-model-processor-v2.interface :as rmp :refer [defreadmodel]]
+         '[ai.obney.grain.event-store-v3.interface        :refer [->event]])
+```
+
 ## Multi-Tenancy
 
 Every event-store operation requires a `:tenant-id`. The processors extract it from the context map and pass it through automatically:
@@ -85,8 +96,8 @@ Todo processors react to events asynchronously. They subscribe to event types an
         member-id (:member-id event)]
     {:result/effect (fn [] (stripe/charge! member-id))
      :result/checkpoint :after
-     :result/on-success [(es/->event {:type :billing/membership-charged
-                                       :body {:member-id member-id}})]}))
+     :result/on-success [(->event {:type :billing/membership-charged
+                                   :body {:member-id member-id}})]}))
 ```
 
 The handler receives a context with `:event`, `:event-store`, and `:tenant-id`. Return one of:
@@ -111,8 +122,8 @@ Periodic tasks run on a schedule and emit trigger events for each tenant. CAS de
   [tenant-id time]
   (let [period (.toString (.toLocalDate time))]
     {:result/events
-     [(es/->event {:type :billing/membership-due
-                   :body {:period period}})]
+     [(->event {:type :billing/membership-due
+                :body {:period period}})]
      :result/cas
      {:types #{:billing/membership-due}
       :predicate-fn (fn [existing]
@@ -170,7 +181,7 @@ Projections use a two-tier cache inspired by [Datomic's object cache](https://do
 | 0 (default) | Always checks event store for new events | Real-time consistency |
 | > 0 | Skips all I/O within TTL window (< 0.2ms) | Pagination, filter changes |
 
-**L2 (LMDB):** [Fressian](https://github.com/clojure/data.fressian)-serialized state on disk. Survives process restarts. Watermark-based incremental updates — on each call, the processor reads only events *after* the last watermark.
+**L2 ([LMDB](http://www.lmdb.tech/doc/starting.html)):** [Fressian](https://github.com/clojure/data.fressian)-serialized state on disk. Survives process restarts. Watermark-based incremental updates — on each call, the processor reads only events *after* the last watermark.
 
 Three L2 storage strategies are selected automatically:
 

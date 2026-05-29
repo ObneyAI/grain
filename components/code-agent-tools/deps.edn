@@ -1,0 +1,30 @@
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        cat/anomalies {:local/root "../anomalies"}
+        cat/command-processor-v2 {:local/root "../command-processor-v2"}
+        cat/core-async-thread-pool {:local/root "../core-async-thread-pool"}
+        cat/query-processor {:local/root "../query-processor"}
+        cat/query-schema {:local/root "../query-schema"}
+        cat/read-model-processor-v2 {:local/root "../read-model-processor-v2"}
+        cat/todo-processor-v2 {:local/root "../todo-processor-v2"}
+        cat/periodic-task {:local/root "../periodic-task"}
+        cat/event-store-v3 {:local/root "../event-store-v3"}
+        cat/fressian-util {:local/root "../fressian-util"}
+        cat/kv-store {:local/root "../kv-store"}
+        cat/pubsub {:local/root "../pubsub"}
+        cat/schema-util {:local/root "../schema-util"}
+        cat/time {:local/root "../time"}
+        cat/control-plane {:local/root "../control-plane"}
+        metosin/malli {:mvn/version "0.16.4"}}
+
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {cat/example-base {:local/root "../../bases/example-base"}
+                               cat/example-service {:local/root "../example-service"}
+                               cat/kv-store {:local/root "../kv-store"}
+                               cat/kv-store-lmdb {:local/root "../kv-store-lmdb"}
+                               cat/webserver {:local/root "../webserver"}
+                               cat/command-request-handler-v2 {:local/root "../command-request-handler-v2"}
+                               cat/query-request-handler {:local/root "../query-request-handler"}
+                               cat/mulog-aws-cloudwatch-emf-publisher {:local/root "../mulog-aws-cloudwatch-emf-publisher"}}
+                  :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}}}

@@ -1,0 +1,21 @@
+{:paths []
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        cat/code-agent-tools {:local/root "../../components/code-agent-tools"}
+        cat/anomalies {:local/root "../../components/anomalies"}
+        cat/command-processor-v2 {:local/root "../../components/command-processor-v2"}
+        cat/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}
+        cat/query-processor {:local/root "../../components/query-processor"}
+        cat/query-schema {:local/root "../../components/query-schema"}
+        cat/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        cat/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
+        cat/periodic-task {:local/root "../../components/periodic-task"}
+        cat/event-store-v3 {:local/root "../../components/event-store-v3"}
+        cat/fressian-util {:local/root "../../components/fressian-util"}
+        cat/kv-store {:local/root "../../components/kv-store"}
+        cat/pubsub {:local/root "../../components/pubsub"}
+        cat/schema-util {:local/root "../../components/schema-util"}
+        cat/time {:local/root "../../components/time"}
+        cat/control-plane {:local/root "../../components/control-plane"}}
+
+ :aliases {:test {:extra-paths []
+                  :extra-deps {}}}}

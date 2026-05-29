@@ -10,7 +10,7 @@
    (REPL) looks the handler up in the registry. Commands either return a
    cognitect anomaly or a map that optionally has a `:command-result/events`
    key containing a sequence of valid events per the event-store event
-   schema and optionally `:command/result` returned to the caller.
+   schema and optionally a `:command/result`.
 
    The `:authorized?` opt is required for the command to be reachable over
    HTTP via command-request-handler-v2."

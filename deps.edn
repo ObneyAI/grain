@@ -15,6 +15,7 @@
                                poly/query-processor {:local/root "components/query-processor"}
                                poly/query-request-handler {:local/root "components/query-request-handler"}
                                poly/query-schema {:local/root "components/query-schema"}
+                               poly/code-agent-tools {:local/root "components/code-agent-tools"}
                                poly/event-store-v2 {:local/root "components/event-store-v2"}
                                poly/event-store-postgres-v2 {:local/root "components/event-store-postgres-v2"}
                                poly/event-store-v3 {:local/root "components/event-store-v3"}
