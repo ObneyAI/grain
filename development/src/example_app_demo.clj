@@ -39,10 +39,8 @@
   (try
     (cp/process-command
      (assoc context
-            :command {:command/name :example/create-counter
-                      :command/timestamp (time/now)
-                      :command/id (random-uuid)
-                      :name "Counter A"}))
+            :command (cp/->command {:command/name :example/create-counter
+                                    :name "Counter A"})))
     (catch Exception e (ex-data e)))
 
   (into [] (es/read event-store {:tenant-id tenant-id}))
@@ -69,10 +67,8 @@
 
   (cp/process-command
    (assoc context
-          :command {:command/name :example/increment-counter
-                    :command/timestamp (time/now)
-                    :command/id (random-uuid)
-                    :counter-id (:counter/id counter)}))
+          :command (cp/->command {:command/name :example/increment-counter
+                                  :counter-id (:counter/id counter)})))
 
 
   ;; Projects the :example/counters read model (read-model-processor-v2).

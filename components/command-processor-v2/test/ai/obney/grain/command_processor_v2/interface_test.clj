@@ -58,13 +58,11 @@
 ;; Test Helpers
 
 (defn make-command
-  [command-name & {:keys [id timestamp extra-data]
-                   :or {id (uuid/v4)
-                        timestamp (OffsetDateTime/now)}}]
-  (merge {:command/name command-name
-          :command/id id
-          :command/timestamp timestamp}
-         extra-data))
+  [command-name & {:keys [id timestamp extra-data]}]
+  (cp/->command
+   (cond-> (merge {:command/name command-name} extra-data)
+     id (assoc :command/id id)
+     timestamp (assoc :command/timestamp timestamp))))
 
 (defn make-context
   [command command-registry]
