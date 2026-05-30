@@ -52,6 +52,19 @@
   (let [g (layout/render-element [:text {:text "abcdefgh"}] {:width 4 :height 1})]
     (is (= ["a" "b" "c" "d"] (chars-of g 0)))))
 
+(deftest text-wraps-on-word-boundaries
+  (let [g (layout/render-element [:text {:text "alpha beta gamma"}]
+                                 {:width 10 :height 2})]
+    (is (= ["a" "l" "p" "h" "a" " " "b" "e" "t" "a"] (chars-of g 0)))
+    (is (= ["g" "a" "m" "m" "a" " " " " " " " " " "] (chars-of g 1)))))
+
+(deftest text-hard-wraps-long-tokens
+  (let [g (layout/render-element [:text {:text "abcdefghijkl"}]
+                                 {:width 5 :height 3})]
+    (is (= ["a" "b" "c" "d" "e"] (chars-of g 0)))
+    (is (= ["f" "g" "h" "i" "j"] (chars-of g 1)))
+    (is (= ["k" "l" " " " " " "] (chars-of g 2)))))
+
 ;; ──────────────────────────────────────────────────────────────────────────
 ;; §7.1 :line
 ;; ──────────────────────────────────────────────────────────────────────────
@@ -170,6 +183,21 @@
     (is (= "▶ " (apply str (subvec (chars-of g 1) 0 2))))
     (is (= "a"  (:char (get-in g [:cells 0 2]))))
     (is (= "b"  (:char (get-in g [:cells 1 2]))))))
+
+(deftest list-advertises-item-count-to-column-layout
+  (let [g (layout/render-element [:col
+                                  [:text {:text "top"}]
+                                  [:list {:items [[:text {:text "one"}]
+                                                   [:text {:text "two"}]
+                                                   [:text {:text "three"}]]
+                                          :selected 0}]
+                                  [:text {:text "bottom"}]]
+                                 {:width 12 :height 5})]
+    (is (= "top" (apply str (take 3 (chars-of g 0)))))
+    (is (re-find #"one" (apply str (chars-of g 1))))
+    (is (re-find #"two" (apply str (chars-of g 2))))
+    (is (re-find #"three" (apply str (chars-of g 3))))
+    (is (re-find #"bottom" (apply str (chars-of g 4))))))
 
 ;; ──────────────────────────────────────────────────────────────────────────
 ;; §7.3 :table

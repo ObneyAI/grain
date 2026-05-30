@@ -21,6 +21,7 @@
             [ai.obney.grain.tui-adapter.cells :as cells]
             [ai.obney.grain.tui-adapter.diff :as diff]
             [ai.obney.grain.tui-adapter.layout :as layout]
+            [ai.obney.grain.tui-adapter.text-wrap :as text-wrap]
             [clojure.string :as string]))
 
 ;; ─────────────────────────────────────────────────────────────────────
@@ -88,12 +89,6 @@
           acc
           (recur (cons s acc) (- budget h) (rest remaining)))))))
 
-(defn- wrap-visual-line-count
-  [width s]
-  (if (or (zero? width) (empty? s))
-    1
-    (long (Math/ceil (/ (count s) (double width))))))
-
 (defn- text-content
   [hiccup]
   (when (and (vector? hiccup) (= :text (first hiccup)))
@@ -105,10 +100,7 @@
 
 (defn- text-visual-height
   [width s]
-  (->> (string/split (or s "") #"\n" -1)
-       (map #(wrap-visual-line-count width %))
-       (reduce + 0)
-       (max 1)))
+  (text-wrap/visual-line-count width s))
 
 (defn- segment-height
   [segment hiccup-path width]

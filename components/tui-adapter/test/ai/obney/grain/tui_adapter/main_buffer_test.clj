@@ -348,6 +348,68 @@
       (is (not (str/includes? c "\n"))
           "fixed chrome repaint should use absolute rows, not newlines"))))
 
+(deftest clearing-passive-overlay-happens-before-new-stream-output
+  ;; Regression: when a progress overlay disappeared in the same frame
+  ;; that the assistant answer arrived, the renderer emitted the answer
+  ;; into the expanded scroll region and then cleared the old overlay
+  ;; footprint, erasing the answer from the terminal.
+  (let [pq (atom {:tui/hiccup [:text "intro"]
+                  :tui/overlay {:type :status
+                                :content [:col
+                                          [:text "Agent"]
+                                          [:text "working"]
+                                          [:text ""]
+                                          [:text ""]
+                                          [:text ""]
+                                          [:text ""]
+                                          [:text ""]
+                                          [:gap 1]]}
+                  :msgs [(attach-h {:id 1 :body "question"})]})
+        {:keys [session out]}
+        (make-session {:default-screen main-stream-screen})]
+    (swap! session assoc :process-query-fn (fn [_] @pq))
+    (session/render-frame! session)
+    (reset! out [])
+    (reset! pq {:tui/hiccup [:text "intro"]
+                :msgs [(attach-h {:id 1 :body "question"})
+                       (attach-h {:id 2 :body "answer"})]})
+    (session/render-frame! session)
+    (let [c (combined out)
+          clear-idx (.indexOf c "                              ")
+          answer-idx (.indexOf c ">> answer")]
+      (is (str/includes? c ">> answer"))
+      (is (<= 0 clear-idx answer-idx)
+          "old overlay rows must be cleared before new answer bytes are emitted"))))
+
+(deftest reserved-lane-palette-uses-compact-height-and-reserves-space
+  (let [pq (atom {:tui/hiccup [:text "intro"]
+                  :tui/overlay {:type :palette
+                                :config {:title "Permission Required"
+                                         :placement :reserved-lane
+                                         :filterable? false
+                                         :max-width 28
+                                         :help "Enter select Esc deny"
+                                         :item-label :label
+                                         :details [{:label "Action" :value "List"}
+                                                   {:label "Tool" :value "fs/list"}]}
+                                :selected 1
+                                :items [{:label "Yes, this time"}
+                                        {:label "Yes, for this session"}
+                                        {:label "No"}]}
+                  :msgs []})
+        {:keys [session out]}
+        (make-session {:default-screen main-stream-screen})]
+    (swap! session assoc
+           :viewport {:width 40 :height 16}
+           :process-query-fn (fn [_] @pq))
+    (session/render-frame! session)
+    (let [c (combined out)]
+      (is (= 8 (:main-overlay-height @session)))
+      (is (= 8 (:main-overlay-reserve-height @session)))
+      (is (str/includes? c "Yes, this time"))
+      (is (str/includes? c "Yes, for this session"))
+      (is (str/includes? c "No")))))
+
 (deftest violation-recovers-on-next-append
   ;; If a key disappears (violation logged), the function emits
   ;; nothing for that call. But subsequent calls with NEW keys past

@@ -308,6 +308,46 @@
   (let [{:keys [query-overlay overlay]} @session]
     (or query-overlay overlay)))
 
+(defn- input-blocking-overlay?
+  [overlay-state]
+  (contains? #{:palette :modal} (:type overlay-state)))
+
+(defn- passive-overlay?
+  [overlay-state]
+  (and overlay-state (not (input-blocking-overlay? overlay-state))))
+
+(defn- reserved-lane-overlay?
+  [overlay-state]
+  (and overlay-state
+       (or (passive-overlay? overlay-state)
+           (= :reserved-lane (:placement overlay-state))
+           (= :reserved-lane (get-in overlay-state [:config :placement])))))
+
+(defn- palette-natural-height
+  [overlay-state]
+  (let [config (:config overlay-state)
+        detail-rows (count (:details config))
+        filter-row (if (not= false (:filterable? config)) 1 0)
+        item-rows (count (:items overlay-state))
+        help-row 1
+        border-rows 2]
+    (+ border-rows detail-rows filter-row item-rows help-row)))
+
+(defn- overlay-render-height
+  [overlay-state viewport]
+  (cond
+    (reserved-lane-overlay? overlay-state)
+    (min (:height viewport)
+         (case (:type overlay-state)
+           :palette (palette-natural-height overlay-state)
+           12))
+
+    (input-blocking-overlay? overlay-state)
+    (:height viewport)
+
+    :else
+    (min (:height viewport) 12)))
+
 (defn- preserve-query-overlay-state
   [prior next-overlay]
   (if (and prior next-overlay (= (:id prior) (:id next-overlay)))
@@ -433,7 +473,7 @@
           max-w (or (get-in overlay-state [:config :max-width])
                     (:width viewport))
           overlay-width (max 1 (min (:width viewport) max-w))
-          height (min (:height viewport) 12)
+          height (overlay-render-height overlay-state viewport)
           grid (layout/render-element hiccup {:width overlay-width
                                               :height height})
           x (max 0 (min 2 (- (:width viewport) (:width grid))))
@@ -494,7 +534,6 @@
         {:keys [viewport terminal-caps ansi-style on-output]} s
         screen      (:current-screen s)
         overlay     (effective-overlay session)
-        prior-overlay-height (:main-overlay-height s 0)
         ia-cfg      (input-area-config session)
         ia-h        (if ia-cfg
                       (input-area/preferred-height (:input-area s) ia-cfg)
@@ -502,9 +541,17 @@
         H        (:height viewport)
         W        (:width  viewport)
         chrome-top  (- H ia-h)
-        emit-row    (max 0 (dec chrome-top)) ; last row of the scroll region
+        overlay-grid (render-overlay-grid overlay
+                                          {:width W :height (max 1 chrome-top)})
+        overlay-height (or (:height overlay-grid) 0)
+        reserve-height (if (reserved-lane-overlay? overlay) overlay-height 0)
+        scroll-bottom (max 0 (dec (- chrome-top reserve-height)))
+        emit-row    scroll-bottom ; last row of the scroll region
         stream-spec (:tui/segments screen)
         prior-ss    (or (:stream-state s) (stream/empty-stream-state))
+        prior-overlay-height (:main-overlay-height s 0)
+        prior-overlay-top (:main-overlay-top s)
+        scroll-region-bytes (ansi/set-scroll-region 0 scroll-bottom)
         ;; First-frame setup: scroll region + intro emission.
         first?      (not (:intro-printed? prior-ss))
         [intro-bytes intro-style]
@@ -516,7 +563,7 @@
                 intro-grid   (when intro-hiccup
                                (layout/render-element
                                  intro-hiccup
-                                 {:width W :height (max 1 (- chrome-top 0))}))
+                                 {:width W :height (max 1 (inc scroll-bottom))}))
                 [body-bytes body-style]
                 (if intro-grid
                   (emit-grid-as-lines intro-grid
@@ -526,8 +573,7 @@
             ;; Sequence: set scroll region, position at top, hide cursor,
             ;; emit intro lines, position at bottom row of scroll region
             ;; so subsequent segments land in the right place.
-            [(str (ansi/set-scroll-region 0 (max 0 (dec chrome-top)))
-                  (ansi/cursor-position 0 0)
+            [(str (ansi/cursor-position 0 0)
                   (ansi/hide-cursor)
                   body-bytes
                   (ansi/cursor-position emit-row 0))
@@ -554,42 +600,61 @@
                          final-style)]
             cb)
           "")
-        overlay-grid (render-overlay-grid overlay
-                                          {:width W :height (max 1 chrome-top)})
-        overlay-height (or (:height overlay-grid) 0)
         overlay-top (max 0 (- chrome-top overlay-height))
-        clear-height (max prior-overlay-height overlay-height)
+        clear-top (cond
+                    (and prior-overlay-top overlay-grid)
+                    (min prior-overlay-top overlay-top)
+                    prior-overlay-top prior-overlay-top
+                    overlay-grid overlay-top
+                    :else nil)
+        clear-bottom (cond
+                       (and prior-overlay-top overlay-grid)
+                       (max (+ prior-overlay-top prior-overlay-height)
+                            (+ overlay-top overlay-height))
+                       prior-overlay-top (+ prior-overlay-top prior-overlay-height)
+                       overlay-grid (+ overlay-top overlay-height)
+                       :else nil)
+        clear-height (if (and clear-top clear-bottom)
+                       (max 0 (- clear-bottom clear-top))
+                       0)
         clear-grid (when (pos? clear-height)
                      (cells/blank W clear-height))
+        [clear-bytes _]
+        (if clear-grid
+          (emit-grid-at-rows clear-grid clear-top
+                             (or terminal-caps {:color :truecolor})
+                             final-style)
+          ["" final-style])
         [overlay-bytes _]
-        (cond
-          overlay-grid
+        (if overlay-grid
           (emit-grid-at-rows overlay-grid overlay-top
                              (or terminal-caps {:color :truecolor})
                              final-style)
-
-          (pos? prior-overlay-height)
-          (emit-grid-at-rows clear-grid
-                             (max 0 (- chrome-top prior-overlay-height))
-                             (or terminal-caps {:color :truecolor})
-                             final-style)
-
-          :else ["" final-style])
+          ["" final-style])
         ;; Cursor: position inside the prompt area (if any) and show.
         cursor-bytes
-        (if (and ia-cur (nil? overlay))
+        (if (and ia-cur (not (input-blocking-overlay? overlay)))
           (let [[c-col c-row] ia-cur]
             (str (ansi/cursor-style-block)
                  (ansi/cursor-position (+ chrome-top c-row) c-col)
                  (ansi/show-cursor)))
           (ansi/hide-cursor))
-        out (str intro-bytes seg-bytes chrome-bytes overlay-bytes cursor-bytes)]
+        out (str scroll-region-bytes
+                 clear-bytes
+                 intro-bytes
+                 seg-bytes
+                 chrome-bytes
+                 overlay-bytes
+                 cursor-bytes)]
     (when (and on-output (seq out))
       (on-output out))
     (swap! session assoc
            :ansi-style    final-style
-           :cursor-shown? (and (some? ia-cur) (nil? overlay))
+           :cursor-shown? (and (some? ia-cur)
+                               (not (input-blocking-overlay? overlay)))
            :main-overlay-height overlay-height
+           :main-overlay-top (when overlay-grid overlay-top)
+           :main-overlay-reserve-height reserve-height
            :stream-state  (assoc new-ss :intro-printed? true))
     nil))
 
@@ -602,14 +667,18 @@
    viewport are reserved for the input area and the terminal cursor
    is positioned inside it.
 
-   Main-buffer stream screens use the same viewport diff path as other
-   screens so refreshes, resizes, and terminal clears repaint from the
-   query result instead of relying on append-only scrollback emission.
+   Main-buffer stream screens use append-only scrollback emission.
+   Snapshot screens and alt-buffer screens use the viewport diff path.
 
    Returns the new render-model CellGrid."
   [session]
-  (render-frame-alt! session)
-  (:render-model @session))
+  (let [{:keys [current-screen]} @session]
+    (if (and (= :main (:tui/buffer current-screen))
+             (= :stream (:tui/projection current-screen)))
+      (do (render-frame-main! session)
+          (:render-model @session))
+      (do (render-frame-alt! session)
+          (:render-model @session)))))
 
 (defn- render-frame-alt!
   "Original viewport-diff render path. Used by alt-buffer screens and
@@ -850,7 +919,8 @@
       (= :palette (:type overlay))
       (dispatch-palette-key! session key-event)
 
-      (and (:tui/input current-screen) (nil? overlay))
+      (and (:tui/input current-screen)
+           (not (input-blocking-overlay? overlay)))
       (dispatch-input-area-key! session key-event)
 
       :else

@@ -10,6 +10,7 @@
             [ai.obney.grain.tui-adapter.element-registry :as er]
             [ai.obney.grain.tui-adapter.input-slot :as input-slot]
             [ai.obney.grain.tui-adapter.layout :as layout]
+            [ai.obney.grain.tui-adapter.text-wrap :as text-wrap]
             [clojure.string :as string]))
 
 ;; ─────────────────────────────────────────────────────────────────────
@@ -27,17 +28,9 @@
   [width style-attrs s]
   (cells/text-row width style-attrs (or s "")))
 
-(defn- wrap-visual-line
-  [width s]
-  (if (or (zero? width) (empty? s))
-    [""]
-    (mapv #(apply str %) (partition-all width s))))
-
 (defn- text-visual-lines
   [width s]
-  (->> (string/split (or s "") #"\n" -1)
-       (mapcat #(wrap-visual-line width %))
-       vec))
+  (text-wrap/visual-lines width s))
 
 (defn- styled-text-grid
   [width height style-attrs s]
@@ -265,6 +258,8 @@
                [:items    [:sequential :any]]
                [:selected {:optional true} [:maybe :int]]]
        :container? true
+       :preferred-size (fn [{:keys [items]} _children]
+                         {:width 0 :height (count (or items []))})
        :render
        (fn [{:keys [items selected]} _children {:keys [width height]} render-child]
          (let [items     (vec items)
