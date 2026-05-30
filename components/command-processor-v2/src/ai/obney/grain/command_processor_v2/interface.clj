@@ -1,6 +1,12 @@
 (ns ai.obney.grain.command-processor-v2.interface
   (:require [ai.obney.grain.command-processor-v2.core :as core]))
 
+(defn ->command
+  "Returns command with :command/id and :command/timestamp filled in
+   when not already present."
+  [command]
+  (core/->command command))
+
 (def command-registry* (atom {}))
 
 (defn register-command!
