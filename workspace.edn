@@ -7,14 +7,37 @@
  :tag-patterns {:stable "stable-*"
                 :release "v[0-9]*"}
  :projects {"development" {:alias "dev"}
-            "grain-core" {:alias "core"}
-            "grain-dspy-extensions" {:alias "gde"}
+            "grain-core" {:alias "core"
+                          :necessary ["behavior-tree-v2"
+                                      "command-request-handler"
+                                      "periodic-task"
+                                      "query-request-handler"
+                                      "read-model-processor"
+                                      "todo-processor"
+                                      "webserver"]}
+            "grain-dspy-extensions" {:alias "gde"
+                                      :necessary ["behavior-tree-v2-dspy-extensions"
+                                                  "clj-dspy"]}
             "grain-event-store-postgres" {:alias "es-pg"}
-            "grain-event-store-postgres-v2" {:alias "es-pg-v2"}
-            "grain-core-v2" {:alias "core-v2"}
-            "grain-datastar" {:alias "ds"}
-            "grain-code-agent-tools" {:alias "cat"}
-            "grain-control-plane" {:alias "cp"}
-            "grain-event-store-postgres-v3" {:alias "es-pg-v3"}
-            "grain-event-store-sqlite-v3" {:alias "es-sq-v3"}
-            "grain-mulog-aws-cloudwatch-emf-publisher" {:alias "mulog-aws-emf-pub"}}}
+            "grain-event-store-postgres-v2" {:alias "es-pg-v2"
+                                             :necessary ["event-store-postgres-v2"]}
+            "grain-core-v2" {:alias "core-v2"
+                             :necessary ["command-request-handler-v2"
+                                         "query-request-handler"
+                                         "read-model-processor-v2"
+                                         "todo-processor-v2"
+                                         "webserver"]}
+            "grain-datastar" {:alias "ds"
+                              :necessary ["datastar"]}
+            "grain-code-agent-tools" {:alias "cat"
+                                      :necessary ["code-agent-tools"]}
+            "grain-control-plane" {:alias "cp"
+                                   :necessary ["control-plane"]}
+            "grain-event-store-postgres-v3" {:alias "es-pg-v3"
+                                             :necessary ["control-plane"
+                                                         "event-store-postgres-v3"]}
+            "grain-event-store-sqlite-v3" {:alias "es-sq-v3"
+                                           :necessary ["control-plane"
+                                                       "event-store-sqlite-v3"]}
+            "grain-mulog-aws-cloudwatch-emf-publisher" {:alias "mulog-aws-emf-pub"
+                                                        :necessary ["mulog-aws-cloudwatch-emf-publisher"]}}}

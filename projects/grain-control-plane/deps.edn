@@ -1,5 +1,4 @@
-{:paths ["resources"]
- :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+{:deps {org.clojure/clojure {:mvn/version "1.12.0"}
 
         ;; Control plane
         control-plane/control-plane {:local/root "../../components/control-plane"}
