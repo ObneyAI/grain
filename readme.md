@@ -8,10 +8,6 @@ Grain is a set of composable building blocks for building event-sourced informat
 
 The constraints are deliberately *shallow*: a small set of foundational rules that bottom out at the storage layer. When natural language is the compiler — when an LLM is translating intent into code — the codebase it targets is what bounds the space of valid outputs. Grain narrows that space until drift becomes structurally impossible.
 
-Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks. Start with an in-memory event store for quick iteration, then swap in SQLite for embedded single-process deployments or Postgres for multi-instance — a single line change either way.
-
-For multi-instance deployments, an opt-in control plane coordinates tenant assignment across nodes using event-sourced leases — no external coordination service required.
-
 ## Why Grain?
 
 We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and-eventsourcing) to design [Simple](https://www.youtube.com/watch?v=SxdOUGdseq4) systems. Grain provides a single, composable toolkit for building multi-tenant, event-sourced applications in Clojure.
@@ -57,6 +53,12 @@ flowchart TB
 - **Todo Processors** — react to events asynchronously with configurable checkpointing (at-most-once or at-least-once).
 - **Periodic Tasks** — run on cron or interval schedules with CAS deduplication across nodes.
 - **Authorization** — all commands and queries require an `:authorized?` predicate. Deny by default.
+
+## Multi-Tenancy
+
+Every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks. Start with an in-memory event store for quick iteration, then swap in SQLite for embedded single-process deployments or Postgres for multi-instance — a single line change either way.
+
+For multi-instance deployments, an opt-in control plane coordinates tenant assignment across nodes using event-sourced leases — no external coordination service required.
 
 ## Distributed Coordination
 
