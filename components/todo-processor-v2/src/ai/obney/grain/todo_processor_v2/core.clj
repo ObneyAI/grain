@@ -8,7 +8,8 @@
             [integrant.core :as ig]
             [clojure.core.async :as async]
             [ai.obney.grain.core-async-thread-pool.interface :as thread-pool]
-            [clj-uuid :as uuid]))
+            [clj-uuid :as uuid])
+  (:import [java.util.concurrent ThreadPoolExecutor TimeUnit]))
 
 ;; ------------------- ;;
 ;; Processor Registry  ;;
@@ -642,4 +643,11 @@
     (.join thread 5000))
   (when pool
     (.shutdown pool)
-    (.awaitTermination pool 5 java.util.concurrent.TimeUnit/SECONDS)))
+    (when-not (.awaitTermination pool 30 TimeUnit/SECONDS)
+      (.shutdownNow pool)
+      (when-not (.awaitTermination pool 30 TimeUnit/SECONDS)
+        (throw (ex-info "Tenant poller worker pool did not terminate"
+                        (if (instance? ThreadPoolExecutor pool)
+                          {:active-count (.getActiveCount ^ThreadPoolExecutor pool)
+                           :queued-count (.size (.getQueue ^ThreadPoolExecutor pool))}
+                          {})))))))
