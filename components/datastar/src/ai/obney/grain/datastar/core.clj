@@ -65,6 +65,7 @@
             [ai.obney.grain.query-processor.interface :as qp]
             [ai.obney.grain.command-processor-v2.interface :as cp]
             [ai.obney.grain.pubsub.interface :as pubsub]
+            [ai.obney.grain.event-tailer.interface :as event-tailer]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.anomalies.interface :refer [anomaly?]]
@@ -348,15 +349,60 @@
     (fn [event]
       (set/subset? resolved (:event/tags event)))))
 
+(defn- resolve-tenant-id
+  [query-context]
+  (or (:tenant-id query-context)
+      (get-in query-context [:auth-claims :tenant-id])))
+
+(defn- resolve-event-filter
+  [tenant-id event-tags query-context]
+  (let [preds (cond-> []
+                tenant-id
+                (conj #(= tenant-id (:grain/tenant-id %)))
+                event-tags
+                (conj (resolve-event-tags event-tags query-context)))]
+    (when (seq preds)
+      (fn [event]
+        (every? #(% event) preds)))))
+
+(def ^:private max-seen-event-ids 1024)
+
+(defn- event-dedupe-key
+  [event]
+  (when-let [event-id (:event/id event)]
+    [(:grain/tenant-id event) event-id]))
+
+(defn- event-dedupe-xf
+  "Drops duplicate stored events within one SSE stream.
+   Events without :event/id are legacy/manual pubsub messages and are passed through."
+  []
+  (let [seen (volatile! #{})
+        order (volatile! clojure.lang.PersistentQueue/EMPTY)]
+    (filter
+     (fn [event]
+       (if-let [k (event-dedupe-key event)]
+         (if (contains? @seen k)
+           false
+           (do
+             (vswap! seen conj k)
+             (vswap! order conj k)
+             (when (> (count @order) max-seen-event-ids)
+               (let [oldest (peek @order)]
+                 (vswap! order pop)
+                 (vswap! seen disj oldest)))
+             true))
+         true)))))
+
 (defn- subscribe-to-events
   "Creates a sliding-buffer channel and subscribes it to each event type via pubsub.
    When event-filter-fn is provided, applies it as a transducer on the channel.
    Returns the subscription channel."
   [event-pubsub event-types event-filter-fn]
   (let [buf (async/sliding-buffer 64)
-        sub-chan (if event-filter-fn
-                  (async/chan buf (filter event-filter-fn))
-                  (async/chan buf))]
+        xf (if event-filter-fn
+             (comp (filter event-filter-fn) (event-dedupe-xf))
+             (event-dedupe-xf))
+        sub-chan (async/chan buf xf)]
     (doseq [event-type event-types]
       (pubsub/sub event-pubsub {:topic event-type :sub-chan sub-chan}))
     sub-chan))
@@ -385,10 +431,13 @@
         session-key [user-id query-name nonce]
         _ (swap! active-stream-contexts assoc session-key
                  {:context-atom context-atom :signal-ch signal-ch :event-ch event-ch})
-        event-filter-fn (when event-tags
-                          (resolve-event-tags event-tags @context-atom))
+        tenant-id (resolve-tenant-id initial-context)
+        event-tailer (:event-tailer initial-context)
+        event-filter-fn (resolve-event-filter tenant-id event-tags @context-atom)
         sub-chan (subscribe-to-events event-pubsub event-types event-filter-fn)]
     (try
+      (when (and event-tailer tenant-id)
+        (event-tailer/subscribe! event-tailer tenant-id event-types))
       ;; Initial render
       (let [initial (poll-and-render @context-atom nil)]
         (when initial
@@ -441,6 +490,8 @@
         (when-not (= "stop" (.getMessage e))
           (u/log ::stream-view-events-error :error e)))
       (finally
+        (when (and event-tailer tenant-id)
+          (event-tailer/unsubscribe! event-tailer tenant-id event-types))
         (swap! active-stream-contexts dissoc session-key)
         (async/close! signal-ch)
         (async/close! sub-chan)

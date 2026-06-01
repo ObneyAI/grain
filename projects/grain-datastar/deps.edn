@@ -5,6 +5,7 @@
         ds/query-processor {:local/root "../../components/query-processor"}
         ds/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
         ds/pubsub {:local/root "../../components/pubsub"}
+        ds/event-tailer {:local/root "../../components/event-tailer"}
         ds/event-store-v3 {:local/root "../../components/event-store-v3"}
         ds/anomalies {:local/root "../../components/anomalies"}
         ds/schema-util {:local/root "../../components/schema-util"}

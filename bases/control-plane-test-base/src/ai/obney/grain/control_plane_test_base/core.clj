@@ -6,6 +6,7 @@
   (:require [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.event-store-postgres-v3.interface]
             [ai.obney.grain.pubsub.interface :as pubsub]
+            [ai.obney.grain.event-tailer.interface :as event-tailer]
             [ai.obney.grain.control-plane.interface :as control-plane]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.periodic-task.interface :as pt]
@@ -18,6 +19,7 @@
             [clj-uuid :as uuid]
             [io.pedestal.http :as http]
             [io.pedestal.http.route :as route]
+            [clojure.core.async :as async]
             [clojure.data.json :as json]))
 
 ;; ------------------- ;;
@@ -186,6 +188,10 @@
         event-pubsub (pubsub/start {:type :core-async :topic-fn :event/type})
         event-store (es/start {:conn (assoc (pg-config) :type :postgres)
                                :event-pubsub event-pubsub})
+        event-tailer (event-tailer/start {:event-store event-store
+                                           :event-pubsub event-pubsub
+                                           :poll-interval-ms 100
+                                           :batch-size 100})
         cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir cache-dir :db-name "cp-test"}))
 
         ;; Control plane — include address in node metadata for routing
@@ -206,6 +212,8 @@
 
         system {:event-store event-store
                 :event-pubsub event-pubsub
+                :event-tailer event-tailer
+                :tail-probe (atom nil)
                 :cache cache
                 :cache-dir cache-dir
                 :control-plane cp
@@ -227,13 +235,80 @@
 
     (assoc system :http-server http-server)))
 
+(defn stop-tail-probe!
+  "Stop the current local tail probe, if one exists."
+  [system]
+  (when-let [probe @(:tail-probe system)]
+    (doseq [event-types (:registrations probe)]
+      (event-tailer/unsubscribe! (:event-tailer system)
+                                 (:tenant-id probe)
+                                 event-types))
+    (async/close! (:chan probe))
+    (reset! (:tail-probe system) nil)
+    true))
+
+(defn start-tail-probe!
+  "Start or extend a local probe for events published through this node's pubsub.
+   Repeated calls for the same tenant/types add overlapping tailer interest
+   without adding another pubsub subscription."
+  [system tenant-id event-types]
+  (let [event-types (set event-types)]
+    (if-let [probe @(:tail-probe system)]
+      (do
+        (when-not (= tenant-id (:tenant-id probe))
+          (throw (ex-info "Tail probe already active for a different tenant"
+                          {:existing-tenant-id (:tenant-id probe)
+                           :requested-tenant-id tenant-id})))
+        (event-tailer/subscribe! (:event-tailer system) tenant-id event-types)
+        (swap! (:tail-probe system)
+               (fn [p]
+                 (-> p
+                     (update :event-types into event-types)
+                     (update :registrations conj event-types)
+                     (update :subscription-count inc))))
+        true)
+      (let [ch (async/chan (async/sliding-buffer 256))
+            events (atom [])]
+        (doseq [event-type event-types]
+          (pubsub/sub (:event-pubsub system) {:topic event-type :sub-chan ch}))
+        (async/go-loop []
+          (when-let [event (async/<! ch)]
+            (swap! events conj event)
+            (recur)))
+        (event-tailer/subscribe! (:event-tailer system) tenant-id event-types)
+        (reset! (:tail-probe system)
+                {:tenant-id tenant-id
+                 :event-types event-types
+                 :registrations [event-types]
+                 :subscription-count 1
+                 :chan ch
+                 :events events})
+        true))))
+
+(defn tail-probe-events
+  "Return events observed by the current local tail probe."
+  [system]
+  (if-let [probe @(:tail-probe system)]
+    @(:events probe)
+    []))
+
+(defn reset-tail-probe-events!
+  "Clear the observed events for the current local tail probe."
+  [system]
+  (when-let [probe @(:tail-probe system)]
+    (reset! (:events probe) [])
+    true))
+
 (defn stop
   "Stop the test app."
-  [{:keys [control-plane periodic-triggers nrepl-server http-server event-pubsub event-store cache console-stop]}]
+  [{:keys [control-plane periodic-triggers nrepl-server http-server event-tailer event-pubsub event-store cache console-stop]
+    :as system}]
+  (stop-tail-probe! system)
   (stop-http-server http-server)
   (pt/stop-periodic-triggers! periodic-triggers)
   (control-plane/stop control-plane)
   (nrepl/stop-server nrepl-server)
+  (event-tailer/stop event-tailer)
   (pubsub/stop event-pubsub)
   (kv/stop cache)
   (es/stop event-store)

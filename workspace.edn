@@ -23,6 +23,7 @@
                                              :necessary ["event-store-postgres-v2"]}
             "grain-core-v2" {:alias "core-v2"
                              :necessary ["command-request-handler-v2"
+                                         "event-tailer"
                                          "query-request-handler"
                                          "read-model-processor-v2"
                                          "todo-processor-v2"

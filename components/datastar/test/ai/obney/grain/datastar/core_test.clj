@@ -12,6 +12,7 @@
             [ai.obney.grain.query-schema.interface]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.pubsub.interface :as pubsub]
+            [ai.obney.grain.event-tailer.interface :as event-tailer]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.webserver.interface :as ws]
             [io.pedestal.http :as http])
@@ -644,6 +645,23 @@
                                        nil [])
                                 (recur events nil []))
             :else (recur events current-name current-data)))))))
+
+(defn- take-event
+  [ch timeout-ms]
+  (async/alt!!
+    ch ([v] v)
+    (async/timeout timeout-ms) nil))
+
+(defn- eventually?
+  [pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (cond
+        (pred) true
+        (> (System/currentTimeMillis) deadline) false
+        :else (do
+                (Thread/sleep 10)
+                (recur))))))
 
 ;; =========================== ;;
 ;; E2E Test Fixture             ;;
@@ -1302,6 +1320,169 @@
     (is (= "datastar-patch-elements" (:name (second stream-events))))
     ;; Second render should contain updated value
     (is (str/includes? (:data (second stream-events)) "42"))))
+
+(deftest event-driven-stream-registers-with-event-tailer-test
+  (let [tenant-id (random-uuid)
+        state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        context {:test-state state
+                 :query-registry (assoc-in @qp/query-registry*
+                                           [:test/event-counters :authorized?]
+                                           (constantly false))
+                 :event-pubsub ps
+                 :event-tailer ::tailer
+                 :tenant-id tenant-id}
+        event-ch (async/chan 10)
+        subscribed (atom [])
+        unsubscribed (atom [])]
+    (try
+      (with-redefs [event-tailer/subscribe! (fn [tailer tid event-types]
+                                              (swap! subscribed conj [tailer tid event-types]))
+                    event-tailer/unsubscribe! (fn [tailer tid event-types]
+                                                (swap! unsubscribed conj [tailer tid event-types]))]
+        (let [stream (future
+                       (#'ds/stream-view-loop-events
+                        event-ch
+                        {:request {:query-params {} :path-params {}}}
+                        context
+                        :test/event-counters
+                        ps
+                        #{:test/counter-incremented}
+                        10
+                        {}
+                        nil))]
+          (is (= "datastar-patch-signals" (:name (async/<!! event-ch))))
+          (is (= [[::tailer tenant-id #{:test/counter-incremented}]]
+                 @subscribed))
+          (is (eventually? #(realized? stream) 1000))
+          (is (= [[::tailer tenant-id #{:test/counter-incremented}]]
+                 @unsubscribed))))
+      (finally
+        (pubsub/stop ps)))))
+
+(deftest event-driven-stream-filters-by-tenant-test
+  (let [tenant-id (random-uuid)
+        other-tenant-id (random-uuid)
+        state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        context {:test-state state
+                 :query-registry @qp/query-registry*
+                 :event-pubsub ps
+                 :event-tailer ::tailer
+                 :tenant-id tenant-id}
+        event-ch (async/chan 10)]
+    (try
+      (with-redefs [event-tailer/subscribe! (fn [& _])
+                    event-tailer/unsubscribe! (fn [& _])]
+        (let [stream (future
+                       (#'ds/stream-view-loop-events
+                        event-ch
+                        {:request {:query-params {} :path-params {}}}
+                        context
+                        :test/event-counters
+                        ps
+                        #{:test/counter-incremented}
+                        10
+                        {}
+                        nil))]
+          (is (= "datastar-patch-elements" (:name (async/<!! event-ch))))
+          (swap! state assoc-in [:counters 0 :value] 41)
+          (pubsub/pub ps {:message {:event/type :test/counter-incremented
+                                    :grain/tenant-id other-tenant-id}})
+          (is (nil? (take-event event-ch 150)))
+          (swap! state assoc-in [:counters 0 :value] 42)
+          (pubsub/pub ps {:message {:event/type :test/counter-incremented
+                                    :grain/tenant-id tenant-id}})
+          (let [rerender (take-event event-ch 1000)]
+            (is (= "datastar-patch-elements" (:name rerender)))
+            (is (str/includes? (:data rerender) "42")))
+          (async/close! event-ch)
+          (pubsub/pub ps {:message {:event/type :test/counter-incremented
+                                    :grain/tenant-id tenant-id}})
+          (is (nil? (deref stream 1000 nil)))))
+      (finally
+        (pubsub/stop ps)))))
+
+(deftest event-driven-stream-dedupes-stored-events-test
+  (let [tenant-id (random-uuid)
+        event-id (random-uuid)
+        state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        context {:test-state state
+                 :query-registry @qp/query-registry*
+                 :event-pubsub ps
+                 :tenant-id tenant-id}
+        event-ch (async/chan 10)
+        event {:event/id event-id
+               :event/type :test/counter-incremented
+               :grain/tenant-id tenant-id}]
+    (try
+      (let [stream (future
+                     (#'ds/stream-view-loop-events
+                      event-ch
+                      {:request {:query-params {} :path-params {}}}
+                      context
+                      :test/event-counters
+                      ps
+                      #{:test/counter-incremented}
+                      0
+                      {}
+                      nil))]
+        (is (= "datastar-patch-elements" (:name (async/<!! event-ch))))
+        (swap! state assoc-in [:counters 0 :value] 41)
+        (pubsub/pub ps {:message event})
+        (let [rerender (take-event event-ch 1000)]
+          (is (= "datastar-patch-elements" (:name rerender)))
+          (is (str/includes? (:data rerender) "41")))
+        (swap! state assoc-in [:counters 0 :value] 42)
+        (pubsub/pub ps {:message event})
+        (is (nil? (take-event event-ch 150)))
+        (async/close! event-ch)
+        (pubsub/pub ps {:message (assoc event :event/id (random-uuid))})
+        (is (nil? (deref stream 1000 nil))))
+      (finally
+        (pubsub/stop ps)))))
+
+(deftest event-driven-stream-does-not-dedupe-idless-events-test
+  (let [state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        context {:test-state state
+                 :query-registry @qp/query-registry*
+                 :event-pubsub ps}
+        event-ch (async/chan 10)
+        event {:event/type :test/counter-incremented}]
+    (try
+      (let [stream (future
+                     (#'ds/stream-view-loop-events
+                      event-ch
+                      {:request {:query-params {} :path-params {}}}
+                      context
+                      :test/event-counters
+                      ps
+                      #{:test/counter-incremented}
+                      0
+                      {}
+                      nil))]
+        (is (= "datastar-patch-elements" (:name (async/<!! event-ch))))
+        (swap! state assoc-in [:counters 0 :value] 41)
+        (pubsub/pub ps {:message event})
+        (let [rerender (take-event event-ch 1000)]
+          (is (= "datastar-patch-elements" (:name rerender)))
+          (is (str/includes? (:data rerender) "41")))
+        (swap! state assoc-in [:counters 0 :value] 42)
+        (pubsub/pub ps {:message event})
+        (let [rerender (take-event event-ch 1000)]
+          (is (= "datastar-patch-elements" (:name rerender)))
+          (is (str/includes? (:data rerender) "42")))
+        (async/close! event-ch)
+        (pubsub/pub ps {:message event})
+        (is (nil? (deref stream 1000 nil))))
+      (finally
+        (pubsub/stop ps)))))
 
 (deftest e2e-event-driven-debounce-test
   (let [client (HttpClient/newHttpClient)

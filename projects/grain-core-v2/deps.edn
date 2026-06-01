@@ -12,6 +12,7 @@
         gcv2/query-request-handler {:local/root "../../components/query-request-handler"}
         gcv2/query-schema {:local/root "../../components/query-schema"}
         gcv2/event-store-v3 {:local/root "../../components/event-store-v3"}
+        gcv2/event-tailer {:local/root "../../components/event-tailer"}
         gcv2/anomalies {:local/root "../../components/anomalies"}
         gcv2/time {:local/root "../../components/time"}
         gcv2/schema-util {:local/root "../../components/schema-util"}
