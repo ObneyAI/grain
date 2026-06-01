@@ -2,7 +2,7 @@
 
 ## grain-core-v2
 
-Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 processors (command, read-model, todo), v2 request handler, query processor, and pub/sub:
+Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 processors (command, read-model, todo), v2 request handler, query processor, pub/sub, and the event tailer for replaying shared-store events into a node's local pub/sub:
 
 ```clojure
 obneyai/grain-core-v2
@@ -26,7 +26,7 @@ Includes the core CQRS components (event store, read model processor, todo proce
 
 ## grain-datastar
 
-Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hiccup-rendered HTML over SSE, with event-driven re-rendering, SSE connection reuse, auto-generated auth redirects, context-dependent gate interceptors, Malli-based JSON coercion, and automatic Pedestal route generation:
+Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hiccup-rendered HTML over SSE, with event-driven re-rendering, distributed live updates via the event tailer, SSE connection reuse, auto-generated auth redirects, context-dependent gate interceptors, Malli-based JSON coercion, and automatic Pedestal route generation:
 
 ```clojure
 obneyai/grain-datastar
@@ -35,7 +35,7 @@ obneyai/grain-datastar
  :deps/root "projects/grain-datastar"}
 ```
 
-Includes the core CQRS components (command/query/read-model processors, event store, pub/sub). See `components/datastar` for the full source.
+Includes the core CQRS components (command/query/read-model processors, event store, pub/sub, event tailer). See `components/datastar` for the full source.
 
 ## grain-code-agent-tools
 

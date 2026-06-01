@@ -70,7 +70,7 @@ The `grain-control-plane` package provides coordinator election, tenant lease ma
 
 > Full documentation: [docs/datastar.md](docs/datastar.md)
 
-Grain integrates with [Datastar](https://data-star.dev/) for reactive server-rendered UIs. Queries return hiccup that streams to the browser over SSE — the server re-renders when domain events fire and Datastar patches the DOM.
+Grain integrates with [Datastar](https://data-star.dev/) for reactive server-rendered UIs. Queries return hiccup that streams to the browser over SSE — the server re-renders when domain events fire and Datastar patches the DOM. In multi-node deployments, the event tailer can feed each node's local pub/sub from the shared event store so live updates reach the node holding the SSE connection.
 
 ## Code Agent Tools
 
@@ -99,9 +99,9 @@ For multi-instance deployments, add the [control plane](docs/distributed-coordin
 
 | Package | Summary |
 | --- | --- |
-| **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store |
+| **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store and event tailing |
 | **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
-| **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE |
+| **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE, including distributed live updates |
 | **grain-code-agent-tools** | Dev-only nREPL tools for coding agents working against live Grain apps |
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
 | **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization |
