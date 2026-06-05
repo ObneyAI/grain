@@ -17,7 +17,7 @@
             [malli.core :as m]))
 
 (def ^:dynamic *signal-scope*
-  "Current automatic signal scope. Bound by `with-signal-scope`."
+  "Current explicit signal scope. Bound by `with-signal-scope`."
   nil)
 
 (def default-command-post
@@ -71,7 +71,8 @@
    non-identifier characters lower to bracket notation."
   [signal-or-name]
   (let [n (cond
-            (signal? signal-or-name) (:resolved-name signal-or-name)
+            (signal? signal-or-name) (or (:resolved-name signal-or-name)
+                                         (:semantic-name signal-or-name))
             (keyword? signal-or-name) (signal-key signal-or-name)
             :else (str signal-or-name))]
     (if (re-matches #"[A-Za-z_$][A-Za-z0-9_$]*" n)
@@ -86,9 +87,10 @@
         (Long/toString 36))))
 
 (defn- resolve-signal-name
-  [binding {:keys [name]}]
-  (let [scope *signal-scope*
-        semantic (or name (clojure.core/name binding))
+  ([binding opts]
+   (resolve-signal-name *signal-scope* binding opts))
+  ([scope binding {:keys [name]}]
+   (let [semantic (or name (clojure.core/name binding))
         prefix (:prefix scope)
         manual-name (:name scope)
         base (cond
@@ -96,9 +98,9 @@
                prefix (str prefix "-" semantic)
                :else semantic)
         suffix (stable-suffix scope binding semantic)]
-    (if suffix
-      (str base "__" suffix)
-      base)))
+     (if suffix
+       (str base "__" suffix)
+       base))))
 
 (defn create-signal
   "Creates a lexical signal handle.
@@ -109,13 +111,14 @@
   [binding {:keys [name init type] :as opts}]
   (->Signal binding
             (or name (clojure.core/name binding))
-            (resolve-signal-name binding opts)
+            (when (seq *signal-scope*)
+              (resolve-signal-name binding opts))
             *signal-scope*
             init
             type))
 
 (defmacro with-signal-scope
-  "Binds automatic signal scope for nested `with-signals` forms.
+  "Binds an explicit signal scope for nested `with-signals` forms.
 
    `{:prefix \"plan\" :key application-id}` produces deterministic,
    collision-resistant names such as `plan-duration-weeks__abc`. `{:name \"x\"}`
@@ -129,7 +132,7 @@
    returned subtree root.
 
    Example:
-   `(with-signals [open? (signal {:init false})] [:button {:on/click (set! open? true)}])`"
+   `(with-signals [open? (signal {:init false})] [:button {:on/click {:effect (set-signal! open? true)}}])`"
   [bindings & body]
   (let [pairs (partition 2 bindings)
         lets (mapcat (fn [[sym form]]
@@ -438,16 +441,228 @@
     (and (keyword? k) (= "on" (namespace k))) :on
     :else :raw))
 
+(defn- modifier-name
+  [k]
+  (let [n (cond
+            (keyword? k) (name k)
+            (symbol? k) (name k)
+            (string? k) k
+            :else nil)]
+    (when-not (and n (not (string/blank? n)))
+      (throw (ex-info "Event modifier names must be non-empty keywords, symbols, or strings"
+                      {:modifier k})))
+    n))
+
+(defn- modifier-value
+  [v]
+  (cond
+    (or (nil? v) (false? v)) nil
+    (true? v) true
+    (string? v) (do
+                  (when (string/blank? v)
+                    (throw (ex-info "Event modifier values must not be blank"
+                                    {:value v})))
+                  v)
+    (number? v) (str v)
+    (keyword? v) (name v)
+    (symbol? v) (name v)
+    :else (throw (ex-info "Event modifier values must be booleans, strings, numbers, keywords, symbols, or nil"
+                          {:value v}))))
+
+(defn- normalize-modifiers
+  [modifiers]
+  (when-not (map? modifiers)
+    (throw (ex-info "Event :modifiers must be a map"
+                    {:modifiers modifiers})))
+  (let [normalized (map (fn [[k v]]
+                          [(modifier-name k) (modifier-value v)])
+                        modifiers)
+        modifier-names (map first normalized)
+        duplicate-names (->> modifier-names
+                             frequencies
+                             (keep (fn [[n c]] (when (< 1 c) n))))]
+    (when (seq duplicate-names)
+      (throw (ex-info "Event :modifiers contains duplicate lowered names"
+                      {:modifiers modifiers
+                       :duplicate-names (vec duplicate-names)})))
+    (into (sorted-map) normalized)))
+
+(defn- normalize-event
+  [event-name v]
+  (when-not (and (map? v) (not (effect? v)))
+    (throw (ex-info "Checked :on/... events must use a map with :effect"
+                    {:event event-name
+                     :value v})))
+  (let [allowed-keys #{:effect :modifiers}
+        unknown-keys (seq (remove allowed-keys (keys v)))]
+    (when unknown-keys
+      (throw (ex-info "Checked event maps may only contain :effect and :modifiers"
+                      {:event event-name
+                       :unknown-keys (vec unknown-keys)})))
+    (when-not (contains? v :effect)
+      (throw (ex-info "Checked event maps must include :effect"
+                      {:event event-name})))
+    {:effect (:effect v)
+     :modifiers (normalize-modifiers (or (:modifiers v) {}))}))
+
 (defn- split-attrs
   [attrs]
   (reduce-kv (fn [acc k v]
                (case (attr-kind k)
                  :signals (assoc acc :signals v)
                  :bind (assoc-in acc [:bindings (keyword (name k))] v)
-                 :on (assoc-in acc [:events (keyword (name k))] v)
+                 :on (assoc-in acc [:events (keyword (name k))]
+                               (normalize-event (keyword (name k)) v))
                  :raw (assoc-in acc [:attrs k] v)))
              {:attrs {} :bindings {} :events {} :signals []}
              attrs))
+
+(defn- auto-signal-scope
+  [path]
+  {:auto/path path})
+
+(defn- resolve-signal
+  [signal-env x]
+  (if (signal? x)
+    (or (.get signal-env x) x)
+    x))
+
+(declare resolve-expr-signals resolve-effect-signals resolve-dsl-signals)
+
+(defn- resolve-expr-signals
+  [signal-env expr]
+  (cond
+    (signal? expr) (resolve-signal signal-env expr)
+    (expr? expr)
+    (case (:op expr)
+      :lit expr
+      :sig (update-in expr [:args :signal] #(resolve-signal signal-env %))
+      :trimmed (update-in expr [:args :expr] #(resolve-expr-signals signal-env %))
+      :num (update-in expr [:args :expr] #(resolve-expr-signals signal-env %))
+      :num-cents (update-in expr [:args :expr] #(resolve-expr-signals signal-env %))
+      :present? (update-in expr [:args :expr] #(resolve-expr-signals signal-env %))
+      :changed? (update-in expr [:args :expr] #(resolve-expr-signals signal-env %))
+      :evt expr
+      :js (update-in expr [:args :parts]
+                     (fn [parts]
+                       (mapv #(resolve-dsl-signals signal-env %) parts))))
+    :else expr))
+
+(defn- resolve-payload-signals
+  [signal-env m]
+  (into {}
+        (map (fn [[k v]]
+               [k (resolve-dsl-signals signal-env v)]))
+        m))
+
+(defn- resolve-effect-signals
+  [signal-env effect]
+  (cond
+    (effect? effect)
+    (case (:op effect)
+      :dispatch (update-in effect [:args :args]
+                           #(resolve-payload-signals signal-env %))
+      :refresh (update-in effect [:args :params]
+                          #(resolve-payload-signals signal-env %))
+      :set! (-> effect
+                (update-in [:args :signal] #(resolve-signal signal-env %))
+                (update-in [:args :expr] #(resolve-expr-signals signal-env %)))
+      :reset! (update-in effect [:args :signal] #(resolve-signal signal-env %))
+      :clear-errors! effect
+      :blur! effect
+      :action effect
+      :do! (update-in effect [:args :effects]
+                      (fn [effects]
+                        (mapv #(resolve-effect-signals signal-env %) effects)))
+      :when! (-> effect
+                 (update-in [:args :pred] #(resolve-expr-signals signal-env %))
+                 (update-in [:args :effect] #(resolve-effect-signals signal-env %)))
+      :if! (-> effect
+               (update-in [:args :pred] #(resolve-expr-signals signal-env %))
+               (update-in [:args :then] #(resolve-effect-signals signal-env %))
+               (update-in [:args :else] #(resolve-effect-signals signal-env %)))
+      :on-keys (update-in effect [:args :key->effect]
+                          (fn [key->effect]
+                            (into {}
+                                  (map (fn [[k v]]
+                                         [k (resolve-effect-signals signal-env v)]))
+                                  key->effect))))
+    :else effect))
+
+(defn- resolve-dsl-signals
+  [signal-env x]
+  (cond
+    (signal? x) (resolve-signal signal-env x)
+    (expr? x) (resolve-expr-signals signal-env x)
+    (effect? x) (resolve-effect-signals signal-env x)
+    :else x))
+
+(defn- resolve-binding-signals
+  [signal-env kind value]
+  (if (= kind :attr)
+    (resolve-payload-signals signal-env value)
+    (resolve-dsl-signals signal-env value)))
+
+(defn- resolve-local-signals!
+  [signal-env path signals]
+  (mapv (fn [^Signal signal]
+          (let [scope (or (:scope signal) (auto-signal-scope path))
+                resolved (if (:resolved-name signal)
+                           signal
+                           (assoc signal
+                                  :scope scope
+                                  :resolved-name (resolve-signal-name scope
+                                                                      (:binding signal)
+                                                                      {:name (:semantic-name signal)})))]
+            (.put signal-env signal resolved)
+            resolved))
+        signals))
+
+(defn- signal-ir
+  [^Signal signal]
+  {:op :signal
+   :binding (:binding signal)
+   :semantic-name (:semantic-name signal)
+   :resolved-name (:resolved-name signal)
+   :scope (:scope signal)
+   :init (:init signal)
+   :type (:type signal)})
+
+(declare ir*)
+
+(defn- ir*
+  [node path signal-env]
+  (cond
+    (vector? node)
+    (let [[tag maybe-attrs & children] node
+          attrs? (map? maybe-attrs)
+          attrs (if attrs? maybe-attrs {})
+          children (if attrs? children (cons maybe-attrs children))
+          raw-signals (get attrs ::signals [])
+          resolved-signals (resolve-local-signals! signal-env path raw-signals)
+          parts (split-attrs attrs)]
+      {:op :element
+       :tag tag
+       :attrs (:attrs parts)
+       :signals (mapv signal-ir resolved-signals)
+       :bindings (into {}
+                       (map (fn [[k v]]
+                              [k (resolve-binding-signals signal-env k v)]))
+                       (:bindings parts))
+       :events (into {}
+                     (map (fn [[k v]]
+                            [k (update v :effect
+                                       #(resolve-effect-signals signal-env %))]))
+                     (:events parts))
+       :children (mapv (fn [[idx child]]
+                         (ir* child (conj path idx) signal-env))
+                       (map-indexed vector children))})
+
+    (seq? node) {:op :fragment
+                 :children (mapv (fn [[idx child]]
+                                    (ir* child (conj path idx) signal-env))
+                                  (map-indexed vector node))}
+    :else {:op :literal :value node}))
 
 (defn ir
   "Compiles Datastar UI source hiccup into Datastar-shaped IR.
@@ -455,31 +670,7 @@
    The IR is stable enough for tests and tooling, but application code should
    normally consume `hiccup`."
   [node]
-  (cond
-    (vector? node)
-    (let [[tag maybe-attrs & children] node
-          attrs? (map? maybe-attrs)
-          attrs (if attrs? maybe-attrs {})
-          children (if attrs? children (cons maybe-attrs children))
-          parts (split-attrs attrs)]
-      {:op :element
-       :tag tag
-       :attrs (:attrs parts)
-       :signals (mapv (fn [^Signal s]
-                        {:op :signal
-                         :binding (:binding s)
-                         :semantic-name (:semantic-name s)
-                         :resolved-name (:resolved-name s)
-                         :scope (:scope s)
-                         :init (:init s)
-                         :type (:type s)})
-                      (:signals parts))
-       :bindings (:bindings parts)
-       :events (:events parts)
-       :children (mapv ir children)})
-
-    (seq? node) {:op :fragment :children (mapv ir node)}
-    :else {:op :literal :value node}))
+  (ir* node [] (java.util.IdentityHashMap.)))
 
 (defn- lower-binding-attr
   [kind value]
@@ -490,6 +681,19 @@
     :class [:data-class (if (or (signal? value) (expr? value)) (expr-value value) (str value))]
     :attr (throw (ex-info "Internal error: :bind/attr handled separately" {}))
     [(keyword "data-bind" (name kind)) value]))
+
+(defn- lower-event-modifier
+  [[modifier-name modifier-value]]
+  (when modifier-value
+    (if (true? modifier-value)
+      (str "__" modifier-name)
+      (str "__" modifier-name "." modifier-value))))
+
+(defn- lower-event-attr
+  [event-name {:keys [effect modifiers]}]
+  [(keyword (str "data-on:" (name event-name)
+                 (apply str (keep lower-event-modifier modifiers))))
+   (lower-effect effect)])
 
 (defn- merge-data-signals
   [attrs signals]
@@ -533,8 +737,8 @@
                              attrs1
                              (:bindings ir-node))
            attrs3 (reduce-kv (fn [m k v]
-                               (assoc m (keyword (str "data-on:" (name k)))
-                                      (lower-effect v)))
+                               (let [[attr-k attr-v] (lower-event-attr k v)]
+                                 (assoc m attr-k attr-v)))
                              attrs2
                              (:events ir-node))
            children (map lower-ir (:children ir-node))]

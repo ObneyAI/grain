@@ -23,12 +23,18 @@
   [node]
   (second node))
 
+(defn- data-signal-keys
+  [node]
+  (->> (:data-signals (attrs node))
+       (re-seq #"\"([^\"]+)\":")
+       (mapv second)))
+
 (deftest hiccup-returns-plain-hiccup
   (let [task-id #uuid "00000000-0000-0000-0000-000000000001"
         out (ui/hiccup
              [:button {:class "btn"
-                       :on/click (ui/dispatch :ui-test/complete-task
-                                   {:task-id task-id})}
+                       :on/click {:effect (ui/dispatch :ui-test/complete-task
+                                            {:task-id task-id})}}
               "Complete"])]
     (is (= :button (first out)))
     (is (= "btn" (:class (attrs out))))
@@ -45,7 +51,7 @@
                  (ui/with-signals [duration (ui/signal {:name "duration-weeks" :init 12 :type :int})]
                    [:input {:class "input"
                             :bind/value duration
-                            :on/input (ui/set-signal! duration (ui/num duration))}]))
+                            :on/input {:effect (ui/set-signal! duration (ui/num duration))}}]))
         ir-node (ui/ir source)
         signal (first (:signals ir-node))]
     (is (= :element (:op ir-node)))
@@ -72,6 +78,99 @@
     (is (= bind-a (re-find #"plan-duration-weeks__[a-z0-9]+" signals-a)))
     (is (= (str "$[\"" bind-a "\"]") text-a))))
 
+(deftest unscoped-signals-get-automatic-compiler-scopes
+  (let [make-node #(ui/with-signals [query (ui/signal {:init ""})]
+                     [:input {:bind/value query
+                              :bind/text (ui/sig query)}])
+        out-a (ui/hiccup (make-node))
+        out-b (ui/hiccup (make-node))
+        signal-name (first (data-signal-keys out-a))]
+    (is (= out-a out-b))
+    (is (string/starts-with? signal-name "query__"))
+    (is (= signal-name (:data-bind (attrs out-a))))
+    (is (= (ui/signal-ref signal-name) (:data-text (attrs out-a))))))
+
+(deftest sibling-signal-scopes-do-not-collide
+  (let [out (ui/hiccup
+             [:div
+              (ui/with-signals [query (ui/signal {:init ""})]
+                [:input {:bind/value query}])
+              (ui/with-signals [query (ui/signal {:init ""})]
+                [:input {:bind/value query}])])
+        left (nth out 2)
+        right (nth out 3)
+        left-name (first (data-signal-keys left))
+        right-name (first (data-signal-keys right))]
+    (is (string/starts-with? left-name "query__"))
+    (is (string/starts-with? right-name "query__"))
+    (is (not= left-name right-name))
+    (is (= left-name (:data-bind (attrs left))))
+    (is (= right-name (:data-bind (attrs right))))))
+
+(deftest parent-signal-scope-applies-to-child-references
+  (let [out (ui/hiccup
+             (ui/with-signals [query (ui/signal {:init ""})]
+               [:div
+                [:input {:bind/value query}]
+                [:button {:on/click {:effect (ui/refresh "/search/__stream"
+                                                {:q query})}}
+                 "Search"]]))
+        signal-name (first (data-signal-keys out))
+        input (nth out 2)
+        button (nth out 3)
+        click (:data-on:click (attrs button))]
+    (is (= signal-name (:data-bind (attrs input))))
+    (is (string/includes? click (str "\"q\": " (ui/signal-ref signal-name))))))
+
+(deftest nested-signals-shadow-by-lexical-handle
+  (let [out (ui/hiccup
+             (ui/with-signals [open? (ui/signal {:init false})]
+               [:div
+                [:input {:bind/value open?}]
+                (ui/with-signals [open? (ui/signal {:init true})]
+                  [:input {:bind/value open?}])
+                [:input {:bind/value open?}]]))
+        parent-name (first (data-signal-keys out))
+        first-input (nth out 2)
+        nested-input (nth out 3)
+        last-input (nth out 4)
+        nested-name (first (data-signal-keys nested-input))]
+    (is (string/starts-with? parent-name "open?__"))
+    (is (string/starts-with? nested-name "open?__"))
+    (is (not= parent-name nested-name))
+    (is (= parent-name (:data-bind (attrs first-input))))
+    (is (= nested-name (:data-bind (attrs nested-input))))
+    (is (= parent-name (:data-bind (attrs last-input))))))
+
+(deftest signal-resolution-covers-checked-effect-and-expression-trees
+  (let [out (ui/hiccup
+             (ui/with-signals [title (ui/signal {:init "Old"})]
+               [:input {:bind/value title
+                        :bind/text (ui/js "String(" title ")")
+                        :on/input {:effect (ui/do!
+                                             (ui/set-signal! title (ui/trimmed title))
+                                             (ui/when! (ui/present? title)
+                                               (ui/dispatch :ui-test/create-campus
+                                                 {:campus-name title
+                                                  :is-virtual false}))
+                                             (ui/if! (ui/changed? title "Old")
+                                               (ui/refresh "/changed/__stream"
+                                                 {:title title})
+                                               (ui/reset! title)))}
+                        :on/keydown {:effect (ui/on-keys {:Escape (ui/reset! title)})}}]))
+        signal-name (first (data-signal-keys out))
+        a (attrs out)
+        input (:data-on:input a)
+        keydown (:data-on:keydown a)]
+    (is (string/includes? (:data-text a) (ui/signal-ref signal-name)))
+    (is (string/includes? input (str (ui/signal-ref signal-name)
+                                     " = "
+                                     (ui/signal-ref signal-name)
+                                     ".trim();")))
+    (is (string/includes? input (str "\"campus-name\": " (ui/signal-ref signal-name))))
+    (is (string/includes? input (str "\"title\": " (ui/signal-ref signal-name))))
+    (is (string/includes? keydown (str (ui/signal-ref signal-name) " = \"Old\";")))))
+
 (deftest raw-datastar-attrs-pass-through
   (let [out (ui/hiccup
              [:div {"data-signals__ifmissing" "{'open': false}"
@@ -93,6 +192,97 @@
     (is (= "window.__initRichtext(el)" (:data-init a)))
     (is (= "@post('/custom')" (:data-on:input__debounce.500ms a)))))
 
+(deftest checked-events-require-explicit-event-maps
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"must use a map with :effect"
+       (ui/hiccup
+        [:button {:on/click (ui/action "$open = true;")}
+         "bad"])))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"must include :effect"
+       (ui/hiccup
+        [:button {:on/click {:modifiers {:prevent true}}}
+         "bad"])))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"may only contain :effect and :modifiers"
+       (ui/hiccup
+        [:button {:on/click {:effect (ui/action "$open = true;")
+                             :target :modal}}
+         "bad"]))))
+
+(deftest checked-event-modifiers-lower-generically
+  (let [debounced (ui/hiccup
+                   [:input {:on/input {:effect (ui/action "@post('/search')")
+                                       :modifiers {:debounce "300ms"}}}])
+        submit (ui/hiccup
+                [:form {:on/submit {:effect (ui/action "@post('/save')")
+                                    :modifiers {:prevent true}}}])
+        keydown (ui/hiccup
+                 [:input {:on/keydown {:effect (ui/action "$open = false;")
+                                       :modifiers {:window true}}}])
+        click (ui/hiccup
+               [:button {:on/click {:effect (ui/action "$open = false;")
+                                    :modifiers {:stop true}}}
+                "Close"])]
+    (is (= "@post('/search')" (:data-on:input__debounce.300ms (attrs debounced))))
+    (is (= "@post('/save')" (:data-on:submit__prevent (attrs submit))))
+    (is (= "$open = false;" (:data-on:keydown__window (attrs keydown))))
+    (is (= "$open = false;" (:data-on:click__stop (attrs click))))))
+
+(deftest checked-event-modifier-validation
+  (testing "false and nil modifiers are omitted"
+    (let [out (ui/hiccup
+               [:button {:on/click {:effect (ui/action "$open = true;")
+                                    :modifiers {:prevent false
+                                                :stop nil}}}
+                "Open"])]
+      (is (= "$open = true;" (:data-on:click (attrs out))))
+      (is (not (contains? (attrs out) :data-on:click__prevent)))
+      (is (not (contains? (attrs out) :data-on:click__stop)))))
+  (testing "modifier output is deterministic by lowered name"
+    (let [out (ui/hiccup
+               [:input {:on/input {:effect (ui/action "@post('/search')")
+                                   :modifiers {:prevent true
+                                               :debounce "300ms"}}}])]
+      (is (= "@post('/search')"
+             (:data-on:input__debounce.300ms__prevent (attrs out))))))
+  (testing "duplicate lowered modifier names fail"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"duplicate lowered names"
+         (ui/hiccup
+          [:button {:on/click {:effect (ui/action "$open = true;")
+                               :modifiers {:mod/prevent true
+                                           :prevent true}}}
+           "bad"]))))
+  (testing "invalid modifier map fails"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"must be a map"
+         (ui/hiccup
+          [:button {:on/click {:effect (ui/action "$open = true;")
+                               :modifiers [[:prevent true]]}}
+           "bad"]))))
+  (testing "invalid modifier names fail"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"modifier names"
+         (ui/hiccup
+          [:button {:on/click {:effect (ui/action "$open = true;")
+                               :modifiers {"" true}}}
+           "bad"]))))
+  (testing "invalid modifier values fail"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"modifier values"
+         (ui/hiccup
+          [:button {:on/click {:effect (ui/action "$open = true;")
+                               :modifiers {:prevent []}}}
+           "bad"])))))
+
 (deftest generated-signals-do-not-rewrite-raw-data-signals
   (let [out (ui/hiccup
              (ui/with-signals [open? (ui/signal {:init false})]
@@ -101,23 +291,24 @@
                 "Modal"]))
         a (attrs out)]
     (is (= "{'raw-open': false}" (:data-signals a)))
-    (is (string/includes? (get a "data-signals__ifmissing") "\"open?\":false"))))
+    (is (string/includes? (get a "data-signals__ifmissing") "\"open?__"))
+    (is (string/includes? (get a "data-signals__ifmissing") "\":false"))))
 
 (deftest payload-dispatch-supports-custom-action-target
   (let [out (ui/hiccup
              (ui/with-signals [name (ui/signal {:name "campus-name" :init ""})
                                virtual? (ui/signal {:name "is-virtual" :init false})]
-               [:form {:on/submit (ui/dispatch :ui-test/create-campus
-                                    {:campus-name name
-                                     :is-virtual virtual?}
-                                    {:post "/actions"})}
+               [:form {:on/submit {:effect (ui/dispatch :ui-test/create-campus
+                                              {:campus-name name
+                                               :is-virtual virtual?}
+                                              {:post "/actions"})}}
                 [:input {:bind/value name}]
                 [:input {:type "checkbox" :bind/value virtual?}]]))
         submit (:data-on:submit (attrs out))]
     (is (string/includes? submit "@post(\"/actions\", {payload:"))
     (is (string/includes? submit "\"command/name\": \"ui-test/create-campus\""))
-    (is (string/includes? submit "\"campus-name\": $[\"campus-name\""))
-    (is (string/includes? submit "\"is-virtual\": $[\"is-virtual\""))
+    (is (re-find #"\"campus-name\": \$\[\"campus-name__[a-z0-9]+\"\]" submit))
+    (is (re-find #"\"is-virtual\": \$\[\"is-virtual__[a-z0-9]+\"\]" submit))
     (is (not (string/includes? submit "$['command/name']")))
     (is (not (string/includes? submit "$[\"command/name\"]")))))
 
@@ -126,9 +317,9 @@
              (ui/with-signals [page (ui/signal {:init 1})
                                search (ui/signal {:init ""})
                                unrelated (ui/signal {:init "client-only"})]
-               [:button {:on/click (ui/refresh "/admin/graduation-pending/__stream"
-                                    {:page page
-                                     :search search})}
+               [:button {:on/click {:effect (ui/refresh "/admin/graduation-pending/__stream"
+                                             {:page page
+                                              :search search})}}
                 "Refresh"]))
         click (:data-on:click (attrs out))]
     (is (string/includes? click "@post(\"/admin/graduation-pending/__stream\", {payload:"))
@@ -141,9 +332,9 @@
 (deftest refresh-can-omit-reusable-stream-nonce
   (let [out (ui/hiccup
              (ui/with-signals [page (ui/signal {:init 1})]
-               [:button {:on/click (ui/refresh "/one-shot/__stream"
-                                    {:page page}
-                                    {:include-nonce? false})}
+               [:button {:on/click {:effect (ui/refresh "/one-shot/__stream"
+                                             {:page page}
+                                             {:include-nonce? false})}}
                 "Refresh"]))
         click (:data-on:click (attrs out))]
     (is (string/includes? click "@post(\"/one-shot/__stream\", {payload:"))
@@ -156,36 +347,36 @@
          clojure.lang.ExceptionInfo
          #"missing required command keys"
          (ui/hiccup
-          [:button {:on/click (ui/dispatch :ui-test/complete-task {})}
+          [:button {:on/click {:effect (ui/dispatch :ui-test/complete-task {})}}
            "bad"]))))
   (testing "unknown command key fails"
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo
          #"keys not present"
          (ui/hiccup
-          [:button {:on/click (ui/dispatch :ui-test/complete-task
-                               {:task-id #uuid "00000000-0000-0000-0000-000000000001"
-                                :extra "nope"})}
+          [:button {:on/click {:effect (ui/dispatch :ui-test/complete-task
+                                        {:task-id #uuid "00000000-0000-0000-0000-000000000001"
+                                         :extra "nope"})}}
            "bad"]))))
   (testing "optional command key may be omitted"
     (is (some?
          (ui/hiccup
-          [:button {:on/click (ui/dispatch :ui-test/optional-command
-                               {:required-id #uuid "00000000-0000-0000-0000-000000000002"})}
+          [:button {:on/click {:effect (ui/dispatch :ui-test/optional-command
+                                        {:required-id #uuid "00000000-0000-0000-0000-000000000002"})}}
            "ok"])))))
 
 (deftest expressions-and-effects-lower
   (let [out (ui/hiccup
              (ui/with-signals [title (ui/signal {:init "Old"})]
                [:input {:bind/value title
-                        :on/blur (ui/when! (ui/changed? title "Old")
-                                   (ui/dispatch :ui-test/create-campus
-                                     {:campus-name (ui/trimmed title)
-                                      :is-virtual false}))
-                        :on/keydown (ui/on-keys {:Enter (ui/blur!)
-                                                 :Escape (ui/do!
-                                                          (ui/reset! title)
-                                                          (ui/blur!))})}]))
+                        :on/blur {:effect (ui/when! (ui/changed? title "Old")
+                                            (ui/dispatch :ui-test/create-campus
+                                              {:campus-name (ui/trimmed title)
+                                               :is-virtual false}))}
+                        :on/keydown {:effect (ui/on-keys {:Enter (ui/blur!)
+                                                          :Escape (ui/do!
+                                                                   (ui/reset! title)
+                                                                   (ui/blur!))})}}]))
         a (attrs out)]
     (is (string/includes? (:data-on:blur a) ".trim()"))
     (is (string/includes? (:data-on:blur a) "if ("))
@@ -197,8 +388,8 @@
   (let [ir-node (ui/ir
                  [:a {:href "/task"
                       :class "link"
-                      :on/click (ui/dispatch :ui-test/complete-task
-                                  {:task-id #uuid "00000000-0000-0000-0000-000000000001"})
+                      :on/click {:effect (ui/dispatch :ui-test/complete-task
+                                          {:task-id #uuid "00000000-0000-0000-0000-000000000001"})}
                       :data-on:input__debounce.500ms "@post('/raw')"}
                   "Task"])
         static-node (ui/static ir-node {:strip-href? true :strip-raw-events? true})

@@ -26,7 +26,7 @@ Use `ui/hiccup` for normal app code:
 ```clojure
 (ui/hiccup
   [:button {:on/click
-            (ui/dispatch :todo/complete-task {:task-id task-id})}
+            {:effect (ui/dispatch :todo/complete-task {:task-id task-id})}}
    "Complete"])
 ```
 
@@ -57,18 +57,21 @@ adapter still accepts flat or legacy wrapped signal bodies for interop.
 ## Signals
 
 Signals are lexical handles, not strings. `with-signals` attaches declarations
-to the returned subtree root, and `with-signal-scope` makes generated names
-deterministic and collision-resistant.
+to the returned subtree root, and `ui/ir` assigns deterministic,
+collision-resistant names automatically.
 
 ```clojure
-(ui/with-signal-scope {:prefix "plan" :key application-id}
-  (ui/with-signals [duration (ui/signal {:name "duration-weeks" :init 12})]
-    [:input {:bind/value duration}]))
+(ui/with-signals [duration (ui/signal {:name "duration-weeks" :init 12})]
+  [:input {:bind/value duration}])
 ```
 
 Signal references choose the correct Datastar syntax automatically. Identifier
 names lower to `$name`; dashed or otherwise unsafe names lower to bracket
-notation such as `$[\"plan-duration-weeks__abc\"]`.
+notation such as `$[\"duration-weeks__abc\"]`.
+
+`with-signal-scope` remains available for advanced raw interop when a component
+must coordinate with manually named Datastar signals, but normal app code should
+not need it.
 
 ## Checked Vocabulary
 
@@ -84,6 +87,21 @@ Datastar UI interprets only its own vocabulary:
 `dispatch` validates literal command names and map keys against Malli command
 schemas when the schema is a registered `[:map ...]` shape. Runtime values
 remain runtime values; raw JavaScript is intentionally opaque.
+
+Checked `:on/...` attrs always use explicit event maps:
+
+```clojure
+{:on/input {:effect (ui/refresh "/students/typeahead/__stream"
+                       {:q search})
+            :modifiers {:debounce "300ms"}}
+ :on/submit {:effect (ui/dispatch :academic/create-campus
+                        {:campus-name campus-name})
+             :modifiers {:prevent true}}}
+```
+
+`modifiers` lower generically to Datastar event attribute suffixes. Modifier
+names are not allowlisted, so future Datastar modifiers can be used without
+library changes.
 
 ## Raw Datastar Passthrough
 
@@ -105,7 +123,7 @@ All non-DSL attrs pass through unchanged, including advanced production attrs:
 Use `ui/action` for raw Datastar actions that should remain unchecked:
 
 ```clojure
-{:on/click (ui/action "@post('/custom/path')")}
+{:on/click {:effect (ui/action "@post('/custom/path')")}}
 ```
 
 ## IR
@@ -129,8 +147,8 @@ Example signal IR:
 {:op :signal
  :binding 'duration
  :semantic-name "duration-weeks"
- :resolved-name "plan-duration-weeks__abc"
- :scope {:prefix "plan" :key application-id}
+ :resolved-name "duration-weeks__abc"
+ :scope {:auto/path [0 1]}
  :init 12
  :type :int}
 ```
