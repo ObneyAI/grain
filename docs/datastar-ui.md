@@ -210,6 +210,23 @@ Commands and queries send only the payload you provide:
              :step "review"})
 ```
 
+Payloads may contain nested maps and collections. Signal handles and checked
+expressions are lowered recursively:
+
+```clojure
+(ui/dispatch :documents/submit
+             {:document {:id document-id
+                         :signer {:name signer-name
+                                  :email signer-email}
+                         :fields [{:id field-id
+                                   :value (ui/trimmed field-value)}]}
+              :tags #{"signed" "urgent"}})
+```
+
+Maps lower to JSON objects. Vectors, lists, and sets lower to JSON arrays.
+Grain command/query schemas remain responsible for nested validation and
+server-side coercion.
+
 The DSL does not have a mode that sends every signal on the page. This keeps
 command and query inputs readable, testable, and stable when surrounding UI
 state changes.

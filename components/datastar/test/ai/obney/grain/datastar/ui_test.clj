@@ -15,6 +15,13 @@
                          [:application-id :uuid]
                          [:duration-weeks :int]
                          [:deposit-amount-cents :int]]
+   :ui-test/submit-document [:map
+                             [:document :map]
+                             [:ordered :vector]
+                             [:choices :set]
+                             [:nil-value nil?]
+                             [:flag? :boolean]
+                             [:quantity :int]]
    :ui-test/optional-command [:map
                               [:required-id :uuid]
                               [:note {:optional true} :string]]})
@@ -69,7 +76,7 @@
 (deftest ir-preserves-meaning-before-lowering
   (let [source (ui/with-signal-scope {:key #uuid "00000000-0000-0000-0000-000000000010"
                                       :prefix "plan"}
-                 (ui/with-signals [duration {:name "duration-weeks" :init 12 :type :int}]
+                 (ui/with-signals [duration {:name "duration-weeks" :init 12}]
                    [:input {:class "input"
                             :bind/value duration
                             :on/input {:effect (ui/set-signal! duration (ui/num duration))}}]))
@@ -79,7 +86,7 @@
     (is (= :input (:tag ir-node)))
     (is (= "duration-weeks" (:semantic-name signal)))
     (is (string/starts-with? (:resolved-name signal) "plan-duration-weeks__"))
-    (is (= :int (:type signal)))
+    (is (= 12 (:init signal)))
     (is (= :value (ffirst (:bindings ir-node))))
     (is (= :input (ffirst (:events ir-node))))))
 
@@ -369,6 +376,77 @@
     (is (string/includes? click "@post(\"/one-shot/__stream\", {payload:"))
     (is (re-find #"\"page\": \$page__[a-z0-9]+" click))
     (is (not (string/includes? click "dsNonce")))))
+
+(deftest dispatch-lowers-nested-payload-data
+  (let [document-id #uuid "00000000-0000-0000-0000-000000000111"
+        field-id #uuid "00000000-0000-0000-0000-000000000222"
+        out (hiccup
+             (ui/with-signals [signer-name {:init ""}
+                               signer-email {:init ""}
+                               field-value {:init ""}]
+               [:button {:on/click
+                         {:effect
+                          (ui/dispatch :ui-test/submit-document
+                            {:document {:id document-id
+                                        :status :draft
+                                        :signer {:name signer-name
+                                                 :email signer-email}
+                                        :fields [{:id field-id
+                                                  :value (ui/trimmed field-value)}
+                                                 {:id "static"
+                                                  :value "ok"}]}
+                             :ordered (list signer-name "literal" 7)
+                             :choices #{"email" "sms"}
+                             :nil-value nil
+                             :flag? true
+                             :quantity (ui/num field-value)})}}
+                "Submit"]))
+        click (:data-on:click (attrs out))]
+    (is (string/includes? click "\"command/name\": \"ui-test/submit-document\""))
+    (is (string/includes? click "\"document\": {"))
+    (is (string/includes? click "\"id\": \"00000000-0000-0000-0000-000000000111\""))
+    (is (string/includes? click "\"status\": \"draft\""))
+    (is (string/includes? click "\"signer\": {"))
+    (is (re-find #"\"name\": \$\[\"signer-name__[a-z0-9]+\"\]" click))
+    (is (re-find #"\"email\": \$\[\"signer-email__[a-z0-9]+\"\]" click))
+    (is (string/includes? click "\"fields\": ["))
+    (is (string/includes? click "\"id\": \"00000000-0000-0000-0000-000000000222\""))
+    (is (re-find #"\"value\": \$\[\"field-value__[a-z0-9]+\"\]\.trim\(\)" click))
+    (is (string/includes? click "\"ordered\": ["))
+    (is (string/includes? click "\"literal\""))
+    (is (string/includes? click "\"choices\": ["))
+    (is (string/includes? click "\"email\""))
+    (is (string/includes? click "\"sms\""))
+    (is (string/includes? click "\"nil-value\": null"))
+    (is (string/includes? click "\"flag?\": true"))
+    (is (re-find #"\"quantity\": Number\(\$\[\"field-value__[a-z0-9]+\"\]\)" click))))
+
+(deftest refresh-lowers-nested-payload-data
+  (let [out (hiccup
+             (ui/with-signals [page {:init 1}
+                               search {:init ""}]
+               [:button {:on/click
+                         {:effect
+                          (ui/refresh :ui-test/graduation-pending-page
+                            {:filters {:search search
+                                       :page page}
+                             :include ["students" "documents"]})}}
+                "Refresh"]))
+        click (:data-on:click (attrs out))]
+    (is (string/includes? click "@post(\"/admin/graduation-pending/__stream\", {payload:"))
+    (is (re-find #"\"filters\": \{\"search\": \$search__[a-z0-9]+, \"page\": \$page__[a-z0-9]+\}" click))
+    (is (string/includes? click "\"include\": [\"students\", \"documents\"]"))
+    (is (string/includes? click "\"dsNonce\": $dsNonce"))))
+
+(deftest payload-map-keys-must-be-static
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"Payload map keys must be static literal values"
+       (hiccup
+        (ui/with-signals [dynamic-key {:init "name"}]
+          [:button {:on/click {:effect (ui/refresh :ui-test/search-page
+                                        {dynamic-key "bad"})}}
+           "bad"])))))
 
 (deftest checked-route-refs-resolve-from-query-metadata
   (let [out (hiccup

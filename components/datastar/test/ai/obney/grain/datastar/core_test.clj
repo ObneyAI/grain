@@ -322,6 +322,22 @@
       (is (= "payload" (get-in result [:request :query-params :search])))
       (is (nil? (get-in result [:request :query-params :ambient])))))
 
+  (testing "POST with explicit payload preserves nested maps and vectors"
+    (let [body-str (json/write-str {:payload {:document {:id "doc-1"
+                                                         :signer {:name "Ada"}
+                                                         :fields [{:id "f1" :value "yes"}]}
+                                               :tags ["urgent" "signed"]}})
+          ctx {:request {:request-method :post
+                         :body body-str
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= "doc-1" (get-in result [:request :query-params :document :id])))
+      (is (= "Ada" (get-in result [:request :query-params :document :signer :name])))
+      (is (= [{:id "f1" :value "yes"}]
+             (get-in result [:request :query-params :document :fields])))
+      (is (= ["urgent" "signed"]
+             (get-in result [:request :query-params :tags])))))
+
   (testing "POST preserves native JSON types (booleans, numbers, maps)"
     (let [body-str (json/write-str {:active true :count 0 :fieldErrors {:name "required"}})
           ctx {:request {:request-method :post

@@ -28,7 +28,7 @@
   "Default Datastar action target used by `dispatch`."
   "$__grainAction")
 
-(defrecord Signal [binding semantic-name resolved-name scope init type])
+(defrecord Signal [binding semantic-name resolved-name scope init])
 (defrecord Expr [op args])
 (defrecord Effect [op args])
 (defrecord Href [query params])
@@ -121,19 +121,18 @@
 
    Usually called by `with-signals`; public primarily for tests and low-level
    interop. `binding` is the source binding symbol, and opts may include
-   `:name`, `:init`, and `:type`."
+   `:name` and `:init`."
   [binding opts]
   (when-not (map? opts)
     (throw (ex-info "Signal options must be a map"
                     {:binding binding :opts opts})))
-  (let [{:keys [name init type]} opts]
+  (let [{:keys [name init]} opts]
     (->Signal binding
               (or name (clojure.core/name binding))
               (when (seq *signal-scope*)
                 (resolve-signal-name binding opts))
               *signal-scope*
-              init
-              type)))
+              init)))
 
 (defmacro with-signal-scope
   "Binds an explicit signal scope for nested `with-signals` forms.
@@ -392,14 +391,42 @@
             (throw (ex-info "Dispatch has keys not present in command schema"
                             {:command command :unknown (vec unknown) :schema schema}))))))))
 
-(defn- object-literal
+(declare payload-literal)
+
+(defn- payload-key-literal
+  [k]
+  (cond
+    (or (expr? k) (signal? k))
+    (throw (ex-info "Payload map keys must be static literal values"
+                    {:key k}))
+
+    (or (keyword? k) (symbol? k)) (js-literal (signal-key k))
+    (or (string? k) (uuid? k) (number? k) (boolean? k)) (js-literal k)
+    :else (throw (ex-info "Payload map keys must be keywords, strings, symbols, UUIDs, numbers, or booleans"
+                          {:key k}))))
+
+(defn- payload-object-literal
   [m]
   (str "{"
        (string/join ", "
                     (map (fn [[k v]]
-                           (str (js-literal (signal-key k)) ": " (expr-value v)))
+                           (str (payload-key-literal k) ": " (payload-literal v)))
                          m))
        "}"))
+
+(defn- payload-array-literal
+  [xs]
+  (str "["
+       (string/join ", " (map payload-literal xs))
+       "]"))
+
+(defn- payload-literal
+  [v]
+  (cond
+    (or (expr? v) (signal? v)) (expr-value v)
+    (map? v) (payload-object-literal v)
+    (or (sequential? v) (set? v)) (payload-array-literal v)
+    :else (js-literal v)))
 
 (declare lower-effect)
 
@@ -416,7 +443,7 @@
   (validate-dispatch! command args)
   (let [target (post-target (:post opts))
         payload (assoc args :command/name (command-name-string command))]
-    (str "@post(" target ", {payload: " (object-literal payload) "})")))
+    (str "@post(" target ", {payload: " (payload-object-literal payload) "})")))
 
 (defn- lower-refresh
   [{:keys [query params opts]}]
@@ -430,7 +457,7 @@
         include-nonce? (not= false (:include-nonce? opts))
         payload (cond-> params
                   include-nonce? (assoc :dsNonce (->Expr :sig {:signal "dsNonce"})))]
-    (str "@" method "(" (js-literal path) ", {payload: " (object-literal payload) "})")))
+    (str "@" method "(" (js-literal path) ", {payload: " (payload-object-literal payload) "})")))
 
 (defn lower-effect
   "Lowers a checked effect to a Datastar action string."
@@ -586,11 +613,19 @@
     :else expr))
 
 (defn- resolve-payload-signals
-  [signal-env m]
-  (into {}
-        (map (fn [[k v]]
-               [k (resolve-dsl-signals signal-env v)]))
-        m))
+  [signal-env value]
+  (cond
+    (or (signal? value) (expr? value) (effect? value))
+    (resolve-dsl-signals signal-env value)
+
+    (map? value) (into {}
+                       (map (fn [[k v]]
+                              [k (resolve-payload-signals signal-env v)]))
+                       value)
+    (vector? value) (mapv #(resolve-payload-signals signal-env %) value)
+    (set? value) (into #{} (map #(resolve-payload-signals signal-env %)) value)
+    (seq? value) (doall (map #(resolve-payload-signals signal-env %) value))
+    :else (resolve-dsl-signals signal-env value)))
 
 (defn- resolve-effect-signals
   [signal-env effect]
@@ -662,8 +697,7 @@
    :semantic-name (:semantic-name signal)
    :resolved-name (:resolved-name signal)
    :scope (:scope signal)
-   :init (:init signal)
-   :type (:type signal)})
+   :init (:init signal)})
 
 (declare ir*)
 
