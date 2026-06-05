@@ -546,6 +546,60 @@
     (is (string/includes? (:data-on:keydown a) "evt.key === \"Escape\""))
     (is (string/includes? (:data-on:keydown a) "el.blur();"))))
 
+(deftest effects-sequence-actions-with-statement-separators
+  (let [task-id #uuid "00000000-0000-0000-0000-000000000001"
+        out (hiccup
+             (ui/with-signals [title {:init ""}]
+               [:div
+                [:button#dispatch-reset
+                 {:on/click {:effect (ui/effects
+                                       (ui/dispatch :ui-test/complete-task
+                                         {:task-id task-id})
+                                       (ui/reset-signal title))}}
+                 "dispatch reset"]
+                [:button#dispatch-set
+                 {:on/click {:effect (ui/effects
+                                       (ui/dispatch :ui-test/complete-task
+                                         {:task-id task-id})
+                                       (ui/set-signal title "Done"))}}
+                 "dispatch set"]
+                [:button#refresh-reset
+                 {:on/click {:effect (ui/effects
+                                       (ui/refresh :ui-test/changed-page
+                                         {:title title})
+                                       (ui/reset-signal title))}}
+                 "refresh reset"]
+                [:button#when-nested
+                 {:on/click {:effect (ui/when-effect (ui/present? title)
+                                      (ui/effects
+                                       (ui/dispatch :ui-test/complete-task
+                                         {:task-id task-id})
+                                       (ui/reset-signal title)))}}
+                 "when nested"]
+                [:button#choose-nested
+                 {:on/click {:effect (ui/choose-effect (ui/present? title)
+                                      (ui/effects
+                                       (ui/dispatch :ui-test/complete-task
+                                         {:task-id task-id})
+                                       (ui/set-signal title "Done"))
+                                      (ui/effects
+                                       (ui/refresh :ui-test/changed-page
+                                         {:title title})
+                                       (ui/reset-signal title)))}}
+                 "choose nested"]]))
+        signal-ref (ui/signal-ref (first (data-signal-keys out)))
+        dispatch-reset (:data-on:click (attrs (nth out 2)))
+        dispatch-set (:data-on:click (attrs (nth out 3)))
+        refresh-reset (:data-on:click (attrs (nth out 4)))
+        when-nested (:data-on:click (attrs (nth out 5)))
+        choose-nested (:data-on:click (attrs (nth out 6)))]
+    (is (string/includes? dispatch-reset (str "}); " signal-ref " = \"\";")))
+    (is (string/includes? dispatch-set (str "}); " signal-ref " = \"Done\";")))
+    (is (string/includes? refresh-reset (str "}); " signal-ref " = \"\";")))
+    (is (string/includes? when-nested (str "}); " signal-ref " = \"\";")))
+    (is (string/includes? choose-nested (str "}); " signal-ref " = \"Done\";")))
+    (is (string/includes? choose-nested (str "}); " signal-ref " = \"\";")))))
+
 (deftest static-interpretation-removes-checked-behavior
   (let [ir-node (ui/ir
                  [:a {:href "/task"

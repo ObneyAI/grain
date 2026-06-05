@@ -457,6 +457,14 @@
                   include-nonce? (assoc :dsNonce (->Expr :sig {:signal "dsNonce"})))]
     (str "@" method "(" (js-literal path) ", {payload: " (payload-object-literal payload) "})")))
 
+(defn- statement
+  [s]
+  (let [s (string/trim (str s))]
+    (when-not (string/blank? s)
+      (if (string/ends-with? s ";")
+        s
+        (str s ";")))))
+
 (defn lower-effect
   "Lowers a checked effect to a Datastar action string."
   [effect]
@@ -476,7 +484,10 @@
       :clear-errors "$fieldErrors = {}; $error = '';"
       :blur "el.blur();"
       :action (get-in effect [:args :raw])
-      :effects (string/join " " (map lower-effect (get-in effect [:args :effects])))
+      :effects (->> (get-in effect [:args :effects])
+                    (map lower-effect)
+                    (keep statement)
+                    (string/join " "))
       :when-effect (str "if (" (lower-expr (get-in effect [:args :pred])) ") { "
                   (lower-effect (get-in effect [:args :effect]))
                   " }")
