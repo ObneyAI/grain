@@ -311,6 +311,17 @@
           result ((:enter ds/parse-datastar-signals) ctx)]
       (is (= "wrapped" (get-in result [:request :query-params :search])))))
 
+  (testing "POST with explicit payload body merges only payload"
+    (let [body-str (json/write-str {:payload {:page 2 :search "payload"}
+                                    :ambient "ignored"})
+          ctx {:request {:request-method :post
+                         :body body-str
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= 2 (get-in result [:request :query-params :page])))
+      (is (= "payload" (get-in result [:request :query-params :search])))
+      (is (nil? (get-in result [:request :query-params :ambient])))))
+
   (testing "POST preserves native JSON types (booleans, numbers, maps)"
     (let [body-str (json/write-str {:active true :count 0 :fieldErrors {:name "required"}})
           ctx {:request {:request-method :post

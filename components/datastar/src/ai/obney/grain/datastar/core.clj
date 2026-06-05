@@ -142,7 +142,10 @@
   (when-let [body (:body request)]
     (let [body-str (if (string? body) body (slurp body))]
       (when (seq body-str)
-        (json/read-str body-str :key-fn keyword)))))
+        (let [parsed (json/read-str body-str :key-fn keyword)]
+          ;; Datastar UI posts explicit server payloads as {:payload {...}}.
+          ;; Keep accepting flat signal bodies for low-level Datastar interop.
+          (or (:payload parsed) parsed))))))
 
 (defn- stringify-signal-values
   "Coerce signal values to strings to match GET query-param semantics.
@@ -163,6 +166,7 @@
 
    POST body formats:
    - Wrapped:  {\"datastar\": {\"key\": \"val\"}}  (older Datastar convention)
+   - Payload:  {\"payload\": {\"key\": \"val\"}}   (Datastar UI explicit payloads)
    - Flat:     {\"key\": \"val\"}                   (Datastar RC.7+)
 
    Both GET and POST paths merge native JSON types (integers stay integers)."
@@ -178,8 +182,9 @@
                          (let [body-str (if (string? body) body (slurp body))]
                            (when (seq body-str)
                              (let [parsed (json/read-str body-str :key-fn keyword)]
-                               ;; Unwrap {:datastar {...}} if present, otherwise use flat signals
-                               (or (:datastar parsed) parsed)))))
+                               ;; Unwrap explicit payloads and legacy datastar
+                               ;; wrappers before falling back to flat signals.
+                               (or (:payload parsed) (:datastar parsed) parsed)))))
                        (catch Exception _ nil)))]
        (cond
          ds-param
