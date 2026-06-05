@@ -13,7 +13,7 @@
    registry so UI code does not hard-code Datastar paths. Raw Datastar
    attributes and raw actions pass through unchanged and are intentionally
    unchecked."
-  (:refer-clojure :exclude [num reset!])
+  (:refer-clojure :exclude [num])
   (:require [ai.obney.grain.datastar.core :as core]
             [ai.obney.grain.query-processor.interface :as qp]
             [clojure.data.json :as json]
@@ -149,7 +149,7 @@
    returned subtree root.
 
    Example:
-   `(with-signals [open? {:init false}] [:button {:on/click {:effect (set-signal! open? true)}}])`"
+   `(with-signals [open? {:init false}] [:button {:on/click {:effect (set-signal open? true)}}])`"
   [bindings & body]
   (when-not (vector? bindings)
     (throw (ex-info "Signal bindings must be a vector" {:bindings bindings})))
@@ -302,28 +302,26 @@
   ([query params]
    (->Href query params)))
 
-(defn set-signal!
+(defn set-signal
   "Sets a signal to an expression.
-
-   Named `set-signal!` because `set!` is a Clojure special form. Docs may still
-   describe this as the checked signal-set effect."
+   Named `set-signal` because `set` is already a core collection function."
   [signal expr]
-  (->Effect :set! {:signal signal :expr expr}))
+  (->Effect :set-signal {:signal signal :expr expr}))
 
-(defn reset!
+(defn reset-signal
   "Resets a signal to its declared initial value."
   [signal]
-  (->Effect :reset! {:signal signal}))
+  (->Effect :reset-signal {:signal signal}))
 
-(defn clear-errors!
+(defn clear-errors
   "Clears the conventional Datastar error signals."
   []
-  (->Effect :clear-errors! {}))
+  (->Effect :clear-errors {}))
 
-(defn blur!
+(defn blur
   "Calls `el.blur()`."
   []
-  (->Effect :blur! {}))
+  (->Effect :blur {}))
 
 (defn action
   "Embeds an opaque raw Datastar action string.
@@ -333,24 +331,24 @@
   [raw]
   (->Effect :action {:raw raw}))
 
-(defn do!
+(defn effects
   "Runs effects in sequence."
   [& effects]
-  (->Effect :do! {:effects effects}))
+  (->Effect :effects {:effects effects}))
 
-(defn when!
+(defn when-effect
   "Runs `effect` when `pred` is truthy."
   [pred effect]
-  (->Effect :when! {:pred pred :effect effect}))
+  (->Effect :when-effect {:pred pred :effect effect}))
 
-(defn if!
+(defn choose-effect
   "Runs `then-effect` or `else-effect` based on `pred`."
-  ([pred then-effect] (if! pred then-effect nil))
+  ([pred then-effect] (choose-effect pred then-effect nil))
   ([pred then-effect else-effect]
-   (->Effect :if! {:pred pred :then then-effect :else else-effect})))
+   (->Effect :choose-effect {:pred pred :then then-effect :else else-effect})))
 
 (defn on-keys
-  "Creates a keydown effect map, e.g. `{:Enter (blur!) :Escape (reset! title)}`."
+  "Creates a keydown effect map, e.g. `{:Enter (blur) :Escape (reset-signal title)}`."
   [key->effect]
   (->Effect :on-keys {:key->effect key->effect}))
 
@@ -372,7 +370,7 @@
                  :schema (if props? maybe-schema maybe-props)})))
           (rest schema))))
 
-(defn- validate-dispatch!
+(defn- validate-dispatch
   [command args]
   (when (keyword? command)
     (let [schema (try (m/form (m/deref (m/schema command)))
@@ -440,7 +438,7 @@
 
 (defn- lower-dispatch
   [{:keys [command args opts]}]
-  (validate-dispatch! command args)
+  (validate-dispatch command args)
   (let [target (post-target (:post opts))
         payload (assoc args :command/name (command-name-string command))]
     (str "@post(" target ", {payload: " (payload-object-literal payload) "})")))
@@ -469,20 +467,20 @@
     (case (:op effect)
       :dispatch (lower-dispatch (:args effect))
       :refresh (lower-refresh (:args effect))
-      :set! (str (signal-ref (get-in effect [:args :signal]))
+      :set-signal (str (signal-ref (get-in effect [:args :signal]))
                  " = "
                  (expr-value (get-in effect [:args :expr]))
                  ";")
-      :reset! (let [s (get-in effect [:args :signal])]
+      :reset-signal (let [s (get-in effect [:args :signal])]
                 (str (signal-ref s) " = " (js-literal (:init s)) ";"))
-      :clear-errors! "$fieldErrors = {}; $error = '';"
-      :blur! "el.blur();"
+      :clear-errors "$fieldErrors = {}; $error = '';"
+      :blur "el.blur();"
       :action (get-in effect [:args :raw])
-      :do! (string/join " " (map lower-effect (get-in effect [:args :effects])))
-      :when! (str "if (" (lower-expr (get-in effect [:args :pred])) ") { "
+      :effects (string/join " " (map lower-effect (get-in effect [:args :effects])))
+      :when-effect (str "if (" (lower-expr (get-in effect [:args :pred])) ") { "
                   (lower-effect (get-in effect [:args :effect]))
                   " }")
-      :if! (str "if (" (lower-expr (get-in effect [:args :pred])) ") { "
+      :choose-effect (str "if (" (lower-expr (get-in effect [:args :pred])) ") { "
                 (lower-effect (get-in effect [:args :then]))
                 " }"
                 (when-let [else-effect (get-in effect [:args :else])]
@@ -636,20 +634,20 @@
                            #(resolve-payload-signals signal-env %))
       :refresh (update-in effect [:args :params]
                           #(resolve-payload-signals signal-env %))
-      :set! (-> effect
+      :set-signal (-> effect
                 (update-in [:args :signal] #(resolve-signal signal-env %))
                 (update-in [:args :expr] #(resolve-expr-signals signal-env %)))
-      :reset! (update-in effect [:args :signal] #(resolve-signal signal-env %))
-      :clear-errors! effect
-      :blur! effect
+      :reset-signal (update-in effect [:args :signal] #(resolve-signal signal-env %))
+      :clear-errors effect
+      :blur effect
       :action effect
-      :do! (update-in effect [:args :effects]
+      :effects (update-in effect [:args :effects]
                       (fn [effects]
                         (mapv #(resolve-effect-signals signal-env %) effects)))
-      :when! (-> effect
+      :when-effect (-> effect
                  (update-in [:args :pred] #(resolve-expr-signals signal-env %))
                  (update-in [:args :effect] #(resolve-effect-signals signal-env %)))
-      :if! (-> effect
+      :choose-effect (-> effect
                (update-in [:args :pred] #(resolve-expr-signals signal-env %))
                (update-in [:args :then] #(resolve-effect-signals signal-env %))
                (update-in [:args :else] #(resolve-effect-signals signal-env %)))
@@ -675,7 +673,7 @@
     (resolve-payload-signals signal-env value)
     (resolve-dsl-signals signal-env value)))
 
-(defn- resolve-local-signals!
+(defn- resolve-local-signals
   [signal-env path signals]
   (mapv (fn [^Signal signal]
           (let [scope (or (:scope signal) (auto-signal-scope path))
@@ -710,7 +708,7 @@
           attrs (if attrs? maybe-attrs {})
           children (if attrs? children (cons maybe-attrs children))
           raw-signals (get attrs ::signals [])
-          resolved-signals (resolve-local-signals! signal-env path raw-signals)
+          resolved-signals (resolve-local-signals signal-env path raw-signals)
           parts (split-attrs attrs)]
       {:op :element
        :tag tag

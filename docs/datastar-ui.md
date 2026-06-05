@@ -51,28 +51,64 @@ Commands and queries are addressed by keywords, not literal routes:
 (ns app.students.ui
   (:require [ai.obney.grain.datastar.ui :as ui]))
 
-(defn search-box []
-  (ui/with-signals [query {:init ""}
-                    selected-id {:init nil}]
-    [:div.search
-     [:input {:bind/value query
-              :on/input {:effect (ui/refresh :students/typeahead-page
-                                             {:q query})
-                         :modifiers {:debounce "250ms"}}}]
-     [:button {:on/click {:effect (ui/dispatch :students/archive
-                                               {:student-id selected-id})}}
-      "Archive"]]))
+(defn student-typeahead []
+  (ui/with-signals [query {:init ""}]
+    [:section.typeahead
+     [:label {:for "student-search"} "Find student"]
+     [:input#student-search
+      {:bind/value query
+       :placeholder "Search by name, email, or id"
+       :on/input {:effect (ui/refresh :students/typeahead-page
+                                      {:q query})
+                  :modifiers {:debounce "250ms"}}}]
+     [:div#student-results]]))
+
+(defn student-index-screen []
+  (ui/with-signals [selected-id {:init nil}
+                    documents-open? {:init false}
+                    saving? {:init false}]
+    [:main.students-screen
+     [:header
+      [:h1 "Students"]
+      [:a {:href (ui/href :students/new-student-page)}
+       "New student"]]
+
+     (student-typeahead)
+
+     [:section.student-workspace
+      [:nav
+       [:a {:href (ui/href :students/profile-page
+                          {:path-params {:student-id selected-id}})}
+        "Profile"]
+       [:button {:on/click {:effect (ui/effects
+                                      (ui/set-signal documents-open? true)
+                                      (ui/refresh :students/documents-panel
+                                                  {:student-id selected-id}))}}
+        "Documents"]]
+
+      [:section {:bind/show documents-open?}
+       [:div#student-documents]]
+
+      [:button {:bind/attr {:disabled (ui/js "!" selected-id " || " saving?)}
+                :on/click {:effect (ui/effects
+                                     (ui/set-signal saving? true)
+                                     (ui/dispatch :students/archive
+                                                  {:student-id selected-id}))}}
+       "Archive student"]]]))
 ```
 
 Lower it before rendering:
 
 ```clojure
-(ui/hiccup (search-box))
+(ui/hiccup (student-index-screen))
 ```
 
 The checked output contains generated Datastar signal names and Datastar action
-strings. The source keeps local signal handles (`query`, `selected-id`) and
-route refs (`:students/typeahead-page`, `:students/archive`).
+strings. The source keeps local signal handles (`query`, `selected-id`,
+`documents-open?`, `saving?`) and route refs (`:students/typeahead-page`,
+`:students/profile-page`, `:students/documents-panel`, `:students/archive`).
+The typeahead has its own scoped `query` signal, separate from the screen's
+state.
 
 ## Mental Model
 
@@ -165,7 +201,7 @@ local Clojure name and an options map:
                   amount {:name "amount-dollars" :init ""}]
   [:div
    [:input {:bind/value query}]
-   [:button {:on/click {:effect (ui/set-signal! open? true)}} "Open"]])
+   [:button {:on/click {:effect (ui/set-signal open? true)}} "Open"]])
 ```
 
 Options:
@@ -189,8 +225,8 @@ generates deterministic scoped names:
 
 ```clojure
 [:div
- (search-box)
- (search-box)]
+ (student-typeahead)
+ (student-typeahead)]
 ```
 
 Application code should not use `with-signal-scope` for normal UI. It exists
@@ -332,36 +368,36 @@ returned stream:
 By default `refresh` includes the reusable stream nonce `dsNonce`. Pass
 `{:include-nonce? false}` for one-shot/manual interop.
 
-`set-signal!`
+`set-signal`
 
 Sets one signal:
 
 ```clojure
-(ui/set-signal! query "")
+(ui/set-signal query "")
 ```
 
-`reset!`
+`reset-signal`
 
 Resets a signal to its declared `:init` value:
 
 ```clojure
-(ui/reset! query)
+(ui/reset-signal query)
 ```
 
-`clear-errors!`
+`clear-errors`
 
 Clears Grain's conventional Datastar error signals:
 
 ```clojure
-(ui/clear-errors!)
+(ui/clear-errors)
 ```
 
-`blur!`
+`blur`
 
 Calls `el.blur()` in the current Datastar event:
 
 ```clojure
-(ui/blur!)
+(ui/blur)
 ```
 
 `action`
@@ -376,33 +412,33 @@ enough:
 Raw actions are not route-checked and do not receive route-ref or payload
 handling.
 
-`do!`
+`effects`
 
 Runs effects in order:
 
 ```clojure
-(ui/do!
-  (ui/set-signal! saving? true)
+(ui/effects
+  (ui/set-signal saving? true)
   (ui/dispatch :documents/submit {:id document-id}))
 ```
 
-`when!`
+`when-effect`
 
 Runs an effect when a predicate is truthy:
 
 ```clojure
-(ui/when! (ui/present? signature)
+(ui/when-effect (ui/present? signature)
   (ui/dispatch :documents/submit-signature {:signature signature}))
 ```
 
-`if!`
+`choose-effect`
 
 Chooses between effects:
 
 ```clojure
-(ui/if! (ui/present? signature)
+(ui/choose-effect (ui/present? signature)
   (ui/dispatch :documents/submit-signature {:signature signature})
-  (ui/set-signal! error "Signature is required"))
+  (ui/set-signal error "Signature is required"))
 ```
 
 `on-keys`
@@ -412,7 +448,7 @@ Runs effects by keyboard key:
 ```clojure
 (ui/on-keys
   {"Enter" (ui/dispatch :search/submit {:q query})
-   "Escape" (ui/do! (ui/reset! query) (ui/blur!))})
+   "Escape" (ui/effects (ui/reset-signal query) (ui/blur))})
 ```
 
 ## Expressions
@@ -719,28 +755,28 @@ Creates a checked page href:
 
 ### Effects
 
-`set-signal!`
+`set-signal`
 
 ```clojure
-(ui/set-signal! saving? true)
+(ui/set-signal saving? true)
 ```
 
-`reset!`
+`reset-signal`
 
 ```clojure
-(ui/reset! query)
+(ui/reset-signal query)
 ```
 
-`clear-errors!`
+`clear-errors`
 
 ```clojure
-(ui/clear-errors!)
+(ui/clear-errors)
 ```
 
-`blur!`
+`blur`
 
 ```clojure
-(ui/blur!)
+(ui/blur)
 ```
 
 `action`
@@ -749,33 +785,33 @@ Creates a checked page href:
 (ui/action "$open = false;")
 ```
 
-`do!`
+`effects`
 
 ```clojure
-(ui/do! (ui/set-signal! saving? true)
+(ui/effects (ui/set-signal saving? true)
         (ui/dispatch :documents/save {:id document-id}))
 ```
 
-`when!`
+`when-effect`
 
 ```clojure
-(ui/when! (ui/present? signature)
+(ui/when-effect (ui/present? signature)
   (ui/dispatch :documents/sign {:signature signature}))
 ```
 
-`if!`
+`choose-effect`
 
 ```clojure
-(ui/if! (ui/present? signature)
+(ui/choose-effect (ui/present? signature)
   (ui/dispatch :documents/sign {:signature signature})
-  (ui/set-signal! error "Required"))
+  (ui/set-signal error "Required"))
 ```
 
 `on-keys`
 
 ```clojure
 (ui/on-keys {"Enter" (ui/dispatch :search/submit {:q query})
-             "Escape" (ui/reset! query)})
+             "Escape" (ui/reset-signal query)})
 ```
 
 `lower-effect`
@@ -783,7 +819,7 @@ Creates a checked page href:
 Low-level. Lowers a checked effect to a Datastar action string:
 
 ```clojure
-(ui/lower-effect (ui/set-signal! query ""))
+(ui/lower-effect (ui/set-signal query ""))
 ```
 
 ### Expressions

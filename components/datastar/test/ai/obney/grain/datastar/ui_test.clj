@@ -79,7 +79,7 @@
                  (ui/with-signals [duration {:name "duration-weeks" :init 12}]
                    [:input {:class "input"
                             :bind/value duration
-                            :on/input {:effect (ui/set-signal! duration (ui/num duration))}}]))
+                            :on/input {:effect (ui/set-signal duration (ui/num duration))}}]))
         ir-node (ui/ir source)
         signal (first (:signals ir-node))]
     (is (= :element (:op ir-node)))
@@ -175,17 +175,17 @@
              (ui/with-signals [title {:init "Old"}]
                [:input {:bind/value title
                         :bind/text (ui/js "String(" title ")")
-                        :on/input {:effect (ui/do!
-                                             (ui/set-signal! title (ui/trimmed title))
-                                             (ui/when! (ui/present? title)
+                        :on/input {:effect (ui/effects
+                                             (ui/set-signal title (ui/trimmed title))
+                                             (ui/when-effect (ui/present? title)
                                                (ui/dispatch :ui-test/create-campus
                                                  {:campus-name title
                                                   :is-virtual false}))
-                                             (ui/if! (ui/changed? title "Old")
+                                             (ui/choose-effect (ui/changed? title "Old")
                                                (ui/refresh :ui-test/changed-page
                                                  {:title title})
-                                               (ui/reset! title)))}
-                        :on/keydown {:effect (ui/on-keys {:Escape (ui/reset! title)})}}]))
+                                               (ui/reset-signal title)))}
+                        :on/keydown {:effect (ui/on-keys {:Escape (ui/reset-signal title)})}}]))
         signal-name (first (data-signal-keys out))
         a (attrs out)
         input (:data-on:input a)
@@ -531,14 +531,14 @@
   (let [out (ui/hiccup
              (ui/with-signals [title {:init "Old"}]
                [:input {:bind/value title
-                        :on/blur {:effect (ui/when! (ui/changed? title "Old")
+                        :on/blur {:effect (ui/when-effect (ui/changed? title "Old")
                                             (ui/dispatch :ui-test/create-campus
                                               {:campus-name (ui/trimmed title)
                                                :is-virtual false}))}
-                        :on/keydown {:effect (ui/on-keys {:Enter (ui/blur!)
-                                                          :Escape (ui/do!
-                                                                   (ui/reset! title)
-                                                                   (ui/blur!))})}}]))
+                        :on/keydown {:effect (ui/on-keys {:Enter (ui/blur)
+                                                          :Escape (ui/effects
+                                                                   (ui/reset-signal title)
+                                                                   (ui/blur))})}}]))
         a (attrs out)]
     (is (string/includes? (:data-on:blur a) ".trim()"))
     (is (string/includes? (:data-on:blur a) "if ("))
