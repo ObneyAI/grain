@@ -12,7 +12,9 @@
    them in its payload. Raw Datastar attributes and raw actions pass through
    unchanged and are intentionally unchecked."
   (:refer-clojure :exclude [num reset!])
-  (:require [clojure.data.json :as json]
+  (:require [ai.obney.grain.datastar.core :as core]
+            [ai.obney.grain.query-processor.interface :as qp]
+            [clojure.data.json :as json]
             [clojure.string :as string]
             [malli.core :as m]))
 
@@ -27,10 +29,20 @@
 (defrecord Signal [binding semantic-name resolved-name scope init type])
 (defrecord Expr [op args])
 (defrecord Effect [op args])
+(defrecord Href [query params])
 
 (defn- signal? [x] (instance? Signal x))
 (defn- expr? [x] (instance? Expr x))
 (defn- effect? [x] (instance? Effect x))
+(defn- href? [x] (instance? Href x))
+
+(def ^:dynamic *lower-opts*
+  {})
+
+(defn- query-registry
+  []
+  (or (:query-registry *lower-opts*)
+      (qp/global-query-registry)))
 
 (defn- signal-key
   [k]
@@ -260,7 +272,8 @@
    signals are not posted unless referenced in `args`.
 
    Options:
-   - `:post` Datastar post target, default `$__grainAction`."
+   - `:post` reserved Datastar signal ref, default `$__grainAction`.
+     Literal route strings are rejected in checked UI."
   ([command args] (dispatch command args {}))
   ([command args opts]
    (->Effect :dispatch {:command command :args args :opts opts})))
@@ -269,12 +282,26 @@
   "Creates an explicit query/stream refresh effect.
 
    `params` are the only request values sent to the server; ambient page signals
-   are not included. By default, Datastar UI includes the reusable-stream
-   protocol nonce `dsNonce` as explicit metadata. Pass
-   `{:include-nonce? false}` to omit it for one-shot/manual interop."
-  ([path params] (refresh path params {}))
-  ([path params opts]
-   (->Effect :refresh {:path path :params params :opts opts})))
+   are not included. `query` is a registered query keyword with `:datastar/path`.
+   By default, Datastar UI includes the reusable-stream protocol nonce `dsNonce`
+   as explicit metadata. Pass `{:include-nonce? false}` to omit it for
+   one-shot/manual interop.
+
+   Options:
+   - `:method` Datastar action method, default `:post`.
+   - `:path-params` values for path templates such as `/items/:item-id`.
+   - `:query-params` values appended to the generated stream path."
+  ([query params] (refresh query params {}))
+  ([query params opts]
+   (->Effect :refresh {:query query :params params :opts opts})))
+
+(defn href
+  "Creates a checked page href for a registered Datastar query.
+
+   `params` may include `:path-params` and `:query-params`."
+  ([query] (href query {}))
+  ([query params]
+   (->Href query params)))
 
 (defn set-signal!
   "Sets a signal to an expression.
@@ -378,7 +405,8 @@
   (cond
     (nil? target) default-command-post
     (string/starts-with? (str target) "$") (str target)
-    :else (js-literal target)))
+    :else (throw (ex-info "Dispatch :post must be a reserved signal ref, not a literal route"
+                          {:post target}))))
 
 (defn- lower-dispatch
   [{:keys [command args opts]}]
@@ -388,8 +416,14 @@
     (str "@post(" target ", {payload: " (object-literal payload) "})")))
 
 (defn- lower-refresh
-  [{:keys [path params opts]}]
+  [{:keys [query params opts]}]
+  (when-not (keyword? query)
+    (throw (ex-info "Refresh target must be a registered query keyword, not a route string"
+                    {:target query})))
   (let [method (name (or (:method opts) :post))
+        path (core/stream-path query
+                               (select-keys opts [:path-params :query-params])
+                               (query-registry))
         include-nonce? (not= false (:include-nonce? opts))
         payload (cond-> params
                   include-nonce? (assoc :dsNonce (->Expr :sig {:signal "dsNonce"})))]
@@ -695,6 +729,19 @@
                  (apply str (keep lower-event-modifier modifiers))))
    (lower-effect effect)])
 
+(defn- lower-attr-value
+  [v]
+  (if (href? v)
+    (core/page-path (:query v) (:params v) (query-registry))
+    v))
+
+(defn- lower-attrs
+  [attrs]
+  (into {}
+        (map (fn [[k v]]
+               [k (lower-attr-value v)]))
+        attrs))
+
 (defn- merge-data-signals
   [attrs signals]
   (if (seq signals)
@@ -718,12 +765,13 @@
    `opts` currently accepts `{:target :datastar}` and is reserved for future
    checked interpretations."
   ([ir-node] (lower-ir ir-node {:target :datastar}))
-  ([ir-node _opts]
-   (case (:op ir-node)
-     :literal (:value ir-node)
-     :fragment (doall (map lower-ir (:children ir-node)))
+  ([ir-node opts]
+   (binding [*lower-opts* opts]
+     (case (:op ir-node)
+     :literal (lower-attr-value (:value ir-node))
+     :fragment (doall (map #(lower-ir % opts) (:children ir-node)))
      :element
-     (let [attrs0 (:attrs ir-node)
+     (let [attrs0 (lower-attrs (:attrs ir-node))
            attrs1 (merge-data-signals attrs0 (:signals ir-node))
            attrs2 (reduce-kv (fn [m k v]
                                (if (= k :attr)
@@ -741,16 +789,17 @@
                                  (assoc m attr-k attr-v)))
                              attrs2
                              (:events ir-node))
-           children (map lower-ir (:children ir-node))]
-       (into [(:tag ir-node) attrs3] children)))))
+           children (map #(lower-ir % opts) (:children ir-node))]
+       (into [(:tag ir-node) attrs3] children))))))
 
 (defn hiccup
   "Compiles Datastar UI source to ordinary Datastar hiccup.
 
    This returns hiccup, not an HTML string. The existing Datastar adapter remains
    responsible for `hiccup2` HTML rendering and SSE patch construction."
-  [source]
-  (lower-ir (ir source)))
+  ([source] (hiccup source {}))
+  ([source opts]
+   (lower-ir (ir source) opts)))
 
 (defn static
   "Interprets IR as static gallery hiccup.
@@ -760,25 +809,26 @@
    - `:strip-raw-events?` removes raw `data-on*` attributes."
   ([ir-node] (static ir-node {}))
   ([ir-node opts]
-   (case (:op ir-node)
-     :literal (:value ir-node)
-     :fragment (doall (map #(static % opts) (:children ir-node)))
-     :element
-     (let [attrs (cond-> (:attrs ir-node)
-                   (:strip-href? opts) (dissoc :href)
-                   (:strip-raw-events? opts)
-                   (as-> a
-                         (into {}
-                               (remove (fn [[k _]]
-                                         (let [s (if (keyword? k)
-                                                   (str (when-let [ns (namespace k)] (str ns ":"))
-                                                        (name k))
-                                                   (str k))]
-                                           (string/starts-with? s "data-on")))
-                                       a))))]
-       (into [(:tag ir-node) attrs]
-             (map #(static % opts))
-             (:children ir-node))))))
+   (binding [*lower-opts* opts]
+     (case (:op ir-node)
+       :literal (lower-attr-value (:value ir-node))
+       :fragment (doall (map #(static % opts) (:children ir-node)))
+       :element
+       (let [attrs (cond-> (lower-attrs (:attrs ir-node))
+                     (:strip-href? opts) (dissoc :href)
+                     (:strip-raw-events? opts)
+                     (as-> a
+                           (into {}
+                                 (remove (fn [[k _]]
+                                           (let [s (if (keyword? k)
+                                                     (str (when-let [ns (namespace k)] (str ns ":"))
+                                                          (name k))
+                                                     (str k))]
+                                             (string/starts-with? s "data-on")))
+                                         a))))]
+         (into [(:tag ir-node) attrs]
+               (map #(static % opts))
+               (:children ir-node)))))))
 
 (defmacro defcomponent
   "Defines a component function whose body is compiled with `hiccup`."

@@ -40,10 +40,9 @@ Datastar signals are client-local UI state unless explicitly referenced in a
 
 ```clojure
 (ui/dispatch :academic/create-campus
-  {:campus-name campus-name}
-  {:post "/actions"})
+  {:campus-name campus-name})
 
-(ui/refresh "/admin/graduation-pending/__stream"
+(ui/refresh :admin/graduation-pending-page
   {:page page
    :search search})
 ```
@@ -53,6 +52,29 @@ These lower to `@post(..., {payload: ...})`; they do not post all page signals.
 metadata so the POST updates the existing SSE connection. Pass
 `{:include-nonce? false}` for one-shot/manual interop. The low-level Datastar
 adapter still accepts flat or legacy wrapped signal bodies for interop.
+
+## Route References
+
+Checked UI uses registry-backed route references. Normal app code should not
+hard-code command or query routes.
+
+```clojure
+(ui/dispatch :financial/record-arbitrary-refund
+  {:application-id application-id
+   :amount-cents amount-cents})
+
+(ui/refresh :admin/student-detail-page
+  {:tab :finance}
+  {:path-params {:student-id student-id}
+   :query-params {:tab :finance}})
+
+[:a {:href (ui/href :student/payments-page)} "Payments"]
+```
+
+Commands post to the reserved `$__grainAction` signal emitted by the shim page.
+Query refreshes and hrefs resolve from query registry `:datastar/path` metadata.
+Literal route strings belong in query metadata, adapter defaults, or raw
+Datastar escape hatches only.
 
 ## Signals
 
@@ -91,7 +113,7 @@ remain runtime values; raw JavaScript is intentionally opaque.
 Checked `:on/...` attrs always use explicit event maps:
 
 ```clojure
-{:on/input {:effect (ui/refresh "/students/typeahead/__stream"
+{:on/input {:effect (ui/refresh :students/typeahead-page
                        {:q search})
             :modifiers {:debounce "300ms"}}
  :on/submit {:effect (ui/dispatch :academic/create-campus
@@ -138,7 +160,7 @@ Example dispatch IR:
  :command :financial/record-arbitrary-refund
  :args {:amount-cents {:op :num-cents
                        :expr {:op :sig :name "amount-dollars"}}}
- :post "/actions"}
+ :post "$__grainAction"}
 ```
 
 Example signal IR:

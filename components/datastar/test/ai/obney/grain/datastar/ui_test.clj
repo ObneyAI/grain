@@ -29,9 +29,30 @@
        (re-seq #"\"([^\"]+)\":")
        (mapv second)))
 
+(def test-query-registry
+  {:ui-test/search-page {:handler-fn identity
+                         :authorized? (constantly true)
+                         :datastar/path "/search"}
+   :ui-test/changed-page {:handler-fn identity
+                          :authorized? (constantly true)
+                          :datastar/path "/changed"}
+   :ui-test/graduation-pending-page {:handler-fn identity
+                                     :authorized? (constantly true)
+                                     :datastar/path "/admin/graduation-pending"}
+   :ui-test/one-shot-page {:handler-fn identity
+                           :authorized? (constantly true)
+                           :datastar/path "/one-shot"}
+   :ui-test/student-detail-page {:handler-fn identity
+                                 :authorized? (constantly true)
+                                 :datastar/path "/admin/students/:student-id"}})
+
+(defn- hiccup
+  [source]
+  (ui/hiccup source {:query-registry test-query-registry}))
+
 (deftest hiccup-returns-plain-hiccup
   (let [task-id #uuid "00000000-0000-0000-0000-000000000001"
-        out (ui/hiccup
+        out (hiccup
              [:button {:class "btn"
                        :on/click {:effect (ui/dispatch :ui-test/complete-task
                                             {:task-id task-id})}}
@@ -68,8 +89,8 @@
                      (ui/with-signals [duration (ui/signal {:name "duration-weeks" :init 12})]
                        [:input {:bind/value duration
                                 :bind/text (ui/sig duration)}]))
-        out-a (ui/hiccup (make-node))
-        out-b (ui/hiccup (make-node))
+        out-a (hiccup (make-node))
+        out-b (hiccup (make-node))
         signals-a (:data-signals (attrs out-a))
         bind-a (:data-bind (attrs out-a))
         text-a (:data-text (attrs out-a))]
@@ -91,7 +112,7 @@
     (is (= (ui/signal-ref signal-name) (:data-text (attrs out-a))))))
 
 (deftest sibling-signal-scopes-do-not-collide
-  (let [out (ui/hiccup
+  (let [out (hiccup
              [:div
               (ui/with-signals [query (ui/signal {:init ""})]
                 [:input {:bind/value query}])
@@ -108,11 +129,11 @@
     (is (= right-name (:data-bind (attrs right))))))
 
 (deftest parent-signal-scope-applies-to-child-references
-  (let [out (ui/hiccup
+  (let [out (hiccup
              (ui/with-signals [query (ui/signal {:init ""})]
                [:div
                 [:input {:bind/value query}]
-                [:button {:on/click {:effect (ui/refresh "/search/__stream"
+                [:button {:on/click {:effect (ui/refresh :ui-test/search-page
                                                 {:q query})}}
                  "Search"]]))
         signal-name (first (data-signal-keys out))
@@ -123,7 +144,7 @@
     (is (string/includes? click (str "\"q\": " (ui/signal-ref signal-name))))))
 
 (deftest nested-signals-shadow-by-lexical-handle
-  (let [out (ui/hiccup
+  (let [out (hiccup
              (ui/with-signals [open? (ui/signal {:init false})]
                [:div
                 [:input {:bind/value open?}]
@@ -143,7 +164,7 @@
     (is (= parent-name (:data-bind (attrs last-input))))))
 
 (deftest signal-resolution-covers-checked-effect-and-expression-trees
-  (let [out (ui/hiccup
+  (let [out (hiccup
              (ui/with-signals [title (ui/signal {:init "Old"})]
                [:input {:bind/value title
                         :bind/text (ui/js "String(" title ")")
@@ -154,7 +175,7 @@
                                                  {:campus-name title
                                                   :is-virtual false}))
                                              (ui/if! (ui/changed? title "Old")
-                                               (ui/refresh "/changed/__stream"
+                                               (ui/refresh :ui-test/changed-page
                                                  {:title title})
                                                (ui/reset! title)))}
                         :on/keydown {:effect (ui/on-keys {:Escape (ui/reset! title)})}}]))
@@ -172,7 +193,7 @@
     (is (string/includes? keydown (str (ui/signal-ref signal-name) " = \"Old\";")))))
 
 (deftest raw-datastar-attrs-pass-through
-  (let [out (ui/hiccup
+  (let [out (hiccup
              [:div {"data-signals__ifmissing" "{'open': false}"
                     "data-on-signal-patch__filter-key__fieldErrors" "console.log($fieldErrors)"
                     "data-effect" "window.__effect && window.__effect(el)"
@@ -300,12 +321,11 @@
                                virtual? (ui/signal {:name "is-virtual" :init false})]
                [:form {:on/submit {:effect (ui/dispatch :ui-test/create-campus
                                               {:campus-name name
-                                               :is-virtual virtual?}
-                                              {:post "/actions"})}}
+                                               :is-virtual virtual?})}}
                 [:input {:bind/value name}]
                 [:input {:type "checkbox" :bind/value virtual?}]]))
         submit (:data-on:submit (attrs out))]
-    (is (string/includes? submit "@post(\"/actions\", {payload:"))
+    (is (string/includes? submit "@post($__grainAction, {payload:"))
     (is (string/includes? submit "\"command/name\": \"ui-test/create-campus\""))
     (is (re-find #"\"campus-name\": \$\[\"campus-name__[a-z0-9]+\"\]" submit))
     (is (re-find #"\"is-virtual\": \$\[\"is-virtual__[a-z0-9]+\"\]" submit))
@@ -313,33 +333,88 @@
     (is (not (string/includes? submit "$[\"command/name\"]")))))
 
 (deftest refresh-posts-explicit-query-payload
-  (let [out (ui/hiccup
+  (let [out (hiccup
              (ui/with-signals [page (ui/signal {:init 1})
                                search (ui/signal {:init ""})
                                unrelated (ui/signal {:init "client-only"})]
-               [:button {:on/click {:effect (ui/refresh "/admin/graduation-pending/__stream"
+               [:button {:on/click {:effect (ui/refresh :ui-test/graduation-pending-page
                                              {:page page
                                               :search search})}}
                 "Refresh"]))
         click (:data-on:click (attrs out))]
     (is (string/includes? click "@post(\"/admin/graduation-pending/__stream\", {payload:"))
-    (is (string/includes? click "\"page\": $page"))
-    (is (string/includes? click "\"search\": $search"))
+    (is (re-find #"\"page\": \$page__[a-z0-9]+" click))
+    (is (re-find #"\"search\": \$search__[a-z0-9]+" click))
     (is (string/includes? click "\"dsNonce\": $dsNonce"))
     (is (not (string/includes? click "client-only")))
     (is (not (string/includes? click "unrelated")))))
 
 (deftest refresh-can-omit-reusable-stream-nonce
-  (let [out (ui/hiccup
+  (let [out (hiccup
              (ui/with-signals [page (ui/signal {:init 1})]
-               [:button {:on/click {:effect (ui/refresh "/one-shot/__stream"
+               [:button {:on/click {:effect (ui/refresh :ui-test/one-shot-page
                                              {:page page}
                                              {:include-nonce? false})}}
                 "Refresh"]))
         click (:data-on:click (attrs out))]
     (is (string/includes? click "@post(\"/one-shot/__stream\", {payload:"))
-    (is (string/includes? click "\"page\": $page"))
+    (is (re-find #"\"page\": \$page__[a-z0-9]+" click))
     (is (not (string/includes? click "dsNonce")))))
+
+(deftest checked-route-refs-resolve-from-query-metadata
+  (let [out (hiccup
+             [:div
+              [:a {:href (ui/href :ui-test/student-detail-page
+                         {:path-params {:student-id #uuid "00000000-0000-0000-0000-000000000099"}
+                          :query-params {:tab :finance :page 2}})}
+               "Student"]
+              [:button {:on/click
+                        {:effect (ui/refresh :ui-test/student-detail-page
+                                   {:tab :finance}
+                                   {:path-params {:student-id #uuid "00000000-0000-0000-0000-000000000099"}
+                                    :query-params {:tab :finance :page 2}})}}
+               "Refresh"]])
+        link (nth out 2)
+        button (nth out 3)
+        click (:data-on:click (attrs button))]
+    (is (= "/admin/students/00000000-0000-0000-0000-000000000099?page=2&tab=finance"
+           (:href (attrs link))))
+    (is (string/includes?
+         click
+         "@post(\"/admin/students/00000000-0000-0000-0000-000000000099/__stream?page=2&tab=finance\""))
+    (is (string/includes? click "\"tab\": \"finance\""))))
+
+(deftest checked-route-refs-reject-literal-and-missing-routes
+  (testing "refresh string paths fail"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"registered query keyword"
+         (hiccup
+          [:button {:on/click {:effect (ui/refresh "/literal/__stream" {})}}
+           "bad"]))))
+  (testing "unknown query routes fail"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"not registered"
+         (hiccup
+          [:button {:on/click {:effect (ui/refresh :ui-test/missing-page {})}}
+           "bad"]))))
+  (testing "queries without datastar paths fail"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"no :datastar/path"
+         (ui/hiccup
+          [:a {:href (ui/href :ui-test/no-path)} "bad"]
+          {:query-registry {:ui-test/no-path {:handler-fn identity}}}))))
+  (testing "literal dispatch post paths fail"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"reserved signal ref"
+         (hiccup
+          [:button {:on/click {:effect (ui/dispatch :ui-test/complete-task
+                                        {:task-id #uuid "00000000-0000-0000-0000-000000000001"}
+                                        {:post "/actions"})}}
+           "bad"])))))
 
 (deftest dispatch-schema-validation
   (testing "missing required command key fails"

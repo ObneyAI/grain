@@ -74,6 +74,10 @@
             [malli.transform :as mt]
             [com.brunobonacci.mulog :as u]))
 
+(def default-action-path
+  "Default command action endpoint emitted as the reserved __grainAction signal."
+  "/actions")
+
 ;; --------------- ;;
 ;; HTML Rendering  ;;
 ;; --------------- ;;
@@ -90,6 +94,71 @@
 
 (defn render-html [hiccup]
   (str (h/html hiccup)))
+
+(defn- url-encode
+  [v]
+  (-> (java.net.URLEncoder/encode (if (keyword? v) (name v) (str v)) "UTF-8")
+      (string/replace "+" "%20")))
+
+(defn- replace-path-params
+  [path params]
+  (reduce-kv (fn [p k v]
+               (string/replace p (str ":" (name k)) (url-encode v)))
+             path
+             (or params {})))
+
+(defn- append-query-params
+  [path params]
+  (let [pairs (->> params
+                   (remove (fn [[_ v]] (nil? v)))
+                   (sort-by (comp name key)))]
+    (if (seq pairs)
+      (str path
+           (if (string/includes? path "?") "&" "?")
+           (string/join "&"
+                        (map (fn [[k v]]
+                               (str (url-encode (name k))
+                                    "="
+                                    (url-encode v)))
+                             pairs)))
+      path)))
+
+(defn- route-path
+  [query-name query-registry]
+  (let [entry (get query-registry query-name)]
+    (cond
+      (nil? entry)
+      (throw (ex-info "Datastar query route is not registered"
+                      {:query query-name}))
+
+      (not (:datastar/path entry))
+      (throw (ex-info "Datastar query route has no :datastar/path"
+                      {:query query-name
+                       :entry entry}))
+
+      :else (:datastar/path entry))))
+
+(defn page-path
+  "Resolves a query keyword to its generated Datastar page path.
+
+   `params` may include `:path-params` and `:query-params`."
+  ([query-name query-registry]
+   (page-path query-name {} query-registry))
+  ([query-name params query-registry]
+   (-> (route-path query-name query-registry)
+       (replace-path-params (:path-params params))
+       (append-query-params (:query-params params)))))
+
+(defn stream-path
+  "Resolves a query keyword to its generated Datastar stream path.
+
+   `params` may include `:path-params` and `:query-params`."
+  ([query-name query-registry]
+   (stream-path query-name {} query-registry))
+  ([query-name params query-registry]
+   (let [page (page-path query-name (select-keys params [:path-params]) query-registry)
+         stream (if (= page "/") "/__stream" (str page "/__stream"))]
+     (append-query-params stream (:query-params params)))))
 
 ;; ---------------------- ;;
 ;; SSE Event Formatters   ;;
@@ -595,8 +664,11 @@
 (defn- shim-page-enter
   "Enter fn for shim-page interceptor."
   [opts context]
-  (let [{:keys [title stream-path body head datastar-url html-attrs stream-method]
-         :or {title "Grain App" datastar-url default-datastar-url stream-method "get"}} opts
+  (let [{:keys [title stream-path body head datastar-url html-attrs stream-method action-path]
+         :or {title "Grain App"
+              datastar-url default-datastar-url
+              stream-method "get"
+              action-path default-action-path}} opts
         query-string (get-in context [:request :query-string])
         ;; Resolve path params (e.g. :event-id → actual UUID) in the stream URL
         path-params (get-in context [:request :path-params])
@@ -615,6 +687,8 @@
                                              resolved-stream-path)
                                       separator (if (string/includes? base "?") "&" "?")]
                                   (str base separator "dsNonce=" nonce)))
+        reserved-signals (cond-> {"__grainAction" action-path}
+                           effective-stream-path (assoc "dsNonce" nonce))
         page-html (str "<!DOCTYPE html>"
                        (h/html
                          [:html (or html-attrs {})
@@ -624,12 +698,12 @@
                            [:title title]
                            [:script {:type "module" :src datastar-url}]
                            (when head (if (fn? head) (head) head))]
-                          [:body (cond-> {}
+                           [:body (cond-> {}
                                   effective-stream-path
                                   (assoc :data-init (str "@" stream-method "('" effective-stream-path "')"))
-                                  ;; Nonce as signal so Datastar sends it with every @get and @post
-                                  effective-stream-path
-                                  (assoc :data-signals (str "{'dsNonce': '" nonce "'}")))
+                                  ;; Reserved signals for checked UI route refs.
+                                  (seq reserved-signals)
+                                  (assoc :data-signals (json/write-str reserved-signals)))
 
 
                            (when body body)
@@ -790,7 +864,11 @@
                          auth-interceptor (conj auth-interceptor)
                          gate-int (conj gate-int)
                          true (into explicit-interceptors))
-          shim-opts (merge {:title title :stream-path stream-path}
+          shim-opts (merge {:title title
+                            :stream-path stream-path
+                            :action-path (or (:datastar/action-path entry)
+                                             (:datastar/action-path defaults)
+                                             default-action-path)}
                            (:datastar/shim-opts defaults)
                            (:datastar/shim-opts entry))
           route-base (query-name->route-name query-name)
@@ -823,7 +901,8 @@
 
    Optional overrides map: {query-name {:datastar/fps 2 :datastar/interceptors [...]}}
    Optional defaults map: {:datastar/shim-opts {:head fn :html-attrs {} :datastar-url str}}
-     Defaults are applied to all routes; per-query shim-opts override them."
+     Defaults are applied to all routes; per-query shim-opts override them.
+     :datastar/action-path sets the command endpoint emitted as __grainAction."
   ([context] (routes context {} {}))
   ([context overrides] (routes context overrides {}))
   ([context overrides defaults]

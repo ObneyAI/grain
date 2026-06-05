@@ -343,7 +343,16 @@
       (is (= 200 (get-in result [:response :status])))
       (is (= "text/html; charset=UTF-8"
              (get-in result [:response :headers "Content-Type"])))
-      (is (str/includes? (get-in result [:response :body]) "<script"))))
+      (is (str/includes? (get-in result [:response :body]) "<script"))
+      (is (str/includes? (get-in result [:response :body]) "__grainAction"))
+      (is (str/includes? (get-in result [:response :body]) "/actions"))))
+
+  (testing "custom action path is emitted as reserved signal"
+    (let [interceptor (ds/shim-page {:action-path "/custom-actions"})
+          result ((:enter interceptor) {})
+          body (get-in result [:response :body])]
+      (is (str/includes? body "__grainAction"))
+      (is (str/includes? body "/custom-actions"))))
 
   (testing "with stream-path — nonce in URL and as signal for all stream methods"
     (let [interceptor (ds/shim-page {:stream-path "/stream"})
@@ -974,6 +983,18 @@
     (testing "query title still takes precedence"
       (is (str/includes? body "Custom Title")))))
 
+(deftest routes-with-action-path-default-test
+  (let [context {:query-registry {:test/action-default {:handler-fn identity
+                                                        :authorized? (constantly true)
+                                                        :datastar/path "/action-default"}}}
+        defaults {:datastar/action-path "/custom-actions"}
+        generated (ds/routes context {} defaults)
+        shim-route (first (filter #(= "/action-default" (first %)) generated))
+        shim-interceptor (last (nth shim-route 2))
+        body (get-in ((:enter shim-interceptor) {}) [:response :body])]
+    (is (str/includes? body "__grainAction"))
+    (is (str/includes? body "/custom-actions"))))
+
 (deftest routes-defaults-per-query-override-test
   (let [context {:query-registry {:test/default-head {:handler-fn identity
                                                        :authorized? (constantly true)
@@ -1209,6 +1230,44 @@
       (is (not (some #(and (str/includes? % "/stream")
                            (not (str/includes? % "/__stream")))
                       paths))))))
+
+(deftest registered-page-and-stream-path-resolution-test
+  (let [registry {:test/list {:handler-fn identity
+                              :authorized? (constantly true)
+                              :datastar/path "/items"}
+                  :test/detail {:handler-fn identity
+                                :authorized? (constantly true)
+                                :datastar/path "/items/:item-id"}
+                  :test/root {:handler-fn identity
+                              :authorized? (constantly true)
+                              :datastar/path "/"}
+                  :test/no-path {:handler-fn identity}}]
+    (testing "page paths resolve from query metadata"
+      (is (= "/items" (ds/page-path :test/list registry)))
+      (is (= "/items/abc-123?page=2&tab=details"
+             (ds/page-path :test/detail
+                           {:path-params {:item-id "abc-123"}
+                            :query-params {:tab :details
+                                           :page 2}}
+                           registry))))
+    (testing "stream paths resolve from query metadata"
+      (is (= "/items/__stream" (ds/stream-path :test/list registry)))
+      (is (= "/items/abc-123/__stream?page=2&tab=details"
+             (ds/stream-path :test/detail
+                             {:path-params {:item-id "abc-123"}
+                              :query-params {:tab :details
+                                             :page 2}}
+                             registry)))
+      (is (= "/__stream" (ds/stream-path :test/root registry))))
+    (testing "missing route metadata fails"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"not registered"
+           (ds/page-path :test/missing registry)))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"no :datastar/path"
+           (ds/page-path :test/no-path registry))))))
 
 (deftest query->route-pair-root-path-test
   (let [entry {:handler-fn identity
