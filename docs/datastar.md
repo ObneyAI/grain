@@ -2,6 +2,8 @@
 
 Grain integrates with [Datastar](https://data-star.dev/) for building reactive server-rendered UIs. Queries that return `:datastar/hiccup` are streamed to the browser over SSE — the server re-renders when domain events fire and Datastar patches the DOM.
 
+For checked client-side Datastar attributes, route references, explicit command/query payloads, and automatic signal scoping, use the [Datastar UI DSL](datastar-ui.md).
+
 ```clojure
 (defquery :example counter-view
   {:authorized?       (constantly true)
@@ -55,11 +57,13 @@ The `defaults` map applies to all generated routes:
   {:datastar/shim-opts {:head        (fn [] [:link {:href "/app.css"}])
                         :html-attrs  {:lang "en" :data-theme "dark"}
                         :datastar-url "https://cdn.jsdelivr.net/..."}
+   :datastar/action-path "/actions"
    :datastar/auth-redirect {:unauthenticated "/auth/sign-in"
                             :unauthorized    "/dashboard"}})
 ```
 
 - **`:datastar/shim-opts`** — default `<head>` content, `<html>` attributes, and Datastar CDN URL. Per-query `:datastar/shim-opts` (from the registry or overrides) take precedence.
+- **`:datastar/action-path`** — default shared action handler route emitted into generated Datastar pages for `ui/dispatch`. Per-query/page `:datastar/action-path` metadata takes precedence.
 - **`:datastar/auth-redirect`** — auto-generates redirect interceptors from each query's `:authorized?` predicate. Queries where `(authorized? {})` returns truthy (e.g. `(constantly true)`) are treated as public and skipped.
 
 ### Auth Redirect
@@ -141,6 +145,7 @@ The adapter logs warnings for common misconfigurations that would otherwise caus
 | Key | Description | Default |
 | --- | --- | --- |
 | `:datastar/path` | Route path, supports Pedestal path params (e.g. `/events/:event-id`) | — |
+| `:datastar/action-path` | Shared command action endpoint emitted into a Datastar page | — |
 | `:datastar/title` | HTML `<title>` in the shim page | `"Grain App"` |
 | `:datastar/fps` | Polling rate (ignored in event-driven mode) | `30` |
 | `:datastar/debounce-ms` | Debounce before re-render after event | `50` |

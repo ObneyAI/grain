@@ -9,8 +9,10 @@
 
    Server effects generated here use explicit payloads. Datastar signals remain
    client-local UI state unless a `dispatch` or `refresh` explicitly references
-   them in its payload. Raw Datastar attributes and raw actions pass through
-   unchanged and are intentionally unchecked."
+   them in its payload. Checked route refs resolve through the Grain query
+   registry so UI code does not hard-code Datastar paths. Raw Datastar
+   attributes and raw actions pass through unchanged and are intentionally
+   unchecked."
   (:refer-clojure :exclude [num reset!])
   (:require [ai.obney.grain.datastar.core :as core]
             [ai.obney.grain.query-processor.interface :as qp]
@@ -120,14 +122,18 @@
    Usually called by `with-signals`; public primarily for tests and low-level
    interop. `binding` is the source binding symbol, and opts may include
    `:name`, `:init`, and `:type`."
-  [binding {:keys [name init type] :as opts}]
-  (->Signal binding
-            (or name (clojure.core/name binding))
-            (when (seq *signal-scope*)
-              (resolve-signal-name binding opts))
-            *signal-scope*
-            init
-            type))
+  [binding opts]
+  (when-not (map? opts)
+    (throw (ex-info "Signal options must be a map"
+                    {:binding binding :opts opts})))
+  (let [{:keys [name init type]} opts]
+    (->Signal binding
+              (or name (clojure.core/name binding))
+              (when (seq *signal-scope*)
+                (resolve-signal-name binding opts))
+              *signal-scope*
+              init
+              type)))
 
 (defmacro with-signal-scope
   "Binds an explicit signal scope for nested `with-signals` forms.
@@ -144,28 +150,22 @@
    returned subtree root.
 
    Example:
-   `(with-signals [open? (signal {:init false})] [:button {:on/click {:effect (set-signal! open? true)}}])`"
+   `(with-signals [open? {:init false}] [:button {:on/click {:effect (set-signal! open? true)}}])`"
   [bindings & body]
+  (when-not (vector? bindings)
+    (throw (ex-info "Signal bindings must be a vector" {:bindings bindings})))
+  (when-not (even? (count bindings))
+    (throw (ex-info "Signal bindings must contain symbol/options pairs"
+                    {:bindings bindings})))
   (let [pairs (partition 2 bindings)
         lets (mapcat (fn [[sym form]]
                        (when-not (symbol? sym)
                          (throw (ex-info "Signal binding must be a symbol" {:binding sym})))
-                       [sym (if (and (seq? form)
-                                     (= "signal" (name (first form))))
-                              `(create-signal '~sym ~(second form))
-                              `(create-signal '~sym ~form))])
+                       [sym `(create-signal '~sym ~form)])
                      pairs)
         syms (mapv first pairs)]
     `(let [~@lets]
        (attach-signals ~syms (do ~@body)))))
-
-(defn signal
-  "Signal declaration marker for `with-signals`.
-
-   This function is also usable directly as a low-level declaration map, but
-   normal app code should call it only inside `with-signals`."
-  [opts]
-  opts)
 
 (defn attach-signals
   "Attaches signal declarations to the root hiccup node.
@@ -185,11 +185,6 @@
   "Wraps a literal expression value."
   [value]
   (->Expr :lit {:value value}))
-
-(defn sig
-  "References a Datastar signal in an expression."
-  [signal]
-  (->Expr :sig {:signal signal}))
 
 (defn trimmed
   "Expression for `.trim()` on a signal or expression."
@@ -222,9 +217,13 @@
   (->Expr :evt {:field field}))
 
 (defn js
-  "Opaque raw JavaScript expression with embedded Weft expressions resolved.
+  "Opaque raw JavaScript expression with embedded checked expressions resolved.
 
-   Example: `(js \"Math.max(0, \" (sig amount) \")\")`."
+   Signal refs and UI expressions inside `parts` are lowered before the raw
+   JavaScript fragments are joined. Use this as an expression escape hatch when
+   the checked helpers cannot describe the condition.
+
+   Example: `(js \"Math.max(0, \" amount \")\")`."
   [& parts]
   (->Expr :js {:parts parts}))
 
@@ -298,7 +297,8 @@
 (defn href
   "Creates a checked page href for a registered Datastar query.
 
-   `params` may include `:path-params` and `:query-params`."
+   `params` may include `:path-params` and `:query-params`. The route keyword
+   resolves through the query registry during lowering."
   ([query] (href query {}))
   ([query params]
    (->Href query params)))
@@ -327,7 +327,10 @@
   (->Effect :blur! {}))
 
 (defn action
-  "Embeds an opaque raw Datastar action string."
+  "Embeds an opaque raw Datastar action string.
+
+   This is an escape hatch for unsupported Datastar behavior. Raw actions are
+   not route-checked and do not receive route-ref or payload handling."
   [raw]
   (->Effect :action {:raw raw}))
 
@@ -762,8 +765,9 @@
 (defn lower-ir
   "Lowers Datastar UI IR to plain Datastar hiccup.
 
-   `opts` currently accepts `{:target :datastar}` and is reserved for future
-   checked interpretations."
+   Options:
+   - `:target` lowering target, currently `:datastar`.
+   - `:query-registry` explicit registry used to resolve checked route refs."
   ([ir-node] (lower-ir ir-node {:target :datastar}))
   ([ir-node opts]
    (binding [*lower-opts* opts]
@@ -796,7 +800,9 @@
   "Compiles Datastar UI source to ordinary Datastar hiccup.
 
    This returns hiccup, not an HTML string. The existing Datastar adapter remains
-   responsible for `hiccup2` HTML rendering and SSE patch construction."
+   responsible for `hiccup2` HTML rendering and SSE patch construction. Pass
+   `{:query-registry registry}` when tests or alternate systems should resolve
+   checked route refs without using the global registry."
   ([source] (hiccup source {}))
   ([source opts]
    (lower-ir (ir source) opts)))
@@ -806,7 +812,8 @@
 
    Checked events and signal declarations are dropped. Options:
    - `:strip-href?` removes `:href`.
-   - `:strip-raw-events?` removes raw `data-on*` attributes."
+   - `:strip-raw-events?` removes raw `data-on*` attributes.
+   - `:query-registry` resolves checked `href` route refs."
   ([ir-node] (static ir-node {}))
   ([ir-node opts]
    (binding [*lower-opts* opts]

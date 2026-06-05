@@ -69,7 +69,7 @@
 (deftest ir-preserves-meaning-before-lowering
   (let [source (ui/with-signal-scope {:key #uuid "00000000-0000-0000-0000-000000000010"
                                       :prefix "plan"}
-                 (ui/with-signals [duration (ui/signal {:name "duration-weeks" :init 12 :type :int})]
+                 (ui/with-signals [duration {:name "duration-weeks" :init 12 :type :int}]
                    [:input {:class "input"
                             :bind/value duration
                             :on/input {:effect (ui/set-signal! duration (ui/num duration))}}]))
@@ -86,9 +86,9 @@
 (deftest automatic-signal-scope-is-deterministic-and-bracket-safe
   (let [scope {:key #uuid "00000000-0000-0000-0000-000000000011" :prefix "plan"}
         make-node #(ui/with-signal-scope scope
-                     (ui/with-signals [duration (ui/signal {:name "duration-weeks" :init 12})]
+                     (ui/with-signals [duration {:name "duration-weeks" :init 12}]
                        [:input {:bind/value duration
-                                :bind/text (ui/sig duration)}]))
+                                :bind/text duration}]))
         out-a (hiccup (make-node))
         out-b (hiccup (make-node))
         signals-a (:data-signals (attrs out-a))
@@ -100,9 +100,9 @@
     (is (= (str "$[\"" bind-a "\"]") text-a))))
 
 (deftest unscoped-signals-get-automatic-compiler-scopes
-  (let [make-node #(ui/with-signals [query (ui/signal {:init ""})]
+  (let [make-node #(ui/with-signals [query {:init ""}]
                      [:input {:bind/value query
-                              :bind/text (ui/sig query)}])
+                              :bind/text query}])
         out-a (ui/hiccup (make-node))
         out-b (ui/hiccup (make-node))
         signal-name (first (data-signal-keys out-a))]
@@ -114,9 +114,9 @@
 (deftest sibling-signal-scopes-do-not-collide
   (let [out (hiccup
              [:div
-              (ui/with-signals [query (ui/signal {:init ""})]
+              (ui/with-signals [query {:init ""}]
                 [:input {:bind/value query}])
-              (ui/with-signals [query (ui/signal {:init ""})]
+              (ui/with-signals [query {:init ""}]
                 [:input {:bind/value query}])])
         left (nth out 2)
         right (nth out 3)
@@ -130,7 +130,7 @@
 
 (deftest parent-signal-scope-applies-to-child-references
   (let [out (hiccup
-             (ui/with-signals [query (ui/signal {:init ""})]
+             (ui/with-signals [query {:init ""}]
                [:div
                 [:input {:bind/value query}]
                 [:button {:on/click {:effect (ui/refresh :ui-test/search-page
@@ -145,10 +145,10 @@
 
 (deftest nested-signals-shadow-by-lexical-handle
   (let [out (hiccup
-             (ui/with-signals [open? (ui/signal {:init false})]
+             (ui/with-signals [open? {:init false}]
                [:div
                 [:input {:bind/value open?}]
-                (ui/with-signals [open? (ui/signal {:init true})]
+                (ui/with-signals [open? {:init true}]
                   [:input {:bind/value open?}])
                 [:input {:bind/value open?}]]))
         parent-name (first (data-signal-keys out))
@@ -165,7 +165,7 @@
 
 (deftest signal-resolution-covers-checked-effect-and-expression-trees
   (let [out (hiccup
-             (ui/with-signals [title (ui/signal {:init "Old"})]
+             (ui/with-signals [title {:init "Old"}]
                [:input {:bind/value title
                         :bind/text (ui/js "String(" title ")")
                         :on/input {:effect (ui/do!
@@ -304,9 +304,18 @@
                                :modifiers {:prevent []}}}
            "bad"])))))
 
+(deftest with-signals-requires-option-maps
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"Signal options must be a map"
+       (ui/hiccup
+        (ui/with-signals [open? false]
+          [:div {:bind/show open?}
+           "Modal"])))))
+
 (deftest generated-signals-do-not-rewrite-raw-data-signals
   (let [out (ui/hiccup
-             (ui/with-signals [open? (ui/signal {:init false})]
+             (ui/with-signals [open? {:init false}]
                [:div {:data-signals "{'raw-open': false}"
                       :bind/show open?}
                 "Modal"]))
@@ -317,8 +326,8 @@
 
 (deftest payload-dispatch-supports-custom-action-target
   (let [out (ui/hiccup
-             (ui/with-signals [name (ui/signal {:name "campus-name" :init ""})
-                               virtual? (ui/signal {:name "is-virtual" :init false})]
+             (ui/with-signals [name {:name "campus-name" :init ""}
+                               virtual? {:name "is-virtual" :init false}]
                [:form {:on/submit {:effect (ui/dispatch :ui-test/create-campus
                                               {:campus-name name
                                                :is-virtual virtual?})}}
@@ -334,9 +343,9 @@
 
 (deftest refresh-posts-explicit-query-payload
   (let [out (hiccup
-             (ui/with-signals [page (ui/signal {:init 1})
-                               search (ui/signal {:init ""})
-                               unrelated (ui/signal {:init "client-only"})]
+             (ui/with-signals [page {:init 1}
+                               search {:init ""}
+                               unrelated {:init "client-only"}]
                [:button {:on/click {:effect (ui/refresh :ui-test/graduation-pending-page
                                              {:page page
                                               :search search})}}
@@ -351,7 +360,7 @@
 
 (deftest refresh-can-omit-reusable-stream-nonce
   (let [out (hiccup
-             (ui/with-signals [page (ui/signal {:init 1})]
+             (ui/with-signals [page {:init 1}]
                [:button {:on/click {:effect (ui/refresh :ui-test/one-shot-page
                                              {:page page}
                                              {:include-nonce? false})}}
@@ -442,7 +451,7 @@
 
 (deftest expressions-and-effects-lower
   (let [out (ui/hiccup
-             (ui/with-signals [title (ui/signal {:init "Old"})]
+             (ui/with-signals [title {:init "Old"}]
                [:input {:bind/value title
                         :on/blur {:effect (ui/when! (ui/changed? title "Old")
                                             (ui/dispatch :ui-test/create-campus

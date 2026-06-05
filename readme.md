@@ -68,7 +68,7 @@ The `grain-control-plane` package provides coordinator election, tenant lease ma
 
 ## Datastar (Reactive UI)
 
-> Full documentation: [docs/datastar.md](docs/datastar.md)
+> Full documentation: [docs/datastar.md](docs/datastar.md) | UI DSL: [docs/datastar-ui.md](docs/datastar-ui.md)
 
 Grain integrates with [Datastar](https://data-star.dev/) for reactive server-rendered UIs. Queries return hiccup that streams to the browser over SSE — the server re-renders when domain events fire and Datastar patches the DOM. In multi-node deployments, the event tailer can feed each node's local pub/sub from the shared event store so live updates reach the node holding the SSE connection.
 
@@ -113,7 +113,7 @@ Grain is MIT licensed. We use it in production, but it's actively evolving. The 
 
 ## More Information
 
-- **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
+- **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
 - **Examples**: `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
 - **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians
