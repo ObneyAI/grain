@@ -546,6 +546,97 @@
     (is (string/includes? (:data-on:keydown a) "evt.key === \"Escape\""))
     (is (string/includes? (:data-on:keydown a) "el.blur();"))))
 
+(deftest bound-value-assignments-before-blur-sync-the-dom-value
+  (let [out (hiccup
+             (ui/with-signals [draft {:init "Original"}
+                               other {:init ""}]
+               [:div
+                [:input#set-before-blur
+                 {:bind/value draft
+                  :on/keydown {:effect (ui/on-keys
+                                         {"Escape" (ui/effects
+                                                    (ui/set-signal draft "Original")
+                                                    (ui/blur))})}}]
+                [:input#reset-before-blur
+                 {:bind/value draft
+                  :on/keydown {:effect (ui/on-keys
+                                         {"Escape" (ui/effects
+                                                    (ui/reset-signal draft)
+                                                    (ui/blur))})}}]
+                [:input#when-before-blur
+                 {:bind/value draft
+                  :on/keydown {:effect (ui/on-keys
+                                         {"Escape" (ui/when-effect (ui/present? draft)
+                                                     (ui/effects
+                                                      (ui/set-signal draft "Original")
+                                                      (ui/blur)))})}}]
+                [:input#choose-before-blur
+                 {:bind/value draft
+                  :on/keydown {:effect (ui/on-keys
+                                         {"Escape" (ui/choose-effect (ui/present? draft)
+                                                     (ui/effects
+                                                      (ui/set-signal draft "Original")
+                                                      (ui/blur))
+                                                     (ui/effects
+                                                      (ui/reset-signal draft)
+                                                      (ui/blur)))})}}]
+                [:input#when-then-blur
+                 {:bind/value draft
+                  :on/keydown {:effect (ui/on-keys
+                                         {"Escape" (ui/effects
+                                                    (ui/when-effect (ui/present? draft)
+                                                      (ui/set-signal draft "Original"))
+                                                    (ui/blur))})}}]
+                [:input#choose-then-blur
+                 {:bind/value draft
+                  :on/keydown {:effect (ui/on-keys
+                                         {"Escape" (ui/effects
+                                                    (ui/choose-effect (ui/present? draft)
+                                                      (ui/set-signal draft "Original")
+                                                      (ui/reset-signal draft))
+                                                    (ui/blur))})}}]
+                [:input#unrelated-before-blur
+                 {:bind/value draft
+                  :on/keydown {:effect (ui/on-keys
+                                         {"Escape" (ui/effects
+                                                    (ui/set-signal other "Unrelated")
+                                                    (ui/blur))})}}]
+                [:input#set-without-blur
+                 {:bind/value draft
+                  :on/keydown {:effect (ui/on-keys
+                                         {"Escape" (ui/effects
+                                                    (ui/set-signal draft "Original")
+                                                    (ui/action "console.log('saved')"))})}}]]))
+        [draft-name other-name] (data-signal-keys out)
+        draft-ref (ui/signal-ref draft-name)
+        other-ref (ui/signal-ref other-name)
+        set-before-blur (:data-on:keydown (attrs (nth out 2)))
+        reset-before-blur (:data-on:keydown (attrs (nth out 3)))
+        when-before-blur (:data-on:keydown (attrs (nth out 4)))
+        choose-before-blur (:data-on:keydown (attrs (nth out 5)))
+        when-then-blur (:data-on:keydown (attrs (nth out 6)))
+        choose-then-blur (:data-on:keydown (attrs (nth out 7)))
+        unrelated-before-blur (:data-on:keydown (attrs (nth out 8)))
+        set-without-blur (:data-on:keydown (attrs (nth out 9)))]
+    (is (string/includes? set-before-blur
+                          (str "el.value = (" draft-ref " = \"Original\"); el.blur();")))
+    (is (string/includes? reset-before-blur
+                          (str "el.value = (" draft-ref " = \"Original\"); el.blur();")))
+    (is (string/includes? when-before-blur
+                          (str "el.value = (" draft-ref " = \"Original\"); el.blur();")))
+    (is (string/includes? choose-before-blur
+                          (str "el.value = (" draft-ref " = \"Original\"); el.blur();")))
+    (is (string/includes? when-then-blur
+                          (str "el.value = (" draft-ref " = \"Original\");")))
+    (is (string/includes? choose-then-blur
+                          (str "el.value = (" draft-ref " = \"Original\");")))
+    (is (string/includes? unrelated-before-blur
+                          (str other-ref " = \"Unrelated\"; el.blur();")))
+    (is (not (string/includes? unrelated-before-blur "el.value = (")))
+    (is (string/includes? set-without-blur
+                          (str draft-ref " = \"Original\"; console.log('saved');")))
+    (is (not (string/includes? set-without-blur "el.value = (")))))
+
 (deftest effects-sequence-actions-with-statement-separators
   (let [task-id #uuid "00000000-0000-0000-0000-000000000001"
         out (hiccup

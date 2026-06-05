@@ -465,9 +465,63 @@
         s
         (str s ";")))))
 
-(defn lower-effect
-  "Lowers a checked effect to a Datastar action string."
+(declare lower-effect*)
+
+(defn- contains-blur?
   [effect]
+  (and (effect? effect)
+       (case (:op effect)
+         :blur true
+         :effects (boolean (some contains-blur? (get-in effect [:args :effects])))
+         :when-effect (contains-blur? (get-in effect [:args :effect]))
+         :choose-effect (or (contains-blur? (get-in effect [:args :then]))
+                            (contains-blur? (get-in effect [:args :else])))
+         :on-keys (boolean (some contains-blur? (vals (get-in effect [:args :key->effect]))))
+         false)))
+
+(defn- same-signal?
+  [a b]
+  (and (signal? a)
+       (signal? b)
+       (= (:resolved-name a) (:resolved-name b))))
+
+(defn- bound-value-assignment?
+  [ctx signal]
+  (and (:sync-bound-value? ctx)
+       (same-signal? signal (:bound-value-signal ctx))))
+
+(defn- lower-set-signal
+  [signal expr sync-dom?]
+  (let [assignment (str (signal-ref signal) " = " (expr-value expr))]
+    (str (if sync-dom?
+           (str "el.value = (" assignment ")")
+           assignment)
+         ";")))
+
+(defn- lower-reset-signal
+  [signal sync-dom?]
+  (let [assignment (str (signal-ref signal) " = " (js-literal (:init signal)))]
+    (str (if sync-dom?
+           (str "el.value = (" assignment ")")
+           assignment)
+         ";")))
+
+(defn- lower-effects
+  [effects ctx]
+  (let [effectv (vec effects)]
+    (->> (map-indexed (fn [idx effect]
+                        (let [later-effects (subvec effectv (inc idx))]
+                          (lower-effect* effect
+                                         (assoc ctx
+                                                :sync-bound-value?
+                                                (boolean (some contains-blur?
+                                                               later-effects))))))
+                      effectv)
+         (keep statement)
+         (string/join " "))))
+
+(defn- lower-effect*
+  [effect ctx]
   (cond
     (nil? effect) ""
     (string? effect) effect
@@ -475,36 +529,41 @@
     (case (:op effect)
       :dispatch (lower-dispatch (:args effect))
       :refresh (lower-refresh (:args effect))
-      :set-signal (str (signal-ref (get-in effect [:args :signal]))
-                 " = "
-                 (expr-value (get-in effect [:args :expr]))
-                 ";")
-      :reset-signal (let [s (get-in effect [:args :signal])]
-                (str (signal-ref s) " = " (js-literal (:init s)) ";"))
+      :set-signal (lower-set-signal (get-in effect [:args :signal])
+                                    (get-in effect [:args :expr])
+                                    (bound-value-assignment?
+                                     ctx
+                                     (get-in effect [:args :signal])))
+      :reset-signal (lower-reset-signal (get-in effect [:args :signal])
+                                        (bound-value-assignment?
+                                         ctx
+                                         (get-in effect [:args :signal])))
       :clear-errors "$fieldErrors = {}; $error = '';"
       :blur "el.blur();"
       :action (get-in effect [:args :raw])
-      :effects (->> (get-in effect [:args :effects])
-                    (map lower-effect)
-                    (keep statement)
-                    (string/join " "))
+      :effects (lower-effects (get-in effect [:args :effects]) ctx)
       :when-effect (str "if (" (lower-expr (get-in effect [:args :pred])) ") { "
-                  (lower-effect (get-in effect [:args :effect]))
+                  (lower-effect* (get-in effect [:args :effect]) ctx)
                   " }")
       :choose-effect (str "if (" (lower-expr (get-in effect [:args :pred])) ") { "
-                (lower-effect (get-in effect [:args :then]))
+                (lower-effect* (get-in effect [:args :then]) ctx)
                 " }"
                 (when-let [else-effect (get-in effect [:args :else])]
-                  (str " else { " (lower-effect else-effect) " }")))
+                  (str " else { " (lower-effect* else-effect ctx) " }")))
       :on-keys (string/join
                 " "
                 (map (fn [[k e]]
                        (str "if (evt.key === " (js-literal (name k)) ") { "
                             "evt.preventDefault(); "
-                            (lower-effect e)
+                            (lower-effect* e ctx)
                             " }"))
                      (get-in effect [:args :key->effect]))))
     :else (js-literal effect)))
+
+(defn lower-effect
+  "Lowers a checked effect to a Datastar action string."
+  [effect]
+  (lower-effect* effect {}))
 
 (defn- attr-kind
   [k]
@@ -770,10 +829,10 @@
       (str "__" modifier-name "." modifier-value))))
 
 (defn- lower-event-attr
-  [event-name {:keys [effect modifiers]}]
+  [event-name {:keys [effect modifiers]} ctx]
   [(keyword (str "data-on:" (name event-name)
                  (apply str (keep lower-event-modifier modifiers))))
-   (lower-effect effect)])
+   (lower-effect* effect ctx)])
 
 (defn- lower-attr-value
   [v]
@@ -832,7 +891,8 @@
                              attrs1
                              (:bindings ir-node))
            attrs3 (reduce-kv (fn [m k v]
-                               (let [[attr-k attr-v] (lower-event-attr k v)]
+                               (let [ctx {:bound-value-signal (get-in ir-node [:bindings :value])}
+                                     [attr-k attr-v] (lower-event-attr k v ctx)]
                                  (assoc m attr-k attr-v)))
                              attrs2
                              (:events ir-node))
