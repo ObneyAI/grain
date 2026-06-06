@@ -695,6 +695,7 @@
     (= k :effect) :effect
     (and (keyword? k) (= "bind" (namespace k))) :bind
     (and (keyword? k) (= "on" (namespace k))) :on
+    (and (keyword? k) (= "morph" (namespace k))) :morph
     :else :raw))
 
 (defn- modifier-name
@@ -770,8 +771,9 @@
                  :bind (assoc-in acc [:bindings (keyword (name k))] v)
                  :on (assoc-in acc [:events (keyword (name k))]
                                (normalize-event (keyword (name k)) v))
+                 :morph (assoc-in acc [:morph (keyword (name k))] v)
                  :raw (assoc-in acc [:attrs k] v)))
-             {:attrs {} :bindings {} :events {} :signals [] :effect nil}
+             {:attrs {} :bindings {} :events {} :morph {} :signals [] :effect nil}
              attrs))
 
 (defn- auto-signal-scope
@@ -916,6 +918,7 @@
       {:op :element
        :tag tag
        :attrs (:attrs parts)
+       :morph (:morph parts)
        :signals (mapv signal-ir resolved-signals)
        :bindings (into {}
                        (map (fn [[k v]]
@@ -1029,6 +1032,18 @@
                [k (lower-attr-value v)]))
         attrs))
 
+(defn- lower-morph-attrs
+  [morph]
+  (reduce-kv (fn [attrs k v]
+               (case k
+                 :ignore (if v
+                           (assoc attrs :data-ignore-morph true)
+                           attrs)
+                 (throw (ex-info "Unknown :morph/... attribute"
+                                 {:attribute (keyword "morph" (name k))}))))
+             {}
+             morph))
+
 (defn- merge-data-signals
   [attrs signals]
   (if (seq signals)
@@ -1060,7 +1075,8 @@
      :fragment (doall (map #(lower-ir % opts) (:children ir-node)))
      :element
      (let [attrs0 (lower-attrs (:attrs ir-node))
-           attrs1 (merge-data-signals attrs0 (:signals ir-node))
+           attrs0b (reduce-kv merge-lowered-attr attrs0 (lower-morph-attrs (:morph ir-node)))
+           attrs1 (merge-data-signals attrs0b (:signals ir-node))
            attrs2 (reduce-kv (fn [m k v]
                                (if (= k :attr)
                                  (reduce-kv (fn [m2 attr-k attr-v]
@@ -1112,7 +1128,8 @@
        :literal (lower-attr-value (:value ir-node))
        :fragment (doall (map #(static % opts) (:children ir-node)))
        :element
-       (let [attrs (cond-> (lower-attrs (:attrs ir-node))
+       (let [attrs (cond-> (merge (lower-attrs (:attrs ir-node))
+                                  (lower-morph-attrs (:morph ir-node)))
                      (:strip-href? opts) (dissoc :href)
                      (:strip-raw-events? opts)
                      (as-> a

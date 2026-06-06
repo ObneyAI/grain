@@ -275,6 +275,28 @@
     (is (= "window.__initRichtext(el)" (:data-init a)))
     (is (= "@post('/custom')" (:data-on:input__debounce.500ms a)))))
 
+(deftest morph-ignore-lowers-to-datastar-ignore-morph-attribute
+  (testing "true lowers to data-ignore-morph"
+    (let [out (hiccup
+               [:canvas {:id "pdf-page"
+                         :morph/ignore true
+                         :on/mousedown {:effect (ui/action "window.__down(el)")}}
+                "fallback"])
+          a (attrs out)]
+      (is (true? (:data-ignore-morph a)))
+      (is (= "pdf-page" (:id a)))
+      (is (= "window.__down(el)" (:data-on:mousedown a)))))
+  (testing "false and nil omit data-ignore-morph"
+    (let [false-out (hiccup [:canvas {:morph/ignore false}])
+          nil-out (hiccup [:canvas {:morph/ignore nil}])]
+      (is (not (contains? (attrs false-out) :data-ignore-morph)))
+      (is (not (contains? (attrs nil-out) :data-ignore-morph)))))
+  (testing "unknown morph attributes fail"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"Unknown :morph/\.\.\. attribute"
+         (hiccup [:canvas {:morph/replace false}])))))
+
 (deftest property-bindings-merge-into-data-effect
   (let [out (hiccup
              (ui/with-signals [selected? {:init false}

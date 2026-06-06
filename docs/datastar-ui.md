@@ -295,12 +295,14 @@ Checked binding attributes lower to Datastar binding attributes:
 [:div {:bind/class (ui/present? query)}]
 [:button {:bind/attr {:disabled saving?}}]
 [:input {:bind/prop {:checked selected?}}]
+[:canvas {:morph/ignore true}]
 ```
 
 Use `:bind/value` for form values, `:bind/text` for text content,
 `:bind/show` for visibility, `:bind/class` for class expressions, and
 `:bind/attr` for attribute maps such as `disabled`, `href`, or `aria-*`.
 Use `:bind/prop` for DOM properties such as checkbox `checked`.
+Use `:morph/ignore` for browser-owned DOM state that Datastar should not morph.
 
 Use element-level `:effect` for reactive Datastar effects that should run when
 the element is initialized or patched:
@@ -791,6 +793,16 @@ Lowers a checked effect to `data-effect`:
 [:section {:effect (ui/set-signal page-ready? true)}]
 ```
 
+`:morph/ignore`
+
+Lowers to `data-ignore-morph` when truthy and is omitted when false or nil.
+Use it for browser-owned DOM state, such as canvases or image content mutated
+after render:
+
+```clojure
+[:canvas {:morph/ignore true}]
+```
+
 Other `:bind/foo` attrs lower to `data-bind:foo`.
 
 ### Event Attributes
@@ -1076,6 +1088,7 @@ When generating UI with this DSL:
 - Pass signal handles directly in bindings, expressions, and payloads.
 - Use `:bind/value`, `:bind/text`, `:bind/show`, `:bind/class`, and
   `:bind/attr` for checked bindings.
+- Use `:morph/ignore` instead of raw `:data-ignore-morph`.
 - Use verbose event maps: `{:effect ...}` and optional `:modifiers`.
 - Use `ui/dispatch`, `ui/refresh`, and `ui/href` with keyword route refs.
 - Put every command/query input in the explicit payload map.
