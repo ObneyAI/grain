@@ -138,6 +138,58 @@
     (is (= left-name (:data-bind (attrs left))))
     (is (= right-name (:data-bind (attrs right))))))
 
+(deftest stable-signals-use-exact-page-level-names
+  (let [make-node #(ui/with-signal-scope {:prefix "ignored" :key %1}
+                     (ui/with-signals [selection {:name "pageSelection"
+                                                  :init {}
+                                                  :stable? true}
+                                       dialog-open? {:name "pageDialogOpen"
+                                                     :init false
+                                                     :stable? true}]
+                       [:div
+                        [:button {:bind/class (ui/js "{'is-open': " dialog-open? "}")
+                                  :on/click {:effect (ui/effects
+                                                       (ui/set-signal selection {})
+                                                       (ui/set-signal dialog-open? false)
+                                                       (ui/dispatch :ui-test/save-amounts
+                                                         {:custom-amounts selection
+                                                          :first-amount (ui/indexed selection "first")}))}}
+                         "Clear"]
+                        [:button {:on/click {:effect (ui/refresh :ui-test/search-page
+                                                      {:selected selection})}}
+                         "Refresh"]]))
+        out-a (hiccup (make-node 1))
+        out-b (hiccup (make-node 2))
+        signals-a (:data-signals (attrs out-a))
+        signals-b (:data-signals (attrs out-b))
+        clear-a (attrs (nth out-a 2))
+        refresh-a (attrs (nth out-a 3))]
+    (is (= signals-a signals-b))
+    (is (string/includes? signals-a "\"pageSelection\":{}"))
+    (is (string/includes? signals-a "\"pageDialogOpen\":false"))
+    (is (string/includes? (:data-class clear-a) "$pageDialogOpen"))
+    (is (string/includes? (:data-on:click clear-a)
+                          "$pageSelection = {};"))
+    (is (string/includes? (:data-on:click clear-a)
+                          "$pageDialogOpen = false;"))
+    (is (string/includes? (:data-on:click clear-a)
+                          "\"custom-amounts\": $pageSelection"))
+    (is (string/includes? (:data-on:click clear-a)
+                          "\"first-amount\": $pageSelection[\"first\"]"))
+    (is (string/includes? (:data-on:click refresh-a)
+                          "\"selected\": $pageSelection"))))
+
+(deftest stable-signals-require-explicit-names
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"Stable signals must declare :name"
+       (ui/create-signal 'selected {:init {} :stable? true})))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"Stable signals must declare :name"
+       (ui/with-signals [selected {:init {} :stable? true}]
+         [:div]))))
+
 (deftest parent-signal-scope-applies-to-child-references
   (let [out (hiccup
              (ui/with-signals [query {:init ""}]
@@ -222,6 +274,37 @@
     (is (true? (:data-ignore-morph a)))
     (is (= "window.__initRichtext(el)" (:data-init a)))
     (is (= "@post('/custom')" (:data-on:input__debounce.500ms a)))))
+
+(deftest property-bindings-merge-into-data-effect
+  (let [out (hiccup
+             (ui/with-signals [selected? {:init false}
+                               custom-amounts {:init [80000]}]
+               [:div
+                [:input#checked {:type "checkbox"
+                                 :bind/prop {:checked selected?
+                                             :indeterminate (ui/js "!" selected?)}}]
+                [:input#raw-merge {:data-effect "window.__raw(el);"
+                                   :bind/prop {:checked selected?}}]
+                [:input#indexed-merge {:bind/value (ui/indexed custom-amounts 0)
+                                       :bind/prop {:checked selected?}}]
+                [:input#attr-checked {:bind/attr {:checked selected?}}]]))
+        selected-name (first (data-signal-keys out))
+        amounts-name (second (data-signal-keys out))
+        selected-ref (ui/signal-ref selected-name)
+        amounts-ref (ui/signal-ref amounts-name)
+        checked (attrs (nth out 2))
+        raw-merge (attrs (nth out 3))
+        indexed-merge (attrs (nth out 4))
+        attr-checked (attrs (nth out 5))]
+    (is (= (str "el.checked = " selected-ref
+                "; el.indeterminate = !" selected-ref ";")
+           (:data-effect checked)))
+    (is (= (str "window.__raw(el); el.checked = " selected-ref ";")
+           (:data-effect raw-merge)))
+    (is (= (str "el.value = " amounts-ref "[0]; el.checked = " selected-ref ";")
+           (:data-effect indexed-merge)))
+    (is (= selected-ref (:data-attr:checked attr-checked)))
+    (is (not (contains? attr-checked :data-effect)))))
 
 (deftest checked-events-require-explicit-event-maps
   (is (thrown-with-msg?

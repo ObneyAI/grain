@@ -122,15 +122,20 @@
 (defn- resolve-signal-name
   ([binding opts]
    (resolve-signal-name *signal-scope* binding opts))
-  ([scope binding {:keys [name]}]
+  ([scope binding {:keys [name stable?]}]
+   (when (and stable? (not name))
+     (throw (ex-info "Stable signals must declare :name"
+                     {:binding binding})))
    (let [semantic (or name (clojure.core/name binding))
         prefix (:prefix scope)
         manual-name (:name scope)
         base (cond
+               stable? semantic
                manual-name (str manual-name "-" semantic)
                prefix (str prefix "-" semantic)
                :else semantic)
-        suffix (stable-suffix scope binding semantic)]
+        suffix (when-not stable?
+                 (stable-suffix scope binding semantic))]
      (if suffix
        (str base "__" suffix)
        base))))
@@ -140,15 +145,18 @@
 
    Usually called by `with-signals`; public primarily for tests and low-level
    interop. `binding` is the source binding symbol, and opts may include
-   `:name` and `:init`."
+   `:name`, `:init`, and `:stable?`."
   [binding opts]
   (when-not (map? opts)
     (throw (ex-info "Signal options must be a map"
                     {:binding binding :opts opts})))
-  (let [{:keys [name init]} opts]
+  (when (and (:stable? opts) (not (:name opts)))
+    (throw (ex-info "Stable signals must declare :name"
+                    {:binding binding :opts opts})))
+  (let [{:keys [name init stable?]} opts]
     (->Signal binding
               (or name (clojure.core/name binding))
-              (when (seq *signal-scope*)
+              (when (or stable? (seq *signal-scope*))
                 (resolve-signal-name binding opts))
               *signal-scope*
               init)))
@@ -774,7 +782,7 @@
 
 (defn- resolve-binding-signals
   [signal-env kind value]
-  (if (= kind :attr)
+  (if (#{:attr :prop} kind)
     (resolve-payload-signals signal-env value)
     (resolve-dsl-signals signal-env value)))
 
@@ -854,6 +862,17 @@
      :data-on:input sync
      :data-on:change sync}))
 
+(defn- lower-prop-bindings
+  [props]
+  (when-not (map? props)
+    (throw (ex-info ":bind/prop value must be a map"
+                    {:value props})))
+  {:data-effect
+   (->> props
+        (map (fn [[prop value]]
+               (str "el." (name prop) " = " (expr-value value) ";")))
+        (string/join " "))})
+
 (defn- lower-binding-attrs
   [kind value]
   (case kind
@@ -871,6 +890,7 @@
                           (expr-value value)
                           (str value))}
     :attr (throw (ex-info "Internal error: :bind/attr handled separately" {}))
+    :prop (lower-prop-bindings value)
     {(keyword "data-bind" (name kind)) value}))
 
 (defn- merge-lowered-attr

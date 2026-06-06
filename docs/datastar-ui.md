@@ -210,6 +210,8 @@ Options:
 - `:init` - initial client-side signal value.
 - `:name` - optional semantic Datastar name. If omitted, the Clojure binding
   name is used.
+- `:stable?` - when true, uses the exact `:name` as page-level shared state.
+  Stable signals must declare `:name`.
 
 Signal handles are lexical values. Pass them directly:
 
@@ -233,6 +235,26 @@ generates deterministic scoped names:
 Application code should not use `with-signal-scope` for normal UI. It exists
 for framework code, tests, and rare raw interop where the scope must be
 controlled explicitly.
+
+Stable signals are a sharp tool for page-level state shared across independent
+Datastar patches, such as selection state used by rows, summary panels, dialogs,
+and command payloads:
+
+```clojure
+(ui/with-signals [page-selection {:name "pageSelection"
+                                  :init {}
+                                  :stable? true}
+                  dialog-open? {:name "pageDialogOpen"
+                                :init false
+                                :stable? true}]
+  [:button {:on/click {:effect (ui/effects
+                                (ui/set-signal page-selection {})
+                                (ui/set-signal dialog-open? false))}}
+   "Clear"])
+```
+
+Use stable signals only when the signal is intentionally part of the page
+contract. Ordinary component-local state should stay scoped.
 
 ## Indexed Collections
 
@@ -272,11 +294,13 @@ Checked binding attributes lower to Datastar binding attributes:
 [:section {:bind/show open?}]
 [:div {:bind/class (ui/present? query)}]
 [:button {:bind/attr {:disabled saving?}}]
+[:input {:bind/prop {:checked selected?}}]
 ```
 
 Use `:bind/value` for form values, `:bind/text` for text content,
 `:bind/show` for visibility, `:bind/class` for class expressions, and
 `:bind/attr` for attribute maps such as `disabled`, `href`, or `aria-*`.
+Use `:bind/prop` for DOM properties such as checkbox `checked`.
 
 Raw, non-DSL Hiccup attributes pass through unchanged.
 
@@ -708,6 +732,15 @@ Lowers each entry to `data-attr:*`:
 ```clojure
 [:button {:bind/attr {:disabled saving?
                       :aria-busy saving?}}]
+```
+
+`:bind/prop`
+
+Lowers each entry to a `data-effect` DOM property write:
+
+```clojure
+[:input {:type "checkbox"
+         :bind/prop {:checked selected?}}]
 ```
 
 Other `:bind/foo` attrs lower to `data-bind:foo`.
