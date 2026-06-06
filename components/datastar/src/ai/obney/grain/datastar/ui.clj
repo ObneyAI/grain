@@ -13,7 +13,7 @@
    registry so UI code does not hard-code Datastar paths. Raw Datastar
    attributes and raw actions pass through unchanged and are intentionally
    unchecked."
-  (:refer-clojure :exclude [num])
+  (:refer-clojure :exclude [num indexed?])
   (:require [ai.obney.grain.datastar.core :as core]
             [ai.obney.grain.query-processor.interface :as qp]
             [clojure.data.json :as json]
@@ -29,11 +29,13 @@
   "$__grainAction")
 
 (defrecord Signal [binding semantic-name resolved-name scope init])
+(defrecord Indexed [collection index])
 (defrecord Expr [op args])
 (defrecord Effect [op args])
 (defrecord Href [query params])
 
 (defn- signal? [x] (instance? Signal x))
+(defn- indexed? [x] (instance? Indexed x))
 (defn- expr? [x] (instance? Expr x))
 (defn- effect? [x] (instance? Effect x))
 (defn- href? [x] (instance? Href x))
@@ -92,6 +94,23 @@
     (if (re-matches #"[A-Za-z_$][A-Za-z0-9_$]*" n)
       (str "$" n)
       (str "$[" (js-literal n) "]"))))
+
+(declare expr-value)
+
+(defn- indexed-ref
+  [indexed]
+  (str (expr-value (:collection indexed))
+       "["
+       (expr-value (:index indexed))
+       "]"))
+
+(defn- target-ref
+  [target]
+  (cond
+    (signal? target) (signal-ref target)
+    (indexed? target) (indexed-ref target)
+    :else (throw (ex-info "Effect target must be a signal or indexed signal"
+                          {:target target}))))
 
 (defn- stable-suffix
   [scope binding semantic-name]
@@ -226,6 +245,11 @@
   [& parts]
   (->Expr :js {:parts parts}))
 
+(defn indexed
+  "References an indexed element inside a collection signal."
+  [collection-signal idx]
+  (->Indexed collection-signal idx))
+
 (declare lower-expr)
 
 (defn- expr-value
@@ -233,6 +257,7 @@
   (cond
     (expr? x) (lower-expr x)
     (signal? x) (signal-ref x)
+    (indexed? x) (indexed-ref x)
     :else (js-literal x)))
 
 (defn lower-expr
@@ -257,10 +282,12 @@
                             (cond
                               (expr? part) (lower-expr part)
                               (signal? part) (signal-ref part)
+                              (indexed? part) (indexed-ref part)
                               :else (str part)))
                           (get-in expr [:args :parts]))))
 
     (signal? expr) (signal-ref expr)
+    (indexed? expr) (indexed-ref expr)
     :else (js-literal expr)))
 
 (defn dispatch
@@ -421,7 +448,7 @@
 (defn- payload-literal
   [v]
   (cond
-    (or (expr? v) (signal? v)) (expr-value v)
+    (or (expr? v) (signal? v) (indexed? v)) (expr-value v)
     (map? v) (payload-object-literal v)
     (or (sequential? v) (set? v)) (payload-array-literal v)
     :else (js-literal v)))
@@ -481,9 +508,9 @@
 
 (defn- same-signal?
   [a b]
-  (and (signal? a)
-       (signal? b)
-       (= (:resolved-name a) (:resolved-name b))))
+  (and (or (signal? a) (indexed? a))
+       (or (signal? b) (indexed? b))
+       (= (target-ref a) (target-ref b))))
 
 (defn- bound-value-assignment?
   [ctx signal]
@@ -492,7 +519,7 @@
 
 (defn- lower-set-signal
   [signal expr sync-dom?]
-  (let [assignment (str (signal-ref signal) " = " (expr-value expr))]
+  (let [assignment (str (target-ref signal) " = " (expr-value expr))]
     (str (if sync-dom?
            (str "el.value = (" assignment ")")
            assignment)
@@ -661,10 +688,17 @@
 
 (declare resolve-expr-signals resolve-effect-signals resolve-dsl-signals)
 
+(defn- resolve-indexed-signals
+  [signal-env indexed]
+  (-> indexed
+      (update :collection #(resolve-dsl-signals signal-env %))
+      (update :index #(resolve-dsl-signals signal-env %))))
+
 (defn- resolve-expr-signals
   [signal-env expr]
   (cond
     (signal? expr) (resolve-signal signal-env expr)
+    (indexed? expr) (resolve-indexed-signals signal-env expr)
     (expr? expr)
     (case (:op expr)
       :lit expr
@@ -683,7 +717,7 @@
 (defn- resolve-payload-signals
   [signal-env value]
   (cond
-    (or (signal? value) (expr? value) (effect? value))
+    (or (signal? value) (indexed? value) (expr? value) (effect? value))
     (resolve-dsl-signals signal-env value)
 
     (map? value) (into {}
@@ -705,7 +739,7 @@
       :refresh (update-in effect [:args :params]
                           #(resolve-payload-signals signal-env %))
       :set-signal (-> effect
-                (update-in [:args :signal] #(resolve-signal signal-env %))
+                (update-in [:args :signal] #(resolve-dsl-signals signal-env %))
                 (update-in [:args :expr] #(resolve-expr-signals signal-env %)))
       :reset-signal (update-in effect [:args :signal] #(resolve-signal signal-env %))
       :clear-errors effect
@@ -733,6 +767,7 @@
   [signal-env x]
   (cond
     (signal? x) (resolve-signal signal-env x)
+    (indexed? x) (resolve-indexed-signals signal-env x)
     (expr? x) (resolve-expr-signals signal-env x)
     (effect? x) (resolve-effect-signals signal-env x)
     :else x))
@@ -811,15 +846,44 @@
   [node]
   (ir* node [] (java.util.IdentityHashMap.)))
 
-(defn- lower-binding-attr
+(defn- indexed-value-binding-attrs
+  [value]
+  (let [target (target-ref value)
+        sync (str target " = el.value;")]
+    {:data-effect (str "el.value = " target ";")
+     :data-on:input sync
+     :data-on:change sync}))
+
+(defn- lower-binding-attrs
   [kind value]
   (case kind
-    :value [:data-bind (if (signal? value) (:resolved-name value) (str value))]
-    :text [:data-text (if (or (signal? value) (expr? value)) (expr-value value) (str value))]
-    :show [:data-show (if (or (signal? value) (expr? value)) (expr-value value) (str value))]
-    :class [:data-class (if (or (signal? value) (expr? value)) (expr-value value) (str value))]
+    :value (cond
+             (signal? value) {:data-bind (:resolved-name value)}
+             (indexed? value) (indexed-value-binding-attrs value)
+             :else {:data-bind (str value)})
+    :text {:data-text (if (or (signal? value) (indexed? value) (expr? value))
+                        (expr-value value)
+                        (str value))}
+    :show {:data-show (if (or (signal? value) (indexed? value) (expr? value))
+                        (expr-value value)
+                        (str value))}
+    :class {:data-class (if (or (signal? value) (indexed? value) (expr? value))
+                          (expr-value value)
+                          (str value))}
     :attr (throw (ex-info "Internal error: :bind/attr handled separately" {}))
-    [(keyword "data-bind" (name kind)) value]))
+    {(keyword "data-bind" (name kind)) value}))
+
+(defn- merge-lowered-attr
+  [attrs attr-k attr-v]
+  (if-let [existing (get attrs attr-k)]
+    (if (and (string? existing)
+             (string? attr-v)
+             (or (= attr-k :data-effect)
+                 (and (keyword? attr-k)
+                      (string/starts-with? (name attr-k) "data-on:"))))
+      (assoc attrs attr-k (str existing " " attr-v))
+      (assoc attrs attr-k attr-v))
+    (assoc attrs attr-k attr-v)))
 
 (defn- lower-event-modifier
   [[modifier-name modifier-value]]
@@ -882,18 +946,21 @@
            attrs2 (reduce-kv (fn [m k v]
                                (if (= k :attr)
                                  (reduce-kv (fn [m2 attr-k attr-v]
-                                              (assoc m2 (keyword (str "data-attr:" (name attr-k)))
-                                                     (expr-value attr-v)))
+                                              (merge-lowered-attr
+                                               m2
+                                               (keyword (str "data-attr:" (name attr-k)))
+                                               (expr-value attr-v)))
                                             m
                                             v)
-                                 (let [[attr-k attr-v] (lower-binding-attr k v)]
-                                   (assoc m attr-k attr-v))))
+                                 (reduce-kv merge-lowered-attr
+                                            m
+                                            (lower-binding-attrs k v))))
                              attrs1
                              (:bindings ir-node))
            attrs3 (reduce-kv (fn [m k v]
                                (let [ctx {:bound-value-signal (get-in ir-node [:bindings :value])}
                                      [attr-k attr-v] (lower-event-attr k v ctx)]
-                                 (assoc m attr-k attr-v)))
+                                 (merge-lowered-attr m attr-k attr-v)))
                              attrs2
                              (:events ir-node))
            children (map #(lower-ir % opts) (:children ir-node))]

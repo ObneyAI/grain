@@ -15,6 +15,9 @@
                          [:application-id :uuid]
                          [:duration-weeks :int]
                          [:deposit-amount-cents :int]]
+   :ui-test/save-amounts [:map
+                          [:custom-amounts :vector]
+                          [:first-amount :int]]
    :ui-test/submit-document [:map
                              [:document :map]
                              [:ordered :vector]
@@ -437,6 +440,59 @@
     (is (re-find #"\"filters\": \{\"search\": \$search__[a-z0-9]+, \"page\": \$page__[a-z0-9]+\}" click))
     (is (string/includes? click "\"include\": [\"students\", \"documents\"]"))
     (is (string/includes? click "\"dsNonce\": $dsNonce"))))
+
+(deftest indexed-collection-signals-bind-express-and-post
+  (let [out (hiccup
+             (ui/with-signals [custom-amounts {:init [80000 80000 80000]}
+                               idx {:init 1}]
+               [:div
+                [:input#first {:bind/value (ui/indexed custom-amounts 0)}]
+                [:input#dynamic {:bind/value (ui/indexed custom-amounts idx)
+                                 :bind/text (ui/num-cents (ui/indexed custom-amounts idx))
+                                 :on/input {:effect (ui/set-signal
+                                                     (ui/indexed custom-amounts idx)
+                                                     (ui/num-cents
+                                                      (ui/indexed custom-amounts idx)))}}]
+                [:span {:bind/show (ui/present? (ui/indexed custom-amounts idx))
+                        :bind/class (ui/changed? (ui/indexed custom-amounts idx)
+                                                 80000)}
+                 "changed"]
+                [:button {:on/click {:effect
+                                      (ui/dispatch :ui-test/save-amounts
+                                        {:custom-amounts custom-amounts
+                                         :first-amount (ui/indexed custom-amounts 0)})}}
+                 "Save"]]))
+        amounts-name (first (data-signal-keys out))
+        idx-name (second (data-signal-keys out))
+        amounts-ref (ui/signal-ref amounts-name)
+        idx-ref (ui/signal-ref idx-name)
+        first-input (attrs (nth out 2))
+        dynamic-input (attrs (nth out 3))
+        status (attrs (nth out 4))
+        click (:data-on:click (attrs (nth out 5)))]
+    (is (= (str "el.value = " amounts-ref "[0];")
+           (:data-effect first-input)))
+    (is (= (str amounts-ref "[0] = el.value;")
+           (:data-on:input first-input)))
+    (is (= (str amounts-ref "[0] = el.value;")
+           (:data-on:change first-input)))
+    (is (= (str "el.value = " amounts-ref "[" idx-ref "];")
+           (:data-effect dynamic-input)))
+    (is (string/includes? (:data-on:input dynamic-input)
+                          (str amounts-ref "[" idx-ref "] = el.value;")))
+    (is (string/includes? (:data-on:input dynamic-input)
+                          (str amounts-ref "[" idx-ref "] = String(Math.round(parseFloat("
+                               amounts-ref "[" idx-ref "] || '0') * 100));")))
+    (is (= (str "String(Math.round(parseFloat("
+                amounts-ref "[" idx-ref "] || '0') * 100))")
+           (:data-text dynamic-input)))
+    (is (= (str "(" amounts-ref "[" idx-ref "] !== '' && "
+                amounts-ref "[" idx-ref "] !== null)")
+           (:data-show status)))
+    (is (= (str "(" amounts-ref "[" idx-ref "] !== 80000)")
+           (:data-class status)))
+    (is (string/includes? click (str "\"custom-amounts\": " amounts-ref)))
+    (is (string/includes? click (str "\"first-amount\": " amounts-ref "[0]")))))
 
 (deftest payload-map-keys-must-be-static
   (is (thrown-with-msg?

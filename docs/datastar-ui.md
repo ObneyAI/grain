@@ -34,6 +34,7 @@ SSE patch rendering.
 - [End-To-End Workflow](#end-to-end-workflow)
 - [Signals](#signals)
 - [Bindings](#bindings)
+- [Indexed Collections](#indexed-collections)
 - [Events And Modifiers](#events-and-modifiers)
 - [Routes And Payloads](#routes-and-payloads)
 - [Effects](#effects)
@@ -232,6 +233,34 @@ generates deterministic scoped names:
 Application code should not use `with-signal-scope` for normal UI. It exists
 for framework code, tests, and rare raw interop where the scope must be
 controlled explicitly.
+
+## Indexed Collections
+
+Use `indexed` when repeated inputs edit elements inside one collection signal:
+
+```clojure
+(ui/with-signals [custom-amounts {:init [80000 80000 80000]}]
+  [:div
+   (for [[idx amount] (map-indexed vector [80000 80000 80000])]
+     [:input {:value amount
+              :bind/value (ui/indexed custom-amounts idx)}])
+   [:button {:on/click {:effect
+                        (ui/dispatch :payment-plan/save
+                          {:custom-amounts custom-amounts})}}
+    "Save"]])
+```
+
+The row input reads from `custom-amounts[idx]` and writes only that element on
+input/change. The whole collection signal can still be sent directly in
+`dispatch` or `refresh` payloads. Server re-rendering can replace the `:init`
+vector when row counts change.
+
+Indexes may be literals, signal handles, or checked expressions:
+
+```clojure
+(ui/indexed custom-amounts idx)
+(ui/num-cents (ui/indexed custom-amounts idx))
+```
 
 ## Bindings
 
@@ -635,10 +664,17 @@ Low-level. Returns the Datastar JavaScript reference for a signal/name:
 
 `:bind/value`
 
-Lowers to `data-bind`:
+Lowers to `data-bind` for ordinary signal handles:
 
 ```clojure
 [:input {:bind/value query}]
+```
+
+For indexed collection references, the compiler emits checked read/write
+behavior that updates only that collection element:
+
+```clojure
+[:input {:bind/value (ui/indexed custom-amounts idx)}]
 ```
 
 `:bind/text`
@@ -838,6 +874,15 @@ Wraps a literal expression value:
 
 ```clojure
 (ui/lit "open")
+```
+
+`indexed`
+
+References one element inside a collection signal:
+
+```clojure
+(ui/indexed custom-amounts 0)
+(ui/indexed custom-amounts idx)
 ```
 
 `trimmed`
