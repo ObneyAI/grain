@@ -335,6 +335,19 @@ Common event attributes:
 :on/submit
 :on/change
 :on/keydown
+:on/signal-patch
+```
+
+`:on/signal-patch` is Datastar's signal patch hook. It lowers to
+`data-on-signal-patch`, not a DOM-style `data-on:*` event. Use it when a
+stable page signal patched by a server response should drive a checked effect:
+
+```clojure
+{:on/signal-patch
+ {:effect
+  (ui/when-effect current-item-id
+    (ui/refresh :items/edit-page
+                {:item-id current-item-id}))}}
 ```
 
 Modifiers lower generically to Datastar event suffixes. There is no hard-coded
@@ -781,6 +794,19 @@ Supported checked event names are open-ended. Common names are:
 :on/submit
 :on/change
 :on/keydown
+:on/signal-patch
+```
+
+`:on/signal-patch`
+
+Datastar signal patch hook. The checked form uses the normal event map but
+lowers to `data-on-signal-patch`:
+
+```clojure
+{:on/signal-patch
+ {:effect (ui/when-effect current-item-id
+            (ui/refresh :items/edit-page
+                        {:item-id current-item-id}))}}
 ```
 
 `:modifiers`

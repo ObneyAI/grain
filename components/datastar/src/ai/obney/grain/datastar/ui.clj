@@ -903,7 +903,8 @@
              (string? attr-v)
              (or (= attr-k :data-effect)
                  (and (keyword? attr-k)
-                      (string/starts-with? (name attr-k) "data-on:"))))
+                      (or (string/starts-with? (name attr-k) "data-on:")
+                          (string/starts-with? (name attr-k) "data-on-")))))
       (assoc attrs attr-k (str existing " " attr-v))
       (assoc attrs attr-k attr-v))
     (assoc attrs attr-k attr-v)))
@@ -915,10 +916,16 @@
       (str "__" modifier-name)
       (str "__" modifier-name "." modifier-value))))
 
+(defn- event-attr-name
+  [event-name modifiers]
+  (str (if (= event-name :signal-patch)
+         "data-on-signal-patch"
+         (str "data-on:" (name event-name)))
+       (apply str (keep lower-event-modifier modifiers))))
+
 (defn- lower-event-attr
   [event-name {:keys [effect modifiers]} ctx]
-  [(keyword (str "data-on:" (name event-name)
-                 (apply str (keep lower-event-modifier modifiers))))
+  [(keyword (event-attr-name event-name modifiers))
    (lower-effect* effect ctx)])
 
 (defn- lower-attr-value

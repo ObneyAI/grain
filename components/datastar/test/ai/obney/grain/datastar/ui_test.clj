@@ -390,6 +390,50 @@
     (is (= "$open = false;" (:data-on:keydown__window (attrs keydown))))
     (is (= "$open = false;" (:data-on:click__stop (attrs click))))))
 
+(deftest signal-patch-events-lower-to-datastar-signal-patch-hook
+  (let [out (hiccup
+             (ui/with-signals [current-item-id {:name "currentItemId"
+                                                :init nil
+                                                :stable? true}
+                               page-scope-key {:name "pageScopeKey"
+                                               :init nil
+                                               :stable? true}
+                               current-scope-key {:name "currentScopeKey"
+                                                  :init "scope"
+                                                  :stable? true}]
+               [:section
+                {:on/signal-patch
+                 {:effect
+                  (ui/effects
+                   (ui/when-effect
+                    current-item-id
+                    (ui/refresh :ui-test/search-page
+                                {:item-id current-item-id}))
+                   (ui/when-effect
+                    (ui/js page-scope-key " !== " current-scope-key)
+                    (ui/set-signal page-scope-key current-scope-key)))}}
+                "watch"]))
+        a (attrs out)
+        effect (:data-on-signal-patch a)]
+    (is (contains? a :data-on-signal-patch))
+    (is (not (contains? a :data-on:signal-patch)))
+    (is (string/includes? effect "$currentItemId"))
+    (is (string/includes? effect "$pageScopeKey"))
+    (is (string/includes? effect "$currentScopeKey"))
+    (is (string/includes? effect "@post(\"/search/__stream\", {payload:"))
+    (is (string/includes? effect "\"item-id\": $currentItemId"))
+    (is (string/includes? effect "\"dsNonce\": $dsNonce"))))
+
+(deftest signal-patch-event-modifiers-use-hook-attribute-spelling
+  (let [out (ui/hiccup
+             [:section
+              {:on/signal-patch {:effect (ui/action "window.__patched = true;")
+                                 :modifiers {:debounce "100ms"}}}
+              "watch"])]
+    (is (= "window.__patched = true;"
+           (:data-on-signal-patch__debounce.100ms (attrs out))))
+    (is (not (contains? (attrs out) :data-on:signal-patch__debounce.100ms)))))
+
 (deftest checked-event-modifier-validation
   (testing "false and nil modifiers are omitted"
     (let [out (ui/hiccup
