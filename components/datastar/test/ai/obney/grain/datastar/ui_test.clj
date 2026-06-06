@@ -306,6 +306,50 @@
     (is (= selected-ref (:data-attr:checked attr-checked)))
     (is (not (contains? attr-checked :data-effect)))))
 
+(deftest element-effects-lower-and-merge-into-data-effect
+  (let [out (hiccup
+             (ui/with-signals [selection {:name "pageSelection"
+                                          :init {}
+                                          :stable? true}
+                               scope-key {:name "pageScopeKey"
+                                          :init nil
+                                          :stable? true}
+                               current-key {:name "currentScopeKey"
+                                            :init "current"
+                                            :stable? true}
+                               checked? {:init false}
+                               amounts {:init [80000]}]
+               [:div
+                [:section#plain
+                 {:effect (ui/when-effect
+                           (ui/js scope-key " !== " current-key)
+                           (ui/effects
+                            (ui/set-signal selection {})
+                            (ui/set-signal scope-key current-key)))}
+                 "plain"]
+                [:section#raw
+                 {:data-effect "window.__raw(el);"
+                  :effect (ui/set-signal scope-key current-key)}
+                 "raw"]
+                [:input#prop
+                 {:bind/prop {:checked checked?}
+                  :effect (ui/set-signal scope-key current-key)}]
+                [:input#indexed
+                 {:bind/value (ui/indexed amounts 0)
+                  :effect (ui/set-signal scope-key current-key)}]]))
+        plain-effect (:data-effect (attrs (nth out 2)))
+        raw-effect (:data-effect (attrs (nth out 3)))
+        prop-effect (:data-effect (attrs (nth out 4)))
+        indexed-effect (:data-effect (attrs (nth out 5)))]
+    (is (= "if ($pageScopeKey !== $currentScopeKey) { $pageSelection = {}; $pageScopeKey = $currentScopeKey; }"
+           plain-effect))
+    (is (= "window.__raw(el); $pageScopeKey = $currentScopeKey;"
+           raw-effect))
+    (is (re-find #"el\.checked = \$\[\"checked\?__[a-z0-9]+\"\]; \$pageScopeKey = \$currentScopeKey;"
+                 prop-effect))
+    (is (re-find #"el\.value = \$amounts__[a-z0-9]+\[0\]; \$pageScopeKey = \$currentScopeKey;"
+                 indexed-effect))))
+
 (deftest checked-events-require-explicit-event-maps
   (is (thrown-with-msg?
        clojure.lang.ExceptionInfo

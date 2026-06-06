@@ -302,6 +302,17 @@ Use `:bind/value` for form values, `:bind/text` for text content,
 `:bind/attr` for attribute maps such as `disabled`, `href`, or `aria-*`.
 Use `:bind/prop` for DOM properties such as checkbox `checked`.
 
+Use element-level `:effect` for reactive Datastar effects that should run when
+the element is initialized or patched:
+
+```clojure
+[:section {:effect
+           (ui/when-effect (ui/js page-scope-key " !== " current-scope-key)
+             (ui/effects
+               (ui/set-signal page-selection {})
+               (ui/set-signal page-scope-key current-scope-key)))}]
+```
+
 Raw, non-DSL Hiccup attributes pass through unchanged.
 
 ## Events And Modifiers
@@ -741,6 +752,14 @@ Lowers each entry to a `data-effect` DOM property write:
 ```clojure
 [:input {:type "checkbox"
          :bind/prop {:checked selected?}}]
+```
+
+`:effect`
+
+Lowers a checked effect to `data-effect`:
+
+```clojure
+[:section {:effect (ui/set-signal page-ready? true)}]
 ```
 
 Other `:bind/foo` attrs lower to `data-bind:foo`.

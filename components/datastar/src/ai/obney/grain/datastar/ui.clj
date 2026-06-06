@@ -604,6 +604,7 @@
   [k]
   (cond
     (= k ::signals) :signals
+    (= k :effect) :effect
     (and (keyword? k) (= "bind" (namespace k))) :bind
     (and (keyword? k) (= "on" (namespace k))) :on
     :else :raw))
@@ -677,11 +678,12 @@
   (reduce-kv (fn [acc k v]
                (case (attr-kind k)
                  :signals (assoc acc :signals v)
+                 :effect (assoc acc :effect v)
                  :bind (assoc-in acc [:bindings (keyword (name k))] v)
                  :on (assoc-in acc [:events (keyword (name k))]
                                (normalize-event (keyword (name k)) v))
                  :raw (assoc-in acc [:attrs k] v)))
-             {:attrs {} :bindings {} :events {} :signals []}
+             {:attrs {} :bindings {} :events {} :signals [] :effect nil}
              attrs))
 
 (defn- auto-signal-scope
@@ -831,6 +833,7 @@
                        (map (fn [[k v]]
                               [k (resolve-binding-signals signal-env k v)]))
                        (:bindings parts))
+       :effect (resolve-effect-signals signal-env (:effect parts))
        :events (into {}
                      (map (fn [[k v]]
                             [k (update v :effect
@@ -977,11 +980,14 @@
                                             (lower-binding-attrs k v))))
                              attrs1
                              (:bindings ir-node))
+           attrs2b (if-let [effect (:effect ir-node)]
+                     (merge-lowered-attr attrs2 :data-effect (lower-effect* effect {}))
+                     attrs2)
            attrs3 (reduce-kv (fn [m k v]
                                (let [ctx {:bound-value-signal (get-in ir-node [:bindings :value])}
                                      [attr-k attr-v] (lower-event-attr k v ctx)]
                                  (merge-lowered-attr m attr-k attr-v)))
-                             attrs2
+                             attrs2b
                              (:events ir-node))
            children (map #(lower-ir % opts) (:children ir-node))]
        (into [(:tag ir-node) attrs3] children))))))
