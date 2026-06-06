@@ -1,0 +1,5 @@
+{:hooks {:analyze-call {ai.obney.grain.datastar.ui/with-signals hooks.grain-datastar/with-signals
+                        ai.obney.grain.datastar.ui/with-signal-scope hooks.grain-datastar/with-signal-scope
+                        ai.obney.grain.datastar.ui/defcomponent hooks.grain-datastar/defcomponent}}
+ :linters {:clojure-lsp/unused-public-var
+           {:exclude-when-defined-by #{ai.obney.grain.datastar.ui/defcomponent}}}}
