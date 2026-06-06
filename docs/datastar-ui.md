@@ -327,6 +327,17 @@ Checked events use explicit maps:
 The event map must contain `:effect`. It may contain `:modifiers`. No other
 keys are allowed.
 
+Checked event effects lower to expression-safe Datastar JavaScript. Conditional
+helpers such as `when-effect` and `choose-effect` are safe to use directly in
+ordinary `:on/*` handlers:
+
+```clojure
+{:on/mousedown
+ {:effect
+  (ui/when-effect (ui/js draw-mode " && evt.target === el")
+    (ui/action "window.__startNewAnnotation(el, evt, $drawMode);"))}}
+```
+
 Common event attributes:
 
 ```clojure
@@ -338,9 +349,9 @@ Common event attributes:
 :on/signal-patch
 ```
 
-`:on/signal-patch` is Datastar's signal patch hook. It lowers to
-`data-on-signal-patch`, not a DOM-style `data-on:*` event. Use it when a
-stable page signal patched by a server response should drive a checked effect:
+`:on/signal-patch` is Datastar's signal patch hook. It uses the same checked
+event map but lowers to `data-on-signal-patch`, not a DOM-style `data-on:*`
+event:
 
 ```clojure
 {:on/signal-patch
@@ -350,10 +361,8 @@ stable page signal patched by a server response should drive a checked effect:
                 {:item-id current-item-id}))}}
 ```
 
-Signal patch handlers use expression-safe lowering internally. Conditional
-effects such as `when-effect` lower to Datastar-safe expressions, so
-application code should not assemble this workflow with `lower-expr` or
-`lower-effect`.
+Application code should not assemble checked event workflows with `lower-expr`
+or `lower-effect`.
 
 Modifiers lower generically to Datastar event suffixes. There is no hard-coded
 modifier allowlist:
@@ -425,7 +434,9 @@ or read that signal directly.
 
 ## Effects
 
-Effects compile to Datastar action strings and are used in checked event maps.
+Effects compile to Datastar action strings. In checked `:on/*` event maps they
+lower as expression-safe Datastar JavaScript. Element-level `:effect` lowers to
+`data-effect` using statement-style JavaScript.
 
 `dispatch`
 
@@ -814,9 +825,9 @@ lowers to `data-on-signal-patch`:
                         {:item-id current-item-id}))}}
 ```
 
-The signal-patch hook is expression-based. The compiler lowers checked
-conditional and sequenced effects to expression-safe JavaScript for this hook
-while preserving statement-style lowering for ordinary events.
+Checked event effects lower to expression-safe Datastar JavaScript. Conditional
+and sequenced effects are safe in ordinary `:on/*` handlers and in
+`:on/signal-patch`.
 
 `:modifiers`
 

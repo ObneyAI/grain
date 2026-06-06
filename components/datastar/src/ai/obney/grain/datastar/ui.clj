@@ -564,19 +564,49 @@
 
 (defn- lower-effects-expr
   [effects ctx]
-  (let [exprs (keep #(expression (lower-effect-expr* % ctx)) effects)]
+  (let [effectv (vec effects)
+        exprs (keep-indexed (fn [idx effect]
+                              (let [later-effects (subvec effectv (inc idx))]
+                                (expression
+                                 (lower-effect-expr*
+                                  effect
+                                  (assoc ctx
+                                         :sync-bound-value?
+                                         (boolean (some contains-blur?
+                                                        later-effects)))))))
+                            effectv)]
     (case (count exprs)
       0 "undefined"
       1 (first exprs)
       (str "(" (string/join ", " exprs) ")"))))
 
 (defn- lower-set-signal-expr
-  [signal expr]
-  (str "(" (target-ref signal) " = " (expr-value expr) ")"))
+  [signal expr sync-dom?]
+  (let [assignment (str (target-ref signal) " = " (expr-value expr))]
+    (str "(" (if sync-dom?
+               (str "el.value = (" assignment ")")
+               assignment)
+         ")")))
 
 (defn- lower-reset-signal-expr
-  [signal]
-  (str "(" (signal-ref signal) " = " (js-literal (:init signal)) ")"))
+  [signal sync-dom?]
+  (let [assignment (str (signal-ref signal) " = " (js-literal (:init signal)))]
+    (str "(" (if sync-dom?
+               (str "el.value = (" assignment ")")
+               assignment)
+         ")")))
+
+(defn- lower-on-keys-expr
+  [key->effect ctx]
+  (lower-effects-expr
+   (map (fn [[k e]]
+          (->Effect :when-effect
+                    {:pred (js "evt.key === " (js-literal (name k)))
+                     :effect (effects
+                              (action "evt.preventDefault()")
+                              e)}))
+        key->effect)
+   ctx))
 
 (defn- lower-effect-expr*
   [effect ctx]
@@ -588,8 +618,14 @@
       :dispatch (lower-dispatch (:args effect))
       :refresh (lower-refresh (:args effect))
       :set-signal (lower-set-signal-expr (get-in effect [:args :signal])
-                                         (get-in effect [:args :expr]))
-      :reset-signal (lower-reset-signal-expr (get-in effect [:args :signal]))
+                                         (get-in effect [:args :expr])
+                                         (bound-value-assignment?
+                                          ctx
+                                          (get-in effect [:args :signal])))
+      :reset-signal (lower-reset-signal-expr (get-in effect [:args :signal])
+                                             (bound-value-assignment?
+                                              ctx
+                                              (get-in effect [:args :signal])))
       :clear-errors "(($fieldErrors = {}), ($error = ''))"
       :blur "el.blur()"
       :action (or (expression (get-in effect [:args :raw])) "undefined")
@@ -604,7 +640,7 @@
                             (lower-effect-expr* else-effect ctx)
                             "undefined")
                           ")")
-      :on-keys (lower-effect* effect ctx))
+      :on-keys (lower-on-keys-expr (get-in effect [:args :key->effect]) ctx))
     :else (js-literal effect)))
 
 (defn- lower-effect*
@@ -978,9 +1014,7 @@
 (defn- lower-event-attr
   [event-name {:keys [effect modifiers]} ctx]
   [(keyword (event-attr-name event-name modifiers))
-   (if (= event-name :signal-patch)
-     (lower-effect-expr* effect ctx)
-     (lower-effect* effect ctx))])
+   (lower-effect-expr* effect ctx)])
 
 (defn- lower-attr-value
   [v]

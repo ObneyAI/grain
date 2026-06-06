@@ -169,9 +169,9 @@
     (is (string/includes? signals-a "\"pageDialogOpen\":false"))
     (is (string/includes? (:data-class clear-a) "$pageDialogOpen"))
     (is (string/includes? (:data-on:click clear-a)
-                          "$pageSelection = {};"))
+                          "($pageSelection = {})"))
     (is (string/includes? (:data-on:click clear-a)
-                          "$pageDialogOpen = false;"))
+                          "($pageDialogOpen = false)"))
     (is (string/includes? (:data-on:click clear-a)
                           "\"custom-amounts\": $pageSelection"))
     (is (string/includes? (:data-on:click clear-a)
@@ -249,10 +249,10 @@
     (is (string/includes? input (str (ui/signal-ref signal-name)
                                      " = "
                                      (ui/signal-ref signal-name)
-                                     ".trim();")))
+                                     ".trim())")))
     (is (string/includes? input (str "\"campus-name\": " (ui/signal-ref signal-name))))
     (is (string/includes? input (str "\"title\": " (ui/signal-ref signal-name))))
-    (is (string/includes? keydown (str (ui/signal-ref signal-name) " = \"Old\";")))))
+    (is (string/includes? keydown (str (ui/signal-ref signal-name) " = \"Old\")")))))
 
 (deftest raw-datastar-attrs-pass-through
   (let [out (hiccup
@@ -387,8 +387,23 @@
                 "Close"])]
     (is (= "@post('/search')" (:data-on:input__debounce.300ms (attrs debounced))))
     (is (= "@post('/save')" (:data-on:submit__prevent (attrs submit))))
-    (is (= "$open = false;" (:data-on:keydown__window (attrs keydown))))
-    (is (= "$open = false;" (:data-on:click__stop (attrs click))))))
+    (is (= "$open = false" (:data-on:keydown__window (attrs keydown))))
+    (is (= "$open = false" (:data-on:click__stop (attrs click))))))
+
+(deftest ordinary-event-conditionals-lower-to-expression-safe-syntax
+  (let [out (hiccup
+             (ui/with-signals [draw-mode {:name "drawMode"
+                                          :init nil
+                                          :stable? true}]
+               [:div
+                {:on/mousedown
+                 {:effect (ui/when-effect
+                           (ui/js draw-mode " && evt.target === el")
+                           (ui/action "window.__startNewAnnotation(el, evt, $drawMode);"))}}]))
+        mousedown (:data-on:mousedown (attrs out))]
+    (is (string/includes? mousedown "($drawMode && evt.target === el) && ("))
+    (is (string/includes? mousedown "window.__startNewAnnotation(el, evt, $drawMode)"))
+    (is (not (string/includes? mousedown "if (")))))
 
 (deftest signal-patch-events-lower-to-datastar-signal-patch-hook
   (let [out (hiccup
@@ -498,7 +513,7 @@
                                     :modifiers {:prevent false
                                                 :stop nil}}}
                 "Open"])]
-      (is (= "$open = true;" (:data-on:click (attrs out))))
+      (is (= "$open = true" (:data-on:click (attrs out))))
       (is (not (contains? (attrs out) :data-on:click__prevent)))
       (is (not (contains? (attrs out) :data-on:click__stop)))))
   (testing "modifier output is deterministic by lowered name"
@@ -710,7 +725,7 @@
                           (str amounts-ref "[" idx-ref "] = el.value;")))
     (is (string/includes? (:data-on:input dynamic-input)
                           (str amounts-ref "[" idx-ref "] = String(Math.round(parseFloat("
-                               amounts-ref "[" idx-ref "] || '0') * 100));")))
+                               amounts-ref "[" idx-ref "] || '0') * 100))")))
     (is (= (str "String(Math.round(parseFloat("
                 amounts-ref "[" idx-ref "] || '0') * 100))")
            (:data-text dynamic-input)))
@@ -825,10 +840,12 @@
                                                                    (ui/blur))})}}]))
         a (attrs out)]
     (is (string/includes? (:data-on:blur a) ".trim()"))
-    (is (string/includes? (:data-on:blur a) "if ("))
+    (is (string/includes? (:data-on:blur a) "&& (@post("))
+    (is (not (string/includes? (:data-on:blur a) "if (")))
     (is (string/includes? (:data-on:keydown a) "evt.key === \"Enter\""))
     (is (string/includes? (:data-on:keydown a) "evt.key === \"Escape\""))
-    (is (string/includes? (:data-on:keydown a) "el.blur();"))))
+    (is (string/includes? (:data-on:keydown a) "evt.preventDefault()"))
+    (is (string/includes? (:data-on:keydown a) "el.blur()"))))
 
 (deftest bound-value-assignments-before-blur-sync-the-dom-value
   (let [out (hiccup
@@ -903,25 +920,25 @@
         unrelated-before-blur (:data-on:keydown (attrs (nth out 8)))
         set-without-blur (:data-on:keydown (attrs (nth out 9)))]
     (is (string/includes? set-before-blur
-                          (str "el.value = (" draft-ref " = \"Original\"); el.blur();")))
+                          (str "el.value = (" draft-ref " = \"Original\")), el.blur()")))
     (is (string/includes? reset-before-blur
-                          (str "el.value = (" draft-ref " = \"Original\"); el.blur();")))
+                          (str "el.value = (" draft-ref " = \"Original\")), el.blur()")))
     (is (string/includes? when-before-blur
-                          (str "el.value = (" draft-ref " = \"Original\"); el.blur();")))
+                          (str "el.value = (" draft-ref " = \"Original\")), el.blur()")))
     (is (string/includes? choose-before-blur
-                          (str "el.value = (" draft-ref " = \"Original\"); el.blur();")))
+                          (str "el.value = (" draft-ref " = \"Original\")), el.blur()")))
     (is (string/includes? when-then-blur
-                          (str "el.value = (" draft-ref " = \"Original\");")))
+                          (str "el.value = (" draft-ref " = \"Original\"))")))
     (is (string/includes? choose-then-blur
-                          (str "el.value = (" draft-ref " = \"Original\");")))
+                          (str "el.value = (" draft-ref " = \"Original\"))")))
     (is (string/includes? unrelated-before-blur
-                          (str other-ref " = \"Unrelated\"; el.blur();")))
+                          (str other-ref " = \"Unrelated\"), el.blur()")))
     (is (not (string/includes? unrelated-before-blur "el.value = (")))
     (is (string/includes? set-without-blur
-                          (str draft-ref " = \"Original\"; console.log('saved');")))
+                          (str draft-ref " = \"Original\"), console.log('saved')")))
     (is (not (string/includes? set-without-blur "el.value = (")))))
 
-(deftest effects-sequence-actions-with-statement-separators
+(deftest event-effects-sequence-actions-with-expression-commas
   (let [task-id #uuid "00000000-0000-0000-0000-000000000001"
         out (hiccup
              (ui/with-signals [title {:init ""}]
@@ -968,12 +985,12 @@
         refresh-reset (:data-on:click (attrs (nth out 4)))
         when-nested (:data-on:click (attrs (nth out 5)))
         choose-nested (:data-on:click (attrs (nth out 6)))]
-    (is (string/includes? dispatch-reset (str "}); " signal-ref " = \"\";")))
-    (is (string/includes? dispatch-set (str "}); " signal-ref " = \"Done\";")))
-    (is (string/includes? refresh-reset (str "}); " signal-ref " = \"\";")))
-    (is (string/includes? when-nested (str "}); " signal-ref " = \"\";")))
-    (is (string/includes? choose-nested (str "}); " signal-ref " = \"Done\";")))
-    (is (string/includes? choose-nested (str "}); " signal-ref " = \"\";")))))
+    (is (string/includes? dispatch-reset (str "}), (" signal-ref " = \"\")")))
+    (is (string/includes? dispatch-set (str "}), (" signal-ref " = \"Done\")")))
+    (is (string/includes? refresh-reset (str "}), (" signal-ref " = \"\")")))
+    (is (string/includes? when-nested (str "}), (" signal-ref " = \"\")")))
+    (is (string/includes? choose-nested (str "}), (" signal-ref " = \"Done\")")))
+    (is (string/includes? choose-nested (str "}), (" signal-ref " = \"\")")))))
 
 (deftest static-interpretation-removes-checked-behavior
   (let [ir-node (ui/ir
