@@ -422,7 +422,64 @@
     (is (string/includes? effect "$currentScopeKey"))
     (is (string/includes? effect "@post(\"/search/__stream\", {payload:"))
     (is (string/includes? effect "\"item-id\": $currentItemId"))
-    (is (string/includes? effect "\"dsNonce\": $dsNonce"))))
+    (is (string/includes? effect "\"dsNonce\": $dsNonce"))
+    (is (string/includes? effect "($currentItemId) && (@post("))
+    (is (string/includes? effect "($pageScopeKey !== $currentScopeKey) && (($pageScopeKey = $currentScopeKey))"))
+    (is (not (string/includes? effect "if (")))))
+
+(deftest signal-patch-effects-lower-to-expression-safe-syntax
+  (testing "when-effect"
+    (let [patch (:data-on-signal-patch
+                 (attrs
+                  (hiccup
+                   (ui/with-signals [current-item-id {:name "currentItemId"
+                                                      :init nil
+                                                      :stable? true}]
+                     [:div
+                      {:on/signal-patch
+                       {:effect (ui/when-effect
+                                 current-item-id
+                                 (ui/refresh :ui-test/search-page
+                                             {:item-id current-item-id}))}}]))))]
+      (is (string/includes? patch "($currentItemId) && (@post("))
+      (is (not (string/includes? patch "if (")))))
+  (testing "choose-effect"
+    (let [patch (:data-on-signal-patch
+                 (attrs
+                  (hiccup
+                   (ui/with-signals [current-item-id {:name "currentItemId"
+                                                      :init nil
+                                                      :stable? true}
+                                     status {:name "status"
+                                             :init "draft"
+                                             :stable? true}
+                                     fallback {:name "fallback"
+                                               :init "empty"
+                                               :stable? true}]
+                     [:div
+                      {:on/signal-patch
+                       {:effect (ui/choose-effect
+                                 current-item-id
+                                 (ui/set-signal status "ready")
+                                 (ui/set-signal status fallback))}}]))))]
+      (is (string/includes? patch "($currentItemId) ? (($status = \"ready\")) : (($status = $fallback))"))
+      (is (not (string/includes? patch "if (")))))
+  (testing "effects"
+    (let [patch (:data-on-signal-patch
+                 (attrs
+                  (hiccup
+                   (ui/with-signals [status {:name "status"
+                                             :init "draft"
+                                             :stable? true}]
+                     [:div
+                      {:on/signal-patch
+                       {:effect (ui/effects
+                                 (ui/set-signal status "refreshing")
+                                 (ui/refresh :ui-test/changed-page
+                                             {:status status}))}}]))))]
+      (is (string/includes? patch "(($status = \"refreshing\"), @post("))
+      (is (string/includes? patch "\"status\": $status"))
+      (is (not (string/includes? patch "if ("))))))
 
 (deftest signal-patch-event-modifiers-use-hook-attribute-spelling
   (let [out (ui/hiccup
@@ -430,7 +487,7 @@
               {:on/signal-patch {:effect (ui/action "window.__patched = true;")
                                  :modifiers {:debounce "100ms"}}}
               "watch"])]
-    (is (= "window.__patched = true;"
+    (is (= "window.__patched = true"
            (:data-on-signal-patch__debounce.100ms (attrs out))))
     (is (not (contains? (attrs out) :data-on:signal-patch__debounce.100ms)))))
 

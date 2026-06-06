@@ -501,6 +501,7 @@
         (str s ";")))))
 
 (declare lower-effect*)
+(declare lower-effect-expr*)
 
 (defn- contains-blur?
   [effect]
@@ -554,6 +555,57 @@
                       effectv)
          (keep statement)
          (string/join " "))))
+
+(defn- expression
+  [s]
+  (let [s (string/trim (str s))]
+    (when-not (string/blank? s)
+      (string/replace s #";+\s*$" ""))))
+
+(defn- lower-effects-expr
+  [effects ctx]
+  (let [exprs (keep #(expression (lower-effect-expr* % ctx)) effects)]
+    (case (count exprs)
+      0 "undefined"
+      1 (first exprs)
+      (str "(" (string/join ", " exprs) ")"))))
+
+(defn- lower-set-signal-expr
+  [signal expr]
+  (str "(" (target-ref signal) " = " (expr-value expr) ")"))
+
+(defn- lower-reset-signal-expr
+  [signal]
+  (str "(" (signal-ref signal) " = " (js-literal (:init signal)) ")"))
+
+(defn- lower-effect-expr*
+  [effect ctx]
+  (cond
+    (nil? effect) "undefined"
+    (string? effect) (or (expression effect) "undefined")
+    (effect? effect)
+    (case (:op effect)
+      :dispatch (lower-dispatch (:args effect))
+      :refresh (lower-refresh (:args effect))
+      :set-signal (lower-set-signal-expr (get-in effect [:args :signal])
+                                         (get-in effect [:args :expr]))
+      :reset-signal (lower-reset-signal-expr (get-in effect [:args :signal]))
+      :clear-errors "(($fieldErrors = {}), ($error = ''))"
+      :blur "el.blur()"
+      :action (or (expression (get-in effect [:args :raw])) "undefined")
+      :effects (lower-effects-expr (get-in effect [:args :effects]) ctx)
+      :when-effect (str "(" (lower-expr (get-in effect [:args :pred])) ") && ("
+                        (lower-effect-expr* (get-in effect [:args :effect]) ctx)
+                        ")")
+      :choose-effect (str "(" (lower-expr (get-in effect [:args :pred])) ") ? ("
+                          (lower-effect-expr* (get-in effect [:args :then]) ctx)
+                          ") : ("
+                          (if-let [else-effect (get-in effect [:args :else])]
+                            (lower-effect-expr* else-effect ctx)
+                            "undefined")
+                          ")")
+      :on-keys (lower-effect* effect ctx))
+    :else (js-literal effect)))
 
 (defn- lower-effect*
   [effect ctx]
@@ -926,7 +978,9 @@
 (defn- lower-event-attr
   [event-name {:keys [effect modifiers]} ctx]
   [(keyword (event-attr-name event-name modifiers))
-   (lower-effect* effect ctx)])
+   (if (= event-name :signal-patch)
+     (lower-effect-expr* effect ctx)
+     (lower-effect* effect ctx))])
 
 (defn- lower-attr-value
   [v]

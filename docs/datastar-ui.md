@@ -350,6 +350,11 @@ stable page signal patched by a server response should drive a checked effect:
                 {:item-id current-item-id}))}}
 ```
 
+Signal patch handlers use expression-safe lowering internally. Conditional
+effects such as `when-effect` lower to Datastar-safe expressions, so
+application code should not assemble this workflow with `lower-expr` or
+`lower-effect`.
+
 Modifiers lower generically to Datastar event suffixes. There is no hard-coded
 modifier allowlist:
 
@@ -808,6 +813,10 @@ lowers to `data-on-signal-patch`:
             (ui/refresh :items/edit-page
                         {:item-id current-item-id}))}}
 ```
+
+The signal-patch hook is expression-based. The compiler lowers checked
+conditional and sequenced effects to expression-safe JavaScript for this hook
+while preserving statement-style lowering for ordinary events.
 
 `:modifiers`
 
