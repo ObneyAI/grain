@@ -15,7 +15,9 @@
             [ai.obney.grain.event-tailer.interface :as event-tailer]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.webserver.interface :as ws]
-            [io.pedestal.http :as http])
+            [cognitect.anomalies :as anom]
+            [io.pedestal.http :as http]
+            [io.pedestal.http.sse :as sse])
   (:import [java.io BufferedReader InputStreamReader InputStream]
            [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]))
@@ -655,6 +657,80 @@
         result (ds/execute-action context signals)]
     (is (= "datastar-patch-signals" (:name result)))
     (is (str/includes? (:data result) "Unauthorized"))))
+
+(deftest execute-action-metadata-success-test
+  (let [context {:command-registry {:test/no-signals
+                                    {:handler-fn (fn [_]
+                                                   {:command/result {:auth/token "token-123"}})
+                                     :authorized? (constantly true)}}
+                 :command-processor/skip-event-storage true}
+        signals {:command/name ":test/no-signals"}
+        result (#'ds/execute-action* context signals)]
+    (is (= :test/no-signals (get-in result [:command :command/name])))
+    (is (= {:command/result {:auth/token "token-123"}}
+           (:command-result result)))
+    (is (= "datastar-patch-signals" (get-in result [:event :name])))
+    (is (str/includes? (get-in result [:event :data]) "token-123"))))
+
+(deftest execute-action-metadata-anomaly-test
+  (let [anomaly {::anom/category ::anom/conflict
+                 ::anom/message "Already exists"}
+        context {:command-registry {:test/no-signals
+                                    {:handler-fn (fn [_] anomaly)
+                                     :authorized? (constantly true)}}
+                 :command-processor/skip-event-storage true}
+        signals {:command/name ":test/no-signals"}
+        result (#'ds/execute-action* context signals)]
+    (is (= :test/no-signals (get-in result [:command :command/name])))
+    (is (= anomaly (:command-result result)))
+    (is (str/includes? (get-in result [:event :data]) "Already exists"))))
+
+(deftest execute-action-metadata-unauthorized-test
+  (let [context {:command-registry {:test/no-signals
+                                    {:handler-fn (fn [_] {:command/result {:ok true}})
+                                     :authorized? (constantly false)}}
+                 :command-processor/skip-event-storage true}
+        signals {:command/name ":test/no-signals"}
+        result (#'ds/execute-action* context signals)]
+    (is (= :test/no-signals (get-in result [:command :command/name])))
+    (is (= ::anom/forbidden (get-in result [:command-result ::anom/category])))
+    (is (= "Unauthorized" (get-in result [:command-result ::anom/message])))
+    (is (str/includes? (get-in result [:event :data]) "Unauthorized"))))
+
+(deftest action-handler-exposes-command-metadata-to-leave-interceptor-test
+  (let [context {:command-registry {:test/no-signals
+                                    {:handler-fn (fn [_]
+                                                   {:command/result {:auth/token "token-123"}})
+                                     :authorized? (constantly true)}}
+                 :command-processor/skip-event-storage true}
+        interceptor (ds/action-handler context {})
+        cookie-leave {:leave (fn [ctx]
+                               (let [command (:grain/command ctx)
+                                     result (:grain/command-result ctx)]
+                                 (if (and (= :test/no-signals (:command/name command))
+                                          (not (::anom/category result))
+                                          (get-in result [:command/result :auth/token]))
+                                   (assoc-in ctx [:response :headers "Set-Cookie"] "auth-token=token-123")
+                                   ctx)))}
+        request-body (json/write-str {"command/name" ":test/no-signals"})
+        start-stream-calls (atom [])]
+    (with-redefs [sse/start-stream
+                  (fn [callback pedestal-context heartbeat-delay]
+                    (let [event-ch (async/chan 1)]
+                      (callback event-ch {:request (:request pedestal-context)})
+                      (swap! start-stream-calls conj {:heartbeat-delay heartbeat-delay
+                                                      :event (async/poll! event-ch)})
+                      (assoc pedestal-context
+                             :response {:status 200 :headers {}})))]
+      (let [entered ((:enter interceptor) {:request {:body request-body}})
+            left ((:leave cookie-leave) entered)]
+        (is (= :test/no-signals (get-in entered [:grain/command :command/name])))
+        (is (= {:command/result {:auth/token "token-123"}}
+               (:grain/command-result entered)))
+        (is (= "auth-token=token-123"
+               (get-in left [:response :headers "Set-Cookie"])))
+        (is (= "datastar-patch-signals"
+               (get-in (first @start-stream-calls) [:event :name])))))))
 
 ;; =========================== ;;
 ;; SSE Test Client              ;;

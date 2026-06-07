@@ -60,7 +60,13 @@
    On success: sends `datastar-patch-signals` with `:datastar/signals` from the
    command result (e.g., `{:__toast \"Saved\"}`).
    On failure: sends `datastar-patch-signals` with `:error` and optional `:fieldErrors`.
-   On unauthorized: sends `datastar-patch-signals` with `{:error \"Unauthorized\"}`."
+   On unauthorized: sends `datastar-patch-signals` with `{:error \"Unauthorized\"}`.
+
+   The returned Pedestal context includes `:grain/command` and
+   `:grain/command-result`, matching Grain's command request handlers. App
+   `:leave` interceptors can inspect these keys; use `anomaly?` on
+   `:grain/command-result` to distinguish failures from successful command
+   results."
   [context opts]
   (core/action-handler context opts))
 

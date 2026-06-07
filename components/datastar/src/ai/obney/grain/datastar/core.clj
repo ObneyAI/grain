@@ -727,8 +727,23 @@
 ;; Command Action Handler ;;
 ;; ---------------------- ;;
 
-(defn execute-action
-  "Executes a command from raw signals. Returns an SSE event map."
+(defn- action-result->event
+  [result]
+  (cond
+    (anomaly? result)
+    (patch-signals (cond-> {:error (::anom/message result)}
+                     (:error/explain result)
+                     (assoc :fieldErrors (:error/explain result)))
+                   {})
+
+    (:datastar/signals result)
+    (patch-signals (:datastar/signals result) {})
+
+    (:command/result result)
+    (patch-signals (:command/result result) {})))
+
+(defn- execute-action*
+  "Executes a command from raw signals. Returns command metadata and an SSE event."
   [context signals]
   (let [command (decode-json-command signals)
         command-context (assoc context :command command)
@@ -738,38 +753,41 @@
                            [(:command/name command) :authorized?])]
     (if (and authorized? (true? (authorized? command-context)))
       (let [result (cp/process-command command-context)]
-        (cond
-          (anomaly? result)
-          (patch-signals (cond-> {:error (::anom/message result)}
-                           (:error/explain result)
-                           (assoc :fieldErrors (:error/explain result)))
-                         {})
-
-          (:datastar/signals result)
-          (patch-signals (:datastar/signals result) {})
-
-          (:command/result result)
-          (patch-signals (:command/result result) {})))
+        {:command command
+         :command-result result
+         :event (action-result->event result)})
       (do
         (when-not authorized?
           (u/log ::missing-authorized-predicate :command-name (:command/name command)))
-        (patch-signals {:error "Unauthorized"} {})))))
+        (let [result {::anom/category ::anom/forbidden
+                      ::anom/message "Unauthorized"}]
+          {:command command
+           :command-result result
+           :event (patch-signals {:error "Unauthorized"} {})})))))
+
+(defn execute-action
+  "Executes a command from raw signals. Returns an SSE event map."
+  [context signals]
+  (:event (execute-action* context signals)))
 
 (defn- action-handler-enter
   "Enter fn for action-handler interceptor."
   [context heartbeat-delay pedestal-context]
   (let [signals (parse-signals (:request pedestal-context))
         additional-context (:grain/additional-context pedestal-context)
-        context-with-auth (merge context additional-context)]
-    (sse/start-stream
-      (fn [event-ch _sse-ctx]
-        (try
-          (when-let [event (execute-action context-with-auth signals)]
-            (async/>!! event-ch event))
-          (catch Exception e (u/log ::action-handler-error :error e))
-          (finally (async/close! event-ch))))
-      pedestal-context
-      heartbeat-delay)))
+        context-with-auth (merge context additional-context)
+        {:keys [command command-result event]} (execute-action* context-with-auth signals)]
+    (assoc (sse/start-stream
+             (fn [event-ch _sse-ctx]
+               (try
+                 (when event
+                   (async/>!! event-ch event))
+                 (catch Exception e (u/log ::action-handler-error :error e))
+                 (finally (async/close! event-ch))))
+             pedestal-context
+             heartbeat-delay)
+           :grain/command command
+           :grain/command-result command-result)))
 
 (defn action-handler
   "Interceptor factory. Processes commands from Datastar signals."
