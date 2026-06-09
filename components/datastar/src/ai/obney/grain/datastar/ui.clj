@@ -415,11 +415,19 @@
         (let [schema-keys (set (map :key entries))
               required (set (keep #(when-not (:optional? %) (:key %)) entries))
               arg-keys (set (keys args))
+              literal-nil-required (seq (keep (fn [k]
+                                                 (when (and (contains? args k)
+                                                            (nil? (get args k)))
+                                                   k))
+                                               required))
               missing (seq (remove arg-keys required))
               unknown (seq (remove schema-keys arg-keys))]
           (when missing
             (throw (ex-info "Dispatch is missing required command keys"
                             {:command command :missing (vec missing) :schema schema})))
+          (when literal-nil-required
+            (throw (ex-info "Dispatch has nil values for required command keys"
+                            {:command command :nil-required (vec literal-nil-required) :schema schema})))
           (when unknown
             (throw (ex-info "Dispatch has keys not present in command schema"
                             {:command command :unknown (vec unknown) :schema schema}))))))))
@@ -442,9 +450,17 @@
   [m]
   (str "{"
        (string/join ", "
-                    (map (fn [[k v]]
-                           (str (payload-key-literal k) ": " (payload-literal v)))
-                         m))
+                    (keep (fn [[k v]]
+                            (let [key-literal (payload-key-literal k)]
+                              (cond
+                                (nil? v) nil
+                                (or (expr? v) (signal? v) (indexed? v))
+                                (let [value (expr-value v)]
+                                  (str "...((" value ") == null ? {} : {"
+                                       key-literal
+                                       ": " value "})"))
+                                :else (str key-literal ": " (payload-literal v)))))
+                          m))
        "}"))
 
 (defn- payload-array-literal

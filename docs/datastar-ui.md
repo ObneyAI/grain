@@ -426,9 +426,12 @@ expressions are lowered recursively:
               :tags #{"signed" "urgent"}})
 ```
 
-Maps lower to JSON objects. Vectors, lists, and sets lower to JSON arrays.
-Payload map keys must be static literal values. Grain command/query schemas
-remain responsible for nested validation and server-side coercion.
+Maps lower to JSON objects. Payload map entries whose value is nil at compile
+time, or null/undefined at submit time for signal and expression values, are
+omitted from the outgoing object. Vectors, lists, and sets lower to JSON arrays
+without filtering elements, so nil collection values remain array nulls. Payload
+map keys must be static literal values. Grain command/query schemas remain
+responsible for nested validation and server-side coercion.
 
 `ui/dispatch` reserves Grain's command route signal name for the command action
 endpoint. By default this is `$__grainAction`. Application code should not set

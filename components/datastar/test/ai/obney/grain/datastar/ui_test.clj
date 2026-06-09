@@ -22,7 +22,7 @@
                              [:document :map]
                              [:ordered :vector]
                              [:choices :set]
-                             [:nil-value nil?]
+                             [:optional-note {:optional true} :string]
                              [:flag? :boolean]
                              [:quantity :int]]
    :ui-test/optional-command [:map
@@ -665,7 +665,7 @@
                                                   :value "ok"}]}
                              :ordered (list signer-name "literal" 7)
                              :choices #{"email" "sms"}
-                             :nil-value nil
+                             :optional-note nil
                              :flag? true
                              :quantity (ui/num field-value)})}}
                 "Submit"]))
@@ -685,9 +685,9 @@
     (is (string/includes? click "\"choices\": ["))
     (is (string/includes? click "\"email\""))
     (is (string/includes? click "\"sms\""))
-    (is (string/includes? click "\"nil-value\": null"))
+    (is (not (string/includes? click "optional-note")))
     (is (string/includes? click "\"flag?\": true"))
-    (is (re-find #"\"quantity\": Number\(\$\[\"field-value__[a-z0-9]+\"\]\)" click))))
+    (is (re-find #"\.\.\(\(Number\(\$\[\"field-value__[a-z0-9]+\"\]\)\) == null \? \{\} : \{\"quantity\": Number\(\$\[\"field-value__[a-z0-9]+\"\]\)\}\)" click))))
 
 (deftest refresh-lowers-nested-payload-data
   (let [out (hiccup
@@ -697,13 +697,17 @@
                          {:effect
                           (ui/refresh :ui-test/graduation-pending-page
                             {:filters {:search search
-                                       :page page}
-                             :include ["students" "documents"]})}}
+                                       :page page
+                                       :empty nil}
+                             :include ["students" "documents" nil]})}}
                 "Refresh"]))
         click (:data-on:click (attrs out))]
     (is (string/includes? click "@post(\"/admin/graduation-pending/__stream\", {payload:"))
-    (is (re-find #"\"filters\": \{\"search\": \$search__[a-z0-9]+, \"page\": \$page__[a-z0-9]+\}" click))
-    (is (string/includes? click "\"include\": [\"students\", \"documents\"]"))
+    (is (string/includes? click "\"filters\": {"))
+    (is (re-find #"\.\.\(\(\$search__[a-z0-9]+\) == null \? \{\} : \{\"search\": \$search__[a-z0-9]+\}\)" click))
+    (is (re-find #"\.\.\(\(\$page__[a-z0-9]+\) == null \? \{\} : \{\"page\": \$page__[a-z0-9]+\}\)" click))
+    (is (not (string/includes? click "empty")))
+    (is (string/includes? click "\"include\": [\"students\", \"documents\", null]"))
     (is (string/includes? click "\"dsNonce\": $dsNonce"))))
 
 (deftest indexed-collection-signals-bind-express-and-post
@@ -840,6 +844,23 @@
           [:button {:on/click {:effect (ui/dispatch :ui-test/complete-task
                                         {:task-id #uuid "00000000-0000-0000-0000-000000000001"
                                          :extra "nope"})}}
+           "bad"]))))
+  (testing "unknown nil command key still fails"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"keys not present"
+         (ui/hiccup
+          [:button {:on/click {:effect (ui/dispatch :ui-test/complete-task
+                                        {:task-id #uuid "00000000-0000-0000-0000-000000000001"
+                                         :extra nil})}}
+           "bad"]))))
+  (testing "required literal nil command key fails"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"nil values for required command keys"
+         (ui/hiccup
+          [:button {:on/click {:effect (ui/dispatch :ui-test/complete-task
+                                        {:task-id nil})}}
            "bad"]))))
   (testing "optional command key may be omitted"
     (is (some?
