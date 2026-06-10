@@ -126,6 +126,35 @@
     (format "(count (filter (fn [e] (= :test/counter-incremented (:event/type e)))
                             (app/all-events @app/app (java.util.UUID/fromString \"%s\"))))" tenant-id)))
 
+(defn start-tail-probe! [port tenant-id]
+  (eval-on port
+    (format "(app/start-tail-probe! @app/app
+                (java.util.UUID/fromString \"%s\")
+                #{:test/counter-incremented})" tenant-id)))
+
+(defn stop-tail-probe! [port]
+  (eval-on port "(app/stop-tail-probe! @app/app)"))
+
+(defn reset-tail-probe-events! [port]
+  (eval-on port "(app/reset-tail-probe-events! @app/app)"))
+
+(defn tail-probe-summary [port]
+  (eval-read port
+    "(mapv (fn [e]
+             {:event-type (:event/type e)
+              :tenant-id (some-> (:grain/tenant-id e) str)
+              :n (:n e)})
+           (app/tail-probe-events @app/app))"))
+
+(defn wait-for-tail-probe-count [port expected-count timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [events (tail-probe-summary port)]
+        (cond
+          (>= (count events) expected-count) events
+          (> (System/currentTimeMillis) deadline) events
+          :else (do (Thread/sleep 200) (recur)))))))
+
 (defn node-reachable? [port]
   (try (node-status port) true
        (catch Exception _ false)))
@@ -258,6 +287,44 @@
           (info (str "Processed after: " after))
           (check "Cross-instance event processed" (> after before))))
       (fail "No tenants owned by non-primary nodes"))))
+
+(defn scenario-3b []
+  (header "Scenario 3b: Event tailer publishes shared-store events to local pubsub")
+  (let [tenant-id (first @tenant-ids)
+        probe-port (second all-ports)
+        append-port primary-port]
+    (try
+      (info (str "Appending baseline event before probe for tenant " tenant-id "..."))
+      (increment! append-port tenant-id)
+      (Thread/sleep 1000)
+      (info (str "Starting tail probe on port " probe-port "..."))
+      (start-tail-probe! probe-port tenant-id)
+      (Thread/sleep 1000)
+      (check "Tail probe does not replay pre-existing event"
+             (empty? (tail-probe-summary probe-port)))
+
+      (info (str "Appending new event through port " append-port "..."))
+      (increment! append-port tenant-id)
+      (let [events (wait-for-tail-probe-count probe-port 1 5000)
+            event (first events)]
+        (info (str "Tail probe events: " (pr-str events)))
+        (check "Tail probe received exactly one new event"
+               (= 1 (count events)))
+        (check "Tail probe event has expected type"
+               (= :test/counter-incremented (:event-type event)))
+        (check "Tail probe event carries tenant id"
+               (= tenant-id (:tenant-id event))))
+
+      (info "Adding overlapping tailer interest on same node...")
+      (start-tail-probe! probe-port tenant-id)
+      (reset-tail-probe-events! probe-port)
+      (increment! append-port tenant-id)
+      (let [events (wait-for-tail-probe-count probe-port 1 5000)]
+        (info (str "Tail probe events after overlapping interest: " (pr-str events)))
+        (check "Overlapping tailer interest produces one local pubsub event"
+               (= 1 (count events))))
+      (finally
+        (stop-tail-probe! probe-port)))))
 
 (defn scenario-4 []
   (header "Scenario 4: Graceful failover")
@@ -619,6 +686,7 @@
     (scenario-1)
     (scenario-2)
     (scenario-3)
+    (scenario-3b)
     (scenario-4)
     (scenario-5)
     (scenario-6)

@@ -2,12 +2,12 @@
 
 ## grain-core-v2
 
-Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 processors (command, read-model, todo), v2 request handler, query processor, and pub/sub:
+Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 processors (command, read-model, todo), v2 request handler, query processor, pub/sub, and the event tailer for replaying shared-store events into a node's local pub/sub:
 
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
+ :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -18,7 +18,7 @@ Distributed coordination for multi-instance deployments. Coordinator election, t
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
+ :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -26,16 +26,16 @@ Includes the core CQRS components (event store, read model processor, todo proce
 
 ## grain-datastar
 
-Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hiccup-rendered HTML over SSE, with event-driven re-rendering, SSE connection reuse, auto-generated auth redirects, context-dependent gate interceptors, Malli-based JSON coercion, and automatic Pedestal route generation:
+Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hiccup-rendered HTML over SSE, with event-driven re-rendering, distributed live updates via the event tailer, SSE connection reuse, auto-generated auth redirects, context-dependent gate interceptors, Malli-based JSON coercion, and automatic Pedestal route generation:
 
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
+ :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
  :deps/root "projects/grain-datastar"}
 ```
 
-Includes the core CQRS components (command/query/read-model processors, event store, pub/sub). See `components/datastar` for the full source.
+Includes the core CQRS components (command/query/read-model processors, event store, pub/sub, event tailer). See `components/datastar` for the full source.
 
 ## grain-tui
 
@@ -57,7 +57,7 @@ Dev-only nREPL-facing tools for coding agents working against a live Grain app. 
 ```clojure
 obneyai/grain-code-agent-tools
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
+ :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
  :deps/root "projects/grain-code-agent-tools"}
 ```
 
@@ -82,7 +82,7 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
+ :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
@@ -93,7 +93,7 @@ Embedded SQLite backend implementing the v3 event store protocol for single-proc
 ```clojure
 obneyai/grain-event-store-sqlite-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
+ :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
  :deps/root "projects/grain-event-store-sqlite-v3"}
 ```
 
@@ -104,7 +104,7 @@ obneyai/grain-event-store-sqlite-v3
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11"
+ :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 

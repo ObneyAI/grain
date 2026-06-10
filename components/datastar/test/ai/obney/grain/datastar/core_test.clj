@@ -12,9 +12,12 @@
             [ai.obney.grain.query-schema.interface]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.pubsub.interface :as pubsub]
+            [ai.obney.grain.event-tailer.interface :as event-tailer]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.webserver.interface :as ws]
-            [io.pedestal.http :as http])
+            [cognitect.anomalies :as anom]
+            [io.pedestal.http :as http]
+            [io.pedestal.http.sse :as sse])
   (:import [java.io BufferedReader InputStreamReader InputStream]
            [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]))
@@ -310,6 +313,33 @@
           result ((:enter ds/parse-datastar-signals) ctx)]
       (is (= "wrapped" (get-in result [:request :query-params :search])))))
 
+  (testing "POST with explicit payload body merges only payload"
+    (let [body-str (json/write-str {:payload {:page 2 :search "payload"}
+                                    :ambient "ignored"})
+          ctx {:request {:request-method :post
+                         :body body-str
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= 2 (get-in result [:request :query-params :page])))
+      (is (= "payload" (get-in result [:request :query-params :search])))
+      (is (nil? (get-in result [:request :query-params :ambient])))))
+
+  (testing "POST with explicit payload preserves nested maps and vectors"
+    (let [body-str (json/write-str {:payload {:document {:id "doc-1"
+                                                         :signer {:name "Ada"}
+                                                         :fields [{:id "f1" :value "yes"}]}
+                                               :tags ["urgent" "signed"]}})
+          ctx {:request {:request-method :post
+                         :body body-str
+                         :query-params {}}}
+          result ((:enter ds/parse-datastar-signals) ctx)]
+      (is (= "doc-1" (get-in result [:request :query-params :document :id])))
+      (is (= "Ada" (get-in result [:request :query-params :document :signer :name])))
+      (is (= [{:id "f1" :value "yes"}]
+             (get-in result [:request :query-params :document :fields])))
+      (is (= ["urgent" "signed"]
+             (get-in result [:request :query-params :tags])))))
+
   (testing "POST preserves native JSON types (booleans, numbers, maps)"
     (let [body-str (json/write-str {:active true :count 0 :fieldErrors {:name "required"}})
           ctx {:request {:request-method :post
@@ -331,7 +361,16 @@
       (is (= 200 (get-in result [:response :status])))
       (is (= "text/html; charset=UTF-8"
              (get-in result [:response :headers "Content-Type"])))
-      (is (str/includes? (get-in result [:response :body]) "<script"))))
+      (is (str/includes? (get-in result [:response :body]) "<script"))
+      (is (str/includes? (get-in result [:response :body]) "__grainAction"))
+      (is (str/includes? (get-in result [:response :body]) "/actions"))))
+
+  (testing "custom action path is emitted as reserved signal"
+    (let [interceptor (ds/shim-page {:action-path "/custom-actions"})
+          result ((:enter interceptor) {})
+          body (get-in result [:response :body])]
+      (is (str/includes? body "__grainAction"))
+      (is (str/includes? body "/custom-actions"))))
 
   (testing "with stream-path — nonce in URL and as signal for all stream methods"
     (let [interceptor (ds/shim-page {:stream-path "/stream"})
@@ -619,6 +658,80 @@
     (is (= "datastar-patch-signals" (:name result)))
     (is (str/includes? (:data result) "Unauthorized"))))
 
+(deftest execute-action-metadata-success-test
+  (let [context {:command-registry {:test/no-signals
+                                    {:handler-fn (fn [_]
+                                                   {:command/result {:auth/token "token-123"}})
+                                     :authorized? (constantly true)}}
+                 :command-processor/skip-event-storage true}
+        signals {:command/name ":test/no-signals"}
+        result (#'ds/execute-action* context signals)]
+    (is (= :test/no-signals (get-in result [:command :command/name])))
+    (is (= {:command/result {:auth/token "token-123"}}
+           (:command-result result)))
+    (is (= "datastar-patch-signals" (get-in result [:event :name])))
+    (is (str/includes? (get-in result [:event :data]) "token-123"))))
+
+(deftest execute-action-metadata-anomaly-test
+  (let [anomaly {::anom/category ::anom/conflict
+                 ::anom/message "Already exists"}
+        context {:command-registry {:test/no-signals
+                                    {:handler-fn (fn [_] anomaly)
+                                     :authorized? (constantly true)}}
+                 :command-processor/skip-event-storage true}
+        signals {:command/name ":test/no-signals"}
+        result (#'ds/execute-action* context signals)]
+    (is (= :test/no-signals (get-in result [:command :command/name])))
+    (is (= anomaly (:command-result result)))
+    (is (str/includes? (get-in result [:event :data]) "Already exists"))))
+
+(deftest execute-action-metadata-unauthorized-test
+  (let [context {:command-registry {:test/no-signals
+                                    {:handler-fn (fn [_] {:command/result {:ok true}})
+                                     :authorized? (constantly false)}}
+                 :command-processor/skip-event-storage true}
+        signals {:command/name ":test/no-signals"}
+        result (#'ds/execute-action* context signals)]
+    (is (= :test/no-signals (get-in result [:command :command/name])))
+    (is (= ::anom/forbidden (get-in result [:command-result ::anom/category])))
+    (is (= "Unauthorized" (get-in result [:command-result ::anom/message])))
+    (is (str/includes? (get-in result [:event :data]) "Unauthorized"))))
+
+(deftest action-handler-exposes-command-metadata-to-leave-interceptor-test
+  (let [context {:command-registry {:test/no-signals
+                                    {:handler-fn (fn [_]
+                                                   {:command/result {:auth/token "token-123"}})
+                                     :authorized? (constantly true)}}
+                 :command-processor/skip-event-storage true}
+        interceptor (ds/action-handler context {})
+        cookie-leave {:leave (fn [ctx]
+                               (let [command (:grain/command ctx)
+                                     result (:grain/command-result ctx)]
+                                 (if (and (= :test/no-signals (:command/name command))
+                                          (not (::anom/category result))
+                                          (get-in result [:command/result :auth/token]))
+                                   (assoc-in ctx [:response :headers "Set-Cookie"] "auth-token=token-123")
+                                   ctx)))}
+        request-body (json/write-str {"command/name" ":test/no-signals"})
+        start-stream-calls (atom [])]
+    (with-redefs [sse/start-stream
+                  (fn [callback pedestal-context heartbeat-delay]
+                    (let [event-ch (async/chan 1)]
+                      (callback event-ch {:request (:request pedestal-context)})
+                      (swap! start-stream-calls conj {:heartbeat-delay heartbeat-delay
+                                                      :event (async/poll! event-ch)})
+                      (assoc pedestal-context
+                             :response {:status 200 :headers {}})))]
+      (let [entered ((:enter interceptor) {:request {:body request-body}})
+            left ((:leave cookie-leave) entered)]
+        (is (= :test/no-signals (get-in entered [:grain/command :command/name])))
+        (is (= {:command/result {:auth/token "token-123"}}
+               (:grain/command-result entered)))
+        (is (= "auth-token=token-123"
+               (get-in left [:response :headers "Set-Cookie"])))
+        (is (= "datastar-patch-signals"
+               (get-in (first @start-stream-calls) [:event :name])))))))
+
 ;; =========================== ;;
 ;; SSE Test Client              ;;
 ;; =========================== ;;
@@ -644,6 +757,23 @@
                                        nil [])
                                 (recur events nil []))
             :else (recur events current-name current-data)))))))
+
+(defn- take-event
+  [ch timeout-ms]
+  (async/alt!!
+    ch ([v] v)
+    (async/timeout timeout-ms) nil))
+
+(defn- eventually?
+  [pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (cond
+        (pred) true
+        (> (System/currentTimeMillis) deadline) false
+        :else (do
+                (Thread/sleep 10)
+                (recur))))))
 
 ;; =========================== ;;
 ;; E2E Test Fixture             ;;
@@ -945,6 +1075,18 @@
     (testing "query title still takes precedence"
       (is (str/includes? body "Custom Title")))))
 
+(deftest routes-with-action-path-default-test
+  (let [context {:query-registry {:test/action-default {:handler-fn identity
+                                                        :authorized? (constantly true)
+                                                        :datastar/path "/action-default"}}}
+        defaults {:datastar/action-path "/custom-actions"}
+        generated (ds/routes context {} defaults)
+        shim-route (first (filter #(= "/action-default" (first %)) generated))
+        shim-interceptor (last (nth shim-route 2))
+        body (get-in ((:enter shim-interceptor) {}) [:response :body])]
+    (is (str/includes? body "__grainAction"))
+    (is (str/includes? body "/custom-actions"))))
+
 (deftest routes-defaults-per-query-override-test
   (let [context {:query-registry {:test/default-head {:handler-fn identity
                                                        :authorized? (constantly true)
@@ -1181,6 +1323,44 @@
                            (not (str/includes? % "/__stream")))
                       paths))))))
 
+(deftest registered-page-and-stream-path-resolution-test
+  (let [registry {:test/list {:handler-fn identity
+                              :authorized? (constantly true)
+                              :datastar/path "/items"}
+                  :test/detail {:handler-fn identity
+                                :authorized? (constantly true)
+                                :datastar/path "/items/:item-id"}
+                  :test/root {:handler-fn identity
+                              :authorized? (constantly true)
+                              :datastar/path "/"}
+                  :test/no-path {:handler-fn identity}}]
+    (testing "page paths resolve from query metadata"
+      (is (= "/items" (ds/page-path :test/list registry)))
+      (is (= "/items/abc-123?page=2&tab=details"
+             (ds/page-path :test/detail
+                           {:path-params {:item-id "abc-123"}
+                            :query-params {:tab :details
+                                           :page 2}}
+                           registry))))
+    (testing "stream paths resolve from query metadata"
+      (is (= "/items/__stream" (ds/stream-path :test/list registry)))
+      (is (= "/items/abc-123/__stream?page=2&tab=details"
+             (ds/stream-path :test/detail
+                             {:path-params {:item-id "abc-123"}
+                              :query-params {:tab :details
+                                             :page 2}}
+                             registry)))
+      (is (= "/__stream" (ds/stream-path :test/root registry))))
+    (testing "missing route metadata fails"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"not registered"
+           (ds/page-path :test/missing registry)))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"no :datastar/path"
+           (ds/page-path :test/no-path registry))))))
+
 (deftest query->route-pair-root-path-test
   (let [entry {:handler-fn identity
                :authorized? (constantly true)
@@ -1302,6 +1482,169 @@
     (is (= "datastar-patch-elements" (:name (second stream-events))))
     ;; Second render should contain updated value
     (is (str/includes? (:data (second stream-events)) "42"))))
+
+(deftest event-driven-stream-registers-with-event-tailer-test
+  (let [tenant-id (random-uuid)
+        state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        context {:test-state state
+                 :query-registry (assoc-in @qp/query-registry*
+                                           [:test/event-counters :authorized?]
+                                           (constantly false))
+                 :event-pubsub ps
+                 :event-tailer ::tailer
+                 :tenant-id tenant-id}
+        event-ch (async/chan 10)
+        subscribed (atom [])
+        unsubscribed (atom [])]
+    (try
+      (with-redefs [event-tailer/subscribe! (fn [tailer tid event-types]
+                                              (swap! subscribed conj [tailer tid event-types]))
+                    event-tailer/unsubscribe! (fn [tailer tid event-types]
+                                                (swap! unsubscribed conj [tailer tid event-types]))]
+        (let [stream (future
+                       (#'ds/stream-view-loop-events
+                        event-ch
+                        {:request {:query-params {} :path-params {}}}
+                        context
+                        :test/event-counters
+                        ps
+                        #{:test/counter-incremented}
+                        10
+                        {}
+                        nil))]
+          (is (= "datastar-patch-signals" (:name (async/<!! event-ch))))
+          (is (= [[::tailer tenant-id #{:test/counter-incremented}]]
+                 @subscribed))
+          (is (eventually? #(realized? stream) 1000))
+          (is (= [[::tailer tenant-id #{:test/counter-incremented}]]
+                 @unsubscribed))))
+      (finally
+        (pubsub/stop ps)))))
+
+(deftest event-driven-stream-filters-by-tenant-test
+  (let [tenant-id (random-uuid)
+        other-tenant-id (random-uuid)
+        state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        context {:test-state state
+                 :query-registry @qp/query-registry*
+                 :event-pubsub ps
+                 :event-tailer ::tailer
+                 :tenant-id tenant-id}
+        event-ch (async/chan 10)]
+    (try
+      (with-redefs [event-tailer/subscribe! (fn [& _])
+                    event-tailer/unsubscribe! (fn [& _])]
+        (let [stream (future
+                       (#'ds/stream-view-loop-events
+                        event-ch
+                        {:request {:query-params {} :path-params {}}}
+                        context
+                        :test/event-counters
+                        ps
+                        #{:test/counter-incremented}
+                        10
+                        {}
+                        nil))]
+          (is (= "datastar-patch-elements" (:name (async/<!! event-ch))))
+          (swap! state assoc-in [:counters 0 :value] 41)
+          (pubsub/pub ps {:message {:event/type :test/counter-incremented
+                                    :grain/tenant-id other-tenant-id}})
+          (is (nil? (take-event event-ch 150)))
+          (swap! state assoc-in [:counters 0 :value] 42)
+          (pubsub/pub ps {:message {:event/type :test/counter-incremented
+                                    :grain/tenant-id tenant-id}})
+          (let [rerender (take-event event-ch 1000)]
+            (is (= "datastar-patch-elements" (:name rerender)))
+            (is (str/includes? (:data rerender) "42")))
+          (async/close! event-ch)
+          (pubsub/pub ps {:message {:event/type :test/counter-incremented
+                                    :grain/tenant-id tenant-id}})
+          (is (nil? (deref stream 1000 nil)))))
+      (finally
+        (pubsub/stop ps)))))
+
+(deftest event-driven-stream-dedupes-stored-events-test
+  (let [tenant-id (random-uuid)
+        event-id (random-uuid)
+        state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        context {:test-state state
+                 :query-registry @qp/query-registry*
+                 :event-pubsub ps
+                 :tenant-id tenant-id}
+        event-ch (async/chan 10)
+        event {:event/id event-id
+               :event/type :test/counter-incremented
+               :grain/tenant-id tenant-id}]
+    (try
+      (let [stream (future
+                     (#'ds/stream-view-loop-events
+                      event-ch
+                      {:request {:query-params {} :path-params {}}}
+                      context
+                      :test/event-counters
+                      ps
+                      #{:test/counter-incremented}
+                      0
+                      {}
+                      nil))]
+        (is (= "datastar-patch-elements" (:name (async/<!! event-ch))))
+        (swap! state assoc-in [:counters 0 :value] 41)
+        (pubsub/pub ps {:message event})
+        (let [rerender (take-event event-ch 1000)]
+          (is (= "datastar-patch-elements" (:name rerender)))
+          (is (str/includes? (:data rerender) "41")))
+        (swap! state assoc-in [:counters 0 :value] 42)
+        (pubsub/pub ps {:message event})
+        (is (nil? (take-event event-ch 150)))
+        (async/close! event-ch)
+        (pubsub/pub ps {:message (assoc event :event/id (random-uuid))})
+        (is (nil? (deref stream 1000 nil))))
+      (finally
+        (pubsub/stop ps)))))
+
+(deftest event-driven-stream-does-not-dedupe-idless-events-test
+  (let [state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        context {:test-state state
+                 :query-registry @qp/query-registry*
+                 :event-pubsub ps}
+        event-ch (async/chan 10)
+        event {:event/type :test/counter-incremented}]
+    (try
+      (let [stream (future
+                     (#'ds/stream-view-loop-events
+                      event-ch
+                      {:request {:query-params {} :path-params {}}}
+                      context
+                      :test/event-counters
+                      ps
+                      #{:test/counter-incremented}
+                      0
+                      {}
+                      nil))]
+        (is (= "datastar-patch-elements" (:name (async/<!! event-ch))))
+        (swap! state assoc-in [:counters 0 :value] 41)
+        (pubsub/pub ps {:message event})
+        (let [rerender (take-event event-ch 1000)]
+          (is (= "datastar-patch-elements" (:name rerender)))
+          (is (str/includes? (:data rerender) "41")))
+        (swap! state assoc-in [:counters 0 :value] 42)
+        (pubsub/pub ps {:message event})
+        (let [rerender (take-event event-ch 1000)]
+          (is (= "datastar-patch-elements" (:name rerender)))
+          (is (str/includes? (:data rerender) "42")))
+        (async/close! event-ch)
+        (pubsub/pub ps {:message event})
+        (is (nil? (deref stream 1000 nil))))
+      (finally
+        (pubsub/stop ps)))))
 
 (deftest e2e-event-driven-debounce-test
   (let [client (HttpClient/newHttpClient)

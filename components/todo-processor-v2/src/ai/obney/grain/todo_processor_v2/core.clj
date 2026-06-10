@@ -8,7 +8,8 @@
             [integrant.core :as ig]
             [clojure.core.async :as async]
             [ai.obney.grain.core-async-thread-pool.interface :as thread-pool]
-            [clj-uuid :as uuid]))
+            [clj-uuid :as uuid])
+  (:import [java.util.concurrent ThreadPoolExecutor TimeUnit]))
 
 ;; ------------------- ;;
 ;; Processor Registry  ;;
@@ -40,42 +41,67 @@
   (uuid/v5 uuid/+namespace-url+ (str processor-name)))
 
 (defn- make-checkpoint-event
-  [processor-name triggering-event-id]
-  (let [proc-uuid (processor-name->uuid processor-name)]
-    (event-store/->event
-     {:type :grain/todo-processor-checkpoint
-      :tags #{[:processor proc-uuid]}
-      :body {:processor/name processor-name
-             :triggered-by triggering-event-id}})))
+  ([processor-name triggering-event-id]
+   (make-checkpoint-event processor-name triggering-event-id nil))
+  ([processor-name triggering-event-id extra-body]
+   (let [proc-uuid (processor-name->uuid processor-name)]
+     (event-store/->event
+      {:type :grain/todo-processor-checkpoint
+       :tags #{[:processor proc-uuid]}
+       :body (cond-> {:processor/name processor-name
+                      :triggered-by triggering-event-id}
+               extra-body (merge extra-body))}))))
+
+(defn- checkpoint-at-or-after?
+  [threshold-id checkpoint]
+  (let [checkpoint-id (:triggered-by checkpoint)]
+    (and checkpoint-id
+         (not (uuid/< checkpoint-id threshold-id)))))
 
 (defn- append-with-checkpoint
   "Appends events + checkpoint atomically with CAS to prevent duplicates."
-  [event-store tenant-id processor-name triggering-event-id events]
-  (let [proc-uuid (processor-name->uuid processor-name)
-        checkpoint (make-checkpoint-event processor-name triggering-event-id)
-        all-events (conj (vec events) checkpoint)
-        result (event-store/append event-store
-                 {:tenant-id tenant-id
-                  :events all-events
-                  :cas {:types #{:grain/todo-processor-checkpoint}
-                        :tags  #{[:processor proc-uuid]}
-                        :predicate-fn
-                        (fn [evts]
-                          (not (reduce
-                                (fn [_ evt]
-                                  (if (= triggering-event-id (:triggered-by evt))
-                                    (reduced true)
-                                    false))
-                                false
-                                evts)))}})]
-    (when (anomaly? result)
-      (if (= ::anom/conflict (::anom/category result))
-        (do (u/log ::already-processed :processor-name processor-name
-                   :triggered-by triggering-event-id)
-            result)
-        (do (u/log ::error-storing-events :anomaly result)
-            {::anom/category ::anom/fault
-             ::anom/message "Error storing events."})))))
+  ([event-store tenant-id processor-name triggering-event-id events]
+   (append-with-checkpoint event-store tenant-id processor-name triggering-event-id events {}))
+  ([event-store tenant-id processor-name triggering-event-id events
+    {:keys [conflict-threshold-id checkpoint-body]
+     :or {conflict-threshold-id triggering-event-id}}]
+   (let [proc-uuid (processor-name->uuid processor-name)
+         checkpoint (make-checkpoint-event processor-name triggering-event-id checkpoint-body)
+         all-events (conj (vec events) checkpoint)
+         result (event-store/append event-store
+                  {:tenant-id tenant-id
+                   :events all-events
+                   :cas {:types #{:grain/todo-processor-checkpoint}
+                         :tags  #{[:processor proc-uuid]}
+                         :predicate-fn
+                         (fn [evts]
+                           (not (reduce
+                                 (fn [_ evt]
+                                   (if (checkpoint-at-or-after? conflict-threshold-id evt)
+                                     (reduced true)
+                                     false))
+                                 false
+                                 evts)))}})]
+     (when (anomaly? result)
+       (if (= ::anom/conflict (::anom/category result))
+         (do (u/log ::already-processed :processor-name processor-name
+                    :triggered-by triggering-event-id
+                    :conflict-threshold-id conflict-threshold-id)
+             result)
+         (do (u/log ::error-storing-events :anomaly result)
+             {::anom/category ::anom/fault
+              ::anom/message "Error storing events."}))))))
+
+(defn- append-batch-with-checkpoint
+  [event-store tenant-id processor-name from-event-id events result-events]
+  (when (seq events)
+    (append-with-checkpoint event-store tenant-id processor-name
+                            (:event/id (last events))
+                            result-events
+                            {:conflict-threshold-id (:event/id (first events))
+                             :checkpoint-body
+                             (cond-> {:checkpoint/kind :batch-range}
+                               from-event-id (assoc :checkpoint/from from-event-id))})))
 
 ;; ------------------- ;;
 ;; Event Processing    ;;
@@ -386,7 +412,22 @@
                                              (take batch-size))
                                        (event-store/read event-store read-args))
                               batch-result-events (atom [])
-                              last-batch-event-id (atom nil)]
+                              batch-source-events (atom [])
+                              flush-batch (fn []
+                                            (when (seq @batch-source-events)
+                                              (let [append-result (append-batch-with-checkpoint
+                                                                   event-store tenant-id processor-name
+                                                                   @last-id
+                                                                   @batch-source-events
+                                                                   @batch-result-events)
+                                                    last-batch-event-id (:event/id (last @batch-source-events))]
+                                                (if (anomaly? append-result)
+                                                  (reset! last-id
+                                                          (get-last-processed-id
+                                                           event-store tenant-id processor-name))
+                                                  (reset! last-id last-batch-event-id))
+                                                (reset! batch-source-events [])
+                                                (reset! batch-result-events []))))]
                           (doseq [event events]
                             (when @running
                               (if (and lease-check-fn
@@ -398,21 +439,24 @@
                                                :tenant-id tenant-id}
                                       result (or (handler-fn context)
                                                  {})]
-                                  (if (:result/effect result)
-                                    ;; Effect handler: checkpoint per-event (delegating to process-event)
-                                    (process-event (cond-> (assoc context
-                                                             :processor-name processor-name)
-                                                     lease-check-fn (assoc :lease-check-fn lease-check-fn)))
+                                  (if (or (:result/effect result)
+                                          (:result/cas result))
+                                    ;; Effect/CAS handler: preserve per-event processing semantics.
+                                    (do
+                                      (flush-batch)
+                                      (process-event (cond-> (assoc context
+                                                                :processor-name processor-name)
+                                                        lease-check-fn (assoc :lease-check-fn lease-check-fn)))
+                                      (when-let [processed-id (get-last-processed-id
+                                                               event-store tenant-id processor-name)]
+                                        (reset! last-id processed-id)))
                                     ;; Pure handler: collect result events for batch checkpoint
-                                    (when-let [revents (:result/events result)]
-                                      (swap! batch-result-events into revents)))))
-                              (reset! last-batch-event-id (:event/id event))))
+                                    (do
+                                      (swap! batch-source-events conj event)
+                                      (when-let [revents (:result/events result)]
+                                        (swap! batch-result-events into revents))))))))
                           ;; After batch: one checkpoint for all pure results
-                          (when @last-batch-event-id
-                            (append-with-checkpoint event-store tenant-id processor-name
-                                                    @last-batch-event-id
-                                                    @batch-result-events)
-                            (reset! last-id @last-batch-event-id)))
+                          (flush-batch))
                         (catch Throwable t
                           (u/log ::poll-processor-error :exception t)))
                       (Thread/sleep poll-interval-ms)))))]
@@ -523,7 +567,24 @@
                                                   (event-store/read event-store read-args))]
                                      (if (seq events)
                                        (let [batch-result-events (atom [])
-                                             handler-fn (:handler-fn proc-config)]
+                                             batch-source-events (atom [])
+                                             handler-fn (:handler-fn proc-config)
+                                             flush-batch (fn []
+                                                           (when (seq @batch-source-events)
+                                                             (let [append-result (append-batch-with-checkpoint
+                                                                                  event-store tid proc-name
+                                                                                  (get-in @watermarks
+                                                                                          [tid proc-name])
+                                                                                  @batch-source-events
+                                                                                  @batch-result-events)
+                                                                   last-event-id (:event/id (last @batch-source-events))]
+                                                               (if (anomaly? append-result)
+                                                                 (swap! watermarks assoc-in
+                                                                        [tid proc-name]
+                                                                        (get-last-processed-id event-store tid proc-name))
+                                                                 (swap! watermarks assoc-in [tid proc-name] last-event-id))
+                                                               (reset! batch-source-events [])
+                                                               (reset! batch-result-events []))))]
                                          ;; Process events sequentially within this tenant
                                          (doseq [event events]
                                            (when @running
@@ -533,16 +594,21 @@
                                                                :event-store event-store
                                                                :tenant-id tid})
                                                    result (or (handler-fn ctx) {})]
-                                               (if (:result/effect result)
-                                                 (process-event (assoc ctx :processor-name proc-name))
-                                                 (when-let [revents (:result/events result)]
-                                                   (swap! batch-result-events into revents))))))
+                                               (if (or (:result/effect result)
+                                                       (:result/cas result))
+                                                 (do
+                                                   (flush-batch)
+                                                   (process-event (assoc ctx :processor-name proc-name))
+                                                   (when-let [processed-id (get-last-processed-id
+                                                                            event-store tid proc-name)]
+                                                     (swap! watermarks assoc-in
+                                                            [tid proc-name] processed-id)))
+                                                 (do
+                                                   (swap! batch-source-events conj event)
+                                                   (when-let [revents (:result/events result)]
+                                                     (swap! batch-result-events into revents)))))))
                                          ;; Batch checkpoint
-                                         (let [last-event-id (:event/id (last events))]
-                                           (append-with-checkpoint event-store tid proc-name
-                                                                   last-event-id
-                                                                   @batch-result-events)
-                                           (swap! watermarks assoc-in [tid proc-name] last-event-id)))
+                                         (flush-batch))
                                        ;; Fallback read returned nothing. Advance pair_wm
                                        ;; to the probed tenant_wm (only forward) so this
                                        ;; pair becomes eligible to skip on subsequent ticks.
@@ -577,4 +643,11 @@
     (.join thread 5000))
   (when pool
     (.shutdown pool)
-    (.awaitTermination pool 5 java.util.concurrent.TimeUnit/SECONDS)))
+    (when-not (.awaitTermination pool 30 TimeUnit/SECONDS)
+      (.shutdownNow pool)
+      (when-not (.awaitTermination pool 30 TimeUnit/SECONDS)
+        (throw (ex-info "Tenant poller worker pool did not terminate"
+                        (if (instance? ThreadPoolExecutor pool)
+                          {:active-count (.getActiveCount ^ThreadPoolExecutor pool)
+                           :queued-count (.size (.getQueue ^ThreadPoolExecutor pool))}
+                          {})))))))

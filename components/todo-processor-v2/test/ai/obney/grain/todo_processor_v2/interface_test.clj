@@ -25,6 +25,7 @@
    :test/effect-failed [:map [:msg :string]]
    :test/billing-trigger [:map [:period :string]]
    :test/billing-done [:map [:period :string] [:billed-by :uuid]]
+   :test/batch-result [:map [:source-event-id :uuid]]
    :test/periodic-trigger [:map [:period :string]]})
 
 ;; Test Fixtures
@@ -708,6 +709,108 @@
       (is (= 2 @effect-count) "Replaying all events must not re-fire effects"))))
 
 ;; 12. Batch checkpointing
+
+(deftest pure-batch-overlap-conflicts-with-high-watermark
+  (testing "Overlapping pure batches conflict when a later checkpoint already exists"
+    (let [tenant-id (random-uuid)
+          processor-name :test/overlapping-batch-proc
+          source-events (mapv #(make-event :test/event-1 :body {:num %}) (range 20))
+          result-events (fn [events]
+                          (mapv (fn [event]
+                                  (es/->event
+                                   {:type :test/batch-result
+                                    :body {:source-event-id (:event/id event)}}))
+                                events))]
+      (es/append *event-store* {:tenant-id tenant-id :events source-events})
+      (let [full-batch source-events
+            overlapping-batch (subvec source-events 0 10)
+            full-result (#'core/append-batch-with-checkpoint
+                         *event-store* tenant-id processor-name nil
+                         full-batch (result-events full-batch))
+            overlap-result (#'core/append-batch-with-checkpoint
+                            *event-store* tenant-id processor-name nil
+                            overlapping-batch (result-events overlapping-batch))
+            committed-results (into []
+                                    (filter #(= :test/batch-result (:event/type %)))
+                                    (es/read *event-store* {:tenant-id tenant-id}))
+            duplicate-source-ids (->> committed-results
+                                      (map :source-event-id)
+                                      frequencies
+                                      (filter (fn [[_ n]] (> n 1)))
+                                      (into {}))]
+        (is (nil? full-result) "First batch commit succeeds")
+        (is (= ::anom/conflict (::anom/category overlap-result))
+            "Overlapping batch conflicts")
+        (is (= 20 (count committed-results))
+            "Only the first batch committed result events")
+        (is (empty? duplicate-source-ids)
+            "No source event has duplicate committed results")))))
+
+(deftest adjacent-pure-batches-commit-with-range-checkpoints
+  (testing "Non-overlapping pure batches can commit sequentially"
+    (let [tenant-id (random-uuid)
+          processor-name :test/adjacent-batch-proc
+          source-events (mapv #(make-event :test/event-1 :body {:num %}) (range 20))
+          result-events (fn [events]
+                          (mapv (fn [event]
+                                  (es/->event
+                                   {:type :test/batch-result
+                                    :body {:source-event-id (:event/id event)}}))
+                                events))]
+      (es/append *event-store* {:tenant-id tenant-id :events source-events})
+      (let [batch-1 (subvec source-events 0 10)
+            batch-2 (subvec source-events 10 20)
+            result-1 (#'core/append-batch-with-checkpoint
+                      *event-store* tenant-id processor-name nil
+                      batch-1 (result-events batch-1))
+            result-2 (#'core/append-batch-with-checkpoint
+                      *event-store* tenant-id processor-name
+                      (:event/id (last batch-1))
+                      batch-2 (result-events batch-2))
+            all-events (into [] (es/read *event-store* {:tenant-id tenant-id}))
+            committed-results (filter #(= :test/batch-result (:event/type %)) all-events)
+            checkpoints (filter #(= :grain/todo-processor-checkpoint (:event/type %)) all-events)
+            duplicate-source-ids (->> committed-results
+                                      (map :source-event-id)
+                                      frequencies
+                                      (filter (fn [[_ n]] (> n 1)))
+                                      (into {}))]
+        (is (nil? result-1) "First batch commit succeeds")
+        (is (nil? result-2) "Second batch commit succeeds")
+        (is (= 20 (count committed-results)))
+        (is (empty? duplicate-source-ids))
+        (is (= 2 (count checkpoints)))
+        (is (every? #(= :batch-range (:checkpoint/kind %)) checkpoints))))))
+
+(deftest pure-batch-overlap-conflicts-with-legacy-checkpoint
+  (testing "Old checkpoint shape still blocks stale overlapping batch commits"
+    (let [tenant-id (random-uuid)
+          processor-name :test/legacy-overlap-batch-proc
+          source-events (mapv #(make-event :test/event-1 :body {:num %}) (range 20))
+          result-events (fn [events]
+                          (mapv (fn [event]
+                                  (es/->event
+                                   {:type :test/batch-result
+                                    :body {:source-event-id (:event/id event)}}))
+                                events))
+          legacy-result (#'core/append-with-checkpoint
+                         *event-store*
+                         tenant-id
+                         processor-name
+                         (:event/id (last source-events))
+                         [])
+          overlap-result (#'core/append-batch-with-checkpoint
+                          *event-store* tenant-id processor-name nil
+                          (subvec source-events 0 10)
+                          (result-events (subvec source-events 0 10)))
+          committed-results (into []
+                                  (filter #(= :test/batch-result (:event/type %)))
+                                  (es/read *event-store* {:tenant-id tenant-id}))]
+      (is (nil? legacy-result) "Legacy checkpoint commit succeeds")
+      (is (= ::anom/conflict (::anom/category overlap-result))
+          "Overlapping batch conflicts with legacy checkpoint")
+      (is (empty? committed-results)
+          "No stale batch result events committed"))))
 
 (deftest bp1-batch-completeness
   (testing "BP1: All events processed, one checkpoint per batch pointing to last event"

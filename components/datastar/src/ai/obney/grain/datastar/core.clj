@@ -65,6 +65,7 @@
             [ai.obney.grain.query-processor.interface :as qp]
             [ai.obney.grain.command-processor-v2.interface :as cp]
             [ai.obney.grain.pubsub.interface :as pubsub]
+            [ai.obney.grain.event-tailer.interface :as event-tailer]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.anomalies.interface :refer [anomaly?]]
@@ -72,6 +73,10 @@
             [malli.core :as mc]
             [malli.transform :as mt]
             [com.brunobonacci.mulog :as u]))
+
+(def default-action-path
+  "Default command action endpoint emitted as the reserved __grainAction signal."
+  "/actions")
 
 ;; --------------- ;;
 ;; HTML Rendering  ;;
@@ -89,6 +94,71 @@
 
 (defn render-html [hiccup]
   (str (h/html hiccup)))
+
+(defn- url-encode
+  [v]
+  (-> (java.net.URLEncoder/encode (if (keyword? v) (name v) (str v)) "UTF-8")
+      (string/replace "+" "%20")))
+
+(defn- replace-path-params
+  [path params]
+  (reduce-kv (fn [p k v]
+               (string/replace p (str ":" (name k)) (url-encode v)))
+             path
+             (or params {})))
+
+(defn- append-query-params
+  [path params]
+  (let [pairs (->> params
+                   (remove (fn [[_ v]] (nil? v)))
+                   (sort-by (comp name key)))]
+    (if (seq pairs)
+      (str path
+           (if (string/includes? path "?") "&" "?")
+           (string/join "&"
+                        (map (fn [[k v]]
+                               (str (url-encode (name k))
+                                    "="
+                                    (url-encode v)))
+                             pairs)))
+      path)))
+
+(defn- route-path
+  [query-name query-registry]
+  (let [entry (get query-registry query-name)]
+    (cond
+      (nil? entry)
+      (throw (ex-info "Datastar query route is not registered"
+                      {:query query-name}))
+
+      (not (:datastar/path entry))
+      (throw (ex-info "Datastar query route has no :datastar/path"
+                      {:query query-name
+                       :entry entry}))
+
+      :else (:datastar/path entry))))
+
+(defn page-path
+  "Resolves a query keyword to its generated Datastar page path.
+
+   `params` may include `:path-params` and `:query-params`."
+  ([query-name query-registry]
+   (page-path query-name {} query-registry))
+  ([query-name params query-registry]
+   (-> (route-path query-name query-registry)
+       (replace-path-params (:path-params params))
+       (append-query-params (:query-params params)))))
+
+(defn stream-path
+  "Resolves a query keyword to its generated Datastar stream path.
+
+   `params` may include `:path-params` and `:query-params`."
+  ([query-name query-registry]
+   (stream-path query-name {} query-registry))
+  ([query-name params query-registry]
+   (let [page (page-path query-name (select-keys params [:path-params]) query-registry)
+         stream (if (= page "/") "/__stream" (str page "/__stream"))]
+     (append-query-params stream (:query-params params)))))
 
 ;; ---------------------- ;;
 ;; SSE Event Formatters   ;;
@@ -141,7 +211,10 @@
   (when-let [body (:body request)]
     (let [body-str (if (string? body) body (slurp body))]
       (when (seq body-str)
-        (json/read-str body-str :key-fn keyword)))))
+        (let [parsed (json/read-str body-str :key-fn keyword)]
+          ;; Datastar UI posts explicit server payloads as {:payload {...}}.
+          ;; Keep accepting flat signal bodies for low-level Datastar interop.
+          (or (:payload parsed) parsed))))))
 
 (defn- stringify-signal-values
   "Coerce signal values to strings to match GET query-param semantics.
@@ -162,6 +235,7 @@
 
    POST body formats:
    - Wrapped:  {\"datastar\": {\"key\": \"val\"}}  (older Datastar convention)
+   - Payload:  {\"payload\": {\"key\": \"val\"}}   (Datastar UI explicit payloads)
    - Flat:     {\"key\": \"val\"}                   (Datastar RC.7+)
 
    Both GET and POST paths merge native JSON types (integers stay integers)."
@@ -177,8 +251,9 @@
                          (let [body-str (if (string? body) body (slurp body))]
                            (when (seq body-str)
                              (let [parsed (json/read-str body-str :key-fn keyword)]
-                               ;; Unwrap {:datastar {...}} if present, otherwise use flat signals
-                               (or (:datastar parsed) parsed)))))
+                               ;; Unwrap explicit payloads and legacy datastar
+                               ;; wrappers before falling back to flat signals.
+                               (or (:payload parsed) (:datastar parsed) parsed)))))
                        (catch Exception _ nil)))]
        (cond
          ds-param
@@ -348,15 +423,60 @@
     (fn [event]
       (set/subset? resolved (:event/tags event)))))
 
+(defn- resolve-tenant-id
+  [query-context]
+  (or (:tenant-id query-context)
+      (get-in query-context [:auth-claims :tenant-id])))
+
+(defn- resolve-event-filter
+  [tenant-id event-tags query-context]
+  (let [preds (cond-> []
+                tenant-id
+                (conj #(= tenant-id (:grain/tenant-id %)))
+                event-tags
+                (conj (resolve-event-tags event-tags query-context)))]
+    (when (seq preds)
+      (fn [event]
+        (every? #(% event) preds)))))
+
+(def ^:private max-seen-event-ids 1024)
+
+(defn- event-dedupe-key
+  [event]
+  (when-let [event-id (:event/id event)]
+    [(:grain/tenant-id event) event-id]))
+
+(defn- event-dedupe-xf
+  "Drops duplicate stored events within one SSE stream.
+   Events without :event/id are legacy/manual pubsub messages and are passed through."
+  []
+  (let [seen (volatile! #{})
+        order (volatile! clojure.lang.PersistentQueue/EMPTY)]
+    (filter
+     (fn [event]
+       (if-let [k (event-dedupe-key event)]
+         (if (contains? @seen k)
+           false
+           (do
+             (vswap! seen conj k)
+             (vswap! order conj k)
+             (when (> (count @order) max-seen-event-ids)
+               (let [oldest (peek @order)]
+                 (vswap! order pop)
+                 (vswap! seen disj oldest)))
+             true))
+         true)))))
+
 (defn- subscribe-to-events
   "Creates a sliding-buffer channel and subscribes it to each event type via pubsub.
    When event-filter-fn is provided, applies it as a transducer on the channel.
    Returns the subscription channel."
   [event-pubsub event-types event-filter-fn]
   (let [buf (async/sliding-buffer 64)
-        sub-chan (if event-filter-fn
-                  (async/chan buf (filter event-filter-fn))
-                  (async/chan buf))]
+        xf (if event-filter-fn
+             (comp (filter event-filter-fn) (event-dedupe-xf))
+             (event-dedupe-xf))
+        sub-chan (async/chan buf xf)]
     (doseq [event-type event-types]
       (pubsub/sub event-pubsub {:topic event-type :sub-chan sub-chan}))
     sub-chan))
@@ -385,10 +505,13 @@
         session-key [user-id query-name nonce]
         _ (swap! active-stream-contexts assoc session-key
                  {:context-atom context-atom :signal-ch signal-ch :event-ch event-ch})
-        event-filter-fn (when event-tags
-                          (resolve-event-tags event-tags @context-atom))
+        tenant-id (resolve-tenant-id initial-context)
+        event-tailer (:event-tailer initial-context)
+        event-filter-fn (resolve-event-filter tenant-id event-tags @context-atom)
         sub-chan (subscribe-to-events event-pubsub event-types event-filter-fn)]
     (try
+      (when (and event-tailer tenant-id)
+        (event-tailer/subscribe! event-tailer tenant-id event-types))
       ;; Initial render
       (let [initial (poll-and-render @context-atom nil)]
         (when initial
@@ -441,6 +564,8 @@
         (when-not (= "stop" (.getMessage e))
           (u/log ::stream-view-events-error :error e)))
       (finally
+        (when (and event-tailer tenant-id)
+          (event-tailer/unsubscribe! event-tailer tenant-id event-types))
         (swap! active-stream-contexts dissoc session-key)
         (async/close! signal-ch)
         (async/close! sub-chan)
@@ -539,8 +664,11 @@
 (defn- shim-page-enter
   "Enter fn for shim-page interceptor."
   [opts context]
-  (let [{:keys [title stream-path body head datastar-url html-attrs stream-method]
-         :or {title "Grain App" datastar-url default-datastar-url stream-method "get"}} opts
+  (let [{:keys [title stream-path body head datastar-url html-attrs stream-method action-path]
+         :or {title "Grain App"
+              datastar-url default-datastar-url
+              stream-method "get"
+              action-path default-action-path}} opts
         query-string (get-in context [:request :query-string])
         ;; Resolve path params (e.g. :event-id → actual UUID) in the stream URL
         path-params (get-in context [:request :path-params])
@@ -559,6 +687,8 @@
                                              resolved-stream-path)
                                       separator (if (string/includes? base "?") "&" "?")]
                                   (str base separator "dsNonce=" nonce)))
+        reserved-signals (cond-> {"__grainAction" action-path}
+                           effective-stream-path (assoc "dsNonce" nonce))
         page-html (str "<!DOCTYPE html>"
                        (h/html
                          [:html (or html-attrs {})
@@ -568,12 +698,12 @@
                            [:title title]
                            [:script {:type "module" :src datastar-url}]
                            (when head (if (fn? head) (head) head))]
-                          [:body (cond-> {}
+                           [:body (cond-> {}
                                   effective-stream-path
                                   (assoc :data-init (str "@" stream-method "('" effective-stream-path "')"))
-                                  ;; Nonce as signal so Datastar sends it with every @get and @post
-                                  effective-stream-path
-                                  (assoc :data-signals (str "{'dsNonce': '" nonce "'}")))
+                                  ;; Reserved signals for checked UI route refs.
+                                  (seq reserved-signals)
+                                  (assoc :data-signals (json/write-str reserved-signals)))
 
 
                            (when body body)
@@ -597,8 +727,23 @@
 ;; Command Action Handler ;;
 ;; ---------------------- ;;
 
-(defn execute-action
-  "Executes a command from raw signals. Returns an SSE event map."
+(defn- action-result->event
+  [result]
+  (cond
+    (anomaly? result)
+    (patch-signals (cond-> {:error (::anom/message result)}
+                     (:error/explain result)
+                     (assoc :fieldErrors (:error/explain result)))
+                   {})
+
+    (:datastar/signals result)
+    (patch-signals (:datastar/signals result) {})
+
+    (:command/result result)
+    (patch-signals (:command/result result) {})))
+
+(defn- execute-action*
+  "Executes a command from raw signals. Returns command metadata and an SSE event."
   [context signals]
   (let [command (decode-json-command signals)
         command-context (assoc context :command command)
@@ -608,38 +753,41 @@
                            [(:command/name command) :authorized?])]
     (if (and authorized? (true? (authorized? command-context)))
       (let [result (cp/process-command command-context)]
-        (cond
-          (anomaly? result)
-          (patch-signals (cond-> {:error (::anom/message result)}
-                           (:error/explain result)
-                           (assoc :fieldErrors (:error/explain result)))
-                         {})
-
-          (:datastar/signals result)
-          (patch-signals (:datastar/signals result) {})
-
-          (:command/result result)
-          (patch-signals (:command/result result) {})))
+        {:command command
+         :command-result result
+         :event (action-result->event result)})
       (do
         (when-not authorized?
           (u/log ::missing-authorized-predicate :command-name (:command/name command)))
-        (patch-signals {:error "Unauthorized"} {})))))
+        (let [result {::anom/category ::anom/forbidden
+                      ::anom/message "Unauthorized"}]
+          {:command command
+           :command-result result
+           :event (patch-signals {:error "Unauthorized"} {})})))))
+
+(defn execute-action
+  "Executes a command from raw signals. Returns an SSE event map."
+  [context signals]
+  (:event (execute-action* context signals)))
 
 (defn- action-handler-enter
   "Enter fn for action-handler interceptor."
   [context heartbeat-delay pedestal-context]
   (let [signals (parse-signals (:request pedestal-context))
         additional-context (:grain/additional-context pedestal-context)
-        context-with-auth (merge context additional-context)]
-    (sse/start-stream
-      (fn [event-ch _sse-ctx]
-        (try
-          (when-let [event (execute-action context-with-auth signals)]
-            (async/>!! event-ch event))
-          (catch Exception e (u/log ::action-handler-error :error e))
-          (finally (async/close! event-ch))))
-      pedestal-context
-      heartbeat-delay)))
+        context-with-auth (merge context additional-context)
+        {:keys [command command-result event]} (execute-action* context-with-auth signals)]
+    (assoc (sse/start-stream
+             (fn [event-ch _sse-ctx]
+               (try
+                 (when event
+                   (async/>!! event-ch event))
+                 (catch Exception e (u/log ::action-handler-error :error e))
+                 (finally (async/close! event-ch))))
+             pedestal-context
+             heartbeat-delay)
+           :grain/command command
+           :grain/command-result command-result)))
 
 (defn action-handler
   "Interceptor factory. Processes commands from Datastar signals."
@@ -734,7 +882,11 @@
                          auth-interceptor (conj auth-interceptor)
                          gate-int (conj gate-int)
                          true (into explicit-interceptors))
-          shim-opts (merge {:title title :stream-path stream-path}
+          shim-opts (merge {:title title
+                            :stream-path stream-path
+                            :action-path (or (:datastar/action-path entry)
+                                             (:datastar/action-path defaults)
+                                             default-action-path)}
                            (:datastar/shim-opts defaults)
                            (:datastar/shim-opts entry))
           route-base (query-name->route-name query-name)
@@ -767,7 +919,8 @@
 
    Optional overrides map: {query-name {:datastar/fps 2 :datastar/interceptors [...]}}
    Optional defaults map: {:datastar/shim-opts {:head fn :html-attrs {} :datastar-url str}}
-     Defaults are applied to all routes; per-query shim-opts override them."
+     Defaults are applied to all routes; per-query shim-opts override them.
+     :datastar/action-path sets the command endpoint emitted as __grainAction."
   ([context] (routes context {} {}))
   ([context overrides] (routes context overrides {}))
   ([context overrides defaults]

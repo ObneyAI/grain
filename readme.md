@@ -8,10 +8,6 @@ Grain is a set of composable building blocks for building event-sourced informat
 
 The constraints are deliberately *shallow*: a small set of foundational rules that bottom out at the storage layer. When natural language is the compiler — when an LLM is translating intent into code — the codebase it targets is what bounds the space of valid outputs. Grain narrows that space until drift becomes structurally impossible.
 
-Multi-tenancy is built in: every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks. Start with an in-memory event store for quick iteration, then swap in SQLite for embedded single-process deployments or Postgres for multi-instance — a single line change either way.
-
-For multi-instance deployments, an opt-in control plane coordinates tenant assignment across nodes using event-sourced leases — no external coordination service required.
-
 ## Why Grain?
 
 We use [Event Modeling and Event Sourcing](https://leanpub.com/eventmodeling-and-eventsourcing) to design [Simple](https://www.youtube.com/watch?v=SxdOUGdseq4) systems. Grain provides a single, composable toolkit for building multi-tenant, event-sourced applications in Clojure.
@@ -58,6 +54,12 @@ flowchart TB
 - **Periodic Tasks** — run on cron or interval schedules with CAS deduplication across nodes.
 - **Authorization** — all commands and queries require an `:authorized?` predicate. Deny by default.
 
+## Multi-Tenancy
+
+Every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks. Start with an in-memory event store for quick iteration, then swap in SQLite for embedded single-process deployments or Postgres for multi-instance — a single line change either way.
+
+For multi-instance deployments, an opt-in control plane coordinates tenant assignment across nodes using event-sourced leases — no external coordination service required.
+
 ## Distributed Coordination
 
 > Full documentation: [docs/distributed-coordination.md](docs/distributed-coordination.md)
@@ -66,9 +68,9 @@ The `grain-control-plane` package provides coordinator election, tenant lease ma
 
 ## Datastar (Reactive UI)
 
-> Full documentation: [docs/datastar.md](docs/datastar.md)
+> Full documentation: [docs/datastar.md](docs/datastar.md) | UI DSL: [docs/datastar-ui.md](docs/datastar-ui.md)
 
-Grain integrates with [Datastar](https://data-star.dev/) for reactive server-rendered UIs. Queries return hiccup that streams to the browser over SSE — the server re-renders when domain events fire and Datastar patches the DOM.
+Grain integrates with [Datastar](https://data-star.dev/) for reactive server-rendered UIs. Queries return hiccup that streams to the browser over SSE — the server re-renders when domain events fire and Datastar patches the DOM. In multi-node deployments, the event tailer can feed each node's local pub/sub from the shared event store so live updates reach the node holding the SSE connection.
 
 ## Code Agent Tools
 
@@ -83,7 +85,7 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "6120a4b3dceaff827bddd7cbf0703ead0131ab11" ;; update to latest commit sha
+ :git/sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21" ;; update to latest commit sha
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -97,9 +99,9 @@ For multi-instance deployments, add the [control plane](docs/distributed-coordin
 
 | Package | Summary |
 | --- | --- |
-| **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store |
+| **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store and event tailing |
 | **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
-| **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE |
+| **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE, including distributed live updates |
 | **grain-code-agent-tools** | Dev-only nREPL tools for coding agents working against live Grain apps |
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
 | **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization |
@@ -111,7 +113,7 @@ Grain is MIT licensed. We use it in production, but it's actively evolving. The 
 
 ## More Information
 
-- **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
+- **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
 - **Examples**: `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
 - **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians

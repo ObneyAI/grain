@@ -5,4 +5,5 @@
            ai.obney.grain.clj-dspy.core/defmodel clojure.core/def}
 
  :config-paths ["../projects/grain-core/resources/clj-kondo.exports/ai.obney.grain/grain-core"
-                "../projects/grain-core-v2/resources/clj-kondo.exports/ai.obney.grain/grain-core-v2"]}
+                "../projects/grain-core-v2/resources/clj-kondo.exports/ai.obney.grain/grain-core-v2"
+                "../projects/grain-datastar/resources/clj-kondo.exports/ai.obney.grain/grain-datastar"]}

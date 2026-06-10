@@ -84,7 +84,9 @@
    :grain/todo-processor-checkpoint
    [:map
     [:processor/name :keyword]
-    [:triggered-by ::id]]
+    [:triggered-by ::id]
+    [:checkpoint/kind {:optional true} :keyword]
+    [:checkpoint/from {:optional true} ::id]]
 
    :grain/todo-processor-effect-failure
    [:map

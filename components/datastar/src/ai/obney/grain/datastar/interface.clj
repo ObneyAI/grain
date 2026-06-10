@@ -48,6 +48,7 @@
      :head          — extra <head> hiccup or (fn [] hiccup)
      :body          — extra <body> hiccup (rendered before the #app div)
      :html-attrs    — attributes for the <html> element
+     :action-path    — command endpoint emitted as __grainAction (default /actions)
      :datastar-url  — CDN URL for Datastar JS (default RC.7)"
   [opts]
   (core/shim-page opts))
@@ -59,7 +60,13 @@
    On success: sends `datastar-patch-signals` with `:datastar/signals` from the
    command result (e.g., `{:__toast \"Saved\"}`).
    On failure: sends `datastar-patch-signals` with `:error` and optional `:fieldErrors`.
-   On unauthorized: sends `datastar-patch-signals` with `{:error \"Unauthorized\"}`."
+   On unauthorized: sends `datastar-patch-signals` with `{:error \"Unauthorized\"}`.
+
+   The returned Pedestal context includes `:grain/command` and
+   `:grain/command-result`, matching Grain's command request handlers. App
+   `:leave` interceptors can inspect these keys; use `anomaly?` on
+   `:grain/command-result` to distinguish failures from successful command
+   results."
   [context opts]
   (core/action-handler context opts))
 
@@ -84,6 +91,24 @@
      :only-if-missing — when true, only sets signals that don't already exist on the client"
   [signals opts]
   (core/patch-signals signals opts))
+
+(defn page-path
+  "Resolve a registered Datastar query keyword to its page path.
+
+   `params` may include `:path-params` and `:query-params`."
+  ([query-name query-registry]
+   (core/page-path query-name query-registry))
+  ([query-name params query-registry]
+   (core/page-path query-name params query-registry)))
+
+(defn stream-path
+  "Resolve a registered Datastar query keyword to its generated stream path.
+
+   `params` may include `:path-params` and `:query-params`."
+  ([query-name query-registry]
+   (core/stream-path query-name query-registry))
+  ([query-name params query-registry]
+   (core/stream-path query-name params query-registry)))
 
 (defn auth-redirect-interceptor
   "Interceptor factory. Checks authorization and redirects with 302 when the
@@ -136,6 +161,7 @@
      {:datastar/shim-opts {:head (fn [] hiccup)    ;; default <head> content
                            :html-attrs {:lang \"en\"} ;; default <html> attributes
                            :datastar-url \"...\"}}    ;; override Datastar CDN URL
+      :datastar/action-path \"/actions\"              ;; command endpoint for __grainAction
       :datastar/auth-redirect {:unauthenticated \"/sign-in\"  ;; 302 when no claims
                                 :unauthorized \"/dashboard\"}} ;; 302 when role mismatch
    Per-query `:datastar/shim-opts` (from registry or overrides) take precedence.

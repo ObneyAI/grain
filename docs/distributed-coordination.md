@@ -52,7 +52,9 @@ Register processors with `defprocessor` before starting the control plane. The c
 
 ## Tenant-Aware Routing
 
-In a multi-instance deployment behind a load balancer, HTTP requests and SSE connections should be served by the node that holds the tenant's lease (warm L2 cache, in-process pub/sub for SSE push).
+In a multi-instance deployment behind a load balancer, command/query HTTP requests usually benefit from being served by the node that holds the tenant's lease. That node has the warmest local cache and owns the tenant poller.
+
+SSE live-update streams have a different delivery path. When a node runs Datastar with `:event-pubsub` and `:event-tailer`, the SSE connection can stay on any node: Datastar registers tenant/event-type interest with the tailer, the tailer reads matching events from the shared event store, and the node's local pub/sub wakes the SSE stream. Routing SSE to the lease owner can still improve locality, but it is no longer required for live updates to reach the browser.
 
 Grain provides a Pedestal interceptor that implements retry-until-correct-node routing with sticky cookies:
 
