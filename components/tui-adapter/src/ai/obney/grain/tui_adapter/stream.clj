@@ -225,9 +225,12 @@
    untouched.
 
    Append-only violations (a previously-emitted key is missing or
-   reordered) log `::main-stream-violation` and the function emits
-   nothing — we cannot un-scroll content the terminal has already
-   committed to its scrollback.
+   reordered) log `::main-stream-violation` and self-heal: emission
+   resumes from the longest common prefix of the emitted keys and the
+   new key sequence. Content already committed to scrollback stays as
+   it was (we cannot un-scroll), so replaced segments remain visible
+   in their old form above, but the stream keeps rendering new
+   segments instead of wedging permanently.
 
    `opts`:
      :width          — viewport width (segment box width).
@@ -243,20 +246,28 @@
         keys-vec     (mapv #(segment-key {:key key} %) segments)
         emitted      (vec (:emitted-keys prior-state))
         ;; Append-only check: the prior emitted-keys must be a prefix
-        ;; of the new keys-vec.
-        prefix-ok?   (= emitted (vec (take (count emitted) keys-vec)))
-        new-keys     (when prefix-ok? (subvec keys-vec (count emitted)))
-        new-segments (when prefix-ok?
-                       (subvec segments (count emitted)))]
+        ;; of the new keys-vec. On violation, resume from the longest
+        ;; common prefix so one bad frame cannot wedge the stream.
+        common       (loop [i 0]
+                       (if (and (< i (count emitted))
+                                (< i (count keys-vec))
+                                (= (emitted i) (keys-vec i)))
+                         (recur (inc i))
+                         i))
+        prefix-ok?   (= common (count emitted))
+        _            (when-not prefix-ok?
+                       (u/log ::main-stream-violation
+                              :prior-emitted emitted
+                              :current-keys  keys-vec
+                              :resumed-at    common))
+        new-keys     (subvec keys-vec common)
+        new-segments (subvec segments common)]
     (cond
-      (not prefix-ok?)
-      (do (u/log ::main-stream-violation
-                 :prior-emitted emitted
-                 :current-keys  keys-vec)
-          {:state prior-state :bytes "" :style style})
-
       (empty? new-segments)
-      {:state prior-state :bytes "" :style style}
+      {:state (if prefix-ok?
+                prior-state
+                (assoc prior-state :emitted-keys keys-vec))
+       :bytes "" :style style}
 
       :else
       (let [position (ansi/cursor-position emission-row 0)
@@ -275,7 +286,7 @@
                          st']))
                     ["" style]
                     new-segments)
-            new-emitted (into emitted new-keys)]
+            new-emitted (into (subvec emitted 0 common) new-keys)]
         {:state (assoc prior-state :emitted-keys new-emitted)
          :bytes bytes
          :style final-style}))))

@@ -551,9 +551,29 @@
         prior-ss    (or (:stream-state s) (stream/empty-stream-state))
         prior-overlay-height (:main-overlay-height s 0)
         prior-overlay-top (:main-overlay-top s)
+        prior-reserve (:main-overlay-reserve-height s 0)
+        lane-delta  (- reserve-height prior-reserve)
+        prior-scroll-bottom (max 0 (dec (- chrome-top prior-reserve)))
         scroll-region-bytes (ansi/set-scroll-region 0 scroll-bottom)
         ;; First-frame setup: scroll region + intro emission.
         first?      (not (:intro-printed? prior-ss))
+        ;; Lane transitions move the transcript instead of letting the
+        ;; overlay stomp it (grow) or leaving a blank band behind
+        ;; (shrink). Grow scrolls content up via newlines at the OLD
+        ;; region bottom (the path that preserves terminal scrollback);
+        ;; shrink pulls content back down via SD within the NEW region,
+        ;; discarding the stale lane rows past the region bottom.
+        lane-bytes  (cond
+                      (or first? (zero? lane-delta)) ""
+
+                      (pos? lane-delta)
+                      (str (ansi/set-scroll-region 0 prior-scroll-bottom)
+                           (ansi/cursor-position prior-scroll-bottom 0)
+                           (apply str (repeat lane-delta "\n")))
+
+                      :else
+                      (str (ansi/set-scroll-region 0 scroll-bottom)
+                           (ansi/scroll-down (- lane-delta))))
         [intro-bytes intro-style]
         (if first?
           (let [intro-hiccup (:tui/hiccup result)
@@ -601,13 +621,19 @@
             cb)
           "")
         overlay-top (max 0 (- chrome-top overlay-height))
+        ;; On lane shrink the SD scroll already consumed the stale
+        ;; overlay rows (they were pushed past the region bottom), and
+        ;; the rows now holding reclaimed transcript content must NOT
+        ;; be blanked — so skip the union clear entirely.
         clear-top (cond
+                    (neg? lane-delta) nil
                     (and prior-overlay-top overlay-grid)
                     (min prior-overlay-top overlay-top)
                     prior-overlay-top prior-overlay-top
                     overlay-grid overlay-top
                     :else nil)
         clear-bottom (cond
+                       (neg? lane-delta) nil
                        (and prior-overlay-top overlay-grid)
                        (max (+ prior-overlay-top prior-overlay-height)
                             (+ overlay-top overlay-height))
@@ -639,7 +665,8 @@
                  (ansi/cursor-position (+ chrome-top c-row) c-col)
                  (ansi/show-cursor)))
           (ansi/hide-cursor))
-        out (str scroll-region-bytes
+        out (str lane-bytes
+                 scroll-region-bytes
                  clear-bytes
                  intro-bytes
                  seg-bytes

@@ -50,6 +50,15 @@
   []
   (str CSI "r"))
 
+;; SD — scroll down within the scroll region (CSI Ps T): content moves
+;; down, blank rows appear at the region top, and rows pushed past the
+;; region bottom are discarded. Used to let the transcript reclaim a
+;; reserved overlay lane without leaving a blank band behind.
+(defn scroll-down
+  "Scroll the current scroll region down by `n` rows."
+  [n]
+  (str CSI n "T"))
+
 ;; Line erase. `CSI K` (= `CSI 0 K`) clears from the cursor to the end
 ;; of the line. Used when redrawing a row in place.
 (defn erase-line-to-eol [] (str CSI "K"))

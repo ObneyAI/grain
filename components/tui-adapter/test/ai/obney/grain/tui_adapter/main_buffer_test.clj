@@ -190,8 +190,10 @@
     (is (= "" bytes))
     (is (= [1 2] (:emitted-keys state)))))
 
-(deftest render-stream-main-append-violation-logs-and-emits-nothing
-  ;; A previously-emitted key disappears — we can't un-scroll history.
+(deftest render-stream-main-append-violation-self-heals
+  ;; A previously-emitted key disappears. We can't un-scroll history,
+  ;; but the stream must not wedge: emission resumes from the longest
+  ;; common prefix, re-emitting the diverged tail.
   (let [prior (-> (ai.obney.grain.tui-adapter.stream/empty-stream-state)
                   (assoc :emitted-keys [1 2 3]))
         result {:msgs [(attach-h {:id 1 :body "a"})
@@ -200,10 +202,37 @@
         {:keys [bytes state]}
         (ai.obney.grain.tui-adapter.stream/render-stream-main
           prior result msgs-spec append-opts)]
-    (is (= "" bytes)
-        "violation should not emit bytes (terminal scrollback is committed)")
-    (is (= [1 2 3] (:emitted-keys state))
-        "state stays as prior — we don't pretend the violation happened")))
+    (is (not (str/includes? bytes ">> a"))
+        "segments before the divergence stay untouched")
+    (is (str/includes? bytes ">> c")
+        "segments after the divergence are (re-)emitted")
+    (is (= [1 3] (:emitted-keys state))
+        "state rebases onto the current key sequence")))
+
+(deftest render-stream-main-replaced-tail-keeps-streaming
+  ;; The exact production failure: a blocked-turn segment is replaced
+  ;; by assistant segments once the turn resumes. The stream must keep
+  ;; rendering the assistant content (it used to wedge permanently).
+  (let [prior (-> (ai.obney.grain.tui-adapter.stream/empty-stream-state)
+                  (assoc :emitted-keys [[:user 1] [:perm 9] [:blocked 1]]))
+        result {:msgs [(attach-h {:id [:user 1] :body "question"})
+                       (attach-h {:id [:perm 9] :body "allow?"})
+                       (attach-h {:id [:answer 1] :body "answer"})]}
+        {:keys [bytes state]}
+        (ai.obney.grain.tui-adapter.stream/render-stream-main
+          prior result msgs-spec append-opts)
+        ;; And the frame after stays on the happy path.
+        r2 (ai.obney.grain.tui-adapter.stream/render-stream-main
+             state
+             {:msgs [(attach-h {:id [:user 1] :body "question"})
+                     (attach-h {:id [:perm 9] :body "allow?"})
+                     (attach-h {:id [:answer 1] :body "answer"})
+                     (attach-h {:id [:user 2] :body "next"})]}
+             msgs-spec append-opts)]
+    (is (str/includes? bytes ">> answer"))
+    (is (= [[:user 1] [:perm 9] [:answer 1]] (:emitted-keys state)))
+    (is (str/includes? (:bytes r2) ">> next"))
+    (is (not (str/includes? (:bytes r2) ">> answer")))))
 
 (deftest render-stream-main-style-threading
   ;; Verify the style state threads across segments so SGR sequences
@@ -375,11 +404,14 @@
                        (attach-h {:id 2 :body "answer"})]})
     (session/render-frame! session)
     (let [c (combined out)
-          clear-idx (.indexOf c "                              ")
+          reclaim (re-find #"\[\d+T" c)
           answer-idx (.indexOf c ">> answer")]
       (is (str/includes? c ">> answer"))
-      (is (<= 0 clear-idx answer-idx)
-          "old overlay rows must be cleared before new answer bytes are emitted"))))
+      (is reclaim "vacated overlay lane is reclaimed via scroll-down")
+      (is (and reclaim (< (.indexOf c ^String reclaim) answer-idx))
+          "lane reclaim happens before new answer bytes are emitted")
+      (is (not (str/includes? (subs c (max 0 answer-idx)) "                              "))
+          "no blank-row clear may follow (and erase) the answer"))))
 
 (deftest reserved-lane-palette-uses-compact-height-and-reserves-space
   (let [pq (atom {:tui/hiccup [:text "intro"]
@@ -411,19 +443,18 @@
       (is (str/includes? c "No")))))
 
 (deftest violation-recovers-on-next-append
-  ;; If a key disappears (violation logged), the function emits
-  ;; nothing for that call. But subsequent calls with NEW keys past
-  ;; the prior :emitted-keys should still work.
+  ;; If a key disappears, state rebases to the surviving prefix; a
+  ;; later frame that re-includes the key plus new ones emits the
+  ;; re-included and new segments without touching the stable prefix.
   (let [prior (-> (ai.obney.grain.tui-adapter.stream/empty-stream-state)
                   (assoc :emitted-keys [1 2]))
-        ;; First call: violation (key 2 missing).
+        ;; First call: violation (key 2 missing). Nothing new past the
+        ;; common prefix, so no bytes; state rebases to [1].
         r1 (ai.obney.grain.tui-adapter.stream/render-stream-main
              prior
              {:msgs [(attach-h {:id 1 :body "a"})]}
              msgs-spec append-opts)
-        ;; Subsequent call: the read-model has recovered (re-includes
-        ;; key 2) plus added key 3. The :emitted-keys is still [1 2]
-        ;; (we didn't mutate state on violation), so only key 3 is new.
+        ;; Subsequent call: keys 2 and 3 are past the rebased prefix.
         r2 (ai.obney.grain.tui-adapter.stream/render-stream-main
              (:state r1)
              {:msgs [(attach-h {:id 1 :body "a"})
@@ -431,6 +462,64 @@
                      (attach-h {:id 3 :body "c"})]}
              msgs-spec append-opts)]
     (is (= "" (:bytes r1)))
+    (is (= [1] (:emitted-keys (:state r1))))
+    (is (str/includes? (:bytes r2) ">> b"))
     (is (str/includes? (:bytes r2) ">> c"))
     (is (not (str/includes? (:bytes r2) ">> a")))
     (is (= [1 2 3] (:emitted-keys (:state r2))))))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Reserved-lane transitions — grow scrolls content up, shrink reclaims
+;; ──────────────────────────────────────────────────────────────────────
+
+(def ^:private lane-overlay
+  {:id [:progress] :type :status
+   :content [:col [:text "Agent"] [:text "working"] [:gap 1]]})
+
+(deftest lane-grow-scrolls-content-up-before-drawing-overlay
+  ;; Overlay appears after content exists: the renderer must make room
+  ;; by scrolling the old region up by the lane height, not draw over
+  ;; the transcript rows.
+  (let [pq (atom {:tui/hiccup [:text "intro"]
+                  :msgs [(attach-h {:id 1 :body "question"})]})
+        {:keys [session out]}
+        (make-session {:default-screen main-stream-screen})]
+    (swap! session assoc :process-query-fn (fn [_] @pq))
+    (session/render-frame! session)
+    (is (= 0 (:main-overlay-reserve-height @session)))
+    (reset! out [])
+    (swap! pq assoc :tui/overlay lane-overlay)
+    (session/render-frame! session)
+    (let [c (combined out)
+          lane-h (:main-overlay-reserve-height @session)]
+      (is (pos? lane-h))
+      ;; Make-room newlines emitted before the overlay bytes.
+      (is (str/includes? c (apply str (repeat lane-h "\n")))
+          "grow must scroll the old region up by the lane height")
+      (is (< (.indexOf c (apply str (repeat lane-h "\n")))
+             (.indexOf c "Agent"))
+          "make-room happens before the overlay is drawn"))))
+
+(deftest lane-shrink-reclaims-rows-with-scroll-down
+  ;; Overlay disappears: the transcript reclaims the lane via SD
+  ;; (CSI n T) instead of leaving a permanent blank band, and no
+  ;; clear pass may blank the reclaimed rows.
+  (let [pq (atom {:tui/hiccup [:text "intro"]
+                  :tui/overlay lane-overlay
+                  :msgs [(attach-h {:id 1 :body "question"})]})
+        {:keys [session out]}
+        (make-session {:default-screen main-stream-screen})]
+    (swap! session assoc :process-query-fn (fn [_] @pq))
+    (session/render-frame! session)
+    (let [lane-h (:main-overlay-reserve-height @session)]
+      (is (pos? lane-h))
+      (reset! out [])
+      (reset! pq {:tui/hiccup [:text "intro"]
+                  :msgs [(attach-h {:id 1 :body "question"})
+                         (attach-h {:id 2 :body "answer"})]})
+      (session/render-frame! session)
+      (let [c (combined out)]
+        (is (str/includes? c (str "[" lane-h "T"))
+            "shrink must reclaim the lane via scroll-down")
+        (is (str/includes? c ">> answer"))
+        (is (= 0 (:main-overlay-reserve-height @session)))))))
