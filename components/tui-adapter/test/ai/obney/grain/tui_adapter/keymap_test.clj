@@ -146,3 +146,35 @@
 (deftest dispatch-unknown-tag-throws
   (is (thrown? clojure.lang.ExceptionInfo
                (km/dispatch! {} [:bogus :x]))))
+
+(deftest dispatch-command-fallback-on-fallthrough
+  (testing "fallback session action fires when the command falls through"
+    (let [calls (atom [])
+          ctx   {:command-dispatcher (fn [n inputs _ctx]
+                                       (swap! calls conj [:command n inputs])
+                                       {:keymap/fallthrough? true})
+                 :session-dispatcher (fn [a opts _ctx]
+                                       (swap! calls conj [:session a opts])
+                                       :ok)
+                 :session-state      {}}]
+      (km/dispatch! ctx [:command :cancel {:inputs {:session-id 1}
+                                           :fallback [:session :quit]}])
+      (is (= [[:command :cancel {:session-id 1}]
+              [:session :quit {}]]
+             @calls))))
+  (testing "fallback does not fire when the command did work"
+    (let [calls (atom [])
+          ctx   {:command-dispatcher (fn [n inputs _ctx]
+                                       (swap! calls conj [:command n inputs])
+                                       {:command-result/events [:e]})
+                 :session-dispatcher (fn [a opts _ctx]
+                                       (swap! calls conj [:session a opts])
+                                       :ok)
+                 :session-state      {}}]
+      (km/dispatch! ctx [:command :cancel {:fallback [:session :quit]}])
+      (is (= [[:command :cancel nil]] @calls))))
+  (testing "no fallback opt means the result is returned untouched"
+    (let [ctx {:command-dispatcher (fn [_ _ _] {:keymap/fallthrough? true})
+               :session-state      {}}]
+      (is (= {:keymap/fallthrough? true}
+             (km/dispatch! ctx [:command :cancel]))))))

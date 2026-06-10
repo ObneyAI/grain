@@ -168,8 +168,15 @@
 (defmethod dispatch! :command [{:keys [command-dispatcher session-state] :as ctx}
                                [_ name opts]]
   (let [opts*  (or opts {})
-        inputs (build-inputs opts* session-state)]
-    (command-dispatcher name inputs ctx)))
+        inputs (build-inputs opts* session-state)
+        result (command-dispatcher name inputs ctx)]
+    ;; Context-sensitive bindings: when the command reports it had nothing
+    ;; to do (result carries truthy :keymap/fallthrough?), dispatch the
+    ;; binding's :fallback action instead. Lets one key mean "cancel the
+    ;; running thing, else quit" without the adapter knowing the domain.
+    (if (and (:fallback opts*) (:keymap/fallthrough? result))
+      (dispatch! ctx (assert-action! (:fallback opts*)))
+      result)))
 
 (defmethod dispatch! :session [{:keys [session-dispatcher] :as ctx}
                                [_ action opts]]

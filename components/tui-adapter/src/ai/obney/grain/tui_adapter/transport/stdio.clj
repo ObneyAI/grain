@@ -99,9 +99,18 @@
 ;; Input pump
 ;; ─────────────────────────────────────────────────────────────────────
 
+(def ^:private escape-flush-timeout-ms
+  "How long to wait for a follow-up byte before a lone ESC is delivered
+   as the <esc> key rather than treated as a sequence introducer."
+  50)
+
 (defn start-input-pump!
   "Start a daemon thread that reads bytes from `terminal`'s reader,
    feeds them into the parser, and pushes events onto `input-ch`.
+
+   While the parser holds an incomplete sequence the read is timed, so a
+   bare Escape press resolves to a `<esc>` key event after
+   `escape-flush-timeout-ms` instead of hanging until the next keystroke.
 
    Returns a function that stops the pump."
   [^Terminal terminal input-ch]
@@ -110,15 +119,27 @@
         t        (Thread.
                    ^Runnable
                    (fn []
-                     (let [parser (atom (input/make-parser))]
+                     (let [parser (atom (input/make-parser))
+                           emit!  (fn [evs]
+                                    (doseq [ev evs]
+                                      (async/>!! input-ch ev)))]
                        (try
                          (while @running?
-                           (let [b (.read reader)]
-                             (when (>= b 0)
+                           (let [b (if (input/pending? @parser)
+                                     (.read reader (long escape-flush-timeout-ms))
+                                     (.read reader))]
+                             (cond
+                               (>= b 0)
                                (let [[evs new-parser] (input/feed @parser [b])]
                                  (reset! parser new-parser)
-                                 (doseq [ev evs]
-                                   (async/>!! input-ch ev))))))
+                                 (emit! evs))
+
+                               ;; Timed read expired with bytes pending —
+                               ;; resolve a lone ESC into the <esc> key.
+                               (= (long b) org.jline.utils.NonBlockingReader/READ_EXPIRED)
+                               (let [[evs new-parser] (input/flush-lone-esc @parser)]
+                                 (reset! parser new-parser)
+                                 (emit! evs)))))
                          (catch InterruptedException _
                            nil)
                          (catch Exception e

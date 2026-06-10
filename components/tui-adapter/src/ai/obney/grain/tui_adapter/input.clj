@@ -233,6 +233,24 @@
       (update :buf into bytes)
       parse-buf))
 
+(defn pending?
+  "True when the parser is holding bytes awaiting sequence completion.
+   The transport uses this to switch to a timed read so a lone ESC can
+   be flushed (see `flush-lone-esc`) instead of waiting forever."
+  [parser]
+  (boolean (seq (:buf parser))))
+
+(defn flush-lone-esc
+  "Resolve the ESC ambiguity by timeout: when the parser is holding
+   exactly a lone ESC (and is not collecting a bracketed paste), emit it
+   as a `<esc>` key event and clear the buffer. Any other pending state
+   (e.g. a partial CSI sequence) is left untouched. Returns
+   `[events new-parser-state]`."
+  [{:keys [buf paste-buf] :as parser}]
+  (if (and (nil? paste-buf) (= [ESC] (vec buf)))
+    [[{:type :key :key "<esc>"}] (assoc parser :buf [])]
+    [[] parser]))
+
 ;; ─────────────────────────────────────────────────────────────────────
 ;; Convenience: feed a Java byte array (signed bytes in -128..127)
 ;; ─────────────────────────────────────────────────────────────────────

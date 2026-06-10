@@ -127,3 +127,29 @@
 (deftest focus-event-shape
   (is (= {:type :focus :in? true}  (input/focus-event true)))
   (is (= {:type :focus :in? false} (input/focus-event false))))
+
+;; ──────────────────────────────────────────────────────────────────────────
+;; Lone-ESC timeout flush
+;; ──────────────────────────────────────────────────────────────────────────
+
+(deftest lone-esc-flush
+  (testing "a bare ESC is held pending, then flushed as <esc>"
+    (let [[evs parser] (input/feed (input/make-parser) [0x1B])]
+      (is (= [] evs))
+      (is (input/pending? parser))
+      (let [[evs parser] (input/flush-lone-esc parser)]
+        (is (= [{:type :key :key "<esc>"}] evs))
+        (is (not (input/pending? parser))))))
+  (testing "a partial CSI sequence is NOT flushed"
+    (let [[evs parser] (input/feed (input/make-parser) [0x1B 0x5B])]
+      (is (= [] evs))
+      (let [[evs parser'] (input/flush-lone-esc parser)]
+        (is (= [] evs))
+        (is (= parser parser')
+            "incomplete escape sequences keep waiting for bytes"))))
+  (testing "flush on an empty parser is a no-op"
+    (let [[evs _] (input/flush-lone-esc (input/make-parser))]
+      (is (= [] evs))))
+  (testing "ESC followed by a key still decodes as Meta, not <esc>+key"
+    (let [[evs _] (input/feed (input/make-parser) [0x1B 0x78])]
+      (is (= [{:type :key :key "M-x"}] evs)))))
