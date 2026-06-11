@@ -41,6 +41,31 @@
                (cells/blank width 0))]
     (cells/clip grid {:width width :height height})))
 
+(defn- text-runs-child
+  "When the first child of a :text node is a vector of styled-run maps
+   (`[{:text s & style} ...]`), return it; nil otherwise (string mode)."
+  [children]
+  (let [c (first children)]
+    (when (and (vector? c) (map? (first c)))
+      c)))
+
+(defn- merge-base-style
+  "Element-level style attrs act as the BASE style merged UNDER each
+   run's own sparse style keys."
+  [base-style runs]
+  (mapv (fn [run]
+          (merge {:text (:text run)} base-style (select-keys run text-wrap/style-keys)))
+        runs))
+
+(defn- styled-runs-grid
+  [width height base-style continuation runs]
+  (let [lines (text-wrap/visual-lines-runs width (merge-base-style base-style runs) continuation)
+        rows  (mapv #(cells/runs-row width %) lines)
+        grid  (if (seq rows)
+                (apply cells/stack rows)
+                (cells/blank width 0))]
+    (cells/clip grid {:width width :height height})))
+
 ;; ─────────────────────────────────────────────────────────────────────
 ;; The registration block — defonce so reloading the namespace doesn't
 ;; spam mulog warnings. Production callers should require this ns from
@@ -55,7 +80,7 @@
     ;; ──────────────────────────────────────────────────────────────────
 
     (er/defelement :text
-      {:doc   "Plain or styled text. Hiccup forms: [:text \"...\"] or [:text {:fg :red ...} \"...\"]. The text content lives in children; the :text attr is also accepted (used by the substrate's string-promotion path)."
+      {:doc   "Plain or styled text. Hiccup forms: [:text \"...\"] or [:text {:fg :red ...} \"...\"]. The text content lives in children; the :text attr is also accepted (used by the substrate's string-promotion path). The child may instead be a vector of styled runs ([{:text s :fg ... :bold? ...} ...]) flowing as one word-wrapped paragraph; element style attrs act as the base style under each run's own keys, and :continuation (string or runs) prefixes every wrapped line after the first of each logical line."
        :attrs [:map
                [:text     {:optional true} :string]
                [:fg       {:optional true} :any]
@@ -63,18 +88,26 @@
                [:bold?    {:optional true} :boolean]
                [:italic?  {:optional true} :boolean]
                [:underline? {:optional true} :boolean]
-               [:dim?     {:optional true} :boolean]]
+               [:dim?     {:optional true} :boolean]
+               [:continuation {:optional true} :any]]
        :container? true
        :preferred-size (fn [{:keys [text]} children]
-                         (let [s (or text (apply str (filter string? children)))]
-                           {:width (count (or s "")) :height 1}))
+                         (if-let [runs (text-runs-child children)]
+                           {:width (reduce + 0 (map (comp count :text) runs)) :height 1}
+                           (let [s (or text (apply str (filter string? children)))]
+                             {:width (count (or s "")) :height 1})))
        :min-size       {:width 1 :height 1}
        :stream-stable? true
        :render
        (fn [attrs children {:keys [width height]} _render-child]
-         (let [s (or (:text attrs)
-                     (apply str (filter string? children)))]
-           (styled-text-grid width (or height 1) (text-attrs->styles attrs) s)))})
+         (if-let [runs (text-runs-child children)]
+           (styled-runs-grid width (or height 1)
+                             (text-attrs->styles attrs)
+                             (:continuation attrs)
+                             runs)
+           (let [s (or (:text attrs)
+                       (apply str (filter string? children)))]
+             (styled-text-grid width (or height 1) (text-attrs->styles attrs) s))))})
 
     (er/defelement :line
       {:doc   "Horizontal rule across the bounding box."

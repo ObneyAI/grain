@@ -54,6 +54,28 @@
      :height 1
      :cells  [row]}))
 
+(defn runs-row
+  "A 1-row CellGrid of the given width displaying styled `runs`
+   (`[{:text s :fg ... :bold? ...} ...]`). Each cell takes its run's
+   style merged over `blank-cell`. Truncates past `width`; right-pads
+   with `blank-cell` if shorter.
+
+   Width 0 produces an empty 0×1 grid."
+  [width runs]
+  (let [cells   (into []
+                      (comp (mapcat (fn [run]
+                                      (let [base (merge blank-cell
+                                                        (select-keys run [:fg :bg :bold? :italic? :underline? :dim?]))]
+                                        (map (fn [c] (assoc base :char (str c)))
+                                             (:text run)))))
+                            (take width))
+                      runs)
+        padding (- width (count cells))
+        row     (into cells (repeat padding blank-cell))]
+    {:width  width
+     :height 1
+     :cells  [row]}))
+
 (defn- pad-row
   "Right-pad a single row vector to `target-width` with `blank-cell`."
   [row target-width]

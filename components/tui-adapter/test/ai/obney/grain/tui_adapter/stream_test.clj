@@ -153,3 +153,36 @@
     ;; Off-window segments not in cache.
     (is (not (contains? (get-in r [:state :segment-cache]) 1)))
     (is (not (contains? (get-in r [:state :segment-cache]) 2)))))
+
+;; ──────────────────────────────────────────────────────────────────────────
+;; styled-runs :text segments — heights from wrapped visual lines
+;; ──────────────────────────────────────────────────────────────────────────
+
+(deftest render-stream-runs-segment-height-counts-wrapped-lines
+  ;; A runs :text segment wrapping to 3 visual lines at width 6 must
+  ;; occupy 3 rows of the window budget (a runs child used to count as
+  ;; height 1 and get clipped).
+  (let [runs-seg {:id 2 :tui/hiccup [:text [{:text "alpha " :bold? true}
+                                            {:text "beta gamma"}]]}
+        r (stream/render-stream (stream/empty-stream-state)
+                                {:items [(mk-seg {:id 1 :text "a"}) runs-seg]}
+                                spec
+                                {:width 6 :height 3})]
+    (is (= [2] (:visible-window (:state r)))
+        "the 3-line runs segment fills the 3-row budget; the older 1-line segment is evicted")
+    (is (= 3 (get-in r [:state :segment-cache 2 :height])))
+    ;; The grid shows all three wrapped rows.
+    (let [row-str (fn [i] (apply str (map :char (get-in r [:grid :cells i]))))]
+      (is (= "alpha " (row-str 0)))
+      (is (= "beta  " (row-str 1)))
+      (is (= "gamma " (row-str 2))))))
+
+(deftest render-stream-runs-segment-with-continuation-height
+  ;; Width 7, continuation "> " (2) → "aaa bbb" + "> ccc" = 2 lines.
+  (let [seg {:id 1 :tui/hiccup [:text {:continuation "> "}
+                                [{:text "aaa bbb ccc"}]]}
+        r   (stream/render-stream (stream/empty-stream-state)
+                                  {:items [seg]}
+                                  spec
+                                  {:width 7 :height 4})]
+    (is (= 2 (get-in r [:state :segment-cache 1 :height])))))

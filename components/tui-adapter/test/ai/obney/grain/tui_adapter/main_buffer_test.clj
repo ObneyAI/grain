@@ -179,6 +179,23 @@
     (is (= 3 (count (re-seq #"\n" bytes))))
     (is (= 3 (count (re-seq #"\[6;1H" bytes))))))
 
+(deftest render-stream-main-emits-wrapped-runs-as-visual-rows
+  ;; A styled-runs :text segment wrapping to 3 visual lines must emit 3
+  ;; positioned rows through the main-buffer append path (a runs child
+  ;; used to be measured at height 1 and lose its wrapped rows).
+  (let [prior  (ai.obney.grain.tui-adapter.stream/empty-stream-state)
+        result {:msgs [{:id 1 :tui/hiccup [:text [{:text "alpha " :bold? true}
+                                                  {:text "beta gamma"}]]}]}
+        {:keys [state bytes]}
+        (ai.obney.grain.tui-adapter.stream/render-stream-main
+          prior result msgs-spec (assoc append-opts :width 6))]
+    (is (= [1] (:emitted-keys state)))
+    (is (str/includes? bytes "alpha"))
+    (is (str/includes? bytes "beta"))
+    (is (str/includes? bytes "gamma"))
+    (is (= 3 (count (re-seq #"\n" bytes))))
+    (is (= 3 (count (re-seq #"\[6;1H" bytes))))))
+
 (deftest render-stream-main-no-new-segments-emits-nothing
   (let [prior (-> (ai.obney.grain.tui-adapter.stream/empty-stream-state)
                   (assoc :emitted-keys [1 2]))

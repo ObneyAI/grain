@@ -98,6 +98,18 @@
       (or (:text attrs)
           (apply str (filter string? children))))))
 
+(defn- text-runs
+  "When `hiccup` is a :text node whose child is a vector of styled-run
+   maps, return `[runs continuation]`; nil otherwise."
+  [hiccup]
+  (when (and (vector? hiccup) (= :text (first hiccup)))
+    (let [[_ maybe-attrs & children] hiccup
+          attrs    (when (map? maybe-attrs) maybe-attrs)
+          children (if attrs children (cons maybe-attrs children))
+          c        (first children)]
+      (when (and (vector? c) (map? (first c)))
+        [c (:continuation attrs)]))))
+
 (defn- text-visual-height
   [width s]
   (text-wrap/visual-line-count width s))
@@ -105,6 +117,8 @@
 (defn- segment-height
   [segment hiccup-path width]
   (or (:height segment)
+      (when-let [[runs continuation] (text-runs (get segment hiccup-path))]
+        (text-wrap/visual-line-count-runs width runs continuation))
       (when-let [s (text-content (get segment hiccup-path))]
         (text-visual-height width s))
       1))

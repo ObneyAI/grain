@@ -66,6 +66,74 @@
     (is (= ["k" "l" " " " " " "] (chars-of g 2)))))
 
 ;; ──────────────────────────────────────────────────────────────────────────
+;; §7.1 :text — styled-runs child
+;; ──────────────────────────────────────────────────────────────────────────
+
+(deftest text-runs-preferred-size
+  (is (= {:width 5 :height 1}
+         (layout/child-preferred-size [:text [{:text "abc"} {:text "de" :fg :red}]])))
+  (is (= {:width 2 :height 1}
+         (layout/child-preferred-size [:text {:fg :red} [{:text "hi"}]]))))
+
+(deftest text-runs-render-per-cell-styles
+  (let [g (layout/render-element [:text [{:text "ab" :bold? true}
+                                         {:text "c" :fg :red}]]
+                                 {:width 5 :height 1})]
+    (is (= ["a" "b" "c" " " " "] (chars-of g 0)))
+    (is (true?  (:bold? (get-in g [:cells 0 0]))))
+    (is (true?  (:bold? (get-in g [:cells 0 1]))))
+    (is (false? (:bold? (get-in g [:cells 0 2]))))
+    (is (= :red (:fg (get-in g [:cells 0 2]))))
+    ;; Padding cells are blank-default.
+    (is (= :default (:fg (get-in g [:cells 0 3]))))
+    (is (false? (:bold? (get-in g [:cells 0 3]))))))
+
+(deftest text-runs-base-style-merges-under-run-styles
+  (let [g (layout/render-element [:text {:fg :red :bold? true}
+                                  [{:text "a"} {:text "b" :fg :blue}]]
+                                 {:width 2 :height 1})]
+    ;; Run without its own :fg inherits the element base style.
+    (is (= :red (:fg (get-in g [:cells 0 0]))))
+    (is (true? (:bold? (get-in g [:cells 0 0]))))
+    ;; A run's own sparse keys win over the base.
+    (is (= :blue (:fg (get-in g [:cells 0 1]))))
+    ;; ...but unset keys still inherit.
+    (is (true? (:bold? (get-in g [:cells 0 1]))))))
+
+(deftest text-runs-wrap-as-one-paragraph
+  ;; Two runs flow together: "bold " (bold) + "plain text" wraps at the
+  ;; word boundary, styles correct per cell on both rows.
+  (let [g (layout/render-element [:text [{:text "bold " :bold? true}
+                                         {:text "plain text"}]]
+                                 {:width 10 :height 2})]
+    (is (= ["b" "o" "l" "d" " " "p" "l" "a" "i" "n"] (chars-of g 0)))
+    (is (= ["t" "e" "x" "t" " " " " " " " " " " " "] (chars-of g 1)))
+    (is (true?  (:bold? (get-in g [:cells 0 0]))))
+    (is (true?  (:bold? (get-in g [:cells 0 4]))))
+    (is (false? (:bold? (get-in g [:cells 0 5]))))
+    (is (false? (:bold? (get-in g [:cells 1 0]))))))
+
+(deftest text-runs-continuation-attr
+  (let [g (layout/render-element [:text {:continuation [{:text "> " :dim? true}]}
+                                  [{:text "aaa bbb ccc"}]]
+                                 {:width 7 :height 2})]
+    (is (= ["a" "a" "a" " " "b" "b" "b"] (chars-of g 0)))
+    (is (= [">" " " "c" "c" "c" " " " "] (chars-of g 1)))
+    (is (true? (:dim? (get-in g [:cells 1 0]))))
+    (is (false? (:dim? (get-in g [:cells 1 2]))))))
+
+(deftest text-runs-string-path-unchanged
+  ;; Regression pin: a plain string child renders exactly as before even
+  ;; though the runs branch exists.
+  (let [g  (layout/render-element [:text {:fg :red} "alpha beta"]
+                                  {:width 5 :height 2})
+        g' (layout/render-element [:text {:text "alpha beta" :fg :red}]
+                                  {:width 5 :height 2})]
+    (is (= g g'))
+    (is (= ["a" "l" "p" "h" "a"] (chars-of g 0)))
+    (is (= ["b" "e" "t" "a" " "] (chars-of g 1)))))
+
+;; ──────────────────────────────────────────────────────────────────────────
 ;; §7.1 :line
 ;; ──────────────────────────────────────────────────────────────────────────
 
