@@ -485,10 +485,13 @@
    Used by the main-buffer renderer to print the intro block (and the
    chrome) into the terminal at the current cursor row, letting the
    scroll region handle vertical positioning naturally."
-  [grid caps style]
+  [grid caps _style]
+  ;; Start from real reset bytes + a default delta base: carried style
+  ;; cannot be trusted across interleaved emission paths (append vs
+  ;; frame) sharing one terminal.
   (loop [rows  (:cells grid)
-         st    style
-         sb    (StringBuilder.)]
+         st    {}
+         sb    (doto (StringBuilder.) (.append "\u001b[0m"))]
     (if (empty? rows)
       [(.toString sb) st]
       (let [[row-bytes st'] (ansi/emit-cells (first rows) caps st)]
@@ -501,11 +504,12 @@
    before writing it and never appending newlines. Used for fixed chrome
    in the main-buffer renderer; newline output there can move the
    terminal cursor and leave stale input behind."
-  [grid start-row caps style]
+  [grid start-row caps _style]
+  ;; Same reset-per-flush rationale as emit-grid-as-lines.
   (loop [rows    (:cells grid)
          row-idx 0
-         st      style
-         sb      (StringBuilder.)]
+         st      {}
+         sb      (doto (StringBuilder.) (.append "\u001b[0m"))]
     (if (empty? rows)
       [(.toString sb) st]
       (let [[row-bytes st'] (ansi/emit-cells (first rows) caps st)]
@@ -768,10 +772,12 @@
                          [canvas nil])
         composed       (compose-overlay canvas overlay viewport)
         runs           (diff/diff render-model composed)
+        ;; Reset-per-flush: the carried :ansi-style goes stale when the
+        ;; append path interleaves on the same terminal.
         [out new-style] (ansi/emit runs (or terminal-caps {:color :truecolor})
-                                   (or ansi-style {}))]
+                                   {})]
     (when (and on-output (seq out))
-      (on-output out))
+      (on-output (str "\u001b[0m" out)))
     ;; Cursor management: show + position at the input area's absolute
     ;; origin (`ia-origin`) when active and no overlay; hide otherwise.
     ;; Emitted after the diff so the cursor sits at the final position.
@@ -984,8 +990,8 @@
                      (cells/overlay base g 0 0))
               runs (diff/diff render-model g)
               [out new-style] (ansi/emit runs (or terminal-caps {:color :truecolor})
-                                         (or ansi-style {}))]
-          (when (and on-output (seq out)) (on-output out))
+                                         {})]
+          (when (and on-output (seq out)) (on-output (str "\u001b[0m" out)))
           (swap! session assoc :render-model g :ansi-style new-style))
         (catch Throwable t2
           (u/log ::error-frame-failed :error t2))))))

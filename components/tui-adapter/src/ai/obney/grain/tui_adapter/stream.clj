@@ -205,10 +205,18 @@
   "Render one segment's hiccup as a CellGrid and emit it as
    sequential ANSI bytes (no cursor-positioning embedded — the caller
    has already positioned the terminal cursor). Returns
-   `[bytes new-style]`."
-  [seg hiccup-path width terminal-caps style]
+   `[bytes new-style]`.
+
+   Each segment opens with an explicit SGR reset and a default-style
+   delta base: the carried `style` cannot be trusted across flushes
+   because frame-path painting (overlay lanes, input area) interleaves
+   on the same terminal with its own style tracking — a stale carried
+   style makes the delta encoder skip attributes the terminal no
+   longer has (observed live as headings losing bold)."
+  [seg hiccup-path width terminal-caps _style]
   (let [hiccup (get seg hiccup-path)
         height (segment-height seg hiccup-path width)
+        style  nil
         grid   (layout/render-element
                  (or hiccup [:text {:text ""}])
                  {:width width :height height})]
@@ -217,7 +225,9 @@
                                                      (or terminal-caps {:color :truecolor})
                                                      (or st {}))]
                 [(str acc row-bytes "\n") st']))
-            ["" style]
+            ;; Real reset bytes, not just a default-style delta base:
+            ;; the terminal must actually BE at default before row one.
+            ["\u001b[0m" style]
             (:cells grid))))
 
 (defn render-stream-main
