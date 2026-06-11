@@ -153,8 +153,9 @@
                   ORDER BY e.id
 
    Returns {:sql \"...\" :params [...]}."
-  [{:keys [tenant-id tags types after as-of]}]
-  (let [tenant-str (str tenant-id)]
+  [{:keys [tenant-id tags types after as-of reverse? limit]}]
+  (let [tenant-str (str tenant-id)
+        order-dir  (if reverse? " DESC" "")]
     (if (seq tags)
       (let [tag-strs (mapv tag->str tags)
             type-strs (when types (mapv #(str ":" (key-fn %)) types))
@@ -163,18 +164,21 @@
                           types  (conj (str "e.type IN (" (placeholders (count type-strs)) ")"))
                           after  (conj "e.id > ?")
                           as-of  (conj "e.id <= ?"))
+            ;; :limit must be the LAST positional param — after the HAVING count.
             params (cond-> (into [tenant-str] tag-strs)
                      types  (into type-strs)
                      after  (conj (str after))
                      as-of  (conj (str as-of))
-                     true   (conj (count tag-strs)))
+                     true   (conj (count tag-strs))
+                     limit  (conj limit))
             sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
                      "FROM events e "
                      "JOIN event_tags t ON t.tenant_id = e.tenant_id AND t.event_id = e.id "
                      "WHERE " (string/join " AND " where-parts) " "
                      "GROUP BY e.id "
                      "HAVING COUNT(DISTINCT t.tag) = ? "
-                     "ORDER BY e.id")]
+                     "ORDER BY e.id" order-dir
+                     (when limit " LIMIT ?"))]
         {:sql sql :params params})
       (let [type-strs (when types (mapv #(str ":" (key-fn %)) types))
             where-parts (cond-> ["tenant_id = ?"]
@@ -184,10 +188,12 @@
             params (cond-> [tenant-str]
                      types (into type-strs)
                      after (conj (str after))
-                     as-of (conj (str as-of)))
+                     as-of (conj (str as-of))
+                     limit (conj limit))
             sql (str "SELECT id, time, type, data FROM events "
                      "WHERE " (string/join " AND " where-parts) " "
-                     "ORDER BY id")]
+                     "ORDER BY id" order-dir
+                     (when limit " LIMIT ?"))]
         {:sql sql :params params}))))
 
 (defn- make-reducible

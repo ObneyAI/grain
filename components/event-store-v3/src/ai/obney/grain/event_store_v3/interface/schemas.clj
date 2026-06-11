@@ -42,7 +42,9 @@
      [:tags  {:optional true} ::tags]
      [:types {:optional true} ::types]
      [:as-of {:optional true}  ::id]
-     [:after {:optional true} ::id]]]
+     [:after {:optional true} ::id]
+     [:reverse? {:optional true} :boolean]
+     [:limit {:optional true} pos-int?]]]
 
    ::batch-read-args
    [:and
@@ -61,6 +63,8 @@
      [:types {:optional true} ::types]
      [:as-of {:optional true} ::id]
      [:after {:optional true} ::id]
+     [:reverse? {:optional true} :boolean]
+     [:limit {:optional true} pos-int?]
      [:predicate-fn fn?]]]
 
    ::append-args

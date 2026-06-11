@@ -9,6 +9,7 @@
             [clojure.core.async :as async]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
+            [clojure.string]
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime ZoneOffset Instant]
            [java.io File]))
@@ -867,3 +868,64 @@
     (is (= 1 (count conflicts)))
     (is (= 1 (count (non-tx-events (into [] (es/read store {:tenant-id tenant-id
                                                             :types #{:test/alpha}}))))))))
+
+;; ===================================================== ;;
+;; Reverse / Limit single-read primitive + EXPLAIN       ;;
+;; ===================================================== ;;
+
+(deftest reverse-returns-descending-by-id-sqlite
+  (let [e1 (append-event! :test/alpha #{} {:n 1})
+        e2 (append-event! :test/alpha #{} {:n 2})
+        e3 (append-event! :test/alpha #{} {:n 3})
+        events (non-tx-events (read-events {:types #{:test/alpha} :reverse? true}))]
+    (is (= [(:event/id e3) (:event/id e2) (:event/id e1)]
+           (mapv :event/id events)))))
+
+(deftest reverse-limit-1-returns-single-newest-sqlite
+  (let [_e1 (append-event! :test/alpha #{} {:n 1})
+        _e2 (append-event! :test/alpha #{} {:n 2})
+        e3 (append-event! :test/alpha #{} {:n 3})
+        events (read-events {:types #{:test/alpha} :reverse? true :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id e3) (:event/id (first events))))))
+
+(deftest reverse-limit-1-with-type-and-tag-sqlite
+  ;; Mirrors the checkpoint read shape: type + processor tag, newest only.
+  (let [pid (uuid/v4)
+        _e1 (append-event! :test/alpha #{[:processor pid]} {:n 1})
+        e2 (append-event! :test/alpha #{[:processor pid]} {:n 2})
+        events (read-events {:types #{:test/alpha}
+                             :tags #{[:processor pid]}
+                             :reverse? true :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id e2) (:event/id (first events))))))
+
+(deftest limit-without-reverse-returns-oldest-sqlite
+  (let [e1 (append-event! :test/alpha #{} {:n 1})
+        _e2 (append-event! :test/alpha #{} {:n 2})
+        events (read-events {:types #{:test/alpha} :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id e1) (:event/id (first events))))))
+
+(deftest checkpoint-read-uses-index-not-full-scan
+  ;; The field-relevant proof: the checkpoint-shaped reverse+limit-1 query plans
+  ;; as an index SEARCH (seek), never a full TABLE SCAN of events.
+  (let [pid (uuid/v4)]
+    (dotimes [n 50] (append-event! :test/alpha #{[:processor pid]} {:n n}))
+    (let [{:keys [sql params]} (#'sqlite-core/build-single-query
+                                {:tenant-id *tenant-id*
+                                 :types #{:test/alpha}
+                                 :tags #{[:processor pid]}
+                                 :reverse? true :limit 1})
+          plan-rows (jdbc/execute! (pool)
+                                   (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                   {:builder-fn rs/as-unqualified-maps})
+          details (mapv :detail plan-rows)
+          joined (clojure.string/join " | " details)]
+      (testing (str "query plan: " joined)
+        ;; Every access path the planner picks must be an index SEARCH, not a
+        ;; full SCAN of the events table.
+        (is (some #(re-find #"(?i)SEARCH" %) details)
+            "plan uses an index SEARCH/seek")
+        (is (not (some #(re-find #"(?i)SCAN .*\bevents\b" %) details))
+            "plan does NOT full-scan the events table")))))

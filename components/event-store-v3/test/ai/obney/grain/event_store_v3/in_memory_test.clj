@@ -336,6 +336,57 @@
                               {:tags #{[:nope (uuid/v4)]}}]))]
     (is (empty? events))))
 
+;; ===================================================== ;;
+;; D2. Reverse / Limit single-read primitive (7 tests)   ;;
+;; ===================================================== ;;
+
+(deftest reverse-returns-descending-by-id
+  (let [evt1 (append-event! :test/alpha #{} {:n 1})
+        evt2 (append-event! :test/alpha #{} {:n 2})
+        evt3 (append-event! :test/alpha #{} {:n 3})
+        events (non-tx-events (read-events {:types #{:test/alpha} :reverse? true}))]
+    (is (= [(:event/id evt3) (:event/id evt2) (:event/id evt1)]
+           (mapv :event/id events)))))
+
+(deftest limit-caps-result-count
+  (dotimes [n 5] (append-event! :test/alpha #{} {:n n}))
+  (let [events (read-events {:types #{:test/alpha} :limit 2})]
+    (is (= 2 (count events)))))
+
+(deftest reverse-limit-1-returns-single-newest
+  (let [_evt1 (append-event! :test/alpha #{} {:n 1})
+        _evt2 (append-event! :test/alpha #{} {:n 2})
+        evt3 (append-event! :test/alpha #{} {:n 3})
+        events (read-events {:types #{:test/alpha} :reverse? true :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id evt3) (:event/id (first events))))))
+
+(deftest limit-without-reverse-returns-oldest
+  (let [evt1 (append-event! :test/alpha #{} {:n 1})
+        _evt2 (append-event! :test/alpha #{} {:n 2})
+        events (read-events {:types #{:test/alpha} :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id evt1) (:event/id (first events))))))
+
+(deftest reverse-limit-with-tags
+  (let [id (uuid/v4)
+        _evt1 (append-event! :test/alpha #{[:proc id]} {:n 1})
+        evt2 (append-event! :test/alpha #{[:proc id]} {:n 2})
+        events (read-events {:tags #{[:proc id]} :reverse? true :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id evt2) (:event/id (first events))))))
+
+(deftest reverse-limit-empty-store
+  (let [events (read-events {:types #{:test/alpha} :reverse? true :limit 1})]
+    (is (empty? events))))
+
+(deftest plain-read-unchanged-by-new-keys
+  ;; A read with neither key is byte-identical to before: ascending, unbounded.
+  (let [evt1 (append-event! :test/alpha #{} {:n 1})
+        evt2 (append-event! :test/alpha #{} {:n 2})
+        events (non-tx-events (read-events {:types #{:test/alpha}}))]
+    (is (= [(:event/id evt1) (:event/id evt2)] (mapv :event/id events)))))
+
 ;; ===================================== ;;
 ;; E. CAS — Compare and Swap (5 tests)   ;;
 ;; ===================================== ;;

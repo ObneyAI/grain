@@ -704,3 +704,40 @@
                            {:builder-fn rs/as-unqualified-maps}))]
       (is (some? (:data raw-row)) "data column should be non-NULL")
       (is (instance? (Class/forName "[B") (:data raw-row)) "data should be a byte array"))))
+
+;; ===================================================== ;;
+;; Reverse / Limit single-read primitive (parity)        ;;
+;; ===================================================== ;;
+
+(deftest reverse-returns-descending-by-id-pg
+  (let [e1 (append-event! :test/alpha #{} {:n 1})
+        e2 (append-event! :test/alpha #{} {:n 2})
+        e3 (append-event! :test/alpha #{} {:n 3})
+        events (non-tx-events (read-events {:types #{:test/alpha} :reverse? true}))]
+    (is (= [(:event/id e3) (:event/id e2) (:event/id e1)]
+           (mapv :event/id events)))))
+
+(deftest reverse-limit-1-returns-single-newest-pg
+  (let [_e1 (append-event! :test/alpha #{} {:n 1})
+        _e2 (append-event! :test/alpha #{} {:n 2})
+        e3 (append-event! :test/alpha #{} {:n 3})
+        events (read-events {:types #{:test/alpha} :reverse? true :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id e3) (:event/id (first events))))))
+
+(deftest reverse-limit-1-with-type-and-tag-pg
+  (let [pid (uuid/v4)
+        _e1 (append-event! :test/alpha #{[:processor pid]} {:n 1})
+        e2 (append-event! :test/alpha #{[:processor pid]} {:n 2})
+        events (read-events {:types #{:test/alpha}
+                             :tags #{[:processor pid]}
+                             :reverse? true :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id e2) (:event/id (first events))))))
+
+(deftest limit-without-reverse-returns-oldest-pg
+  (let [e1 (append-event! :test/alpha #{} {:n 1})
+        _e2 (append-event! :test/alpha #{} {:n 2})
+        events (read-events {:types #{:test/alpha} :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id e1) (:event/id (first events))))))

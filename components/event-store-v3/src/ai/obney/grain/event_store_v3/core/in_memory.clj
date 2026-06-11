@@ -22,22 +22,24 @@
   (dissoc event :grain/tenant-id))
 
 (defn- read-single
-  [event-store {:keys [tenant-id tags types as-of after] :as args}]
-  (let [filtered-events (->> (-> event-store :state deref :events)
-                              (filter
-                               (fn [event]
-                                 (and
-                                  (matches-tenant? tenant-id event)
-                                  (or (not tags)
-                                      (set/subset? tags (:event/tags event)))
-                                  (or (not types)
-                                      (contains? types (:event/type event)))
-                                  (cond
-                                    as-of (or (uuid/< (:event/id event) as-of)
-                                              (uuid/= (:event/id event) as-of))
-                                    after (uuid/> (:event/id event) after)
-                                    :else true))))
-                              (map strip-tenant-id))]
+  [event-store {:keys [tenant-id tags types as-of after reverse? limit] :as args}]
+  (let [filtered-events (cond->> (->> (-> event-store :state deref :events)
+                                      (filter
+                                       (fn [event]
+                                         (and
+                                          (matches-tenant? tenant-id event)
+                                          (or (not tags)
+                                              (set/subset? tags (:event/tags event)))
+                                          (or (not types)
+                                              (contains? types (:event/type event)))
+                                          (cond
+                                            as-of (or (uuid/< (:event/id event) as-of)
+                                                      (uuid/= (:event/id event) as-of))
+                                            after (uuid/> (:event/id event) after)
+                                            :else true))))
+                                      (map strip-tenant-id))
+                          reverse? reverse
+                          limit    (take limit))]
      (reify
        clojure.lang.IReduceInit
        (reduce [_ f init]

@@ -180,6 +180,14 @@
     {:where-sql where-sql
      :params    (mapv second clauses)}))
 
+(defn- order-limit-clause
+  "Build the ` ORDER BY id [DESC] [LIMIT ?]` tail + its trailing param for a
+   single read query. :limit's value, when present, must be appended to the
+   query params AFTER the where-clause params. Single-query reads only."
+  [{:keys [reverse? limit]}]
+  {:sql    (str " ORDER BY id" (when reverse? " DESC") (when limit " LIMIT ?"))
+   :params (if limit [limit] [])})
+
 (defn- make-reducible
   "Create a reducible that opens a transaction, sets tenant context, and streams
    rows via transform-row over a JDBC plan. The transaction stays open for the
@@ -216,10 +224,11 @@
 (defn- read-single
   [event-store tenant-id query]
   (let [{:keys [where-sql params]} (build-single-query-sql query)
+        {ol-sql :sql ol-params :params} (order-limit-clause query)
         sql  (str "SELECT id, time, type, tags, data FROM grain.events "
-                  where-sql " ORDER BY id")
+                  where-sql ol-sql)
         conn (get-in event-store [:state ::connection-pool])]
-    (make-reducible conn tenant-id sql params)))
+    (make-reducible conn tenant-id sql (into params ol-params))))
 
 (defn- read-batch
   [event-store tenant-id queries]
@@ -303,11 +312,12 @@
       ;; reflects events actually inserted; a CAS failure must not leave a
       ;; phantom watermark.
       (if cas
-        (let [{:keys [where-sql params]} (build-single-query-sql
-                                          (assoc cas :tenant-id tenant-id))
+        (let [cas-query (assoc cas :tenant-id tenant-id)
+              {:keys [where-sql params]} (build-single-query-sql cas-query)
+              {ol-sql :sql ol-params :params} (order-limit-clause cas-query)
               sql (str "SELECT id, time, type, tags, data FROM grain.events "
-                       where-sql " ORDER BY id")
-              plan (jdbc/plan conn (into [sql] params) {:fetch-size 500})
+                       where-sql ol-sql)
+              plan (jdbc/plan conn (into [sql] (into params ol-params)) {:fetch-size 500})
               cas-events (reify
                            clojure.lang.IReduceInit
                            (reduce [_ f init]

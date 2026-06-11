@@ -80,4 +80,13 @@
 
      :as-of - A UUID v7 event id to filter events that occurred before or at this time.
 
-     :after - A UUID v7 event id to filter events that occurred after this time."))
+     :after - A UUID v7 event id to filter events that occurred after this time.
+
+     :reverse? - When true, stream events in descending :event/id order (newest first)
+                 instead of the default ascending order. Single-query reads only; ignored
+                 for batch reads.
+
+     :limit - Cap the number of events returned. Combined with :reverse?, this is the
+              efficient way to fetch the newest matching event(s) (e.g. {:reverse? true
+              :limit 1}) via an indexed seek rather than scanning the whole match set.
+              Single-query reads only; ignored for batch reads."))
