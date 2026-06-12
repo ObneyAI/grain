@@ -58,13 +58,11 @@
 ;; Test Helpers
 
 (defn make-command
-  [command-name & {:keys [id timestamp extra-data]
-                   :or {id (uuid/v4)
-                        timestamp (OffsetDateTime/now)}}]
-  (merge {:command/name command-name
-          :command/id id
-          :command/timestamp timestamp}
-         extra-data))
+  [command-name & {:keys [id timestamp extra-data]}]
+  (cp/->command
+   (cond-> (merge {:command/name command-name} extra-data)
+     id (assoc :command/id id)
+     timestamp (assoc :command/timestamp timestamp))))
 
 (defn make-context
   [command command-registry]
@@ -132,6 +130,32 @@
           result (cp/process-command context)]
       (is (not (contains? result ::anom/category)))
       (is (= {:status "completed"} (:command/result result)))
+      (is (true? (:command-result/success result))))))
+
+(deftest ->command-test
+  (testing "->command fills in :command/id and :command/timestamp when absent"
+    (let [command (cp/->command {:command/name :example/create-counter
+                                 :name "Counter A"})]
+      (is (uuid? (:command/id command)))
+      (is (instance? OffsetDateTime (:command/timestamp command)))
+      (is (= :example/create-counter (:command/name command)))
+      (is (= "Counter A" (:name command)))))
+
+  (testing "->command preserves a caller-supplied :command/id and :command/timestamp"
+    (let [id (uuid/v4)
+          ts (OffsetDateTime/now)
+          command (cp/->command {:command/name :example/create-counter
+                                 :command/id id
+                                 :command/timestamp ts})]
+      (is (= id (:command/id command)))
+      (is (= ts (:command/timestamp command)))))
+
+  (testing "a command built with ->command round-trips through process-command"
+    (let [command (cp/->command {:command/name :test/create-resource})
+          registry (make-registry {:test/create-resource successful-handler})
+          context (make-context command registry)
+          result (cp/process-command context)]
+      (is (not (contains? result ::anom/category)))
       (is (true? (:command-result/success result))))))
 
 (deftest test-command-with-events
@@ -508,8 +532,8 @@
           parent-handler (fn [context]
                            (let [child-ctx (assoc context :command-processor/skip-event-storage true)
                                  child-result (cp/process-command
-                                                (assoc child-ctx
-                                                       :command (make-command :test/skip-storage-child)))]
+                                               (assoc child-ctx
+                                                      :command (make-command :test/skip-storage-child)))]
                              {:command-result/events (:command-result/events child-result)
                               :command/result {:aggregated true}}))
           command (make-command :test/skip-storage)

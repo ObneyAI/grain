@@ -2,7 +2,6 @@
   (:require [ai.obney.grain.anomalies.interface :refer [anomaly?]]
             [ai.obney.grain.command-processor-v2.interface.schemas :as command-schema]
             [ai.obney.grain.command-processor-v2.interface :as cp]
-            [ai.obney.grain.time.interface :as time]
             [clojure.core.async :as async]
             [com.brunobonacci.mulog :as u]
             [cognitect.anomalies :as anom]
@@ -50,9 +49,9 @@
 
 (defn decode-command
   [command]
-  (-> command
-      (assoc :command/id (random-uuid))
-      (assoc :command/timestamp (time/now))))
+  ;; Always (re)generate :command/id and :command/timestamp server-side, ignoring
+  ;; any client-supplied values, by dropping them before ->command fills them in.
+  (cp/->command (dissoc command :command/id :command/timestamp)))
 
 (defn prep-response
   [response]

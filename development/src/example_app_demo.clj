@@ -26,8 +26,7 @@
   ;;
   (service/stop service)
 
-  ""
-  )
+  "")
 
 
 (comment
@@ -39,40 +38,36 @@
   (try
     (cp/process-command
      (assoc context
-            :command {:command/name :example/create-counter
-                      :command/timestamp (time/now)
-                      :command/id (random-uuid)
-                      :name "Counter A"}))
+            :command (cp/->command {:command/name :example/create-counter
+                                    :name "Counter A"})))
     (catch Exception e (ex-data e)))
 
   (into [] (es/read event-store {:tenant-id tenant-id}))
 
-  (def counters
-    (->> (qp/process-query
-          (assoc context
-                 :query {:query/name :example/counters
-                         :query/timestamp (time/now)
-                         :query/id (random-uuid)}))
-         :query/result))
+  @(def counters
+     (->> (qp/process-query
+           (assoc context
+                  :query {:query/name :example/counters
+                          :query/timestamp (time/now)
+                          :query/id (random-uuid)}))
+          :query/result))
 
 
-  (def counter
-    (->> (qp/process-query
-          (assoc context
-                 :query {:query/name :example/counter
-                         :query/timestamp (time/now)
-                         :query/id (random-uuid)
-                         :counter-id (:counter/id (first counters))}))
-         :query/result))
+  @(def counter
+     (->> (qp/process-query
+           (assoc context
+                  :query {:query/name :example/counter
+                          :query/timestamp (time/now)
+                          :query/id (random-uuid)
+                          :counter-id (:counter/id (first counters))}))
+          :query/result))
 
 
 
   (cp/process-command
    (assoc context
-          :command {:command/name :example/increment-counter
-                    :command/timestamp (time/now)
-                    :command/id (random-uuid)
-                    :counter-id (:counter/id counter)}))
+          :command (cp/->command {:command/name :example/increment-counter
+                                  :counter-id (:counter/id counter)})))
 
 
   ;; Projects the :example/counters read model (read-model-processor-v2).
@@ -83,8 +78,7 @@
   (into [] (es/read event-store {:tenant-id tenant-id}))
 
 
-  ""
-  )
+  "")
 
 (comment
   ;; Interact with the service via HTTP
@@ -101,15 +95,15 @@
     (catch Exception e (ex-data e)))
 
   ;; Get all counters
-  (def counters
-    (try
-      (:body
-       (http/post
-        "http://localhost:8080/query"
-        {:content-type :transit+json
-         :as :transit+json
-         :form-params {:query {:query/name :example/counters}}}))
-      (catch Exception e (ex-data e))))
+  @(def counters
+     (try
+       (:body
+        (http/post
+         "http://localhost:8080/query"
+         {:content-type :transit+json
+          :as :transit+json
+          :form-params {:query {:query/name :example/counters}}}))
+       (catch Exception e (ex-data e))))
 
 
 
@@ -143,5 +137,4 @@
 
 
 
-  ""
-  )
+  "")

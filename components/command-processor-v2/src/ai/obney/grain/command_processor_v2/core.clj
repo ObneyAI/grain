@@ -3,10 +3,17 @@
    [ai.obney.grain.event-store-v3.interface :as event-store]
    [ai.obney.grain.command-processor-v2.interface.schemas :as command-schema]
    [ai.obney.grain.anomalies.interface :refer [anomaly?]]
+   [ai.obney.grain.time.interface :as time]
    [com.brunobonacci.mulog :as u]
    [cognitect.anomalies :as anom]
    [malli.core :as mc]
    [malli.error :as me]))
+
+(defn ->command
+  [command]
+  (merge {:command/id (random-uuid)
+          :command/timestamp (time/now)}
+         command))
 
 (defn execute-command
   [handler {:keys [event-store tenant-id] :as context}]
