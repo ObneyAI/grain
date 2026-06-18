@@ -1051,7 +1051,7 @@
     (testing "default title is 'Grain App'"
       (is (str/includes? (get-in shim-result [:response :body]) "Grain App")))
 
-    (testing "default fps is 30 (stream interceptor is created)"
+    (testing "default fps is 0 (stream interceptor is created)"
       (is (some? stream-route)))))
 
 (deftest routes-with-global-defaults-shim-opts-test

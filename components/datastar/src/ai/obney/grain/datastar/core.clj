@@ -640,7 +640,7 @@
    - One-shot: when :fps is 0 or nil, renders once and closes."
   [context query-name opts]
   (let [{:keys [fps heartbeat-delay event-types debounce-ms event-tags]
-         :or {fps 30 heartbeat-delay 10 debounce-ms 50}} opts
+         :or {fps 0 heartbeat-delay 10 debounce-ms 50}} opts
         event-pubsub (:event-pubsub context)]
     (if (and (seq event-types) event-pubsub)
       ;; Event-driven mode — both GET and POST check for existing SSE first
@@ -861,7 +861,7 @@
   (when-let [path (:datastar/path entry)]
     (let [stream-path (if (= path "/") "/__stream" (str path "/__stream"))
           title (or (:datastar/title entry) "Grain App")
-          fps (:datastar/fps entry 30)
+          fps (:datastar/fps entry 0)
           explicit-interceptors (or (:datastar/interceptors entry) [])
           ;; Auto-generate auth-redirect interceptor when configured in defaults
           ;; and the query's :authorized? predicate rejects empty context (non-public).

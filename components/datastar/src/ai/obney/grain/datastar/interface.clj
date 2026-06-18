@@ -22,7 +22,7 @@
    - **One-shot**: when `:fps` is 0 or nil — renders once and closes.
 
    opts keys:
-     :fps            — frames per second for polling mode (default 30, ignored in event-driven)
+     :fps            — frames per second for polling mode (default 0, ignored in event-driven)
      :heartbeat-delay — SSE heartbeat interval in seconds (default 10)
      :event-types    — set of event type keywords to subscribe to
      :debounce-ms    — ms to wait before re-rendering after an event (default 50)

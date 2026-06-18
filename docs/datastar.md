@@ -174,7 +174,7 @@ The adapter logs warnings for common misconfigurations that would otherwise caus
 | `:datastar/path` | Route path, supports Pedestal path params (e.g. `/events/:event-id`) | — |
 | `:datastar/action-path` | Shared command action endpoint emitted into a Datastar page | — |
 | `:datastar/title` | HTML `<title>` in the shim page | `"Grain App"` |
-| `:datastar/fps` | Polling rate (ignored in event-driven mode) | `30` |
+| `:datastar/fps` | Polling rate (ignored in event-driven mode; `0` means one-shot) | `0` |
 | `:datastar/debounce-ms` | Debounce before re-render after event | `50` |
 | `:datastar/event-tags` | Tag-based event filtering `{:tag-key :query-key}` | — |
 | `:datastar/shim-opts` | Per-query override for shim page options | — |
