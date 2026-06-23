@@ -30,6 +30,7 @@
                  (concat
                    (when ?docstring [?docstring])
                    [args-node]
+                   (when ?opts [?opts])
                    body)))
        :defined-by defined-by})))
 
