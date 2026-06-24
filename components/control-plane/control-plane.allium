@@ -1,0 +1,367 @@
+-- allium: 3
+-- control-plane.allium
+--
+-- Distilled from components/control-plane (grain).
+--
+-- Scope: Cluster coordination for a multi-node, multi-tenant, event-sourced
+--        system. How nodes prove liveness, how one node is elected to
+--        coordinate, and how each domain tenant is assigned to exactly one
+--        live node so its events are processed in exactly one place.
+--
+-- Includes: node liveness (heartbeat / staleness / departure), leaderless
+--           coordinator election, tenant-to-node lease assignment and
+--           rebalancing, and tenant-aware request routing.
+--
+-- Excludes (implementation, governed elsewhere):
+--   - event store internals and the read-model projection mechanism
+--   - todo-processor polling, batching and thread pools (the at-most-once
+--     processing guarantees the control plane relies on are recorded as the
+--     ProcessingHandoff contract and owned by the todo-processor component)
+--   - HTTP / load-balancer / sticky-cookie routing transport
+--   - metrics and logging
+--   - serialization and storage backends (in-memory / SQLite / Postgres)
+--
+-- Conformance properties CP1..CP9 correspond to the control-plane test suite
+-- (test-kit.clj, assignment_test.clj). Where each is captured:
+--   CP1 -> invariant OneLeasePerTenant
+--   CP2 -> contract AssignmentPolicy.AssignmentCompleteness
+--   CP3/CP9 -> contract AssignmentPolicy.CoordinatorConvergence
+--   CP4 -> contract AssignmentPolicy.AssignmentDeterminism
+--   CP5 -> rules NodeDeparts / NodePresumedDead + ReconcileLeases
+--   CP6 -> contract ProcessingHandoff.LeaseFencing
+--   CP7 -> contract ProcessingHandoff.CatchUpCompleteness
+--   CP8 -> surface ClusterCoordination @guarantee TenantIsolation
+--   even distribution -> contract AssignmentPolicy.BalancedDistribution
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A domain tenant. Tenants are created and governed by the event store, not by
+-- the control plane; the control plane only decides which node owns each. The
+-- reserved control-plane coordination tenant is NOT a Tenant instance, so it is
+-- naturally excluded from assignment (CP8).
+external entity Tenant {}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The policy the coordinator applies. These are code-behaviour guarantees about
+-- pure functions, so they live as contract invariants rather than entity state.
+contract AssignmentPolicy {
+    -- The elected coordinator over a set of live nodes.
+    elect_coordinator: (live_nodes: Set<Node>) -> Node
+    -- The node a given tenant should be owned by, under a strategy.
+    assigned_owner: (tenant: Tenant, tenants: Set<Tenant>, live_nodes: Set<Node>, strategy: AssignmentStrategy) -> Node
+
+    @invariant CoordinatorConvergence
+        -- CP3 / CP9: all nodes electing over the same live set choose the same
+        -- coordinator — the oldest live node (smallest, time-ordered identity).
+        -- The choice is deterministic and leaderless (no election protocol); it
+        -- changes only when an older node joins or the current coordinator dies.
+
+    @invariant AssignmentCompleteness
+        -- CP2: every domain tenant is assigned to exactly one live node, and
+        -- only live nodes receive assignments.
+
+    @invariant AssignmentDeterminism
+        -- CP4: assigned_owner is pure and deterministic — the same tenant set
+        -- and live set always produce the same ownership. Independent nodes
+        -- therefore compute identical assignments without coordination, so CP1
+        -- holds even when two nodes briefly both act as coordinator.
+
+    @invariant BalancedDistribution
+        -- Under round_robin, tenants are spread evenly: the most- and
+        -- least-loaded live nodes differ by at most one tenant.
+}
+
+-- The processing runtime each node embeds. The control plane DEMANDS these
+-- guarantees so that handing a tenant from one node to another is safe.
+contract ProcessingHandoff {
+    -- Process the next unprocessed event for a tenant on its owning node.
+    process_next: (tenant: Tenant, owner: Node) -> Any
+
+    @invariant LeaseFencing
+        -- CP6: at most one node processes a tenant's events at a time.
+        -- Checkpoint writes use compare-and-swap, so if two nodes briefly both
+        -- believe they own a tenant, only one commits each checkpoint; the
+        -- other is rejected.
+
+    @invariant CatchUpCompleteness
+        -- CP7: when a lease moves to a new owner, the new owner resumes from the
+        -- last checkpoint and processes every event since — no gaps, no
+        -- reprocessing.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How domain tenants are distributed across live nodes. round_robin spreads
+-- them evenly; custom strategies are pluggable.
+enum AssignmentStrategy { round_robin }
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How often a node proves it is alive.
+    heartbeat_interval: Duration = 5.seconds
+    -- How long a node may be silent before it is presumed dead. Deliberately
+    -- three heartbeat intervals, tolerating two missed heartbeats. Expressed as
+    -- a relationship so the ratio survives a change to either knob.
+    staleness_threshold: Duration = heartbeat_interval * 3
+    -- The default tenant-distribution strategy.
+    strategy: AssignmentStrategy = round_robin
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A running application instance participating in the cluster. A node has a
+-- stable identity of its own (assigned on creation); its address is separate,
+-- optional metadata used for routing.
+entity Node {
+    -- Where other nodes and the load balancer can reach this node, when known.
+    -- Supplied as node metadata, so it may be absent.
+    address: String?
+    -- When this node last proved liveness.
+    last_heartbeat_at: Timestamp
+
+    -- The tenant leases this node currently owns.
+    leases: Lease with owner = this
+
+    -- A node is live while its last heartbeat is recent enough. Staleness is
+    -- observed at read time: a node that goes silent past the threshold is
+    -- simply treated as not live (and its work reassigned), but the node
+    -- remains and becomes live again the moment it heartbeats.
+    is_live: now - last_heartbeat_at < config.staleness_threshold
+}
+
+-- Ownership of a single domain tenant by a single node. A lease exists while a
+-- node is responsible for processing that tenant's events. Acquiring a lease
+-- makes the node the sole processor for the tenant; releasing it hands the
+-- tenant back for reassignment.
+entity Lease {
+    tenant: Tenant
+    owner: Node
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A node joins the cluster by announcing itself with optional address metadata.
+-- This is the same underlying fact as a heartbeat — the first heartbeat keyed
+-- by a node's identity creates it; later heartbeats keep it alive.
+rule NodeJoins {
+    when: NodeStarts(address?)
+    ensures:
+        Node.created(address: address, last_heartbeat_at: now)
+        ReassignmentNeeded()
+}
+
+-- A live node periodically proves it is still alive. A node that had gone stale
+-- becomes live again as soon as it heartbeats.
+rule NodeHeartbeat {
+    when: NodeSendsHeartbeat(node)
+    ensures: node.last_heartbeat_at = now
+}
+
+-- A node leaves the cluster gracefully. It gives up its leases immediately so
+-- its tenants can be reassigned without waiting for the staleness timeout.
+rule NodeDeparts {
+    when: NodeStops(node)
+    ensures:
+        for lease in node.leases:
+            not exists lease
+        not exists node
+        ReassignmentNeeded()
+}
+
+-- A node silent longer than the staleness threshold is presumed dead, so its
+-- tenants are reassigned to live nodes. The node entity is NOT removed (it may
+-- revive via a later heartbeat); the leases-held guard is a spec-level guard
+-- against re-firing once its leases have moved away, not a precondition the
+-- implementation enforces.
+rule NodePresumedDead {
+    when: node: Node.last_heartbeat_at + config.staleness_threshold <= now
+    requires: node.leases.count > 0
+    ensures: ReassignmentNeeded()
+}
+
+-- A newly created domain tenant must be assigned to a node.
+rule TenantAppears {
+    when: tenant: Tenant.created
+    ensures: ReassignmentNeeded()
+}
+
+-- The coordinator reconciles leases toward the desired assignment: every domain
+-- tenant owned by exactly one live node, balanced per the strategy. A tenant
+-- whose current owner differs from the desired owner (because a node joined,
+-- departed or died) is moved; a tenant with no live node to host it is released.
+rule ReconcileLeases {
+    when: ReassignmentNeeded()
+
+    -- Tenants is the set of domain tenants only; the reserved control-plane
+    -- coordination tenant is not a Tenant instance and so is never assigned.
+    let live_nodes = Nodes where is_live
+    let all_tenants = Tenants
+
+    for tenant in all_tenants:
+        let desired_owner = assigned_owner(tenant, all_tenants, live_nodes, config.strategy)
+        ensures:
+            -- The tenant ends owned by exactly the desired live node: any
+            -- existing lease is released and the desired one acquired. A tenant
+            -- with no live node to host it is left unowned.
+            not exists Lease{tenant: tenant}
+            if exists desired_owner:
+                Lease.created(tenant: tenant, owner: desired_owner)
+
+    @guidance
+        -- Reconciliation is performed by a single node, the coordinator: the
+        -- oldest live node, chosen deterministically with no election protocol
+        -- (smallest identity wins). Because assigned_owner is pure and
+        -- deterministic, any node would compute the same result, so a brief
+        -- disagreement about who the coordinator is cannot corrupt the
+        -- assignment (CP1, CP3, CP4).
+        --
+        -- Rebalancing on join works precisely because reconciliation recomputes
+        -- the desired owner for EVERY tenant over the current live set: a new
+        -- node takes a balanced share off existing nodes, not merely the
+        -- unowned tenants.
+        --
+        -- The ReassignmentNeeded() emissions are a logical signal. The
+        -- implementation does not emit a real event per change (TenantAppears in
+        -- particular has no direct code path); instead a periodic loop on each
+        -- node recomputes the assignment when that node is the coordinator, and
+        -- only emits the diff between current and desired leases rather than
+        -- releasing and reacquiring unchanged ones.
+}
+
+-- A request for a tenant must be handled by the node that owns the tenant's
+-- lease. If a different node receives it, the request is redirected to the
+-- owner; if the owner is unreachable (stale) or there is no owner yet, the
+-- receiving node serves it in a degraded mode rather than failing.
+rule RouteRequest {
+    when: TenantRequestReceived(host, tenant)
+    let lease = Lease{tenant: tenant}
+    ensures:
+        if exists lease:
+            if lease.owner = host:
+                RequestServedByOwner(host: host, tenant: tenant)
+            else if lease.owner.is_live:
+                RequestRedirected(host: host, tenant: tenant, to_address: lease.owner.address)
+            else:
+                RequestServedDegraded(host: host, tenant: tenant)
+        else:
+            RequestServedDegraded(host: host, tenant: tenant)
+
+    @guidance
+        -- The redirect is a local "serve here vs send to the owner" decision,
+        -- not a transport-level redirect; the caller retries against to_address,
+        -- which may be absent when the owner published no address (then it is a
+        -- plain retry signal). Both degraded cases — a presumed-dead owner and
+        -- no owner yet — serve locally. When served by the true owner, the
+        -- caller is pinned to that node for subsequent requests (load-balancer
+        -- stickiness); during degraded service no pinning happens, so callers
+        -- can find the real owner once the lease settles.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- CP1: a tenant is owned by at most one node at any time. Preserved even under
+-- concurrent coordinators because assigned_owner is deterministic (see the
+-- AssignmentPolicy.AssignmentDeterminism contract invariant).
+invariant OneLeasePerTenant {
+    for a in Leases:
+        for b in Leases:
+            a != b implies a.tenant != b.tenant
+}
+
+-- The eventual / behavioural conformance properties not expressible as a single
+-- point-in-time state assertion are homed in the contracts and surfaces above
+-- (see the CP map in the file header). The two that remain purely descriptive:
+--
+--   CP2 completeness holds "exactly one live node" only when at least one live
+--        node exists; with no live node a tenant is left unowned (see
+--        ReconcileLeases). The AssignmentPolicy contract states the with-nodes
+--        guarantee.
+--   CP5 failover liveness — when a node departs or dies, its tenants are picked
+--        up by the remaining live nodes (rules NodeDeparts / NodePresumedDead
+--        emit ReassignmentNeeded; ReconcileLeases moves them).
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary a node's runtime drives: proving liveness and leaving cleanly.
+surface NodeLifecycle {
+    facing node: Node
+
+    exposes:
+        node.address
+        node.is_live
+
+    provides:
+        NodeSendsHeartbeat(node)
+        NodeStops(node)
+}
+
+-- The cluster-wide coordination boundary this spec fulfils.
+surface ClusterCoordination {
+    facing host: Node
+
+    contracts:
+        fulfils AssignmentPolicy
+
+    @guarantee TenantIsolation
+        -- CP8: control-plane coordination state lives under a reserved tenant
+        -- and is never assigned to a node; the domain tenants' event streams and
+        -- the control-plane event stream never share a tenant and never mix.
+}
+
+-- Each node hosts a processing runtime that the control plane drives.
+surface NodeProcessing {
+    facing host: Node
+    context lease: Lease where owner = host
+
+    exposes:
+        lease.tenant
+
+    contracts:
+        demands ProcessingHandoff
+
+    @guarantee ProcessesOnlyOwnedTenants
+        -- A node processes events for exactly the tenants it currently holds
+        -- leases for; when a lease moves, the old owner stops and the new owner
+        -- starts, relying on ProcessingHandoff for a clean cutover.
+}
+
+-- The boundary where a caller's tenant-scoped request meets the cluster.
+surface TenantRequestRouting {
+    facing host: Node
+    context tenant: Tenant
+
+    provides:
+        TenantRequestReceived(host, tenant)
+
+    @guarantee ServedByOwnerOrRedirected
+        -- A request for a tenant is served by the node that owns its lease, or
+        -- redirected to that owner. When the owner is unreachable (stale or
+        -- unassigned) the receiving node serves it in a degraded mode rather
+        -- than failing.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "When a domain tenant is deleted, should its lease be released explicitly, or is silent reconciliation (no desired owner) sufficient?"
+open question "During a network partition two nodes may each believe they are coordinator. Deterministic assignment plus checkpoint fencing keep this safe, but should the spec model partition explicitly?"
+open question "A stale node that revives via heartbeat should trigger rebalancing. Is the periodic reconciliation loop the intended mechanism, or should revival emit an explicit signal?"

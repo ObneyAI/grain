@@ -1,0 +1,337 @@
+-- allium: 3
+-- command-processor.allium
+--
+-- Distilled from components/command-processor (grain).
+--
+-- NOTE: this component is the DEPRECATED v1 command processor
+-- (superseded by command-processor-v2). The spec captures the behaviour
+-- the v1 code and its test suite actually prove, so the guarantees can be
+-- compared against the successor.
+--
+-- Scope: The write side of CQRS. A command names an intent; the processor
+--        looks up a registered handler for that name, validates the command
+--        against a schema, runs the handler, and (when the handler produced
+--        events) appends those events to the tenant's event store. Commands
+--        are the ONLY path to state change: handlers do not mutate state
+--        directly, they emit immutable events.
+--
+-- Includes: handler registration and lookup, command schema validation,
+--           handler outcome classification (result / events / anomaly / nil
+--           / thrown), atomic event submission to the store, and the
+--           skip-storage composition mechanism by which a parent command
+--           aggregates a child command's events and stores them exactly once.
+--
+-- Excludes (implementation / governed elsewhere):
+--   - the event store itself: append durability, ordering, serialization
+--     and tenant scoping are the event-store component's guarantees
+--     (modelled here only as the EventLog contract the processor demands)
+--   - what any individual domain command means (business rules live in the
+--     domain specs that register handlers, not here)
+--   - the registry's storage form (a global atom vs. a per-call map) and the
+--     macro that generates handler functions — framework mechanics
+--   - logging, tracing and metrics
+--   - the read side (queries, projections, read-models)
+--   - the on-the-wire shape of a command and the keyword/anomaly value types
+--
+-- Authorization note: the registration mechanism carries an `:authorized?`
+--   opt alongside each handler, but THIS component does not evaluate it; the
+--   processor dispatches on name and schema alone. Deny-by-default
+--   authorization is enforced by the request handler that sits in front of
+--   the processor, not here. Recorded as an open question.
+
+-- Tenancy note: every command is processed against exactly one tenant's
+--   event store. The tenant and the store are governed by the event-store /
+--   control-plane components, not by this one; the processor only writes a
+--   handler's events to the store it was handed. That scoping is recorded as
+--   the EventLog.TenantScoped contract invariant rather than as entities here,
+--   so the boundary's guarantee is captured without claiming ownership of a
+--   tenant or store lifecycle this component does not manage.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- An immutable fact a handler asks to record. Its internal shape (type, tags,
+-- body) is the event store's concern; here an event is an opaque unit that is
+-- either stored or not. The processor never inspects an event, so it carries no
+-- fields at this altitude.
+value Event {}
+
+-- The reply to processing a command. A handler yields one of four outcomes,
+-- and the processor maps store failures onto a fifth. Modelled as a value
+-- because a command result has no identity or lifecycle — it is the return of
+-- a single processing attempt.
+value CommandResult {
+    outcome: ProcessingOutcome
+    -- The events the handler asked to record, empty when it recorded none.
+    events: Set<Event>
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The append-only event log the processor writes to. The processor DEMANDS
+-- this so that recording a handler's events is an all-or-nothing operation
+-- against the correct tenant's store.
+contract EventLog {
+    -- Append a batch of events to the store the command was processed against.
+    append: (events: Set<Event>) -> Any
+
+    @invariant AtomicAppend
+        -- A batch either lands in full or not at all. A handler's events are
+        -- never partially recorded; a partial or failed append is surfaced to
+        -- the processor as a failure rather than silently dropping events.
+
+    @invariant TenantScoped
+        -- Events are appended to the store of the tenant the command was
+        -- processed for, and to no other tenant's log. The processor never
+        -- chooses or crosses tenants; it writes only to the store it was
+        -- handed for this command.
+}
+
+-- The pure decision a registered handler makes. Handlers do not touch
+-- storage; they read context, apply business rules and return an intended
+-- outcome. The processor DEMANDS that a handler behaves like this so the
+-- store side stays the processor's responsibility alone.
+contract CommandHandler {
+    -- Decide what should happen for a validated command.
+    handle: (command: Command) -> CommandResult
+
+    @invariant EmitsEventsNotState
+        -- A handler never mutates state directly. The only way it changes the
+        -- system is by returning events for the processor to record; commands
+        -- are the sole path to state change in CQRS.
+
+    @invariant NonNullResult
+        -- A handler must return an outcome. Returning nothing is treated by
+        -- the processor as a fault, never as success.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How a single processing attempt ended. `succeeded` covers both a plain
+-- result and a result that recorded events; the failure values mirror the
+-- anomaly categories the processor returns and preserves.
+enum ProcessingOutcome {
+    succeeded
+    unknown_command
+    invalid_command
+    rejected
+    fault
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A registered command name bound to a handler. Registration makes a name
+-- processable; without it a command for that name is unknown. The handler is
+-- modelled by the CommandHandler contract; `authorized` records that an
+-- authorization predicate is carried alongside the registration even though
+-- this component does not evaluate it.
+entity HandlerRegistration {
+    -- The qualified command name this registration answers to. Unique across
+    -- the registry (see UniqueRegistration).
+    name: String
+    -- Whether an authorization predicate was supplied at registration time.
+    -- Carried as metadata; not enforced by the processor.
+    authorized: Boolean
+}
+
+-- A request to change state: an intent named by a qualified command name,
+-- carrying a unique id and the moment it was issued, plus whatever
+-- command-specific parameters its own schema declares. A command is well-formed
+-- only when the common envelope (name, id, timestamp) is present and correctly
+-- typed AND the command's own named schema accepts it. Each command is processed
+-- against a single tenant's store (see the EventLog contract); that scoping is
+-- the store's concern, not a field here.
+entity Command {
+    -- The qualified command name; selects which handler runs and which
+    -- command-specific schema validates the command's parameters.
+    name: String
+    -- A unique identifier for this command instance.
+    id: String
+    -- When the command was issued.
+    issued_at: Timestamp
+
+    -- The registration this command's name resolves to, if any.
+    registration: HandlerRegistration with name = this.name
+
+    -- The outcome of running the registered handler for this command. Present
+    -- once the handler has been invoked; absent until then. Typed by the value
+    -- the CommandHandler contract produces.
+    handler_result: CommandResult?
+
+    -- Well-formed iff the command passes schema validation. Validation has two
+    -- parts: the common envelope (id and timestamp present and correctly typed)
+    -- and the command's own name-keyed schema (its declared parameters present
+    -- and correctly typed). Both must pass for the handler to run; the
+    -- per-command part of validation is a black box keyed by the command name.
+    is_well_formed: id != null and issued_at != null and schema_valid(this)
+
+    -- Recognised iff some handler is registered for the name.
+    is_recognised: registration != null
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- When set, a command's events are returned to the caller but NOT appended
+    -- by this processing attempt. Used to compose commands: a parent runs a
+    -- child with storage skipped, collects the child's events and appends them
+    -- once itself, so the events are stored exactly once (by the parent).
+    skip_event_storage: Boolean = false
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A command for an unregistered name is rejected as unknown before any
+-- validation or handler runs. Lookup precedes schema checking, so a command
+-- whose name is missing or mistyped also lands here.
+rule UnknownCommand {
+    when: ProcessCommand(command)
+    requires: not command.is_recognised
+    ensures: CommandRejected(command: command, outcome: unknown_command)
+}
+
+-- A recognised command that fails schema validation is rejected as invalid; the
+-- handler does not run. Validation covers both the common envelope (a missing or
+-- mistyped id or timestamp) and the command's own name-keyed schema (a missing
+-- or mistyped command-specific parameter). The caller receives a human-readable
+-- explanation of what was wrong.
+rule InvalidCommand {
+    when: ProcessCommand(command)
+    requires:
+        command.is_recognised
+        not command.is_well_formed
+    ensures: CommandRejected(command: command, outcome: invalid_command)
+}
+
+-- A recognised, well-formed command runs its handler. The handler's outcome
+-- is passed back unchanged; in particular a handler that declines (returns an
+-- anomaly) is surfaced with its own category preserved, and a handler that
+-- returns nothing is a fault. No events are recorded by this rule — event
+-- storage is a separate, subsequent step (see RecordHandlerEvents).
+rule ExecuteCommand {
+    when: ProcessCommand(command)
+    requires:
+        command.is_recognised
+        command.is_well_formed
+    ensures: CommandHandled(command: command, result: command.handler_result)
+
+    @guidance
+        -- The handler is given a context (the command plus ambient
+        -- dependencies) and returns one of: a plain result (succeeded with no
+        -- events), a result carrying events (succeeded), an anomaly (rejected,
+        -- preserving the anomaly's category and any extra context fields), or
+        -- nothing/an exception (fault). The processor classifies the return;
+        -- it does not interpret the handler's business logic. `handler_result`
+        -- denotes the outcome the CommandHandler contract produces for this
+        -- command.
+}
+
+-- When a handled command yielded events and storage is not being skipped, the
+-- events are appended atomically to its tenant's store. If the append fails,
+-- the whole attempt is a fault and the events are reported as not recorded
+-- (the batch is all-or-nothing per the EventLog contract).
+rule RecordHandlerEvents {
+    when: CommandHandled(command, result)
+    requires:
+        result.outcome = succeeded
+        result.events.count > 0
+        not config.skip_event_storage
+    ensures: EventsRecorded(command: command, events: result.events)
+}
+
+-- A command processed with storage skipped returns its events to the caller
+-- without appending them. The caller (typically a parent command) is then
+-- responsible for recording them. This is the composition primitive that lets
+-- a parent aggregate a child's events and store them exactly once.
+rule SkipEventStorage {
+    when: CommandHandled(command, result)
+    requires:
+        result.outcome = succeeded
+        result.events.count > 0
+        config.skip_event_storage
+    ensures: EventsDeferred(command: command, events: result.events)
+
+    @guidance
+        -- A parent handler invokes a child command with skip_event_storage set,
+        -- takes the child's deferred events into its own result, and lets its
+        -- own (non-skipped) processing append them. The events therefore reach
+        -- the store once, written by the outermost non-skipping processor.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A command name resolves to at most one handler: registry lookup is
+-- unambiguous, so processing is deterministic in which handler runs.
+invariant UniqueRegistration {
+    for a in HandlerRegistrations:
+        for b in HandlerRegistrations:
+            a != b implies a.name != b.name
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The write boundary: a caller submits a command and receives a classified
+-- outcome. The processor fulfils dispatch + validation + storage; it demands a
+-- well-behaved handler and an atomic, tenant-scoped event log. The boundary
+-- faces the command itself — the caller's identity is not checked here (see
+-- the authorization open question), so any submitted command is a party.
+surface CommandSubmission {
+    facing command: Command
+
+    exposes:
+        command.name
+        command.is_recognised
+        command.is_well_formed
+
+    provides:
+        ProcessCommand(command)
+
+    contracts:
+        demands CommandHandler
+        demands EventLog
+
+    @guarantee SingleWritePath
+        -- The only way a submitted command changes system state is by its
+        -- handler returning events that this processor appends. A handler that
+        -- returns no events leaves the store untouched.
+
+    @guarantee OutcomePreserved
+        -- Every attempt yields exactly one classified outcome: succeeded,
+        -- unknown_command, invalid_command, rejected (the handler's own
+        -- anomaly, category and context preserved) or fault (handler returned
+        -- nothing, threw, or the append failed).
+
+    @guarantee AtMostOnceStorage
+        -- A handler's events are appended at most once. Under skip-storage
+        -- composition the child defers its events and the parent appends them,
+        -- so a composed command's events are stored exactly once, by the
+        -- outermost non-skipping processor.
+
+    @guidance
+        -- Lookup precedes validation: an unknown name short-circuits to
+        -- unknown_command before the schema is checked, which is why a command
+        -- with a missing or mistyped name reports unknown rather than invalid.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The registry carries an :authorized? predicate per handler, but the v1 processor never evaluates it. Should authorization be a guarantee of this component, or is it correctly delegated entirely to the request handler in front of it (as the code implies)?"
+open question "Under skip-storage composition, if the child succeeds but the parent's own append later fails, the child's already-deferred events are discarded with the parent's fault. Is parent-level atomicity across aggregated children a guarantee the component should make, or is it the caller's responsibility?"
+open question "This is the deprecated v1 processor. Should this spec be retired in favour of a command-processor-v2 spec, or kept as the documented baseline the successor must not regress against?"

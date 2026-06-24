@@ -1,0 +1,447 @@
+-- allium: 3
+-- event-store-v3.allium
+--
+-- Distilled from components/event-store-v3 (grain).
+--
+-- Scope: The append-only, tenant-scoped event store at the heart of grain's
+--        event-sourced CQRS model. Commands append immutable events; everything
+--        else reads them back as an ordered stream. This spec captures the
+--        store's behavioural guarantees: what an append durably records, how
+--        events are identified and ordered, how reads are filtered and merged,
+--        how a conditional (compare-and-swap) append decides whether to commit,
+--        and how tenants are kept isolated.
+--
+-- Includes: event identity and time-ordering; the atomic append of an event
+--           batch together with its transaction marker and per-tenant
+--           high-watermark; filtered and reversed/limited streaming reads;
+--           batch reads (union, dedup, ordering); conditional CAS append;
+--           tenant isolation; serialization round-trip; deny-by-default
+--           argument and schema validation; tenant-tagged publication of
+--           appended events.
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the storage backend itself (in-memory ref, SQLite, Postgres are
+--     interchangeable; the projects/ wire up concrete backends)
+--   - serialization / wire format (Fressian, EDN encoding) — only the
+--     round-trip guarantee is specified, not the encoding
+--   - the reducible / streaming mechanism (IReduce, transducers, laziness):
+--     a behavioural detail of how a read is consumed, not what it returns
+--   - UUID v7 generation internals and clock source (time component)
+--   - the pubsub transport (core.async topics) — only that appended events
+--     are published carrying the tenant id
+--   - threads, connection pools, logging and metrics
+--
+-- Conformance properties ES1..ES9 correspond to the in-memory test suite
+-- (in_memory_test.clj). Where each is captured:
+--   ES1 round-trip          -> contract EventCodec.Roundtrip
+--   ES2 tx marker + metadata -> rule AppendBatch + invariant TxMarkerNamesRealEvents
+--   ES3 high-watermark       -> rule AppendBatch (tenant.last_event_id)
+--   ES4 id time-ordering     -> contract EventStream.AscendingByEventId
+--   ES5 read filtering       -> contract EventStream (read signature) + surface
+--   ES6 batch union/dedup    -> contract EventStream.BatchUnionDeduplicated
+--   ES7 CAS                  -> rules CasAppendCommits / CasAppendRejected
+--   ES8 tenant isolation     -> invariant TenantScoped + surface guarantee
+--   ES9 publication          -> rule AppendBatch + surface @guarantee
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A time-ordered event identifier (UUID v7). Identity is global and monotonic:
+-- a later-appended event always has a greater id than an earlier one, so the id
+-- doubles as the total order over a tenant's stream.
+value EventId {
+    -- The embedded creation time that gives the id its ordering. Two ids
+    -- compare in the same direction as the times they were minted at.
+    minted_at: Timestamp
+}
+
+-- A tag attaching an event to a domain entity: the entity's type and its id.
+-- Reads filter by requiring a query's tags to all be present on an event.
+value EventTag {
+    entity_type: String
+    entity_id: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The serialization guarantee. An event's type, tags and arbitrary body data
+-- survive a store-and-read cycle unchanged. The encoding is an implementation
+-- choice; only the round-trip identity is promised.
+contract EventCodec {
+    serialize: (event: Event) -> ByteArray
+    deserialize: (bytes: ByteArray) -> Event
+
+    @invariant Roundtrip
+        -- ES1: deserialize(serialize(event)) reproduces the event exactly —
+        -- its id, type, timestamp, tag set and every body field (strings,
+        -- numbers, keywords, nested maps, vectors, booleans and explicit nils),
+        -- with no loss and no added fields.
+
+    @guidance
+        -- The body is an open map of caller-defined data. The store does not
+        -- interpret it beyond preserving it, so new body shapes need no change
+        -- to the store.
+}
+
+-- The read side of the store: an ordered, filtered, streaming view over a
+-- tenant's committed events. These are properties of the function that returns
+-- the stream, not of stored entity state, so they live as contract invariants.
+contract EventStream {
+    -- A single filtered read over one tenant's stream.
+    read: (query: ReadQuery) -> Sequence<Event>
+    -- A batch of reads over one tenant, merged into a single stream.
+    read_batch: (queries: Set<ReadQuery>) -> Sequence<Event>
+
+    @invariant TenantScoped
+        -- ES8: every read carries a tenant id and returns only that tenant's
+        -- events. There is no cross-tenant read; in a batch all queries must
+        -- name the same tenant.
+
+    @invariant AscendingByEventId
+        -- ES4/ES5: results are ordered by event id ascending (oldest first),
+        -- which is also chronological order. A reversed read yields the same
+        -- set in descending id order; a limited read caps the count, taking
+        -- from whichever end the order selects (oldest by default, newest when
+        -- reversed).
+
+    @invariant SubsetTagAndTypeMatch
+        -- ES5: an event matches a query's tags only if it carries all of them
+        -- (subset match), and matches a query's types only if its type is among
+        -- them. With neither tags nor types, every event for the tenant
+        -- matches. The as-of bound keeps events up to and including a given id;
+        -- the after bound keeps events strictly past a given id; the two bounds
+        -- are mutually exclusive within one query.
+
+    @invariant BatchUnionDeduplicated
+        -- ES6: a batch read returns the union of its per-query results, with
+        -- each event appearing at most once even if several queries select it,
+        -- and the whole merged result ordered by event id ascending. A batch
+        -- read is always ascending and unbounded: the reverse and limit
+        -- modifiers shape only single-query reads and have no effect on a batch.
+
+    @invariant NoInternalLeakage
+        -- ES8: the tenant-scoping marker the store attaches internally is never
+        -- present on events returned to a reader.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The kinds of event the store distinguishes. A domain event carries
+-- caller-defined data; the transaction marker is synthesised by the store to
+-- record the boundary of an append batch.
+enum EventKind { domain | transaction_marker }
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Whether appended events are published to subscribers as they commit.
+    -- When publication is enabled, each event is announced carrying its
+    -- tenant id; the stored copy never carries it (see AppendBatch).
+    publish_on_append: Boolean = true
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The store's record of a tenant. A tenant's domain identity originates outside
+-- the store (the control plane decides which node owns it), but the store keeps
+-- a row per tenant the first time events are committed under its id, and that
+-- row holds the durable high-watermark. Every operation is scoped to exactly
+-- one tenant; this entity is the isolation boundary.
+entity Tenant {
+    -- The id of the most recent event committed for this tenant: a durable
+    -- high-watermark advanced on every successful append. Absent until the
+    -- first event is committed.
+    last_event_id: EventId?
+
+    -- Every event committed under this tenant.
+    events: Event with tenant = this
+}
+
+-- An immutable fact committed to a tenant's stream. Events are never updated or
+-- deleted; the store is append-only. An event's id fixes both its identity and
+-- its position in the total order.
+entity Event {
+    id: EventId
+    tenant: Tenant
+    kind: EventKind
+    -- The domain meaning of the event (a qualified name such as
+    -- :order/placed). Always present; the store does not enumerate the set.
+    event_type: String
+    -- When the event was minted.
+    timestamp: Timestamp
+    -- The entities this event concerns; reads filter on these.
+    tags: Set<EventTag>
+    -- For a transaction marker only: the ids of the domain events committed in
+    -- the same batch, and the optional caller-supplied transaction metadata.
+    batch_event_ids: Set<EventId> when kind = transaction_marker
+    metadata: Metadata? when kind = transaction_marker
+
+    transitions kind {
+        terminal: domain, transaction_marker
+    }
+}
+
+------------------------------------------------------------
+-- Value Types (transaction metadata and read query)
+------------------------------------------------------------
+
+-- Caller-supplied transaction annotations, preserved verbatim on the
+-- transaction marker that closes an append batch. The store does not interpret
+-- them; their shape is open (a note shown here only as an example field).
+value Metadata {
+    note: String?
+}
+
+-- A description of which of a tenant's events to return. All fields beyond the
+-- tenant are optional filters; an empty query (just the tenant) returns the
+-- whole stream in order.
+value ReadQuery {
+    tenant: Tenant
+    -- Keep only events carrying all of these tags.
+    tags: Set<EventTag>?
+    -- Keep only events whose type is one of these.
+    types: Set<String>?
+    -- Keep events up to and including this id (mutually exclusive with after).
+    as_of: EventId?
+    -- Keep events strictly after this id (mutually exclusive with as_of).
+    after: EventId?
+    -- Return newest-first instead of oldest-first.
+    reverse: Boolean
+    -- Cap the number of events returned.
+    limit: Integer?
+
+    -- A query is well-formed only when it does not bound by both ends at once.
+    has_single_bound: as_of = null or after = null
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Appending a batch of domain events. The store commits all of them atomically
+-- together with a single transaction marker that records their ids and any
+-- caller metadata, and advances the tenant's high-watermark to the marker's id.
+-- Each domain event is also published (when publication is enabled) carrying
+-- the tenant id, while the stored copy stays tenant-clean.
+rule AppendBatch {
+    when: AppendEvents(tenant, events, metadata?)
+
+    requires:
+        -- Deny-by-default: every event must carry a type the store has a
+        -- registered schema for, and conform to that schema (and to the common
+        -- event shape), or the whole batch is rejected before anything commits.
+        -- An unrecognised type or a malformed event fails the batch as a whole.
+        events.all(e => has_registered_schema(e.event_type) and conforms_to_schema(e))
+
+    ensures:
+        let marker = Event.created(
+            tenant: tenant,
+            kind: transaction_marker,
+            event_type: tx_marker_type(),
+            timestamp: now,
+            tags: {},
+            batch_event_ids: event_ids(events),
+            metadata: metadata
+        )
+        for e in events:
+            Event.created(
+                tenant: tenant,
+                kind: domain,
+                event_type: e.event_type,
+                timestamp: e.timestamp,
+                tags: e.tags
+            )
+        -- The durable high-watermark advances to the marker that closed this
+        -- batch.
+        tenant.last_event_id = marker.id
+        if config.publish_on_append:
+            for e in events:
+                EventCommitted(tenant: tenant, event: e)
+
+    @guidance
+        -- The batch and its marker land in one atomic commit, so a reader never
+        -- sees a partial batch and concurrent appenders never interleave within
+        -- a batch. Publication announces each event with its tenant id attached;
+        -- the stored and read-back event never carries that tenant marker
+        -- (contract EventStream.NoInternalLeakage).
+}
+
+-- A conditional (compare-and-swap) append. The caller supplies a predicate and
+-- a filter; the store reads the current events matching that filter for the
+-- tenant, and commits the new events only if the predicate accepts them.
+-- Unlike a plain append, a CAS commit records no transaction marker.
+rule CasAppendCommits {
+    when: CasAppend(tenant, events, filter, predicate)
+    let current = matching_events(tenant, filter)
+    requires:
+        -- Same deny-by-default gate as a plain append: malformed or
+        -- unrecognised events fail before the predicate is even consulted.
+        events.all(e => has_registered_schema(e.event_type) and conforms_to_schema(e))
+        accepts(predicate, current)
+    ensures:
+        for e in events:
+            Event.created(
+                tenant: tenant,
+                kind: domain,
+                event_type: e.event_type,
+                timestamp: e.timestamp,
+                tags: e.tags
+            )
+        let last_appended = ordered_last(events)
+        tenant.last_event_id = last_appended.id
+        if config.publish_on_append:
+            for e in events:
+                EventCommitted(tenant: tenant, event: e)
+
+    @guidance
+        -- The predicate sees exactly the events matching the filter for this
+        -- tenant — the same subset a read with that filter would return — so a
+        -- caller can enforce optimistic-concurrency conditions ("commit only if
+        -- no event of this type has appeared since X") atomically with the
+        -- append.
+}
+
+-- The CAS predicate rejected the proposed events. Nothing is committed and the
+-- caller is told the append conflicted; the stream is left exactly as it was.
+rule CasAppendRejected {
+    when: CasAppend(tenant, events, filter, predicate)
+    let current = matching_events(tenant, filter)
+    requires: not accepts(predicate, current)
+    ensures: AppendConflicted(tenant: tenant)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- ES8: every event belongs to exactly one tenant and is only ever read within
+-- that tenant's scope. Two events with the same id cannot belong to different
+-- tenants — id identity does not cross the tenant boundary.
+invariant TenantScoped {
+    for a in Events:
+        for b in Events:
+            (a != b and a.id = b.id) implies a.tenant = b.tenant
+}
+
+-- ES2: a transaction marker records the ids of the domain events it closed.
+-- Every id it names is the id of a real event in the same tenant's stream.
+invariant TxMarkerNamesRealEvents {
+    for m in Events:
+        m.kind = transaction_marker implies
+            m.batch_event_ids.all(id => Events.any(e => e.id = id and e.tenant = m.tenant))
+}
+
+-- ES3: once a tenant has any committed event, its high-watermark is set; a
+-- tenant with no events has none.
+invariant WatermarkPresentWhenNonEmpty {
+    for t in Tenants:
+        t.events.count > 0 implies t.last_event_id != null
+}
+
+-- The caller's transaction annotations are carried only by the marker that
+-- closes a batch (the field is marker-only by construction, so domain events
+-- never carry it). When a caller supplies metadata it is preserved verbatim on
+-- the marker; when none is supplied the marker carries none — the store never
+-- interprets or invents it.
+invariant MetadataPreservedVerbatim {
+    for m in Events:
+        m.kind = transaction_marker implies
+            (m.metadata = null or is_verbatim_metadata(m.metadata))
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The code on the other side of the store boundary is a program, not a person:
+-- command handlers that append, and projectors / processors that read. Every
+-- caller is scoped to exactly one tenant, so the surfaces face the Tenant the
+-- caller operates on directly.
+
+-- The append boundary: how a caller commits new facts for a tenant. The caller
+-- is tenant-scoped code (a command handler), so it both is the party and names
+-- the tenant it operates on.
+surface EventAppend {
+    facing tenant: Tenant
+
+    exposes:
+        tenant.last_event_id
+
+    provides:
+        AppendEvents(tenant, events, metadata?)
+        CasAppend(tenant, events, filter, predicate)
+
+    contracts:
+        demands EventCodec
+
+    @guarantee AtomicBatchCommit
+        -- A batch of events and its transaction marker commit together or not
+        -- at all; a reader never observes a partial batch, and concurrent
+        -- appenders never interleave within a batch.
+
+    @guarantee ConditionalAppendIsAtomic
+        -- A CAS append evaluates the predicate against the current matching
+        -- events and commits the new events in one atomic step, so the
+        -- condition cannot be invalidated between the check and the commit.
+
+    @guarantee DenyByDefault
+        -- Events whose type has no registered schema, and malformed arguments,
+        -- are rejected before anything is committed.
+}
+
+-- The read boundary: how a caller streams a tenant's events back.
+surface EventRead {
+    facing tenant: Tenant
+
+    exposes:
+        tenant.last_event_id
+
+    provides:
+        ReadStream(tenant, query)
+        ReadBatch(tenant, queries)
+
+    contracts:
+        demands EventCodec
+        fulfils EventStream
+
+    @guarantee TenantIsolation
+        -- ES8: a read returns only the requesting tenant's events and never
+        -- leaks another tenant's events or the store's internal tenant marker,
+        -- including across the queries of a batch read.
+
+    @guarantee OrderedByEventId
+        -- ES4: events stream in event-id order — chronological, oldest first,
+        -- or newest first when the read is reversed.
+}
+
+-- The administrative boundary: an operator-side caller enumerating every tenant
+-- the store knows about together with its durable high-watermark. Unlike a read,
+-- this is not an event stream and is not scoped to a single tenant; it surveys
+-- all tenant rows at once. It never returns any tenant's events.
+surface StoreAdministration {
+    exposes:
+        for t in Tenants:
+            t.last_event_id
+
+    @guarantee WatermarkSurveyOnly
+        -- The survey reports each tenant's high-watermark and nothing more: no
+        -- event bodies, no cross-tenant event read. It reads committed state
+        -- without taking part in any append or read transaction.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "A plain append records a transaction marker but a CAS append does not. Should CAS appends also be marker-bracketed, or is the absence of a marker the intended signal that the batch was conditional?"
+open question "The high-watermark is advanced to the transaction marker on a plain append but to the last domain event on a CAS append. Should both advance to the same kind of boundary so consumers reading the watermark see a uniform reference point?"
+open question "Tenants come into existence implicitly on first append. Should tenant lifecycle (creation, retirement, deletion of an entire stream) be modelled here or remain wholly outside the store?"

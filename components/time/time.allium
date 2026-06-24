@@ -1,0 +1,118 @@
+-- allium: 3
+-- time.allium
+--
+-- Distilled from components/time (grain).
+--
+-- Scope: The system clock. A single source of the current instant, plus two
+--        helpers that construct an instant from an external representation (an
+--        ISO-8601 string, or epoch milliseconds). Every timestamp the rest of
+--        grain reasons about — event recording times, checkpoint times, lease
+--        staleness — ultimately originates here.
+--
+-- Classification: INFRASTRUCTURE / thin plumbing. This component owns no domain
+--        model, no entities, no lifecycle and no workflow. Its entire surface is
+--        a clock and a parser. The spec is deliberately brief: a single Clock
+--        contract carrying the only properties that genuinely hold (a current
+--        instant is produced, and parsing then re-reading an instant is faithful
+--        to its source). The component has no test suite, so no guarantee here
+--        is claimed as test-proven; the properties are read from the
+--        implementation and the contract its callers depend on.
+--
+-- Includes:
+--   - now: a reading of the current instant, carrying a zone offset
+--   - from_iso / from_epoch_millis: constructing an instant from an external
+--     form, and the fidelity of that construction (the instant denotes the same
+--     point in time as its source)
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the underlying date-time library and its types
+--   - the wire / string format of timestamps (ISO-8601 layout, epoch encoding)
+--   - which zone offset a result carries: every result is rendered under the
+--     host's default zone (the JVM default zone on Clojure, UTC on ClojureScript),
+--     independent of any offset the source carried. The offset is a rendering
+--     detail, not a behavioural promise — only the moment is guaranteed
+--   - monotonicity, resolution, drift and clock-skew across nodes: this clock
+--     reflects wall time and makes no ordering or monotonicity promise; any code
+--     needing those (e.g. checkpoint fencing) establishes them elsewhere
+--   - which callers read the clock, and why
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The clock boundary the rest of grain depends on. now reads the present
+-- instant; from_iso and from_epoch_millis construct an instant from an external
+-- representation. All three yield a timestamp; none has side effects beyond
+-- reading the wall clock in now's case.
+contract Clock {
+    -- Read the current instant. Volatile: successive reads advance.
+    now: () -> Timestamp
+    -- Construct an instant from an ISO-8601 string.
+    from_iso: (text: String) -> Timestamp
+    -- Construct an instant from epoch milliseconds.
+    from_epoch_millis: (millis: Integer) -> Timestamp
+
+    @invariant CurrentInstant
+        -- now reports a reading of wall-clock time: the instant it returns is
+        -- the present moment as observed at the call. It is volatile — two
+        -- reads are not guaranteed equal and a later read is not guaranteed
+        -- earlier or later than an earlier one (this clock makes no monotonicity
+        -- promise). It carries a zone offset rather than a bare local time.
+
+    @invariant ParseFidelity
+        -- from_iso and from_epoch_millis denote exactly the point in time their
+        -- argument names: parsing a well-formed source and reading the resulting
+        -- instant recovers the same moment the source described, with no shift.
+        -- The guarantee is over the moment alone. The zone offset the result
+        -- carries is NOT the source's: a source that fixes its own offset has the
+        -- same instant returned under the host's default zone, not under the
+        -- source's offset. Two sources naming the same moment under different
+        -- offsets therefore yield equal results.
+
+    @guidance
+        -- now is impure only in depending on the wall clock; from_iso and
+        -- from_epoch_millis are pure and deterministic in their argument. The
+        -- contract says nothing about malformed input, leap-second handling or
+        -- sub-millisecond resolution; those are out of scope for this plumbing.
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A grain component that reads the clock. Its identity, fields and lifecycle are
+-- owned by the consuming component, not by this one; the clock is agnostic to
+-- which component it is. A placeholder for "the code that calls now": it carries
+-- no fields and has no lifecycle here.
+entity Component {}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Whatever reads the clock: code, not a person. No entity in this spec models
+-- the caller, so the actor is bound to the one placeholder type that crosses the
+-- boundary with a trivial predicate. The binding name documents intent; the
+-- underlying type carries no meaning here.
+actor Caller {
+    identified_by: Component where true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The single boundary this component exposes: a caller reads the current instant
+-- or constructs one from an external representation, and depends on the Clock
+-- contract for what those readings mean.
+surface TimeSource {
+    facing caller: Caller
+
+    contracts:
+        fulfils Clock
+
+    @guarantee FaithfulClock
+        -- now yields the present instant with a zone offset, and constructing an
+        -- instant from a well-formed source preserves the moment that source
+        -- describes.
+}

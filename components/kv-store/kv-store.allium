@@ -1,0 +1,156 @@
+-- allium: 3
+-- kv-store.allium
+--
+-- Distilled from components/kv-store (grain).
+--
+-- Scope: The boundary contract for a minimal binary key/value store. This
+--        component defines the abstraction only — a small protocol of five
+--        operations (start, stop, read, write, batch-write). Concrete stores
+--        (e.g. kv-store-lmdb) implement it; consumers (e.g. the read-model
+--        processor's durable L2 cache) depend on it.
+--
+-- Classification: LIBRARY / abstraction boundary. There is no domain model,
+--   no entity lifecycle and no state machine here. The component's whole job
+--   is to name a contract and the behavioural guarantees an implementation
+--   must honour. The shape is therefore one module-level contract carrying the
+--   operation signatures and their guarantees, plus a surface where an
+--   implementer fulfils it. Keys and values are opaque (Any): the store ascribes
+--   them no structure, so prose invariants — not field types — express how they
+--   relate, exactly as the language reference prescribes for opaque payloads.
+--
+-- Includes (the guarantees implementers must honour and consumers may assume):
+--   - read-your-write roundtrip: a value written under a key is read back
+--     unchanged under that key
+--   - absent-key reads yield nothing
+--   - last write wins: writing an existing key replaces its value
+--   - batch atomicity: a batch write commits every entry or none
+--   - the empty batch is a no-op
+--   - concurrent reads from many callers are safe
+--   - a store is usable only between start and stop
+--
+-- Excludes (implementation, governed by each concrete store, not here):
+--   - storage engine, on-disk format, transactions, map sizing, reader-slot
+--     pools and any retry/back-pressure on resource exhaustion (LMDB specifics)
+--   - serialization of the values themselves: keys and values are opaque byte
+--     sequences; callers encode/decode their own payloads
+--   - tenant scoping: the protocol is tenant-agnostic. Multi-tenant consumers
+--     achieve isolation by namespacing keys (baking the tenant into the key),
+--     not by anything this contract provides (see Open Questions)
+--   - durability/crash semantics beyond "a committed write is later readable"
+--   - cache tiering, watermarks and projection logic (those belong to the
+--     read-model processor that uses this store as its L2 tier)
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- One key/value pair, the unit of a batch write. A value type, not an entity:
+-- it has no identity of its own and is compared by its contents. Both the key
+-- and the value are opaque (Any) — uninterpreted byte sequences the store
+-- stores and returns verbatim, never inspecting their structure.
+value Entry {
+    key: Any
+    value: Any
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The key/value store boundary. Five operations and the guarantees a conformant
+-- implementation must provide. These are properties of store behaviour rather
+-- than entity state, so they live as contract invariants.
+--
+-- Keys and values are opaque (Any): an uninterpreted byte sequence with value
+-- equality — two keys are the same key iff their bytes are equal. read returns
+-- a value or nothing, because a key may be absent. start, stop, write and
+-- batch_write report no value (Unit); their effect is observed by a later read.
+contract KeyValueStore {
+    -- Make the store ready to serve reads and writes.
+    start: () -> Unit
+    -- Release the store. After stop, no operation is valid until a later start.
+    stop: () -> Unit
+    -- Read the value stored under a key, or nothing if the key is absent.
+    read: (key: Any) -> Any
+    -- Store (or replace) the value under a key.
+    write: (key: Any, value: Any) -> Unit
+    -- Store (or replace) many entries as one all-or-nothing unit.
+    batch_write: (entries: Set<Entry>) -> Unit
+
+    @invariant ReadYourWrite
+        -- After write(k, v) succeeds, read(k) returns a value byte-for-byte
+        -- equal to v, until a later write replaces it. The store neither
+        -- inspects nor transforms the bytes — what is put is what is got.
+
+    @invariant AbsentKeyReadsNothing
+        -- read(k) returns nothing when no write has stored a value under k
+        -- (and is not an error). Distinguishing "absent" from "present" is the
+        -- caller's, and this contract's, only notion of key membership.
+
+    @invariant LastWriteWins
+        -- write(k, v2) after write(k, v1) leaves read(k) returning v2. There is
+        -- exactly one current value per key; the store keeps no history.
+
+    @invariant BatchAtomicity
+        -- batch_write(entries) commits every entry or none. A reader never
+        -- observes a partially-applied batch: either all the batch's keys read
+        -- back their new values, or none of them changed. On success, every
+        -- entry obeys ReadYourWrite.
+
+    @invariant EmptyBatchIsNoOp
+        -- batch_write with no entries changes nothing and succeeds. It leaves
+        -- every key's current value exactly as it was.
+
+    @invariant ConcurrentReadsAreSafe
+        -- Many callers may read concurrently without corrupting results or one
+        -- another. A read under contention still satisfies ReadYourWrite and
+        -- AbsentKeyReadsNothing for some committed state of the store. The
+        -- contract bounds no number of concurrent readers; a conformant store
+        -- absorbs contention rather than surfacing it to the caller.
+
+    @invariant UsableOnlyWhileStarted
+        -- read, write and batch_write are defined only between a start and the
+        -- next stop. Operations before start or after stop are outside the
+        -- contract; the store guarantees nothing about them.
+
+    @guidance
+        -- Keys and values are opaque byte sequences; this contract ascribes
+        -- them no encoding, size bound or schema. The fixed-size key buffers,
+        -- single-writer transactions and reader-slot reclamation seen in a
+        -- concrete store (kv-store-lmdb) are implementation choices that realise
+        -- these guarantees, not part of the contract.
+        --
+        -- The store is single-tenant by construction. A multi-tenant consumer
+        -- (e.g. the read-model processor's L2 cache) obtains isolation by
+        -- prefixing the tenant identity into the key it forms, so two tenants
+        -- never collide on a key. That namespacing is the consumer's
+        -- responsibility; the store sees only opaque keys.
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary an implementing store presents to its callers. The implementing
+-- store (code, e.g. an LMDB- or in-memory-backed store) fulfils the
+-- KeyValueStore contract; a consumer on the other side (e.g. the read-model
+-- processor using the store as a durable cache tier) may rely on every
+-- guarantee it names. The parties are code, not people, so the boundary is
+-- expressed by the fulfilled contract rather than a facing actor.
+surface KeyValueStoreBoundary {
+    contracts:
+        fulfils KeyValueStore
+
+    @guarantee OpaqueBytesRoundTrip
+        -- A value handed to write is returned, unchanged, by a later read of
+        -- the same key. The store is a faithful container of caller-owned
+        -- bytes; it adds no interpretation, no schema and no tenancy of its own.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should the contract state durability/crash semantics — i.e. that a write acknowledged before a crash is still readable after restart — or is that deliberately left to each concrete store (in-memory stores would not honour it)?"
+open question "Should tenant scoping be promoted into the contract (e.g. a tenant-keyed namespace) rather than left to consumers prefixing keys, given that every multi-tenant consumer must reimplement the same namespacing discipline?"
+open question "Is there a required behaviour for batch_write when two entries in the same batch share a key, or is that an undefined-order caller error?"

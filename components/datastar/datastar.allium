@@ -1,0 +1,581 @@
+-- allium: 3
+-- datastar.allium
+--
+-- Distilled from components/datastar (grain).
+--
+-- Scope: The server-driven reactive-UI boundary for grain's CQRS pipeline.
+--        How a browser viewing a query stays current as domain events fire,
+--        how a user's actions become commands, and how server-side UI code
+--        produces client behaviour without hard-coding transport details.
+--
+--        This is a LIBRARY / FRAMEWORK spec. The substance is the behavioural
+--        guarantees the boundary upholds (mode selection, render-on-change,
+--        connection reuse, tenant isolation, event de-duplication, deny-by-
+--        default authorization, resilience to render errors, checked UI
+--        lowering), modelled as module-level `contract`s and `surface`s over
+--        `external entity` placeholders the consuming app supplies.
+--
+-- Includes:
+--   - the lifecycle of a live view: open a stream, render, re-render on
+--     relevant domain events, reuse the connection for signal updates, close.
+--   - the three streaming modes and how one is chosen.
+--   - server -> client patches (rendered markup and signal changes) and
+--     client -> server signals (action inputs).
+--   - command execution from user actions, with deny-by-default authorization.
+--   - the per-page-load identity (nonce) that isolates browser tabs/streams.
+--   - the checked server-side UI layer that turns app intent (dispatch a
+--     command, refresh a query, link to a page) into client behaviour while
+--     validating against the command/query registries.
+--
+-- Excludes (implementation, governed elsewhere or by other components):
+--   - SSE / HTTP transport, Pedestal interceptors, routes and route names.
+--   - HTML/hiccup serialization and the Datastar client library / wire format.
+--   - core.async channels, threads, buffers, debounce timers, heartbeats.
+--   - JSON parsing, Malli coercion of signal strings into typed values, and the
+--     generated JavaScript expression strings the UI layer emits.
+--   - the command processor, query processor, read-model processor, pubsub and
+--     event-tailer internals (referenced here only as the contracts this
+--     boundary relies on; each is owned by its own component).
+--   - logging and metrics.
+--
+-- Conformance notes (where each guarantee is captured) appear inline with the
+-- contract invariants and surface guarantees below; they correspond to the
+-- behaviours pinned by core_test.clj and ui_test.clj.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A query the app has registered for rendering as a live page. The app
+-- declares which read models — hence which domain event types — the query
+-- depends on, plus an authorization predicate. The query produces the rendered
+-- view. Governed by the query processor; referenced here as the thing a
+-- LiveView renders and the thing whose registration creates an entry point.
+external entity Query {
+    -- The domain event types whose occurrence should re-render this query.
+    -- Empty when the query has no event dependency (polling / one-shot only).
+    triggering_event_types: Set<EventType>
+    -- Whether this query is exposed as a live page (the app gave it a path).
+    has_page: Boolean
+}
+
+-- A domain event in a tenant's stream. The boundary observes these — as they
+-- are published — to decide when a live view must re-render. Governed by the
+-- event store / pubsub.
+external entity DomainEvent {
+    tenant: TenantId
+    event_type: EventType
+    -- Stable identity for stored events. Absent for legacy / manual messages,
+    -- which are therefore never de-duplicated.
+    event_id: String?
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The kind of a domain event. An opaque label the app and the event store
+-- agree on; the boundary only compares it for subscription and tag matching.
+value EventType {
+    name: String
+}
+
+-- An opaque tenant identity. The boundary never inspects it; it only compares
+-- a view's tenant with an event's tenant to enforce isolation. The tenant
+-- itself is governed by the event store.
+value TenantId {
+    value: String
+}
+
+-- The signed-in principal a view is owned by and a command authorizes against.
+-- Identity and authentication are governed elsewhere; here it is an opaque key
+-- the boundary compares (to isolate one user's connections from another's).
+value Principal {
+    user_id: String
+    tenant: TenantId
+}
+
+-- A command the app has registered, named for execution in response to a user
+-- action. The boundary never inspects its shape (that is the command
+-- processor's concern and, for authoring-time checks, the registry's); it only
+-- names which command to run. Governed by the command processor.
+value CommandRef {
+    name: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The query side the boundary drives to produce a view. Rendering is a pure
+-- read over current state plus the view's current inputs (signals); it never
+-- mutates domain state.
+contract ViewRenderer {
+    -- Authorization predicate for a query, evaluated against the live view's
+    -- context (principal, tenant, current inputs).
+    authorized: (query: Query, view: LiveView) -> Boolean
+    -- Produce the current rendered view for a query under the view's inputs.
+    render: (query: Query, view: LiveView) -> RenderedView
+
+    @invariant RenderIsPure
+        -- render performs no domain mutation and no I/O beyond reading current
+        -- state; the same state and the same inputs produce the same view.
+
+    @invariant DenyByDefault
+        -- A query with no authorization predicate, or whose predicate does not
+        -- return true for the view's principal, is treated as unauthorized: no
+        -- view is rendered and the principal is told so. Authorization is never
+        -- assumed.
+}
+
+-- The command side the boundary drives when a user acts. Submitting a command
+-- is the only way a view changes domain state; the resulting events flow back
+-- through the event store and re-render subscribed views.
+contract CommandRunner {
+    -- Authorization predicate for a command, evaluated against the actor.
+    authorized: (command: CommandRef, actor: Principal) -> Boolean
+    -- Execute a command; the result is the UI signals to surface to the user,
+    -- whether the command was accepted (a success payload) or refused (an error
+    -- and any per-field errors).
+    run: (command: CommandRef, actor: Principal) -> SignalSet
+
+    @invariant DenyByDefault
+        -- A command with no authorization predicate, or whose predicate does
+        -- not return true for the actor, is refused without executing. The user
+        -- is told the action was not permitted. Authorization is never assumed.
+
+    @invariant TenantScoped
+        -- A command runs in its actor's tenant scope; events it emits belong to
+        -- that tenant and so only re-render that tenant's views.
+}
+
+-- The event feed the boundary listens to so a live view re-renders when
+-- relevant domain events occur. The boundary subscribes to exactly the event
+-- types its query depends on, scoped to the view's tenant.
+contract EventFeed {
+    -- Begin / end interest in a tenant's events of the given types for a view.
+    subscribe: (view: LiveView) -> Any
+    unsubscribe: (view: LiveView) -> Any
+    -- Deliver an observed domain event to a view that has subscribed to it.
+    deliver: (view: LiveView, event: DomainEvent) -> Any
+
+    @invariant TenantFilteredDelivery
+        -- A view is only re-rendered by events of its subscribed types that
+        -- belong to its own tenant. Events of other tenants are ignored even
+        -- when they share an event type.
+
+    @invariant SymmetricSubscription
+        -- Every subscription a live view opens is released when the view
+        -- closes, for the same tenant and event-type set it subscribed with.
+        -- No subscription outlives its view.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How a live view decides when to re-render. The mode is chosen once, when the
+-- view opens, from what the query declares and what the runtime offers:
+--   * event_driven when the query declares triggering event types AND a domain
+--     event feed is available — re-render only on relevant events.
+--   * polling when no event feed applies but a positive frame rate is set —
+--     re-render on a timer.
+--   * one_shot otherwise — render once and close.
+enum StreamMode { event_driven | polling | one_shot }
+
+-- The lifecycle of a live view's connection to the browser.
+enum ViewStatus { open | closed }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A patch pushed from server to client. Either replaces a region of the page
+-- with freshly rendered markup, or updates the client's UI signals (e.g. a
+-- toast, field errors, an error message). A patch carries the live view it
+-- flows over, when there is one; an action's outcome patch has no view (it is
+-- pushed on the action's own short-lived response).
+entity ServerPatch {
+    kind: ElementPatch | SignalPatch
+    view: LiveView?
+}
+
+-- New markup for a region of the page, produced by rendering a query.
+variant ElementPatch : ServerPatch {
+    markup: RenderedView
+}
+
+-- A change to the client's UI signals: surfaced state such as a success
+-- message, an error, or per-field validation errors.
+variant SignalPatch : ServerPatch {
+    signals: SignalSet
+}
+
+-- The rendered output of a query at a point in time. Compared by value: the
+-- boundary only pushes an ElementPatch when the new rendering differs from the
+-- last one it pushed on this view, so an unchanged view produces no patch.
+value RenderedView {
+    content: String
+}
+
+-- The UI signals carried in a SignalPatch (client-local view state). When an
+-- action is accepted these are its success payload (e.g. a toast); when refused
+-- they are the error and any per-field validation errors. Either way the user
+-- receives a SignalSet — the boundary's uniform result of running a command.
+value SignalSet {
+    content: String
+}
+
+-- One browser's live connection to one query: an SSE that stays open and
+-- re-renders the query as state changes. Its identity is the triple
+-- (principal, query, nonce): the nonce is minted once per page load so two
+-- tabs of the same page held by the same user are independent views.
+--
+-- A live view carries the current inputs (signals) the query is rendered with.
+-- When the user changes an input, the existing view is reused: its inputs are
+-- updated and it re-renders in place, rather than a second connection opening.
+entity LiveView {
+    principal: Principal
+    query: Query
+    tenant: TenantId
+    -- The per-page-load identity that isolates this view from sibling tabs.
+    nonce: String
+    -- How this view re-renders; fixed when the view opens.
+    mode: StreamMode
+    status: ViewStatus
+
+    -- The last rendering pushed to this view, used to suppress no-op patches.
+    -- Present only while the view is open.
+    last_render: RenderedView? when status = open
+
+    transitions status {
+        open -> closed
+        terminal: closed
+    }
+
+    -- Two open views are the same connection iff they share principal, query
+    -- and nonce; the boundary reuses an existing one rather than opening a
+    -- duplicate.
+    is_same_connection(other): principal = other.principal
+        and query = other.query
+        and nonce = other.nonce
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Default re-render rate for polling mode. Zero selects one-shot: render
+    -- once and close. Event-driven views ignore this.
+    frames_per_second: Integer = 0
+
+    -- How long to wait after a triggering event before re-rendering, so a burst
+    -- of near-simultaneous events (and any pending input change) collapses into
+    -- a single render with the latest inputs.
+    rerender_debounce: Duration = 50.milliseconds
+
+    -- How long the boundary keeps a view alive without traffic before checking
+    -- liveness. Purely a keep-alive concern; it does not change what is shown.
+    heartbeat_interval: Duration = 10.seconds
+
+    -- How many recent stored-event identities a view remembers for
+    -- de-duplication. Bounded on purpose: once a view has remembered this many,
+    -- the oldest identity is forgotten, so a much later redelivery of a very old
+    -- event may re-render once more. De-duplication is therefore best-effort with
+    -- at-least-once re-render as the safe fallback, never at-most-once.
+    dedupe_memory: Integer = 1024
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A query the app registers with a page becomes reachable as a live view: the
+-- boundary exposes an entry point a browser can open. A query without a page is
+-- not exposed. This is the registration step the live-view lifecycle starts
+-- from.
+rule QueryExposed {
+    when: query: Query.created
+    requires: query.has_page
+    ensures: QueryPageAvailable(query: query)
+}
+
+-- A browser opens a view of a query. The mode is fixed now from the query's
+-- declared event dependency, whether a domain event feed is available, and the
+-- configured frame rate. The view is rendered once immediately and, if
+-- event-driven, subscribes to its query's triggering events for its own tenant
+-- so later events re-render it.
+rule ViewOpens {
+    when: BrowserOpensView(principal, query, nonce)
+
+    -- event_driven needs BOTH a declared event dependency AND a live event feed:
+    -- a query that declares triggering types but reaches a runtime with no feed
+    -- falls back to polling or one_shot, exactly as if it declared none.
+    let mode =
+        if query.triggering_event_types.count > 0 and event_feed_available(): event_driven
+        else if config.frames_per_second > 0: polling
+        else: one_shot
+
+    ensures:
+        let view = LiveView.created(
+            principal: principal,
+            query: query,
+            tenant: principal.tenant,
+            nonce: nonce,
+            mode: mode,
+            status: open
+        )
+        ViewRendered(view: view)
+        if mode = event_driven:
+            ViewSubscribed(view: view)
+
+    @guidance
+        -- The initial render must not be allowed to kill the view: if rendering
+        -- fails transiently the view still opens and begins listening, so a
+        -- later event re-renders it. This is why opening and rendering are
+        -- distinct outcomes rather than a precondition of one another.
+}
+
+-- A domain event appearing in a tenant's stream re-renders every open,
+-- event-driven view of that tenant whose query subscribes to the event's type.
+-- Only the event's own tenant's views are reached; a view that has already
+-- seen this stored event (same event_id) is not re-rendered again for it.
+rule RelevantEventArrives {
+    when: event: DomainEvent.created
+    for view in LiveViews where status = open and mode = event_driven:
+        requires: view.tenant = event.tenant
+        requires: event.event_type in view.query.triggering_event_types
+        -- De-duplication: a stored event (one bearing an event_id) already
+        -- delivered to this view is dropped. Events without an event_id
+        -- (legacy / manual messages) carry no de-dupe key and always re-render.
+        requires: event.event_id = null or not already_delivered(view, event.event_id)
+        ensures: ViewRendered(view: view)
+
+    @guidance
+        -- The de-dupe key is (tenant, event_id), remembered per view for the
+        -- most recent config.dedupe_memory stored events. Once that many are
+        -- remembered the oldest identity is evicted, so de-duplication is
+        -- best-effort: a redelivery of an evicted event re-renders once more
+        -- (at-least-once), never silently dropped. The EventFeed.TenantFiltered
+        -- Delivery invariant is the tenant half of this guard; this rule adds
+        -- the per-view best-effort-once-per-stored-event half.
+}
+
+-- The user changes a view's inputs (e.g. a filter or search term). The existing
+-- connection is reused: its inputs are updated in place and it re-renders, so
+-- no second connection opens. Reuse is keyed by (principal, query, nonce).
+rule ViewInputsChange {
+    when: UserUpdatesInputs(view, inputs)
+    requires: view.status = open
+    ensures: ViewRendered(view: view)
+
+    @guidance
+        -- A signal change and a domain event arriving together are coalesced:
+        -- the input update is applied before re-rendering, so the user never
+        -- sees a flash of the view rendered with stale inputs. POST always
+        -- attempts connection reuse; GET reuses only when the page's nonce is
+        -- present, so an absent nonce always opens a fresh view rather than
+        -- colliding with an unrelated one.
+}
+
+-- Rendering an open view. Authorization is checked first: an unauthorized
+-- principal is told so via a signal patch and the view stops; otherwise the
+-- query is rendered and an element patch is pushed only when the rendering
+-- differs from the last one pushed on this view.
+rule ViewRendered {
+    when: ViewRendered(view)
+    requires: view.status = open
+    let outcome = render(view.query, view)
+    ensures:
+        if not authorized(view.query, view):
+            SignalPatch.created(view: view, signals: unauthorized_signals)
+            view.status = closed
+            view.last_render = null
+        else if outcome != view.last_render:
+            ElementPatch.created(view: view, markup: outcome)
+            view.last_render = outcome
+
+    @guidance
+        -- A render that errors transiently must not close a live event-driven
+        -- view: the failed render is skipped and the view keeps listening, so
+        -- the next event re-renders once the condition passes. Only an explicit
+        -- authorization failure closes the view.
+}
+
+-- The browser goes away (navigation, tab close) or the server shuts the view
+-- down. The view closes and, if it was event-driven, its event subscription is
+-- released for exactly the tenant and event types it subscribed with.
+rule ViewCloses {
+    when: BrowserLeaves(view)
+    requires: view.status = open
+    ensures:
+        if view.mode = event_driven:
+            ViewUnsubscribed(view: view)
+        view.status = closed
+        view.last_render = null
+}
+
+-- A user action submits a command. Authorization is deny-by-default: an
+-- unauthorized actor is refused without the command running. Either way the
+-- outcome becomes a signal patch back to the user (a toast on success, the
+-- error and any field errors on refusal). Accepted commands' events flow back
+-- through the event feed and re-render subscribed views.
+rule ActionSubmitted {
+    when: UserSubmitsAction(actor, command)
+    ensures:
+        if not authorized(command, actor):
+            ActionRefused(actor: actor, command: command)
+            SignalPatch.created(view: null, signals: unauthorized_signals)
+        else:
+            let result_signals = run(command, actor)
+            SignalPatch.created(view: null, signals: result_signals)
+
+    @guidance
+        -- The command and its outcome are also surfaced to the surrounding
+        -- request pipeline so app-level concerns (e.g. setting a session
+        -- cookie from a successful sign-in) can inspect them, without this
+        -- boundary knowing about those concerns.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Connection identity: at most one open view per (principal, query, nonce).
+-- This is what makes reuse-on-input-change well defined and what isolates
+-- sibling tabs (which differ by nonce). A closed view does not count.
+invariant OneOpenViewPerConnection {
+    for a in LiveViews:
+        for b in LiveViews:
+            (a != b and a.status = open and b.status = open and a.is_same_connection(b))
+                implies false
+}
+
+-- A view always belongs to its principal's tenant. This is the static anchor
+-- of tenant isolation: since a view only re-renders from events of its own
+-- tenant (the rule guard and the EventFeed.TenantFilteredDelivery contract
+-- invariant), pinning the view's tenant to its owner's tenant is what keeps one
+-- user's stream from ever surfacing another tenant's activity.
+invariant ViewTenantMatchesPrincipal {
+    for v in LiveViews:
+        v.tenant = v.principal.tenant
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+-- The signals shown when a render or command is refused for lack of
+-- authorization. The user is informed; no domain state is read or changed.
+default SignalSet unauthorized_signals = { content: "Unauthorized" }
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary a browser drives: open a view, change its inputs, leave. The
+-- party on the other side is the signed-in principal; any authenticated
+-- principal can reach the boundary, and per-query authorization is enforced by
+-- the deny-by-default ViewRenderer contract rather than by who is asking. What
+-- it sees is the live rendering and the current view status; the boundary
+-- guarantees a current, authorized, tenant-correct view that survives transient
+-- render errors and reuses one connection per page load.
+surface LiveViewBoundary {
+    facing viewer: Principal
+    context view: LiveView where principal = viewer and status = open
+
+    exposes:
+        view.query
+        view.last_render
+        view.status
+
+    provides:
+        BrowserOpensView(viewer, view.query, view.nonce)
+        UserUpdatesInputs(view, view_inputs)
+        BrowserLeaves(view)
+
+    contracts:
+        demands ViewRenderer
+        demands EventFeed
+
+    @guarantee RendersOnChangeOnly
+        -- An open view is re-rendered on relevant change (a subscribed domain
+        -- event in its tenant, a timer tick in polling mode, or an input
+        -- change) and a fresh patch is pushed only when the rendered output
+        -- actually differs from the last one — an unchanged view is silent.
+
+    @guarantee SurvivesRenderErrors
+        -- A transient render or query failure does not tear down a live view:
+        -- the failed render is skipped and the view keeps listening, so a later
+        -- change renders it. Only an authorization failure closes the view.
+
+    @guarantee OneConnectionPerPageLoad
+        -- Each page load owns a nonce, giving (principal, query, nonce)
+        -- identity. Input changes reuse that connection in place; two tabs of
+        -- the same page get independent views and never cross-render.
+
+    @guarantee TenantIsolation
+        -- A view only ever renders from, and only ever subscribes to, its own
+        -- tenant's events. One tenant's activity never drives another tenant's
+        -- view, even for shared event types.
+}
+
+-- The boundary a user's action crosses to change domain state. The user
+-- submits a command; the boundary runs it deny-by-default and returns the
+-- outcome as a signal patch.
+surface ActionBoundary {
+    facing viewer: Principal
+
+    provides:
+        UserSubmitsAction(viewer, action_command)
+
+    contracts:
+        demands CommandRunner
+
+    @guarantee DenyByDefault
+        -- A command is only executed when its own authorization predicate
+        -- admits the actor. A missing or failing predicate refuses the action
+        -- without running it and tells the user it was not permitted.
+
+    @guarantee OutcomeReturnedAsSignals
+        -- Every action yields a signal patch back to the user: a success
+        -- payload (e.g. a toast) on acceptance, or the error and any per-field
+        -- errors on refusal.
+}
+
+-- The boundary the app's server-side UI code crosses when it expresses intent
+-- declaratively — dispatch a command, refresh a query's view, or link to a
+-- page — and the boundary turns that into client behaviour. The point of this
+-- surface is that UI intent is checked against the live registries and never
+-- hard-codes a transport path.
+surface CheckedUiAuthoring {
+    facing viewer: Principal
+
+    @guarantee IntentValidatedAgainstRegistries
+        -- A dispatch is checked against its command's declared shape (required
+        -- keys present, no unknown keys); a refresh and a page link resolve
+        -- their target through the query registry. A literal route string or an
+        -- unregistered target is rejected at authoring time, so UI code cannot
+        -- drift from the commands and queries that actually exist.
+
+    @guarantee ExplicitPayloadsOnly
+        -- An action sends only the values the author names in its payload;
+        -- ambient page state is never posted implicitly. This keeps what a
+        -- command or refresh receives explicit and stable. The reusable-stream
+        -- nonce is included automatically so a refresh reuses the open view.
+
+    @guidance
+        -- Authors may drop to raw, unchecked attributes and actions as an
+        -- escape hatch; those deliberately bypass the checks above. A static
+        -- interpretation that strips all checked behaviour exists for rendering
+        -- UI in galleries / documentation outside a live page.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "GET reuses a connection only when the page nonce is present, while POST always attempts reuse for backward compatibility. Is that asymmetry intended long-term, or should both require a nonce once all clients send one?"
+open question "Per-view event de-duplication is bounded best-effort (config.dedupe_memory recent stored events, at-least-once re-render on eviction). Is that bound a knob worth surfacing to consuming apps, or should it stay an internal implementation detail?"
+open question "A live view is identified by (principal, query, nonce). For an unauthenticated public page the principal is absent — should public live views be modelled as a distinct connection identity, or is nonce alone sufficient there?"

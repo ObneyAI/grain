@@ -1,0 +1,465 @@
+-- allium: 3
+-- behavior-tree-v2.allium
+--
+-- Distilled from components/behavior-tree-v2 (grain).
+--
+-- NOTE: This component is marked DEPRECATED in code and is no longer
+--       maintained. The spec records the behaviour it proves while it exists.
+--
+-- Scope: A reusable behaviour-tree execution engine. A tree is a static
+--        composition of typed nodes; "ticking" (running) the tree walks it and
+--        collapses to exactly one outcome — success, failure, or running. The
+--        value of this component is the *composition semantics*: how each
+--        composite node combines its children's outcomes, and how a tree reads
+--        scratch state (short-term memory) and derived domain state (long-term
+--        memory) while it runs.
+--
+-- Includes:
+--   - the tick outcome alphabet (success / failure / running)
+--   - per-node tick semantics for the five node kinds: sequence, fallback,
+--     parallel, condition, action
+--   - the running / re-tick contract (a tree returning running must be ticked
+--     again to make progress)
+--   - short-term memory: per-tree mutable scratch state and value assertions
+--   - long-term memory: an incremental read model derived from event-store
+--     domain events via a caller-supplied reducer
+--
+-- Excludes (implementation / governed elsewhere):
+--   - the event store, its query/read protocol and event serialization
+--     (owned by event-store-v2; demanded here as the LongTermMemorySource and
+--     ReadModel contracts)
+--   - thread/future mechanics used to tick parallel children concurrently
+--   - the host language's map/atom/multimethod dispatch and malli schema engine
+--   - logging and metrics
+--
+-- Classification: LIBRARY / FRAMEWORK. The tree itself has no domain identity;
+-- node kinds and their outcome-combination rules are the behaviour. Tick is a
+-- recursive walk over the tree whose outcome-composition is deterministic (the
+-- leaf functions it runs may have effects), so its per-kind guarantees are
+-- recorded as contract @invariants rather than point-in-time entity-state ones.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The caller's scratch state for a single tree run. Its shape is caller-defined
+-- (an arbitrary keyed structure); the engine only reads and writes locations
+-- the caller's nodes name. Opaque to the engine — structured data the consumer
+-- supplies and interprets.
+value ShortTermMemory {
+    description: String
+}
+
+-- A point reached in the event stream. The long-term read model remembers the
+-- last domain event it folded so the next read resumes after it rather than
+-- re-folding from the beginning. Identity/ordering of events is owned by the
+-- event store; this value carries only the opaque frontier marker.
+value EventPosition {
+    description: String
+}
+
+-- A caller-supplied query selecting which domain events feed the long-term
+-- read model. Opaque to the engine.
+value MemoryQuery {
+    description: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The composition semantics of ticking a tree. `tick` is a recursive walk over
+-- the tree's static shape: given a node and the run context, it returns exactly
+-- one outcome. The *composition* of children's outcomes into a parent's outcome
+-- is deterministic and depends only on the children's outcomes; the leaf
+-- functions ticked along the way (conditions and actions) may read and mutate
+-- the run context and perform work, so tick as a whole is not pure. These are
+-- guarantees about how outcomes compose over the tree shape, so they live as
+-- contract invariants rather than entity state.
+contract TickSemantics {
+    -- Tick a node within a run context, yielding one outcome.
+    tick: (node: Node, context: RunContext) -> Outcome
+
+    @invariant TotalOutcome
+        -- Absent an uncaught error, every tick yields exactly one of
+        -- success, failure or running. There is no fourth outcome and no
+        -- "no result" state.
+
+    @invariant SequenceSemantics
+        -- A sequence ticks its children left to right and stops at the first
+        -- child that is not success: it yields failure on the first failing
+        -- child and running on the first running child, ticking no further
+        -- children. It yields success only when every child succeeds. An empty
+        -- sequence succeeds.
+
+    @invariant FallbackSemantics
+        -- A fallback ticks its children left to right and stops at the first
+        -- child that is not failure: it yields success on the first succeeding
+        -- child and running on the first running child, ticking no further
+        -- children. It yields failure only when every child fails. An empty
+        -- fallback fails.
+
+    @invariant ParallelSemantics
+        -- A parallel ticks all of its children. It yields success once the
+        -- number of succeeding children reaches the success threshold; it
+        -- yields failure once enough children have failed that the threshold
+        -- can no longer be reached; otherwise it yields running. The threshold
+        -- defaults to the child count, so by default every child must succeed.
+
+    @invariant ConditionSemantics
+        -- A condition evaluates a predicate over the context and yields success
+        -- when the predicate holds and failure otherwise. A condition never
+        -- yields running.
+
+    @invariant ActionSemantics
+        -- An action yields whatever outcome its effecting function returns —
+        -- any of success, failure or running — so a long-running action can
+        -- report running and be resumed on the next tick.
+
+    @invariant Shape
+        -- tick is a fold over the tree's static shape: composite nodes are
+        -- ticked by ticking their declared children. Sequence and fallback visit
+        -- children in declared order (and may stop early); parallel visits all of
+        -- its children and combines their outcomes order-independently. The tree
+        -- structure is fixed at build time and is not mutated by ticking.
+}
+
+-- The caller's domain reducer that folds events into the long-term read model.
+-- The engine treats it as an opaque pure function of (prior state, new events).
+contract ReadModel {
+    -- Fold a batch of new domain events onto the prior read-model state.
+    apply: (prior_state: Any, events: Any) -> Any
+
+    @invariant Purity
+        -- apply has no side effects and depends only on its arguments: the
+        -- same prior state and the same events always produce the same result.
+
+    @invariant Incrementality
+        -- apply must be a left-fold compatible reducer: folding events in two
+        -- batches (a then b) yields the same state as folding (a ++ b) in one
+        -- batch. This is what makes incremental resumption sound.
+}
+
+-- The event-store boundary the long-term read model reads from. Demanded, not
+-- fulfilled: another component (event-store-v2) provides this.
+contract LongTermMemorySource {
+    -- Read the domain events matching a query, optionally only those occurring
+    -- after a known position.
+    read_events: (query: MemoryQuery, after: EventPosition) -> Any
+
+    @invariant ResumeAfterPosition
+        -- When an `after` position is supplied, only events for that query
+        -- strictly after it are returned, in stream order. The position is a
+        -- per-query cursor: it is sound for resuming a single query's stream,
+        -- not for reconciling positions across independent queries.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The complete outcome alphabet of a tick. success and failure are terminal for
+-- that node on that tick; running means the node has not finished and the tree
+-- must be ticked again to make progress.
+enum Outcome { success | failure | running }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A node in a behaviour tree. Every node has a kind that fixes how it produces
+-- an outcome when ticked. Composite kinds (sequence, fallback, parallel) own
+-- ordered children; leaf kinds (condition, action) own an effecting function
+-- the engine treats as opaque.
+entity Node {
+    kind: Sequence | Fallback | Parallel | Condition | Action
+}
+
+-- Ticks children in order; the first non-success child decides the outcome.
+variant Sequence : Node {
+    children: List<Node>
+}
+
+-- Ticks children in order; the first non-failure child decides the outcome.
+variant Fallback : Node {
+    children: List<Node>
+}
+
+-- Ticks all children; succeeds once enough have succeeded, fails once success
+-- has become unreachable. The threshold defaults to "all children".
+variant Parallel : Node {
+    children: List<Node>
+    -- How many children must succeed for the parallel to succeed. Absent means
+    -- "all of them".
+    success_threshold: Integer?
+}
+
+-- A leaf that asks a yes/no question of the run context. Never running.
+variant Condition : Node {
+    description: String
+}
+
+-- A leaf that performs work and reports its own outcome, possibly running.
+variant Action : Node {
+    description: String
+}
+
+-- A single execution of a built tree. The run carries the scratch state the
+-- tree reads and writes (short-term memory) and, when configured, a derived
+-- view of domain state (long-term memory). One run is one tick of the root.
+entity RunContext {
+    root: Node
+    short_term: ShortTermMemory
+
+    -- The outcome of the most recent tick of this run's root, if it has been
+    -- ticked. running here means the run is mid-flight and should be ticked
+    -- again; success/failure means the last tick completed.
+    last_outcome: Outcome?
+
+    -- Present only when the caller wired an event source, a read model and at
+    -- least one query at build time; otherwise the tree runs on scratch state
+    -- alone.
+    long_term: LongTermMemory?
+}
+
+-- An incrementally maintained read model over selected domain events. Each time
+-- its latest value is requested it reads each configured query (resuming after
+-- the remembered frontier), folds the concatenated events onto the prior state,
+-- then remembers a new frontier position so the next request resumes from there.
+entity LongTermMemory {
+    queries: List<MemoryQuery>
+    -- The folded state as of the last refresh.
+    state: Any
+    -- The single position remembered after the last fold: the position of the
+    -- last event in the concatenated batch (the configured queries are read in
+    -- order and their results concatenated, not globally merged). The same
+    -- position is then supplied as the `after` cursor to every query on the next
+    -- read. Absent before the first refresh, when the fold starts from the empty
+    -- state. With more than one query this single shared cursor does not track
+    -- each query's stream independently (see ExactlyOnceFold).
+    last_seen: EventPosition?
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Building a tree from a configuration fixes its static shape and creates the
+-- run context. Short-term memory always exists (empty if the caller gave none).
+-- Long-term memory exists only when an event source, a read model and at least
+-- one query were all supplied together; supplying some but not all yields a
+-- tree with no long-term memory.
+rule BuildTree {
+    when: BuildRequested(root, short_term?, queries?)
+    ensures:
+        RunContext.created(
+            root: root,
+            short_term: short_term
+        )
+
+    @guidance
+        -- "Configuration" is a nested vector describing the node tree; the
+        -- engine translates it into the Node shape above. The short-term map is
+        -- wrapped so nodes can mutate it during the run; if omitted it starts
+        -- empty. Long-term memory is attached only when event source + read
+        -- model + queries are all present — this is the AND-gate in build, and a
+        -- freshly built long-term memory has folded nothing yet (empty state,
+        -- absent frontier) until its first read.
+}
+
+-- Ticking the root walks the tree once and collapses it to a single outcome per
+-- TickSemantics. A running outcome means the walk reached a node that has not
+-- finished; the same tree should be ticked again to continue.
+rule TickTree {
+    when: TickRequested(run)
+    ensures:
+        run.last_outcome = tick(run.root, run)
+        TreeTicked(run: run, outcome: run.last_outcome)
+
+    @guidance
+        -- A success or failure outcome means the walk completed for this tick.
+        -- A running outcome is an explicit "call me again" — no progress is
+        -- lost, because actions that report running resume where they left off
+        -- and composites re-walk from the root each tick.
+}
+
+-- Asking a configured long-term memory for its latest value reads each query
+-- (resuming after the remembered frontier), folds the concatenated events onto
+-- the prior state, and advances the remembered frontier to the last event read.
+-- With a single query this folds each event exactly once over the life of the
+-- memory; see ExactlyOnceFold for the multi-query caveat. Only meaningful for a
+-- run that was built with long-term memory.
+rule RefreshLongTermMemory {
+    when: LatestRequested(run)
+    requires: run.long_term != null
+    let memory = run.long_term
+    let new_events = read_events_for(memory)
+    ensures:
+        memory.state = apply_read_model(memory.state, new_events)
+        if has_events(new_events):
+            memory.last_seen = frontier_of(new_events)
+
+    @guidance
+        -- The first refresh folds from the empty state with no `after` bound.
+        -- Subsequent refreshes pass the single remembered position as `after` to
+        -- every configured query and fold the concatenated results. If no new
+        -- events arrived, the frontier is left unchanged and the state is the
+        -- prior fold. ReadModel.Incrementality holds; exactly-once folding holds
+        -- for a single query but not in general across multiple queries, because
+        -- one shared cursor cannot resume several independent streams (see
+        -- ExactlyOnceFold).
+}
+
+-- A short-term-memory assertion checks that the scratch state (optionally at a
+-- named location within it) satisfies a caller-supplied shape. It is the basis
+-- for condition nodes that gate on accumulated scratch state.
+rule AssertShortTermMemory {
+    when: ShortTermValueChecked(run, shape, location?)
+    ensures: MemoryAssertionResolved(
+        run: run,
+        holds: st_memory_satisfies(run.short_term, location, shape)
+    )
+}
+
+-- The long-term counterpart: check that the folded read model (optionally at a
+-- named location) satisfies a caller-supplied shape. Reading long-term memory is
+-- never a passive read: there is a single access path that first folds any
+-- events that have arrived since the last access and advances the frontier (the
+-- same step as RefreshLongTermMemory), then evaluates the shape against the
+-- freshly folded state. Because assertions and latest-requests share this one
+-- folding access path, they share its folding guarantees (and its multi-query
+-- caveat) identically.
+rule AssertLongTermMemory {
+    when: LongTermValueChecked(run, shape, location?)
+    requires: run.long_term != null
+    let memory = run.long_term
+    let new_events = read_events_for(memory)
+    ensures:
+        memory.state = apply_read_model(memory.state, new_events)
+        if has_events(new_events):
+            memory.last_seen = frontier_of(new_events)
+        MemoryAssertionResolved(
+            run: run,
+            holds: lt_memory_satisfies(memory.state, location, shape)
+        )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A parallel's success threshold is meaningful only when it is at least one and
+-- no greater than its child count; outside that range it could never be reached
+-- or would be trivially met. The engine's default (all children) sits at the
+-- upper bound.
+invariant ParallelThresholdInRange {
+    for n in Nodes:
+        n.kind = Parallel and n.success_threshold != null
+            implies n.success_threshold >= 1
+                and n.success_threshold <= n.children.count
+}
+
+-- Long-term memory exists on a run context exactly when the engine has a real
+-- read model to maintain. A run without long-term memory runs purely on scratch
+-- state — the two memory facilities are independent.
+invariant LongTermMemoryConsistency {
+    for r in RunContexts:
+        r.long_term != null implies r.long_term.queries.count >= 1
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The behaviour tree is driven by host code, not a person. The driver is the
+-- run it holds: it builds a tree, ticks it (repeatedly while it reports
+-- running) and inspects outcomes. Identified by a run that has a root.
+actor TreeDriver {
+    identified_by: RunContext where root != null
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary the host code drives: build a tree, tick it (repeatedly while it
+-- reports running), and inspect the outcome.
+surface TreeExecution {
+    facing driver: TreeDriver
+
+    exposes:
+        driver.root.kind
+        driver.last_outcome
+
+    provides:
+        TickRequested(driver)
+
+    contracts:
+        fulfils TickSemantics
+
+    @guarantee SingleOutcomePerTick
+        -- Each tick collapses the tree to exactly one of success, failure or
+        -- running. running is the engine's explicit request to be ticked again;
+        -- success and failure are completion for this tick.
+}
+
+-- The boundary the caller's custom nodes use to read and assert scratch state
+-- accumulated during a run.
+surface ShortTermMemoryAccess {
+    facing driver: TreeDriver
+
+    exposes:
+        driver.short_term
+
+    provides:
+        ShortTermValueChecked(driver, shape)
+
+    @guarantee ScopedToRun
+        -- Short-term memory is private to a single run: it is created (empty if
+        -- unspecified) when the tree is built and is visible only to that run's
+        -- nodes. It carries no state between independent runs.
+}
+
+-- The boundary where the tree reads derived domain state. Visible only when the
+-- run was built with long-term memory. The engine fulfils the incremental read
+-- model; it demands the event source and the caller's reducer.
+surface LongTermMemoryAccess {
+    facing driver: TreeDriver
+
+    exposes:
+        driver.long_term when driver.long_term != null
+
+    provides:
+        LatestRequested(driver) when driver.long_term != null
+        LongTermValueChecked(driver, shape) when driver.long_term != null
+
+    contracts:
+        demands LongTermMemorySource
+        demands ReadModel
+
+    @guarantee FoldOnEveryRead
+        -- Every read of long-term memory — whether a latest-request or a
+        -- value-check — first folds: there is no read path that observes the
+        -- state without folding pending events first. The memory always resumes
+        -- the fold after the single position it last saw.
+
+    @guarantee ExactlyOnceFold
+        -- With a single configured query, every matching domain event is folded
+        -- into the read model exactly once across successive reads: the memory
+        -- resumes after the last position it saw, so events are neither skipped
+        -- nor re-applied. This guarantee is NOT general across multiple queries:
+        -- the configured queries are read independently and concatenated, and a
+        -- single shared frontier (the last event of the concatenated batch) is
+        -- applied as the `after` cursor to every query on the next read. When the
+        -- queries' streams interleave, that one cursor can leave some queries
+        -- re-reading already-folded events or skipping events, so per-event
+        -- exactly-once does not hold for the multi-query case.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Parallel children are ticked concurrently and their outcomes combined. The spec treats a tick as atomic; should concurrent side effects of action children within one parallel tick be constrained (ordering, isolation), or is that the caller's responsibility?"
+open question "When an action or condition function throws, tick has no defined outcome (the alphabet is success/failure/running). Should an uncaught error be a fourth outcome, surface as failure, or propagate to the driver unmodelled? Code currently propagates."
+open question "Long-term memory advances its frontier to the last event folded. If a query is configured but matches no events on the first read, last_seen stays absent and the next read re-reads from the beginning. Is re-reading-until-first-match the intended behaviour, or should an empty initial read still record a frontier?"

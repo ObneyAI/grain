@@ -1,0 +1,434 @@
+-- allium: 3
+-- command-request-handler-v2.allium
+--
+-- Distilled from components/command-request-handler-v2 (grain).
+--
+-- Scope: The boundary where an external caller submits a tenant-scoped COMMAND.
+--        The handler decodes and stamps the command, validates its shape,
+--        enforces deny-by-default authorization against the full request
+--        context, dispatches the authorized command to the command processor,
+--        and maps the result onto a stable, transport-agnostic outcome
+--        classification. It isolates handler faults so a misbehaving command
+--        cannot crash the boundary.
+--
+-- Classification: LIBRARY / FRAMEWORK. This is a reusable request boundary with
+--        behavioural guarantees, not a domain. The guarantees are modelled as a
+--        module-level contract plus a surface; the command, the registry, the
+--        request context and the command processor are external placeholders the
+--        consuming system supplies. This v2 replaces command-request-handler;
+--        it preserves that component's guarantees and is explicit about the
+--        tenant the request is scoped to.
+--
+-- Includes (the guarantees the code and tests actually prove):
+--   - command admission: a fresh identity and receipt timestamp are stamped on
+--     arrival, before the command's fate is decided
+--   - shape validation as a rejection gate: a malformed command is rejected as
+--     incorrect and never reaches authorization or dispatch
+--   - deny-by-default authorization: a command proceeds ONLY when its
+--     registration carries an authorizer AND that authorizer, given the full
+--     request context, returns true; a missing authorizer denies
+--   - the authorization predicate and the handler both see the full assembled
+--     context (ambient grain context + per-request context + the command)
+--   - dispatch to the command processor and persistence of any emitted events
+--     under the request's tenant
+--   - outcome classification into a fixed category set (ok / incorrect /
+--     not_found / forbidden / conflict / fault); the boundary relays the
+--     processor's verdict rather than re-deriving it
+--   - fault isolation: a handler that returns nothing or throws is contained by
+--     the command processor and relayed as a fault outcome; an exception never
+--     propagates out through the boundary, which survives to serve the next
+--     command
+--
+-- Excludes (implementation, governed elsewhere):
+--   - HTTP transport, routing, status codes and the transit wire format
+--     (captured only as the codec roundtrip the boundary relies on)
+--   - the command processor's internal validation, effect application and the
+--     event store's durability mechanism — the CommandProcessing contract
+--     records only the guarantees this boundary relies on; they are owned by
+--     command-processor-v2 and event-store-v3
+--   - the command registry's storage and the schema language
+--   - logging, tracing and metrics
+--   - threads, async channels and connection pools
+--
+-- Conformance properties below correspond to the component's test suite
+-- (interface_test.clj). Where each is captured:
+--   id/timestamp stamped on admission            -> rule ReceiveCommand
+--   shape validation rejected as incorrect       -> rule ValidateShape (incorrect outcome)
+--   missing authorizer => forbidden              -> rule AuthorizeCommand + invariant DenyByDefault
+--   authorizer false => forbidden                -> rule AuthorizeCommand
+--   authorizer true => proceeds                  -> rule DispatchCommand
+--   authorizer receives full context             -> surface CommandSubmission @guarantee FullContextToAuthorizer
+--   handler outcome category mapping             -> enum OutcomeCategory + rule DispatchCommand (passes the processor's verdict through)
+--   handler exception/nil => fault               -> contract CommandProcessing.HandlerFaultsContained + @guarantee FaultIsolation
+--   emitted events persisted under the tenant    -> contract CommandProcessing.EventsPersistedToTenant
+--   merged context reaches the handler           -> surface @guarantee FullContextToAuthorizer + rule guidance
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The tenant a request is scoped to. Every command is submitted for exactly one
+-- tenant; the boundary carries that tenant through authorization and dispatch so
+-- that any events the command emits are recorded under it. Tenants are governed
+-- by the event store, not here; this component only looks up and routes to them.
+external entity Tenant {
+    id: String
+}
+
+-- A command submitted by a caller: a named, tenant-scoped intent to change
+-- state, carried with its caller-supplied fields. The command's name selects a
+-- handler and an authorization predicate from the registry. Stamped with a fresh
+-- identity and a receipt timestamp the moment it is admitted. The shape of each
+-- named command is governed by the consuming system's schemas, not here.
+external entity Command {
+    name: String
+    tenant: Tenant
+    id: String?
+    received_at: Timestamp?
+}
+
+-- The decided handler and authorizer for a command name. Registered by the
+-- consuming system; this boundary only looks them up. A registration may carry
+-- no authorizer at all, which this boundary treats as "deny".
+external entity CommandRegistration {
+    command_name: String
+    has_authorizer: Boolean
+}
+
+-- The caller's request context: the ambient grain context (registry, event
+-- store, tenant) merged with any context contributed by upstream interceptors,
+-- plus the decoded command. Both the authorization predicate and the handler see
+-- this whole context. Modelled as an opaque placeholder, identified only by the
+-- request it belongs to; its internal shape is the consuming system's concern
+-- and this boundary never inspects it.
+external entity RequestContext {
+    request_id: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- Serialization of the command in and the response out. The boundary treats the
+-- payload as opaque bytes; the only behavioural property that matters here is
+-- that a value survives the round trip unchanged, so the caller observes the
+-- outcome the boundary computed, undistorted by transport.
+contract CommandCodec {
+    decode_request: (bytes: ByteArray) -> Any
+    encode_response: (value: Any) -> ByteArray
+
+    @invariant Roundtrip
+        -- decode_request(encode_response(value)) yields a value equivalent to
+        -- the original for every supported payload.
+}
+
+-- The processing runtime this boundary dispatches to once a command is admitted
+-- and authorized. The boundary DEMANDS these guarantees; it does not implement
+-- them. The processor returns a classified outcome and durably records any
+-- events the command produced, scoped to the command's tenant.
+contract CommandProcessing {
+    -- Process an admitted, authorized command in its context, returning a
+    -- classified outcome.
+    process: (command: Command, context: RequestContext) -> OutcomeCategory
+
+    @invariant EventsPersistedToTenant
+        -- Any events a command's handler emits are durably recorded under the
+        -- command's tenant before the command is reported as successful. A
+        -- success outcome implies the command's events are persisted to that
+        -- tenant's stream; a non-success outcome records nothing. A command for
+        -- one tenant can never write into another's stream.
+
+    @invariant OutcomeClassified
+        -- Every processing result resolves to exactly one OutcomeCategory. A
+        -- result that carries no anomaly is ok; an anomalous result carries a
+        -- category that maps to incorrect, not_found, forbidden, conflict, or —
+        -- for any unrecognised anomaly — fault. A command name the processor
+        -- does not recognise yields not_found; a payload that fails the
+        -- processor's per-name validation yields incorrect.
+
+    @invariant HandlerFaultsContained
+        -- The processor, not the boundary, contains handler failure: a handler
+        -- that throws, or that returns nothing, is caught and reported as the
+        -- fault category rather than propagating an exception to the caller.
+        -- Because the boundary relays this verdict, one command's failure never
+        -- prevents the boundary from serving the next.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The fixed, transport-agnostic classification of a command's outcome. This is
+-- the boundary's stable vocabulary; the mapping onto transport-level codes (e.g.
+-- HTTP status) lives in the implementation and is out of scope.
+--   ok        - the command succeeded (with or without a result payload)
+--   incorrect - the command was malformed or failed validation
+--   not_found - the command targeted something that does not exist
+--   forbidden - the caller is not permitted to run this command
+--   conflict  - the command conflicts with current state
+--   fault     - an unexpected failure, including an uncaught handler exception
+enum OutcomeCategory { ok | incorrect | not_found | forbidden | conflict | fault }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- One pass of a command through the boundary. Tracks the command from arrival
+-- through admission, the authorization decision, and the final classified
+-- outcome. Each request is independent; nothing is shared or retained between
+-- requests beyond the registry the boundary reads.
+entity CommandRequest {
+    command: Command
+    context: RequestContext
+
+    -- The single tenant this request is scoped to: the one the command names,
+    -- recorded on arrival. Authorization, dispatch and any emitted events are
+    -- all bound to it; a request never crosses into another tenant's stream.
+    tenant: Tenant
+
+    -- Lifecycle of a single request through the boundary.
+    status: received | admitted | authorized | rejected | completed
+
+    -- The classified outcome, set once the request reaches a terminal state.
+    outcome: OutcomeCategory when status = rejected | completed
+
+    transitions status {
+        received -> admitted        -- shape is valid; command stamped
+        received -> rejected        -- shape is invalid (incorrect outcome)
+        admitted -> authorized      -- authorizer present and returned true
+        admitted -> rejected        -- denied (no authorizer, or not true)
+        authorized -> completed     -- dispatched; processor returned an outcome
+        terminal: rejected, completed
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A command arrives for a tenant. It is stamped with a fresh identity and a
+-- receipt timestamp, and a request is opened to track its passage through the
+-- boundary. The caller's context travels with the command so that authorization
+-- and the handler both see the same view the caller submitted under.
+rule ReceiveCommand {
+    when: CommandSubmitted(caller, command)
+    -- The request is scoped to the tenant the command names; that tenant is
+    -- recorded on the request and carried through authorization and dispatch.
+    let tenant = Tenant{id: command.tenant.id}
+    -- The context the caller submitted under — the ambient grain context
+    -- (registry, event store, tenant) merged with any context upstream
+    -- interceptors contributed, resolved by its request id and threaded,
+    -- unchanged, through to authorization and the handler.
+    let submission_context = RequestContext{request_id: caller.request_id}
+    ensures:
+        command.id = fresh_id()
+        command.received_at = now
+        CommandRequest.created(
+            command: command,
+            context: submission_context,
+            tenant: tenant,
+            status: received
+        )
+
+    @guidance
+        -- Identity and timestamp are assigned on arrival regardless of validity,
+        -- so even a command that is about to be rejected is uniquely
+        -- identifiable. fresh_id() is opaque to this spec. The command names the
+        -- tenant it acts within and that tenant is recorded on the request and
+        -- travels with it, so dispatch and any resulting events land under it.
+        -- Resolving the tenant only records the scope; it is NOT a rejection
+        -- gate — the boundary does not reject a command because its tenant is
+        -- unknown, it trusts the ambient context (the event store materialises a
+        -- tenant on first append). The boundary does not deduplicate on the
+        -- freshly minted command id; at-most-once delivery, if required, is the
+        -- event store's concern (see open questions).
+}
+
+-- A received command is checked against its declared shape. A well-formed
+-- command is admitted; a malformed one is rejected immediately as incorrect and
+-- never reaches authorization or dispatch.
+rule ValidateShape {
+    when: request: CommandRequest.status becomes received
+    requires: request.status = received
+    -- The command being validated is the one stamped on receipt, identified by
+    -- the fresh id the boundary assigned it.
+    let stamped = Command{id: request.command.id}
+    ensures:
+        if valid_shape(stamped):
+            request.status = admitted
+        else:
+            request.status = rejected
+            request.outcome = incorrect
+
+    @guidance
+        -- This gate checks the command's base envelope: that it carries a name
+        -- and the identity and receipt timestamp the boundary stamped on it. A
+        -- command that fails this is incorrect and is rejected here, before
+        -- authorization or dispatch. valid_shape() is opaque to this spec. The
+        -- deeper, per-name payload validation (and the not_found verdict for an
+        -- unknown command name) is the command processor's, not the boundary's —
+        -- so a well-formed envelope naming an unregistered command is admitted
+        -- here and resolved downstream (see DispatchCommand).
+}
+
+-- An admitted command is authorized deny-by-default: it proceeds ONLY when its
+-- registration carries an authorizer AND that authorizer, given the full request
+-- context, returns true. A missing authorizer or any non-true result is a
+-- denial, reported as forbidden. The authorizer sees the whole context,
+-- including the decoded command and the tenant, so it can make a
+-- command-specific, tenant-specific decision.
+rule AuthorizeCommand {
+    when: request: CommandRequest.status transitions_to admitted
+    requires: request.status = admitted
+    let registration = CommandRegistration{command_name: request.command.name}
+    ensures:
+        if exists registration and registration.has_authorizer and authorizer_grants(request.command, request.context):
+            request.status = authorized
+        else:
+            request.status = rejected
+            request.outcome = forbidden
+
+    @guidance
+        -- Deny-by-default: absence of an authorizer is a denial, not an
+        -- allowance, and is indistinguishable at the boundary from an authorizer
+        -- that returned false. authorizer_grants() evaluates the registered
+        -- predicate against the full context and is true only when the predicate
+        -- returns exactly true (any other value, including a truthy non-true
+        -- value, is a denial).
+}
+
+-- An authorized command is dispatched to the command processor, and whatever
+-- classified outcome the processor reports becomes the request's outcome. The
+-- request then completes. The boundary does not inspect or re-derive the
+-- category; it passes the processor's verdict straight through.
+rule DispatchCommand {
+    when: request: CommandRequest.status transitions_to authorized
+    requires: request.status = authorized
+    let result = process(request.command, request.context)
+    ensures:
+        request.status = completed
+        request.outcome = result
+
+    @guidance
+        -- The outcome is exactly the category the processor reports: ok on
+        -- success, or the anomaly's category otherwise. Fault containment is the
+        -- processor's responsibility, not the boundary's — a handler that
+        -- returns nothing or throws is caught by the processor and reported as
+        -- the fault category (see CommandProcessing.OutcomeClassified); this
+        -- boundary merely relays it, so a misbehaving handler never propagates
+        -- an exception out through the boundary. A command name the processor
+        -- does not recognise is reported as not_found, and a payload that fails
+        -- the processor's own per-name validation as incorrect. Events emitted
+        -- by a successful handler are persisted by the processor under the
+        -- command's tenant (CommandProcessing.EventsPersistedToTenant); this
+        -- boundary does not itself touch the event store.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Deny-by-default: a request can only reach the authorized state when its
+-- command's registration actually carries an authorizer. No authorizer means no
+-- authorized request — the request must have been rejected instead. This is the
+-- structural statement of the deny-by-default guarantee.
+invariant DenyByDefault {
+    for r in CommandRequests:
+        r.status = authorized implies
+            CommandRegistration{command_name: r.command.name}.has_authorizer
+}
+
+-- A terminal request always carries a classified outcome, and a non-terminal one
+-- never does. The boundary never completes a request without a verdict.
+invariant TerminalRequestsAreClassified {
+    for r in CommandRequests:
+        r.status in {rejected, completed} implies r.outcome != null
+}
+
+-- Every request is scoped to exactly the tenant its command names. The boundary
+-- carries this tenant through authorization and dispatch, and any events the
+-- command emits are recorded under it — never another tenant's stream.
+invariant TenantScoped {
+    for r in CommandRequests:
+        r.tenant = Tenant{id: r.command.tenant.id}
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The party on the far side of the boundary is a caller submitting commands in a
+-- request context. It is code rather than a person, so it carries a minimal
+-- identity tied to the per-request context it submits under.
+actor Caller {
+    identified_by: RequestContext where request_id != null
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The command-submission boundary. A caller submits a named, tenant-scoped
+-- command in a context; the boundary admits, authorizes, dispatches and returns
+-- a classified outcome. The codec roundtrip is fulfilled here; the processing
+-- guarantees the boundary relies on are demanded from the command processor.
+surface CommandSubmission {
+    facing caller: Caller
+    context request: CommandRequest
+
+    exposes:
+        request.status
+        request.outcome
+
+    provides:
+        CommandSubmitted(caller, request.command)
+
+    contracts:
+        fulfils CommandCodec
+        demands CommandProcessing
+
+    @guarantee DenyByDefaultAuthorization
+        -- A command runs only when its registration supplies an authorizer that
+        -- returns true for this caller's context. A missing authorizer or any
+        -- non-true result is denied as forbidden — the same observable outcome
+        -- either way, so an unprotected command is never reachable by accident.
+
+    @guarantee FullContextToAuthorizer
+        -- The authorization predicate and the handler both receive the caller's
+        -- entire context — the ambient grain context (registry, event store,
+        -- tenant), any context contributed by upstream interceptors, and the
+        -- decoded command — so authorization can be command-specific and the
+        -- handler need not re-fetch ambient state.
+
+    @guarantee TenantScoped
+        -- Every command is handled within the tenant it was submitted for, and
+        -- any events it emits are recorded under that tenant. A caller's command
+        -- cannot read or write another tenant's stream.
+
+    @guarantee StableOutcomeClassification
+        -- Every submitted command resolves to exactly one OutcomeCategory.
+        -- Malformed input is incorrect, denied access is forbidden, and the
+        -- remaining categories come from the handler's own result; the caller
+        -- can rely on this fixed vocabulary independent of transport.
+
+    @guarantee FaultIsolation
+        -- A handler that fails unexpectedly, including by throwing, cannot crash
+        -- the boundary or propagate an exception to the caller: the demanded
+        -- command processor catches the failure and reports it as the fault
+        -- category (CommandProcessing.HandlerFaultsContained), and the boundary
+        -- relays that as the fault outcome. One command's failure never affects
+        -- the boundary's ability to serve the next.
+
+    @guarantee RequestIndependence
+        -- Each submission is handled in isolation: identity and receipt timestamp
+        -- are stamped per request, and no caller state leaks between requests
+        -- beyond the shared command registry the boundary reads.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Command identity is assigned at the boundary on admission rather than supplied by the caller. Should a caller be able to supply an idempotency key so retried submissions are deduplicated, or is at-least-once submission the intended contract (with at-most-once left to the event store's CAS)?"
+open question "Deny-by-default treats a missing authorizer and an authorizer returning false as the same observable outcome (forbidden). Is the caller ever entitled to distinguish 'no authorizer configured' (an operator misconfiguration) from 'access denied' (a legitimate rejection)?"
+open question "An uncaught handler exception is classified as fault and the failure detail is surfaced to the caller in the message. Is exposing handler failure detail to the caller intended, or should faults be opaque at the boundary?"

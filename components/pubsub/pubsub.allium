@@ -1,0 +1,256 @@
+-- allium: 3
+-- pubsub.allium
+--
+-- Distilled from components/pubsub (grain).
+--
+-- Scope: An instance-local, topic-routed publish/subscribe bus. A publisher
+--        emits a message; the bus derives the message's topic and delivers it to
+--        exactly those subscribers registered for that topic, on the same node.
+--        It is fire-and-forget best-effort fan-out: messages are buffered behind
+--        a fixed bound and the oldest are dropped under backpressure, with no
+--        durability, no acknowledgement and no replay. It is the local delivery
+--        primitive that durable components (the event notifier and the event
+--        tailer) republish onto, and that live views (datastar streams) subscribe
+--        to in order to re-render on new events.
+--
+-- Includes: topic-keyed routing (a message's topic is derived from the message
+--           itself, and a message reaches exactly the subscribers of that topic);
+--           multi-subscriber fan-out (every subscriber registered for the topic
+--           receives a copy); best-effort, lossy delivery under a single fixed
+--           buffer bound at the publish ingress (the oldest as-yet-undelivered
+--           message is dropped to admit the newest when that buffer is full, so a
+--           burst or a lagging fan-out sheds the oldest messages rather than
+--           blocking the publisher); the dropping of empty (absent) publishes; and
+--           a stop that ends all further delivery.
+--
+-- Excludes (implementation / plumbing, governed elsewhere):
+--   - the concrete bus backend (core.async channels, publication, sliding
+--     buffers) and its swappable selection by type
+--   - threads, channels, buffer sizes as wall-clock tuning, and the non-blocking
+--     put/drain mechanics
+--   - the wire encoding of messages and topics
+--   - how a subscriber consumes its delivered messages once handed to it
+--     (subscriber-side debounce, de-duplication and rendering live in the
+--     consumer, e.g. datastar, not here)
+--   - logging, tracing and metrics
+--   - any cross-node / durable / tenant-partitioned delivery: this bus is
+--     strictly node-local and message-agnostic. Tenant scoping, when present, is
+--     a field publishers attach to the payload, not a property of the bus.
+--
+-- The conformance points below correspond to the component's behaviour as
+-- exercised by its consumers (event-tailer, event-notifier-postgres, datastar).
+-- Where each is captured:
+--   topic-keyed delivery to matching subscribers -> contract LocalBus.RoutedByTopic
+--   every matching subscriber receives a copy    -> contract LocalBus.FanOutToAllSubscribers
+--   lossy under backpressure, never blocks pub   -> contract LocalBus.BoundedBestEffort
+--   empty publishes are dropped                  -> rule PublishMessage requires guard
+--   stop ends delivery                           -> surface PublishBoundary PublishingStopsOnStop
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- An opaque message published onto the bus. The bus neither creates nor
+-- interprets messages beyond deriving the topic each is routed under; payload
+-- shape, identity and any tenant key are the publisher's concern. A type
+-- placeholder: a consuming spec substitutes its own message (a stored event, a
+-- notification) wherever the bus expects a Message.
+external entity Message {
+    -- The routing key this message is delivered under. Derived from the message
+    -- by the bus (a topic function the consumer supplies at startup), it is what
+    -- a subscriber matches its interest against. Modelled as a field because,
+    -- from the bus's point of view, every message carries the topic it routes on.
+    topic: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The instance-local delivery primitive. A publisher hands a message to the bus;
+-- the bus routes it by topic and fans it out to the matching subscribers on the
+-- same node. Delivery is best-effort and lossy under load: a fixed buffer
+-- absorbs bursts and drops the oldest undelivered messages rather than blocking
+-- the publisher or growing without bound. There is no acknowledgement, no
+-- durability and no replay — this is the live, local edge that durable
+-- components sit in front of.
+contract LocalBus {
+    -- Publish one message. The bus derives its topic and delivers it to that
+    -- topic's current subscribers. Returns nothing observable: publishing is
+    -- fire-and-forget.
+    publish: (message: Message) -> Any
+
+    -- Register a subscriber's interest in a topic. From then until stop, messages
+    -- routed under that topic are delivered to this subscriber.
+    subscribe: (topic: String, subscriber: Subscriber) -> Any
+
+    @invariant RoutedByTopic
+        -- A published message is delivered only to subscribers registered for the
+        -- message's topic. The topic is derived from the message itself, so the
+        -- publisher does not name recipients; subscribers select what they
+        -- receive by the topic they registered. A subscriber to a different topic
+        -- never sees the message.
+
+    @invariant FanOutToAllSubscribers
+        -- Every subscriber registered for a message's topic receives the message.
+        -- Multiple subscribers to the same topic each get their own copy,
+        -- independently; one subscriber's consumption does not consume the message
+        -- for another. There is no competing-consumer / single-delivery semantics
+        -- here — delivery is broadcast within a topic.
+
+    @invariant BoundedBestEffort
+        -- Delivery is best-effort under a single fixed buffer bound the bus holds
+        -- at the publish ingress, shared across all topics and subscribers (not a
+        -- separate bound per subscriber). Publishing never blocks the publisher
+        -- and this buffer never grows without limit: when it is full, the oldest
+        -- as-yet-undelivered message is dropped to admit the newest. Loss is
+        -- therefore a property of the bus as a whole — a burst, or any lag in
+        -- fanning a message out, can shed the oldest messages for any subscriber,
+        -- not just one that has fallen behind. There is no acknowledgement, retry,
+        -- durability or replay; a message dropped, or published while no subscriber
+        -- was registered for its topic, is simply gone. Any further buffering a
+        -- subscriber places on its own intake, and durability, ordering guarantees
+        -- and de-duplication where required, are supplied by the components in
+        -- front of and behind this bus, not by the bus.
+
+    @invariant NodeLocal
+        -- Delivery is confined to subscribers on the same running instance as the
+        -- publisher. The bus carries no message across nodes and partitions
+        -- nothing by tenant; any tenant key a message carries is opaque payload
+        -- that the bus neither reads nor routes on.
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A party that receives messages for the topics it has registered. The consumer
+-- behind it (how it consumes a delivered message) is opaque to the bus, but the
+-- registration fact — which topics this subscriber currently receives — is state
+-- this spec governs: subscribing raises interest, and the bus reads that interest
+-- when routing. Modelled here as an internal entity because this module's own
+-- rules establish and mutate its topic set.
+entity Subscriber {
+    -- The topics this subscriber currently receives. Registering raises interest
+    -- in a topic; a message routes to this subscriber when its topic is in this
+    -- set.
+    topics: Set<String>
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A listener registers interest in a topic. From then until the bus stops, the
+-- subscriber receives messages routed under that topic. Registering the same
+-- topic again leaves interest unchanged (the topic set is idempotent).
+rule ListenerSubscribes {
+    when: ListenerSubscribes(listener, topic)
+    ensures: listener.topics.add(topic)
+}
+
+-- A publisher emits a message; the bus routes it by topic and fans it out to the
+-- topic's current subscribers. An empty (absent) publish carries nothing and is
+-- dropped — there is no message to route.
+rule PublishMessage {
+    when: PublisherEmits(publisher, message)
+    requires: message != null
+    ensures:
+        for subscriber in Subscribers where message.topic in subscriber.topics:
+            MessageDelivered(subscriber: subscriber, message: message)
+
+    @guidance
+        -- The fan-out here is the logical contract, not the mechanism: the bus
+        -- derives the topic from the message (a topic function supplied at
+        -- startup) and routes to that topic's subscribers. Delivery is best-effort
+        -- and lossy under a single fixed buffer bound at the publish ingress
+        -- (LocalBus.BoundedBestEffort): a MessageDelivered emission models the
+        -- intent to deliver the message to each matching subscriber, but when that
+        -- shared buffer is full the oldest as-yet-undelivered message is dropped
+        -- before it is ever fanned out, so a matching subscriber may never see it.
+        -- Publishing never blocks the publisher. There is no ordering,
+        -- de-duplication or durability guarantee at this layer; consumers that
+        -- need them (the event tailer's cursor, datastar's de-dupe) layer them on
+        -- top.
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The party that emits messages. Code on the same node, not a person, so any
+-- subscriber-bearing instance qualifies; it is the in-process producer (an event
+-- notifier or tailer republishing stored events, or a manual publisher).
+actor Publisher {
+    identified_by: Subscriber where true
+}
+
+-- The party that registers topic interest and receives matching messages. Code
+-- on the same node, not a person, so any instance qualifies.
+actor Listener {
+    identified_by: Subscriber where true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary where a publisher hands a message to the bus. The bus derives the
+-- topic and delivers best-effort to the matching subscribers; the publisher
+-- names no recipients and is never blocked.
+surface PublishBoundary {
+    facing publisher: Publisher
+
+    provides:
+        PublisherEmits(publisher, message)
+
+    contracts:
+        fulfils LocalBus
+
+    @guarantee RoutedAndFannedOut
+        -- A published message reaches exactly the subscribers registered for its
+        -- topic, every one of them, each with its own copy. A subscriber to
+        -- another topic never receives it, and an empty publish delivers nothing.
+
+    @guarantee BestEffortNeverBlocks
+        -- Publishing never blocks and the bus never grows without bound: it holds
+        -- a single fixed buffer at the publish ingress, and when that buffer is
+        -- full the oldest as-yet-undelivered message is dropped to admit the
+        -- newest. Delivery is lossy and unacknowledged — there is no durability or
+        -- replay at this boundary.
+
+    @guarantee PublishingStopsOnStop
+        -- Once the bus is stopped, no further messages are delivered to any
+        -- subscriber, even if a publish is subsequently attempted.
+}
+
+-- The boundary where a subscriber registers interest in a topic and thereafter
+-- receives matching messages until the bus stops.
+surface SubscriptionBoundary {
+    facing listener: Listener
+
+    provides:
+        ListenerSubscribes(listener, topic)
+
+    @guarantee DeliveredWhileSubscribed
+        -- From registration until the bus stops, every message routed under a
+        -- registered topic is offered to the subscriber, subject to best-effort
+        -- delivery: the bus's single fixed ingress buffer may drop the oldest
+        -- as-yet-undelivered message under load before it is fanned out, so a
+        -- matching message can be lost without blocking the publisher and without
+        -- any signal. Messages published before registration, or to topics not
+        -- registered, are not delivered.
+
+    @guarantee NodeLocalOnly
+        -- A subscriber receives only messages published on the same running
+        -- instance. The bus carries nothing across nodes and routes purely on
+        -- topic, never on any tenant key a message may carry.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Delivery is lossy under a fixed buffer bound: the oldest undelivered messages are dropped under backpressure with no signal to publisher or subscriber. Durable consumers (notifier, tailer) tolerate this because they re-derive state from the store; is silent loss the intended contract for every consumer, or should some subscribers be able to detect a dropped message?"
+open question "The bus is message-agnostic and routes only on a derived topic; tenant scoping lives entirely in the payload that consumers attach. Should tenant isolation be a property of the bus itself, or is it correct that it stays the consumers' responsibility?"
+open question "Subscriptions live until the bus stops; there is no explicit unsubscribe in the boundary. Is per-subscription teardown out of scope (subscribers simply stop consuming), or should the bus model unsubscribe as a first-class operation?"

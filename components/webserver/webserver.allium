@@ -1,0 +1,129 @@
+-- allium: 3
+-- webserver.allium
+--
+-- Distilled from components/webserver (grain).
+--
+-- Scope: The HTTP entry point for a grain application. A thin lifecycle wrapper
+--        that brings an HTTP server up against a supplied set of routes and
+--        tears it down again. This component is infrastructure: it has almost no
+--        behaviour of its own beyond start/stop and route binding. The
+--        request-handling behaviour (command/query dispatch, authorization,
+--        tenant scoping) belongs to the route-providing components
+--        (command/query-request-handler, datastar), not here.
+--
+-- Includes:
+--   - the start/stop lifecycle of a single HTTP server instance
+--   - binding the server to a configured listen port, with port 0 meaning the
+--     OS chooses an ephemeral port that the caller can read back afterwards
+--   - serving a caller-supplied set of routes, or a trivial default route when
+--     none is supplied
+--   - whether start blocks the calling thread (join) or returns immediately
+--
+-- Excludes (implementation / governed elsewhere):
+--   - the HTTP framework, container and connector internals (Pedestal / Jetty)
+--   - the dependency-injection / system-lifecycle wiring used to assemble it
+--   - request routing, interceptors, command/query dispatch, authorization and
+--     tenant scoping — all carried by the route set, owned by other components
+--   - wire formats, serialization, threading and connection pooling
+--   - TLS, host/interface binding and other transport configuration
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The set of routes the server should serve, supplied by the caller. Its shape
+-- and semantics (paths, verbs, handlers, interceptors) are owned by the
+-- route-providing components; the webserver treats it as an opaque, identity-less
+-- payload to mount. A placeholder the consumer substitutes with its own routes.
+value RouteSet {}
+
+-- A live, listening HTTP server instance produced by start and consumed by
+-- stop. An opaque handle with no identity of its own; its only externally
+-- meaningful property is the port it actually ended up listening on.
+value HttpServer {
+    -- The port the server is actually listening on once started. When the caller
+    -- requested an ephemeral port (0), this is the concrete port the OS chose,
+    -- readable back from the running instance.
+    bound_port: Integer
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The lifecycle the webserver fulfils. start/stop are the entire behavioural
+-- surface; everything else is configuration of how the single server listens.
+contract ServerLifecycle {
+    -- Bring up a listening HTTP server serving the given routes on the given
+    -- port. Each input is independently optional: a null route set means the
+    -- default route is served, an absent port falls back to the default port,
+    -- and an absent join flag falls back to the default join behaviour.
+    start: (routes: RouteSet?, port: Integer?, join: Boolean?) -> HttpServer
+    -- Shut a running server down, releasing its listening port.
+    stop: (server: HttpServer) -> Any
+
+    @invariant ServesSuppliedRoutes
+        -- A started server serves exactly the route set supplied to start. When
+        -- no route set is supplied, it serves a single trivial default route
+        -- instead, so a freshly started server is always reachable.
+
+    @invariant EphemeralPortReadBack
+        -- Starting with port 0 binds an OS-chosen ephemeral port; the actual
+        -- bound port is then readable from the returned server instance. Starting
+        -- with a non-zero port binds that exact port.
+
+    @invariant JoinControlsBlocking
+        -- The join flag decides whether start blocks the calling thread for the
+        -- life of the server (join = true) or returns the running instance
+        -- immediately (join = false). It does not affect which routes are served
+        -- or which port is bound.
+
+    @invariant StopReleasesPort
+        -- Stopping a server stops it listening and releases its port, so the
+        -- same port can be bound again by a subsequent start.
+
+    @guidance
+        -- This component owns no request semantics. Authorization, tenant
+        -- scoping and command/query dispatch live entirely in the supplied route
+        -- set and the components that build it. Treat the webserver as plumbing:
+        -- if a behaviour could be implemented on any HTTP container without
+        -- changing what callers observe, it does not belong in this spec.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The default listen port when the caller does not override it.
+    default_port: Integer = 8080
+    -- Whether start blocks the calling thread by default. Servers are normally
+    -- run as a managed component alongside others, so start returns immediately.
+    default_join: Boolean = false
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Whatever assembles and runs the application (the system runtime / DI wiring).
+-- It supplies the routes and port and owns the server's lifecycle.
+actor Host {}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The single boundary this component offers: a host starts a server over a set
+-- of routes and later stops it.
+surface WebserverLifecycle {
+    facing host: Host
+
+    contracts:
+        fulfils ServerLifecycle
+
+    @guarantee ReachableWhileRunning
+        -- Between a successful start and the matching stop, the server is
+        -- listening on its bound port and serving the supplied routes (or the
+        -- default route). After stop it is no longer listening.
+}

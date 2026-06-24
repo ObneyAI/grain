@@ -1,0 +1,369 @@
+-- allium: 3
+-- code-agent-tools.allium
+--
+-- Distilled from components/code-agent-tools (grain).
+--
+-- Scope: A developer-facing toolkit a code agent drives (over a REPL) to
+--        introspect and exercise a *live* Grain runtime. The agent installs a
+--        running application once, then calls read-only tools (catalog the
+--        registries, inspect schemas, validate values, read events, project
+--        read models, gather diagnostics) and write tools (invoke commands and
+--        queries) against it. This component does not implement command,
+--        query, event-store, read-model, todo-processor, periodic-task or
+--        control-plane behaviour; it forwards to those runtimes and is
+--        specified by how it gates, scopes and sanitizes that forwarding.
+--
+-- Includes:
+--   - install gate: the store-touching execution tools (invoke command/query,
+--     read events, project, diagnostics) require an installed runtime;
+--     introspection and validation do not. Install itself is dev-only (a
+--     non-dev mode is rejected)
+--   - tenant scoping: every store-touching tool resolves a tenant id from
+--     explicit arguments or the installed context, and fails if neither
+--     supplies one (deny-by-default on tenant)
+--   - introspection sanitization: catalog / runtime / schema views never leak
+--     raw runtime objects (functions, classes, vars) — only data. Catalog and
+--     schema views read the host's process-wide registries, independent of any
+--     installation
+--   - request normalization: commands and queries get an id and a timestamp
+--     filled in when absent before being forwarded
+--   - graceful degradation: diagnostics report a present/absent control plane
+--     rather than failing when none is installed
+--
+-- Excludes (implementation, governed by the demanded runtime contracts):
+--   - command validation/authorization and event emission (command processor)
+--   - query handling and read-model projection (query / read-model processors)
+--   - event-store read/storage, serialization and tenant partitioning
+--   - todo-processor checkpointing, periodic-task scheduling, control-plane
+--     leasing and routing — surfaced only as catalog/diagnostic data here
+--   - REPL transport, EDN/wire encoding, Malli internals, logging/metrics
+
+-- This toolkit has no domain entities of its own beyond the installed runtime
+-- handle. Tenants, registry entries, schemas, commands, queries and events are
+-- all artifacts of the host runtime; the toolkit treats them as opaque values
+-- (a tenant is identified by a String id, the rest as Any) that it scopes,
+-- forwards and sanitizes rather than as entities it governs. They are therefore
+-- modelled in contract signatures as values, not as external entities.
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The introspection guarantee: every view the toolkit returns is reduced to
+-- plain data. Live runtime objects (functions, classes, vars) are represented
+-- as descriptive data, so nothing un-serializable escapes the boundary.
+-- Catalog and schema views describe the host's process-wide registries and so
+-- do not depend on an installation; only the runtime summary reflects the
+-- installed handle, reporting absent when nothing is installed.
+contract Introspection {
+    catalog: () -> Any
+    runtime_summary: () -> Any
+    list_schemas: () -> Any
+
+    @invariant Sanitized
+        -- No raw runtime object crosses the boundary. Functions, classes and
+        -- vars are replaced by descriptive data (e.g. a var by its defining
+        -- namespace, name and source location), so every returned view is
+        -- pure, inert data safe to ship over the REPL.
+
+    @invariant CompleteCatalog
+        -- The catalog enumerates every registered command, query, read model,
+        -- todo processor and periodic trigger, each annotated with whether its
+        -- schema is present and whether an authorization predicate is declared,
+        -- plus the events each consumer reads and a list of names that are
+        -- referenced but have no registered schema.
+}
+
+-- The validation guarantee: a value can be checked against a registered schema,
+-- optionally wrapped in the command / query / event envelope, yielding a
+-- definite verdict with humanized explanation on failure.
+contract SchemaValidation {
+    validate: (schema: Any, value: Any) -> Any
+    validate_envelope: (kind: EnvelopeKind, schema: Any, value: Any) -> Any
+
+    @invariant TotalVerdict
+        -- Validation always returns a verdict: valid, or invalid with both
+        -- machine-readable and humanized explanation. A schema that throws
+        -- while checking yields an invalid verdict carrying the error, never a
+        -- propagated failure.
+
+    @invariant EnvelopeWrapping
+        -- When a kind is supplied the value is checked against the Grain
+        -- envelope for that kind (command, query or event) conjoined with the
+        -- named schema, so envelope-shape violations are caught alongside
+        -- payload violations.
+}
+
+-- The execution guarantee the toolkit DEMANDS of the host: a normalized,
+-- tenant-scoped command or query is processed by the real Grain processors,
+-- so an invoked command may append events and mutate application state.
+contract RuntimeExecution {
+    process_command: (tenant_id: String, command: Any) -> Any
+    process_query: (tenant_id: String, query: Any) -> Any
+    read_events: (tenant_id: String, filter: Any) -> Sequence<Any>
+    project: (tenant_id: String, read_model: Any) -> Any
+
+    @invariant TenantScoped
+        -- Every execution and read is confined to the resolved tenant; results
+        -- and emitted events belong to that tenant and no other. The resolved
+        -- tenant is authoritative: a tenant carried inside the request payload
+        -- is stripped before forwarding and cannot override it, so a request
+        -- can never be processed under a tenant other than the resolved one.
+
+    @invariant CommandsCanMutate
+        -- Processing a command runs the host's command pipeline, which
+        -- validates business rules and may append events — invoking a command
+        -- is a state-changing act, unlike the read-only tools.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The installation mode. Only dev is permitted; any other requested mode is
+-- rejected at install time, so the toolkit can never attach to production.
+enum InstallMode { dev }
+
+-- Which Grain envelope a value is validated against when a kind is supplied.
+enum EnvelopeKind { command | query | event }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The single installed runtime handle. At most one exists at a time: installing
+-- replaces any prior installation. Its presence is the precondition for the
+-- store-touching execution tools (invoke command/query, read events, project,
+-- diagnostics) — introspection and validation read process-wide state and need
+-- no installation. Its context optionally carries a default tenant, the event
+-- store and the read-model cache.
+entity Installation {
+    -- Always normalized to dev on install.
+    mode: InstallMode
+    installed_at: Timestamp
+    -- The default tenant id carried by the installed context, when one is bound.
+    -- Tools fall back to this when a call supplies no explicit tenant.
+    default_tenant_id: String?
+    -- Whether the installed context exposes an event store. Reads that need it
+    -- fail when it is absent.
+    has_event_store: Boolean
+    -- Whether the installed context exposes a read-model cache.
+    has_cache: Boolean
+    -- Whether the installed application embeds a control plane. When false,
+    -- diagnostics still succeed but report it absent.
+    has_control_plane: Boolean
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- The agent installs a runtime. Install is dev-only: a request naming any mode
+-- other than dev is rejected. A successful install records the handle, stamps
+-- the install time, and supersedes any previous installation (at most one is
+-- ever active).
+rule InstallRuntime {
+    when: InstallRequested(requested_mode?, default_tenant_id?, has_event_store, has_cache, has_control_plane)
+    requires: requested_mode = null or requested_mode = dev
+    ensures:
+        for prior in Installations:
+            not exists prior
+        Installation.created(
+            mode: dev,
+            installed_at: now,
+            default_tenant_id: default_tenant_id,
+            has_event_store: has_event_store,
+            has_cache: has_cache,
+            has_control_plane: has_control_plane
+        )
+}
+
+-- A request to install with a non-dev mode is refused; no installation results.
+-- This is the production guard: the toolkit is strictly a development affordance.
+rule RejectNonDevInstall {
+    when: InstallRequested(requested_mode?, default_tenant_id?, has_event_store, has_cache, has_control_plane)
+    requires: requested_mode != null
+    requires: requested_mode != dev
+    ensures: InstallRejected(requested_mode: requested_mode)
+}
+
+-- The agent invokes a command. It requires an installation and a resolvable
+-- tenant (taken from the request, else the installed default). The command is
+-- normalized — an id and timestamp are filled in when the caller omitted them,
+-- and any tenant embedded in the request is dropped so only the resolved tenant
+-- scopes execution — then handed to the host's command pipeline, which may
+-- append events.
+rule InvokeCommand {
+    when: CommandSubmitted(command, tenant_id?)
+    let installation = Installations.first
+    requires: exists installation
+    let resolved_tenant_id = tenant_id ?? installation.default_tenant_id
+    requires: resolved_tenant_id != null
+    ensures: CommandForwarded(tenant_id: resolved_tenant_id, command: normalize_request(command))
+}
+
+-- The agent runs a query. Same install-and-tenant gate as commands; the query
+-- is normalized (id and timestamp filled in, any embedded tenant dropped) and
+-- forwarded to the host's query pipeline. Read-only.
+rule InvokeQuery {
+    when: QuerySubmitted(query, tenant_id?)
+    let installation = Installations.first
+    requires: exists installation
+    let resolved_tenant_id = tenant_id ?? installation.default_tenant_id
+    requires: resolved_tenant_id != null
+    ensures: QueryForwarded(tenant_id: resolved_tenant_id, query: normalize_request(query))
+}
+
+-- The agent reads tenant-scoped events. Requires an installation whose context
+-- exposes an event store, and a resolvable tenant. The filter (types, tags,
+-- limit) selects which events come back, in store order.
+rule ReadEvents {
+    when: EventsRequested(filter, tenant_id?)
+    let installation = Installations.first
+    requires: exists installation
+    requires: installation.has_event_store
+    let resolved_tenant_id = tenant_id ?? installation.default_tenant_id
+    requires: resolved_tenant_id != null
+    ensures: EventsRead(tenant_id: resolved_tenant_id, filter: filter)
+}
+
+-- The agent projects a registered read model. Requires an installation whose
+-- context exposes both an event store and a cache, and a resolvable tenant.
+rule ProjectReadModel {
+    when: ProjectionRequested(read_model, scope?, tenant_id?)
+    let installation = Installations.first
+    requires: exists installation
+    requires: installation.has_event_store
+    requires: installation.has_cache
+    let resolved_tenant_id = tenant_id ?? installation.default_tenant_id
+    requires: resolved_tenant_id != null
+    ensures: ReadModelProjected(tenant_id: resolved_tenant_id, read_model: read_model)
+}
+
+-- The agent asks for diagnostics. Requires an installation. Diagnostics never
+-- fail on a missing control plane: they report it present or absent. When a
+-- tenant is supplied and a control plane is present, the report includes how a
+-- request for that tenant would route.
+rule ReportDiagnostics {
+    when: DiagnosticsRequested(tenant_id?)
+    let installation = Installations.first
+    requires: exists installation
+    ensures:
+        DiagnosticsProduced(
+            control_plane_present: installation.has_control_plane,
+            tenant_id: tenant_id
+        )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At most one runtime is installed at a time; installing supersedes any prior
+-- handle. This makes "the installed runtime" unambiguous for every tool.
+invariant AtMostOneInstallation {
+    for a in Installations:
+        for b in Installations:
+            a = b
+}
+
+-- The toolkit never attaches to anything but a development runtime.
+invariant InstallIsDevOnly {
+    for i in Installations:
+        i.mode = dev
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The code agent on the other side of the toolkit boundary, driving Grain over
+-- a REPL. Modelled as the installed runtime handle it operates through.
+actor CodeAgent {
+    identified_by: Installation where mode = dev
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Installing and inspecting the runtime handle.
+surface RuntimeInstallation {
+    facing agent: CodeAgent
+
+    exposes:
+        agent.mode
+        agent.installed_at
+        agent.has_event_store
+        agent.has_cache
+        agent.has_control_plane
+
+    provides:
+        InstallRequested(agent)
+
+    @guarantee DevOnly
+        -- Installation is rejected unless the requested mode is dev (or unset);
+        -- the toolkit can never attach to a production runtime.
+
+    @guarantee SupersedesPrior
+        -- Installing replaces any prior installation, so exactly one runtime
+        -- handle is ever active and "the installed runtime" is unambiguous.
+}
+
+-- Read-only introspection of the live runtime: registries, schemas, validation.
+surface RuntimeInspection {
+    facing agent: CodeAgent
+
+    contracts:
+        fulfils Introspection
+        fulfils SchemaValidation
+
+    @guarantee InstallationIndependent
+        -- Introspection and validation read the host's process-wide registries
+        -- and schemas directly; they do not require an installation and succeed
+        -- even before one is performed (returning absent for the runtime
+        -- summary). The install gate applies only to the store-touching
+        -- execution tools, not to inspection.
+
+    @guarantee NoRawObjectsLeak
+        -- All returned views are inert data; live functions, classes and vars
+        -- are reduced to descriptive data before crossing the boundary.
+}
+
+-- Driving the live runtime: invoking commands and queries, reading events,
+-- projecting read models, gathering diagnostics. Every store-touching tool is
+-- tenant-scoped and deny-by-default on tenant resolution.
+surface RuntimeExecutionSurface {
+    facing agent: CodeAgent
+
+    provides:
+        CommandSubmitted(agent)
+        QuerySubmitted(agent)
+        EventsRequested(agent)
+        ProjectionRequested(agent)
+        DiagnosticsRequested(agent)
+
+    contracts:
+        demands RuntimeExecution
+
+    @guarantee TenantResolvedOrRejected
+        -- Each command, query, event read and projection resolves a tenant
+        -- from the call or the installed context, and is rejected when neither
+        -- supplies one — tenant scoping is deny-by-default.
+
+    @guarantee CommandsMayMutate
+        -- Invoking a command runs the host's command pipeline and may append
+        -- events; queries, event reads and projections are read-only.
+
+    @guarantee DiagnosticsDegradeGracefully
+        -- Diagnostics succeed whether or not a control plane is installed,
+        -- reporting its presence rather than failing without it.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "normalize_request fills a missing id and timestamp on commands and queries. Should re-submitting an already-stamped request be treated as idempotent by id, or is that purely the command processor's concern?"
+open question "Reads degrade by rejecting when the installed context lacks an event store or cache. Should the toolkit instead report the missing capability as data (as diagnostics does for the control plane), for a uniform degradation model?"
+open question "Installation is modelled as at-most-one global handle. Is a single shared installation per REPL the intended contract, or should installations be scoped (e.g. per session) so concurrent agents do not clobber one another?"

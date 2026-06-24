@@ -1,0 +1,213 @@
+-- allium: 3
+-- mulog-aws-cloudwatch-emf-publisher.allium
+--
+-- Distilled from components/mulog-aws-cloudwatch-emf-publisher (grain).
+--
+-- Scope: A μ/log publisher that turns structured telemetry events into
+--        CloudWatch metrics, expressed in AWS Embedded Metric Format (EMF).
+--        This is infrastructure / thin plumbing: it observes an existing
+--        event stream and re-emits the metric-bearing ones as EMF records.
+--        It owns no domain state, no lifecycle and no workflow of its own.
+--
+-- Includes (the small set of genuine behavioural guarantees):
+--   - selection: only events that carry a named metric AND either a metric
+--     value (a counter) or a duration (a timer) are published; every other
+--     observed event is silently dropped.
+--   - measurement translation: a counter publishes its value as a count; a
+--     timer publishes its duration in milliseconds. The unit recorded with the
+--     metric follows that classification.
+--   - storage resolution: a metric is recorded at either high (per-second) or
+--     standard (per-minute) granularity; anything else defaults to high.
+--   - publish-once: an observed event is considered exactly once and produces
+--     at most one measurement; it is never published twice.
+--
+-- Excludes (implementation, governed elsewhere):
+--   - μ/log framework mechanics: the agent buffer, publish-delay polling, the
+--     PPublisher protocol, buffer capacity, and the per-flush drain loop.
+--   - the EMF wire format itself (JSON shape, the _aws envelope, dimension and
+--     namespace string layout) and how/where the record is transported to
+--     CloudWatch.
+--   - the unit-of-time arithmetic for converting nanoseconds to milliseconds.
+--   - the fixed metric namespace and the app-name / env dimension labels,
+--     which are deployment metadata, not behaviour.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A single structured telemetry event observed on the μ/log stream. It carries
+-- optional metric annotations; most events on the stream carry none and are not
+-- metrics at all. Produced and named entirely outside this component.
+external entity TelemetryEvent {
+    -- The metric this event records, when it records one.
+    metric_name: String?
+    -- A directly-measured quantity (a counter sample), when present.
+    metric_value: Decimal?
+    -- An elapsed time the event measured, when present (a timer sample).
+    duration: Duration?
+    -- The granularity the metric should be stored at, when specified.
+    resolution: ResolutionRequest?
+
+    -- Whether this event qualifies as a publishable metric: it must name a
+    -- metric and supply either a counter value or a timed duration. Everything
+    -- else is not a metric and is dropped on observation.
+    is_metric: metric_name != null and (metric_value != null or duration != null)
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How a published metric's value is interpreted. A counter sample is a count;
+-- a timer sample is reported in milliseconds.
+enum MetricUnit { count | milliseconds }
+
+-- The granularity a metric is stored at: per-second (high) or per-minute (low).
+enum StorageResolution { per_second | per_minute }
+
+-- The resolution a producer may ask for on an event.
+enum ResolutionRequest { high | low }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A measurement published to CloudWatch for one qualifying telemetry event: the
+-- interpreted quantity together with how to read and store it. The event's raw
+-- value or duration, the chosen unit and the storage granularity are exactly
+-- what crosses the boundary; the EMF envelope around them is excluded.
+entity Measurement {
+    -- The observed event this measurement was published from.
+    source: TelemetryEvent
+    -- count for a counter sample, milliseconds for a timer sample.
+    unit: MetricUnit
+    -- per_second for a high-resolution request, otherwise per_minute.
+    storage_resolution: StorageResolution
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The boundary the publisher fulfils: observe the telemetry stream and turn the
+-- metric-bearing events into CloudWatch measurements. These guarantees concern a
+-- pure, deterministic classification of each event, so they live as contract
+-- invariants rather than entity state.
+contract MetricPublication {
+    -- Classify one observed event into a published measurement, or nothing when
+    -- the event is not a publishable metric.
+    measure: (event: TelemetryEvent) -> Measurement
+    -- Drain a batch of buffered events, publishing the qualifying ones.
+    publish_batch: (events: Set<TelemetryEvent>) -> Set<Measurement>
+
+    @invariant MetricSelection
+        -- A measurement is produced for an event if and only if the event names
+        -- a metric and carries either a value or a duration. Every other
+        -- observed event — including a bare name with no measurement — is
+        -- silently dropped: not published and not errored.
+
+    @invariant CounterVersusTimer
+        -- An event carrying a metric value is published as a count of that
+        -- value. An event with no value but a duration is published as that
+        -- duration in milliseconds. The recorded unit follows the same split.
+
+    @invariant ResolutionMapping
+        -- A low-resolution request stores the metric at per-minute granularity.
+        -- Every other case — a high-resolution request, an unspecified request
+        -- or an unrecognised one — stores it at per-second granularity. Only the
+        -- low request diverts from the per-second default.
+
+    @invariant DrainCompleteness
+        -- A publish flush considers every event in the batch exactly once and
+        -- leaves none behind: a buffered event is either published or dropped on
+        -- the flush that observes it, never carried into a later flush and never
+        -- published twice.
+
+    @invariant Passive
+        -- Publishing is read-only with respect to the telemetry stream: it
+        -- observes events and emits measurements, and never alters the meaning
+        -- or content of the events it reads.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- When a buffered event is observed on a publish flush, a qualifying event (a
+-- named metric with a value or a duration) is published as one measurement; a
+-- non-qualifying event is dropped without producing anything. A counter
+-- publishes as a count, a timer as milliseconds; a high-resolution request
+-- stores per-second, otherwise per-minute. The publisher does not write back to
+-- the observed event: consider-once is a property of the batch drain
+-- (DrainCompleteness), not a flag set on the event.
+rule ObserveEvent {
+    when: event: TelemetryEvent.created
+    requires: event.is_metric
+    ensures:
+        Measurement.created(
+            source: event,
+            unit: if event.metric_value != null: count else: milliseconds,
+            storage_resolution:
+                if event.resolution = low: per_minute else: per_second
+        )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A measurement is only ever published from a qualifying event: nothing that
+-- lacks a named metric with a value or duration produces a measurement.
+invariant OnlyMetricsMeasured {
+    for m in Measurements:
+        m.source.is_metric
+}
+
+-- A counter sample is recorded as a count and a timer sample as milliseconds:
+-- the chosen unit always matches whether the source carried a direct value.
+invariant UnitMatchesSample {
+    for m in Measurements:
+        (m.source.metric_value != null implies m.unit = count)
+        and (m.source.metric_value = null implies m.unit = milliseconds)
+}
+
+-- A low-resolution request stores per-minute; every other case (high or
+-- unspecified) stores per-second. The mapping is total over the source request.
+invariant ResolutionFollowsRequest {
+    for m in Measurements:
+        (m.source.resolution = low implies m.storage_resolution = per_minute)
+        and (m.source.resolution != low implies m.storage_resolution = per_second)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary between the telemetry runtime and this publisher. The runtime
+-- (the μ/log framework, code rather than a person) feeds observed events by
+-- periodically asking the publisher to drain its buffer; the publisher fulfils
+-- the measurement contract.
+surface MetricPublishing {
+    context event: TelemetryEvent
+
+    exposes:
+        event.metric_name
+        event.metric_value
+        event.duration
+        event.is_metric
+
+    contracts:
+        fulfils MetricPublication
+
+    @guarantee OnlyMetricsArePublished
+        -- A measurement crosses this boundary for an event if and only if the
+        -- event names a metric and carries either a value or a duration. All
+        -- other observed events pass through unpublished.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "On a publish failure for one event in a batch, should the rest of the batch still be published, or is the whole flush abandoned? The current behaviour drains and emits per event with no batch-level failure handling specified."
+open question "Are duplicate metric names within a single flush expected (the same name appearing on multiple events in one batch), and if so should they aggregate or each publish independently?"

@@ -1,0 +1,730 @@
+-- allium: 3
+-- todo-processor-v2.allium
+--
+-- Distilled from components/todo-processor-v2 (grain).
+--
+-- Scope: A reusable event-processing mechanism. A registered processor reacts
+--        to events in a tenant's stream. Each event it consumes is run through a
+--        handler exactly once per processor+tenant, tracked by a durable
+--        checkpoint. The handler's output — new events and/or a side effect — is
+--        recorded with a delivery guarantee the handler chooses: pure handlers
+--        and at-least-once or at-most-once effects. Processing survives restarts
+--        and lease handoff between nodes without gaps and without re-running work
+--        that is already checkpointed.
+--
+-- This is a LIBRARY/FRAMEWORK spec: there is no domain state machine here. The
+-- real guarantees — idempotent replay, monotonic gap-free checkpoints, at-least
+-- and at-most-once effect delivery, tenant isolation, lease fencing, catch-up
+-- completeness and O(1) checkpoint reads — live in module-level contracts and
+-- invariants. The handful of entities (Processor, Checkpoint) exist only to give
+-- the per-tenant processing position a place to hang.
+--
+-- Includes:
+--   - the processor registry: named processors, each subscribed to a set of
+--     event types (topics), discoverable so a node can run them for owned tenants
+--   - per (processor, tenant) checkpoint tracking: a single monotonic, gap-free
+--     high-watermark naming the last event processed
+--   - idempotency: an event at or below the watermark is never reprocessed; the
+--     newest checkpoint alone is consulted (constant work, independent of history)
+--   - the four handler outcome shapes and their delivery guarantees:
+--       * pure (events only): batch-checkpointed, one checkpoint per batch
+--       * effect, checkpoint-after: at-least-once (effect runs, then checkpoint)
+--       * effect, checkpoint-before: at-most-once (checkpoint, then effect)
+--       * handler-supplied compare-and-swap: append guarded by the handler's CAS
+--   - failure handling: a handler that returns nil/anomaly or throws is recorded
+--     as processed (skipped) so it does not block the stream, unless retry is on
+--   - catch-up on start: every event since the last checkpoint is processed, no
+--     gaps and no re-firing of already-checkpointed effects
+--   - lease fencing: a node processes a tenant only while it owns that tenant's
+--     lease; an unowned tenant's events are skipped
+--   - tenant isolation: events a handler produces are appended to the same tenant
+--     they were read from and no other
+--   - dynamic owned-tenant sets: tenants acquired after start seed their
+--     watermark from existing checkpoints rather than reprocessing history
+--   - liveness under blocking handlers: a slow handler on one tenant does not
+--     starve other tenants
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the event store, its CAS mechanism and the read-model projection layer
+--     (this component DEMANDS append-with-CAS, ordered reads and a tenant
+--     enumeration with per-tenant watermarks)
+--   - the control plane's lease assignment (this component DEMANDS only a
+--     lease-ownership check; control-plane.allium owns assignment)
+--   - delivery transport: pubsub vs. direct polling vs. coalesced poller are
+--     interchangeable mechanisms behind the same processing guarantees
+--   - threads, thread pools, poll intervals, batch sizes as tuning knobs,
+--     in-flight dispatch bookkeeping
+--   - serialization, wire formats, storage backends, logging and metrics
+--   - the defprocessor macro (a registration convenience over the registry)
+--
+-- Conformance notes correspond to the todo-processor-v2 test suite. Where each
+-- guarantee is captured:
+--   tenant-id propagated from event, stripped before handler, used for storage
+--       -> rule ProcessEvent + surface DomainProcessing @guarantee TenantIsolation
+--   pure handler events stored; empty result stores nothing
+--       -> rule ProcessPure
+--   effect :after at-least-once, no re-run on replay
+--       -> rule ProcessEffectAtLeastOnce + contract Delivery.AtLeastOnceEffect
+--   effect :before at-most-once, no re-run on replay
+--       -> rule ProcessEffectAtMostOnce + contract Delivery.AtMostOnceEffect
+--   handler returns nil/anomaly/throws -> checkpointed-and-skipped
+--       -> rule ProcessEvent (failed branch) + rule SkipFailedEvent
+--   CAS success-then-conflict; conflict passed through not wrapped
+--       -> rule ProcessWithHandlerCas + contract Delivery.HandlerCasDedup
+--   lease-check skips unowned tenants
+--       -> rule ProcessEvent (requires) + contract LeaseFencing
+--   catch-up processes missed events, no re-fire after restart
+--       -> rule CatchUp + contract Checkpointing.CatchUpCompleteness
+--   batch checkpoint: one per batch; effect handlers per-event; batch faster
+--       -> contract Checkpointing.BatchCheckpointCompleteness
+--   overlapping pure batches conflict; adjacent commit; legacy checkpoint blocks
+--       -> contract Checkpointing.MonotonicGapFreeWatermark + invariant OneCheckpointWatermarkPerProcessorTenant
+--   O(1) checkpoint reads regardless of N (get-last-processed-id, already-checkpointed?)
+--       -> contract Checkpointing.ConstantTimeWatermarkRead
+--   coalesced poller: skip-when-caught-up, fail-closed probe, dedup, dynamic tenants
+--       -> rule CatchUp @guidance + contract Checkpointing.CatchUpCompleteness
+--   blocking handlers at scale don't starve other tenants
+--       -> surface DomainProcessing @guarantee TenantsProcessConcurrently
+--   PT-CAS: two processors handle same trigger, only one checkpoints
+--       -> rule ProcessPure + invariant OneCheckpointWatermarkPerProcessorTenant
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A domain tenant whose event stream a processor reads from and writes to.
+-- Tenants are created and governed by the event store, not by this component; a
+-- processor only reads a tenant's events in order and appends its handler's
+-- output back to the same tenant. The reserved control-plane coordination tenant
+-- is governed separately and is not processed as a domain tenant here.
+external entity Tenant {}
+
+-- A single immutable fact in a tenant's stream. Events carry a stream position
+-- (a time-ordered id) that establishes a total order within a tenant; "at or
+-- below the watermark" and "since the last checkpoint" are defined against that
+-- order. The event store assigns and orders events; this component treats an
+-- event as opaque apart from its position and type.
+external entity Event {
+    -- The event's type. A processor only consumes events whose type is in its
+    -- subscribed topics.
+    event_type: String
+    -- The tenant whose stream this event belongs to.
+    tenant: Tenant
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A handler's output for one event: exactly one of the four delivery shapes.
+-- `events` are facts to append. `effect` is an opaque side effect (a write to an
+-- external system) run with at-least-once or at-most-once semantics per
+-- `checkpoint_mode`. `cas` is a handler-supplied compare-and-swap predicate that
+-- guards an unconditional pure append. A handler that returns nothing produces an
+-- empty result, which is processed (checkpointed) but appends nothing.
+value HandlerResult {
+    outcome: HandlerOutcome
+    -- New facts to append (pure and effect-success/effect-failure paths).
+    events: Set<Event>
+    -- The opaque side effect, present only on effect outcomes.
+    effect: Effect? when outcome = effect
+    -- Whether the effect is recorded after (at-least-once) or before
+    -- (at-most-once) it runs; present only on effect outcomes.
+    checkpoint_mode: CheckpointMode? when outcome = effect
+    -- A handler-supplied CAS predicate; present only on the cas outcome.
+    cas: CasPredicate? when outcome = cas
+
+    transitions outcome {
+        terminal: empty, pure, effect, cas, failed
+    }
+}
+
+-- An opaque side effect a handler performs against an external system. The
+-- framework runs it but cannot inspect it; its only observable property is
+-- whether it raised. Modelled as a value because it has no identity.
+value Effect {}
+
+-- A compare-and-swap predicate a handler attaches to a pure append. It names the
+-- expected prior state of the tenant's stream; the append commits only if that
+-- expectation still holds. Opaque to this component.
+value CasPredicate {}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The event-store capability this component DEMANDS. The framework reads a
+-- tenant's events in order from a position, appends a handler's output together
+-- with a checkpoint atomically under compare-and-swap, and consults only the
+-- newest checkpoint to recover a watermark. These are properties of the store's
+-- ordered, CAS-capable append; they live as contract invariants, not entity
+-- state.
+contract EventLog {
+    -- The domain tenants currently known, each with the position of its newest
+    -- event (its high watermark). Used to detect which tenants have new work.
+    domain_tenants: () -> Set<Tenant>
+    -- Read a tenant's events of the given types in order, starting strictly after
+    -- a position (or from the beginning when none is given).
+    read_after: (tenant: Tenant, types: Set<String>, after: Event?) -> Sequence<Event>
+    -- Append events plus a checkpoint atomically, committing only if no existing
+    -- checkpoint already covers the conflict threshold (the CAS guard).
+    append_with_checkpoint: (tenant: Tenant, events: Set<Event>, checkpoint_for: Event, conflict_threshold: Event) -> Any
+    -- Append a handler's events under the handler's own CAS predicate.
+    append_with_cas: (tenant: Tenant, events: Set<Event>, cas: CasPredicate) -> Any
+
+    @invariant AtomicEventAndCheckpoint
+        -- A handler's output events and the checkpoint that records them commit
+        -- in a single atomic append: either both land or neither does. There is
+        -- never a committed event without its checkpoint, nor a checkpoint
+        -- without the events it claims to cover.
+
+    @invariant CompareAndSwapAdmitsOne
+        -- The checkpoint append commits only if no existing checkpoint for this
+        -- processor+tenant already covers the conflict threshold. When two nodes
+        -- (or a node and its replay) attempt the same append concurrently, only
+        -- the first commits; the rest are rejected with a conflict. This is the
+        -- store-level guarantee the processor's fencing and dedup rest on.
+
+    @invariant ConflictDistinctFromFault
+        -- A rejected append carries a distinct conflict outcome, never collapsed
+        -- into a generic storage fault. Callers can tell "already done by someone
+        -- else" apart from "the store is broken".
+}
+
+-- The lease-ownership check this component DEMANDS from the control plane. A node
+-- processes a tenant's events only while it owns that tenant's lease.
+contract LeaseFencing {
+    -- Whether this node currently owns the lease for a tenant under a processor.
+    owns_lease: (tenant: Tenant, processor: Processor) -> Boolean
+
+    @invariant ProcessesOnlyOwnedTenants
+        -- A processor handles a tenant's events only while this node owns the
+        -- tenant's lease. When the check denies ownership the events are skipped,
+        -- not processed, so a tenant whose lease has moved away is not processed
+        -- on the old node. Combined with the store's compare-and-swap, at most one
+        -- node advances a tenant's checkpoint at a time.
+}
+
+-- The per-event work a registered processor performs. Supplied by the consumer of
+-- this component; the framework DEMANDS only that it is a pure function of the
+-- event and the current tenant state it reads.
+contract HandlerFunction {
+    -- Compute the outcome for one event in a tenant's stream.
+    handle: (event: Event, tenant: Tenant) -> HandlerResult
+    -- The shape of the outcome the framework must record. Names the four
+    -- delivery paths a result routes to; carried so the boundary is explicit
+    -- about the result type it consumes.
+    outcome_shape: (result: HandlerResult) -> HandlerOutcome
+
+    @invariant PureOfEventAndState
+        -- handle is a function of the event and the tenant state it reads: two
+        -- nodes processing the same event compute the same events and the same
+        -- CAS predicate. Any side effect lives in the returned `effect`, which the
+        -- framework runs under the chosen delivery mode — the handler never
+        -- appends or checkpoints itself.
+}
+
+-- The checkpoint discipline this component itself GUARANTEES to its consumers.
+-- These are properties of how the processor advances and reads its position; they
+-- are behavioural guarantees the test suite proves, not point-in-time state.
+contract Checkpointing {
+    @invariant MonotonicGapFreeWatermark
+        -- For each (processor, tenant) the watermark advances strictly forward and
+        -- gap-free in stream order: it only ever moves to a later event, and it
+        -- never skips an event of the subscribed topics. Because of this a single
+        -- value — the newest checkpoint's position — soundly summarises the entire
+        -- processed history.
+
+    @invariant ConstantTimeWatermarkRead
+        -- Recovering the watermark and testing whether an event is already
+        -- processed consult only the single newest checkpoint, never the whole
+        -- checkpoint history. The work is constant regardless of how many
+        -- checkpoints exist (the O(1), not O(N), property the efficiency tests
+        -- pin down).
+
+    @invariant BatchCheckpointCompleteness
+        -- A batch of consecutive pure-handler events is recorded by one checkpoint
+        -- naming the batch's last event, covering every event from the batch's
+        -- first. Every event in the batch is processed and none is double-counted:
+        -- an overlapping batch whose range a newer checkpoint already covers is
+        -- rejected, while an adjacent non-overlapping batch commits. Effect and
+        -- CAS handlers checkpoint per event rather than per batch.
+
+    @invariant CatchUpCompleteness
+        -- On start, restart or lease acquisition, a processor resumes from its
+        -- last checkpoint and processes every subscribed event since — no gaps and
+        -- no reprocessing. Events already at or below the watermark are skipped, so
+        -- effects that already checkpointed do not re-fire. A tenant acquired after
+        -- start seeds its watermark from existing checkpoints before reading, so it
+        -- never replays already-processed history.
+}
+
+-- The delivery guarantee each handler outcome carries. These distinguish the four
+-- outcome shapes; they are properties of the order in which the effect runs
+-- relative to the checkpoint, so they live as contract invariants.
+contract Delivery {
+    @invariant PureBatched
+        -- A pure outcome (events only, no effect) appends its events and is
+        -- batch-checkpointed. An empty outcome appends nothing and the event is
+        -- still recorded as processed.
+
+    @invariant AtLeastOnceEffect
+        -- A checkpoint-after effect runs first, then its checkpoint and any
+        -- success events commit. If the effect raises, a failure record and the
+        -- checkpoint still commit. On replay the checkpoint already exists, so the
+        -- effect is not run again — the effect fires at least once and, in the
+        -- common path, exactly once.
+
+    @invariant AtMostOnceEffect
+        -- A checkpoint-before effect commits its checkpoint first, then runs the
+        -- effect only if the checkpoint append was not rejected as a conflict. A
+        -- replay's append conflicts, so the effect is not run again — the effect
+        -- fires at most once. A crash between checkpoint and effect drops the
+        -- effect rather than risking a duplicate.
+
+    @invariant HandlerCasDedup
+        -- A handler-supplied CAS outcome appends its events only if the tenant's
+        -- stream still matches the predicate's expectation. When several
+        -- processors handle the same triggering event, only the first append
+        -- commits; the rest are rejected with a conflict that is passed through
+        -- unchanged. So the events a triggering event yields are recorded at most
+        -- once even across nodes.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The shapes a handler outcome can take. `empty` records the event as processed
+-- but appends nothing; `pure` appends events and is batch-checkpointed; `effect`
+-- runs an opaque side effect under a delivery mode; `cas` appends events under a
+-- handler-supplied compare-and-swap predicate; `failed` is a handler that returned
+-- nothing usable (nil or an anomaly) or threw, routed to the checkpoint-and-skip
+-- path rather than to an append.
+enum HandlerOutcome { empty | pure | effect | cas | failed }
+
+-- Whether an effect is recorded after it runs (at-least-once) or before it runs
+-- (at-most-once).
+enum CheckpointMode { after | before }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A registered processor: a stable name paired with a handler and the set of
+-- event types it consumes. Registration makes it discoverable so a node can run
+-- it for the tenants it owns. A processor advances one checkpoint per tenant it
+-- processes.
+entity Processor {
+    -- Stable name the processor is registered and checkpointed under.
+    name: String
+    -- The event types this processor subscribes to. It consumes only events whose
+    -- type is in this set.
+    topics: Set<String>
+
+    -- The per-tenant checkpoints this processor has written.
+    checkpoints: Checkpoint with processor = this
+}
+
+-- The processing position of one processor for one tenant: a high-watermark
+-- naming the last event of the subscribed topics that this processor has
+-- processed for this tenant. It advances strictly forward and gap-free. There is
+-- at most one watermark per (processor, tenant): the newest checkpoint
+-- summarises all earlier ones.
+entity Checkpoint {
+    processor: Processor
+    tenant: Tenant
+    -- The last processed event. Everything at or below this position is
+    -- considered processed and is never handled again.
+    watermark: Event
+    -- How this checkpoint was produced: a single event, a range of batched pure
+    -- events, or an effect path.
+    kind: CheckpointKind
+}
+
+------------------------------------------------------------
+-- Enumerations (entity-scoped)
+------------------------------------------------------------
+
+-- How a checkpoint was produced. `single` covers one event (effect/CAS paths);
+-- `batch_range` covers a contiguous run of pure-handler events recorded by a
+-- single checkpoint at the run's end.
+enum CheckpointKind { single | batch_range }
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Whether an event whose handler fails (returns nil/anomaly or throws) is
+    -- recorded as processed (skipped) so it does not block the stream, or left
+    -- unprocessed so it is retried on the next pass. Default false: a failing
+    -- event is checkpointed and skipped, matching the production default that a
+    -- poison event must not wedge the tenant's stream.
+    retry_on_error: Boolean = false
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A new event appearing in a tenant's stream is the real stimulus a processor
+-- reacts to (however it is discovered — pushed via pubsub or pulled by a poller).
+-- For each registered processor subscribed to the event's type, the event is
+-- handed to processing for the tenant it belongs to.
+rule EventAppeared {
+    when: event: Event.created
+    for processor in Processors where event.event_type in topics:
+        ensures: ProcessEvent(processor: processor, tenant: event.tenant, event: event)
+
+    @guidance
+        -- The same dispatch underlies every delivery mechanism: a pubsub
+        -- subscriber, a direct poller and a coalesced multi-tenant poller all
+        -- reduce to "for each processor whose topics include this event's type,
+        -- process the event for its tenant". The mechanisms differ only in how the
+        -- new event is discovered, not in what happens next.
+}
+
+-- The processing funnel: a processor is handed one event for a tenant it may own.
+-- It runs only while this node owns the tenant's lease (fencing). The handler is
+-- a pure function of the event, so it always runs and is safe to re-run on
+-- replay; idempotency is NOT a precondition of this funnel but a property of the
+-- delivery paths below, each of which dedupes against the watermark at commit
+-- time (the checkpoint CAS for pure and at-most-once effects; the effect path's
+-- own already-processed check for at-least-once). The handler's outcome then
+-- routes to one of those paths.
+rule ProcessEvent {
+    when: ProcessEvent(processor, tenant, event)
+    let owned = LeaseFencing.owns_lease(tenant, processor)
+    requires: owned
+    requires: event.event_type in processor.topics
+    let result = HandlerFunction.handle(event, tenant)
+    ensures:
+        -- A handler that returned nothing usable or raised routes to the
+        -- checkpoint-and-skip path; every other outcome routes to a delivery path.
+        -- Failure is detected here, in the same funnel, not on a separate stimulus.
+        if result.outcome = failed:
+            HandlerFailed(processor: processor, tenant: tenant, event: event)
+        else:
+            ProcessOutcome(processor: processor, tenant: tenant, event: event, result: result)
+
+    @guidance
+        -- This is the single funnel every delivery mechanism shares: the pubsub
+        -- subscriber, the direct poller and the coalesced multi-tenant poller all
+        -- reach the same per-event processing with the same lease guard. The
+        -- handler re-runs on replay and catch-up — being pure, that is harmless;
+        -- only the commit is deduped, so an effect (or a pure append) fires once
+        -- while the handler itself may be invoked more than once for the same
+        -- event (at-least-once handler, exactly-once effect on the happy path).
+        -- The mechanisms differ only in how events are discovered and how pure
+        -- events are grouped for batch checkpointing; the guarantees do not.
+        -- `event_id` is the event's stream position assigned by the event store;
+        -- comparing ids is comparing positions in the tenant's total order.
+}
+
+-- A pure outcome (events only) appends its events and advances the watermark. An
+-- empty outcome appends nothing but still advances the watermark so the event is
+-- not reconsidered. Pure events from consecutive events are batch-checkpointed:
+-- one checkpoint at the batch's end covering the whole range.
+rule ProcessPure {
+    when: ProcessOutcome(processor, tenant, event, result)
+    requires: result.outcome in {empty, pure}
+    ensures:
+        let _ = EventLog.append_with_checkpoint(
+            tenant: tenant,
+            events: result.events,
+            checkpoint_for: event,
+            conflict_threshold: event
+        )
+        let cp = Checkpoint{processor: processor, tenant: tenant}
+        if exists cp:
+            cp.watermark = event
+            cp.kind = batch_range
+        else:
+            Checkpoint.created(
+                processor: processor,
+                tenant: tenant,
+                watermark: event,
+                kind: batch_range
+            )
+
+    @guidance
+        -- Batch checkpointing groups the pure results of a poll cycle and records
+        -- them with one checkpoint naming the last event, covering from the first
+        -- (Checkpointing.BatchCheckpointCompleteness). The atomic
+        -- append-with-checkpoint plus the store's compare-and-swap
+        -- (EventLog.CompareAndSwapAdmitsOne) make overlapping batches conflict
+        -- while adjacent batches commit, so no source event is double-counted even
+        -- when two processors race the same trigger
+        -- (Delivery.HandlerCasDedup applies to the handler-CAS path;
+        -- the checkpoint CAS covers the pure path).
+}
+
+-- A handler-supplied CAS outcome appends its events under the handler's own
+-- compare-and-swap predicate. The append commits only if the predicate still
+-- holds; a losing race is rejected with a conflict that is surfaced unchanged
+-- rather than recast as a fault.
+rule ProcessWithHandlerCas {
+    when: ProcessOutcome(processor, tenant, event, result)
+    requires: result.outcome = cas
+    ensures:
+        let _ = EventLog.append_with_cas(tenant: tenant, events: result.events, cas: result.cas)
+
+    @guidance
+        -- This is how a triggering event (e.g. a periodic billing trigger) is
+        -- handled exactly once across nodes: every processor computes the same
+        -- events and the same predicate, and only the first append satisfies the
+        -- predicate (Delivery.HandlerCasDedup). The conflict outcome is passed
+        -- through (EventLog.ConflictDistinctFromFault) so the caller sees
+        -- "already done", not a storage error.
+}
+
+-- At-least-once effect: run the effect first, then commit its checkpoint together
+-- with any success (or, on failure, failure) events. Because the checkpoint is
+-- written after the effect, a replay finds the checkpoint already present and
+-- does not run the effect again — the effect fires at least once and, on the
+-- happy path, exactly once.
+rule ProcessEffectAtLeastOnce {
+    when: ProcessOutcome(processor, tenant, event, result)
+    requires: result.outcome = effect
+    requires: result.checkpoint_mode = after
+    let prior = Checkpoint{processor: processor, tenant: tenant}
+    -- This path carries its own replay guard: the effect runs only when no
+    -- checkpoint already covers this event. A replay or catch-up therefore re-runs
+    -- the handler (it is pure) but not the effect.
+    let unprocessed = not exists prior or prior.watermark.event_id < event.event_id
+    ensures:
+        if unprocessed:
+            -- The effect runs, then the checkpoint and outcome events commit
+            -- atomically; a raised effect still commits a checkpoint so the event
+            -- is not retried forever.
+            RunEffect(effect: result.effect)
+            let _ = EventLog.append_with_checkpoint(
+                tenant: tenant,
+                events: result.events,
+                checkpoint_for: event,
+                conflict_threshold: event
+            )
+            Checkpoint.created(
+                processor: processor,
+                tenant: tenant,
+                watermark: event,
+                kind: single
+            )
+
+    @guidance
+        -- The replay guard lives in this path itself: before running the effect it
+        -- compares the event against the watermark (the newest checkpoint), so an
+        -- event already at or below the watermark re-enters the funnel but its
+        -- effect is not run again (Delivery.AtLeastOnceEffect,
+        -- Checkpointing.CatchUpCompleteness). On the first run the watermark sits
+        -- just below this event, so the effect does fire once. The watermark read
+        -- is the same O(1) newest-checkpoint read the pure path uses
+        -- (Checkpointing.ConstantTimeWatermarkRead).
+}
+
+-- At-most-once effect: commit the checkpoint first, then run the effect only if
+-- the checkpoint append was not already rejected as a conflict. A replay's
+-- checkpoint append conflicts, so the effect is skipped — the effect fires at
+-- most once, trading a possible lost effect on crash for never duplicating it.
+rule ProcessEffectAtMostOnce {
+    when: ProcessOutcome(processor, tenant, event, result)
+    requires: result.outcome = effect
+    requires: result.checkpoint_mode = before
+    let prior = Checkpoint{processor: processor, tenant: tenant}
+    let claimed = not exists prior or prior.watermark.event_id < event.event_id
+    ensures:
+        let _ = EventLog.append_with_checkpoint(
+            tenant: tenant,
+            events: result.events,
+            checkpoint_for: event,
+            conflict_threshold: event
+        )
+        Checkpoint.created(
+            processor: processor,
+            tenant: tenant,
+            watermark: event,
+            kind: single
+        )
+        -- The effect runs only when the checkpoint append committed (no prior
+        -- checkpoint already covered this event); a conflicting replay skips it.
+        if claimed:
+            RunEffect(effect: result.effect)
+
+    @guidance
+        -- Checkpoint-before is for effects that must never duplicate even if it
+        -- means occasionally dropping one: the checkpoint claims the event before
+        -- the effect runs, so a concurrent or replayed attempt loses the CAS and
+        -- never reaches the effect (Delivery.AtMostOnceEffect).
+}
+
+-- A failing handler must not wedge the tenant's stream. When a handler returns
+-- nothing usable (nil or an anomaly) or throws, the funnel (ProcessEvent) routes
+-- it here: the event is recorded as processed with an empty checkpoint and
+-- skipped — unless retry-on-error is set, in which case nothing is checkpointed
+-- and the event is left unprocessed for a later pass.
+rule SkipFailedEvent {
+    when: HandlerFailed(processor, tenant, event)
+    requires: not config.retry_on_error
+    ensures:
+        let _ = EventLog.append_with_checkpoint(
+            tenant: tenant,
+            events: {},
+            checkpoint_for: event,
+            conflict_threshold: event
+        )
+        Checkpoint.created(
+            processor: processor,
+            tenant: tenant,
+            watermark: event,
+            kind: single
+        )
+
+    @guidance
+        -- A poison event (handler returns nil/anomaly or raises) is checkpointed
+        -- with no output so the watermark advances past it and the stream keeps
+        -- moving. With retry_on_error true no checkpoint is written and the event
+        -- is retried on the next pass — the escape hatch for transient failures
+        -- where skipping would lose work.
+}
+
+-- Catch-up on start, restart or lease acquisition: a processor resumes from its
+-- last checkpoint and processes every subscribed event since, in order. Reading
+-- strictly after the watermark already excludes most processed events; any that
+-- are re-read (e.g. when the watermark read transiently returns nothing) re-run
+-- the handler but are deduped at commit, so already-recorded effects do not
+-- re-fire.
+rule CatchUp {
+    when: tenant: Tenant.created
+    for processor in Processors:
+        let owned = LeaseFencing.owns_lease(tenant, processor)
+        let watermark = Checkpoint{processor: processor, tenant: tenant}
+        let resume_after = if exists watermark: watermark.watermark else: null
+        let missed = EventLog.read_after(tenant, processor.topics, resume_after)
+        ensures:
+            if owned:
+                for event in missed:
+                    ProcessEvent(processor: processor, tenant: tenant, event: event)
+
+    @guidance
+        -- Catch-up runs whenever a processor begins servicing a tenant: node
+        -- start, restart, and lease acquisition (the production path on the first
+        -- assignment cycle, reassignment and failover). Reading strictly after the
+        -- watermark, and deduping at commit anything that is nonetheless re-read,
+        -- makes this gap-free and replay-safe (Checkpointing.CatchUpCompleteness).
+        -- The catch-up test seeds events, runs catch-up twice on the same processor
+        -- name, and asserts effects fire only on the first pass.
+        --
+        -- The coalesced multi-tenant poller adds two efficiency behaviours that do
+        -- not change the guarantees: (1) it probes each tenant's high watermark in
+        -- one query and skips reading a (processor, tenant) pair that is already
+        -- caught up, falling back to a per-pair read if the probe fails (fail
+        -- closed, never starve); (2) it seeds a newly-owned tenant's watermark from
+        -- existing checkpoints exactly once before reading, so a tenant added to a
+        -- running poller's owned set does not reread and reprocess its checkpointed
+        -- history. A blocking handler on one tenant runs on its own and does not
+        -- delay other tenants' processing.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At most one checkpoint watermark per (processor, tenant). The processing
+-- position is a single high-watermark, not a growing set of marks: the newest
+-- checkpoint summarises all earlier ones, which is what makes the watermark read
+-- constant-time and what makes "already processed" a single comparison.
+invariant OneCheckpointWatermarkPerProcessorTenant {
+    for a in Checkpoints:
+        for b in Checkpoints:
+            a != b implies not (a.processor = b.processor and a.tenant = b.tenant)
+}
+
+-- The remaining conformance properties are behavioural rather than point-in-time
+-- state, so they are homed in the contracts above (see the header map):
+--   monotonic, gap-free, O(1) checkpoint reads  -> Checkpointing
+--   at-least / at-most-once effect delivery      -> Delivery
+--   catch-up completeness and replay safety      -> Checkpointing.CatchUpCompleteness
+--   lease fencing across nodes                   -> LeaseFencing
+--   handler-CAS at-most-once across nodes        -> Delivery.HandlerCasDedup
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The node runtime that drives processors over the tenants it owns. It is code,
+-- not a person, so the actor has a minimal identity.
+actor NodeRuntime {
+    identified_by: Processor where name != ""
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The registration boundary: a processor is registered with its topics and
+-- handler so a node can discover and run it. Registration alone does not start
+-- processing; a node starts a processor for a tenant once it owns the lease.
+surface ProcessorRegistration {
+    facing runtime: NodeRuntime
+    context processor: Processor
+
+    exposes:
+        processor.name
+        processor.topics
+
+    @guarantee DiscoverableAfterRegistration
+        -- Once registered, a processor is discoverable by name with its topics and
+        -- handler, so the node runtime can run it for the tenants it owns. The
+        -- registration convenience (defprocessor) is sugar over this boundary.
+}
+
+-- The integration boundary toward the event store, the control plane and the
+-- handler. This component DEMANDS ordered CAS-capable reads and appends, a
+-- lease-ownership check, and a pure per-event handler; in return it GUARANTEES
+-- the processing, checkpoint and delivery properties.
+surface DomainProcessing {
+    facing runtime: NodeRuntime
+    context processor: Processor
+
+    exposes:
+        processor.name
+
+    contracts:
+        demands EventLog
+        demands LeaseFencing
+        demands HandlerFunction
+        fulfils Checkpointing
+        fulfils Delivery
+
+    @guarantee TenantIsolation
+        -- A handler's output is appended to the same tenant the triggering event
+        -- was read from and no other; one tenant's processing never lands in
+        -- another's stream. The tenant id is carried with each event and used for
+        -- both reading and storage.
+
+    @guarantee ProcessedExactlyOncePerCheckpoint
+        -- Each subscribed event advances the (processor, tenant) watermark exactly
+        -- once. Replay, restart and catch-up never reprocess an event at or below
+        -- the watermark, so pure appends are not duplicated and checkpointed
+        -- effects do not re-fire.
+
+    @guarantee FencedToOwnedTenants
+        -- A processor handles a tenant only while this node owns its lease. With
+        -- the store's compare-and-swap on checkpoints, at most one node advances a
+        -- tenant's watermark at a time even during a brief ownership overlap.
+
+    @guarantee TenantsProcessConcurrently
+        -- A slow or blocking handler on one tenant does not starve other tenants:
+        -- tenants are serviced independently, so high tenant counts with blocking
+        -- handlers still make progress across all of them.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "A failing handler is checkpointed and skipped by default (retry_on_error false), advancing the watermark past a poison event. Should there be a dead-letter record of skipped events, or is the logged failure sufficient?"
+open question "retry_on_error leaves a failed event unprocessed for the next pass but advances no checkpoint; nothing here bounds the number of retries. Should a max-retry / backoff policy be modelled, or is unbounded retry intentional?"
+open question "Checkpoint-before (at-most-once) drops the effect if the node crashes between checkpoint and effect. Is silent loss acceptable for all at-most-once effects, or should the crash window be recorded so an operator can reconcile?"
+open question "Catch-up reads every subscribed event since the watermark with no upper bound on the gap. For a tenant idle a long time behind many events, should catch-up be paced/bounded, or is a single unbounded sweep intended?"

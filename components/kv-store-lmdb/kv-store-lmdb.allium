@@ -1,0 +1,262 @@
+-- allium: 3
+-- kv-store-lmdb.allium
+--
+-- Distilled from components/kv-store-lmdb (grain).
+--
+-- Scope: An embedded, durable key/value store. Callers write opaque byte
+--        values under opaque byte keys, read them back, and write several
+--        entries together as one atomic batch. The store is local to the node
+--        that opens it; there is no tenancy, no authorization and no event
+--        sourcing here -- it is a low-level building block other components use
+--        for local caches and checkpoints.
+--
+-- Classification: LIBRARY / FRAMEWORK. This component is a reusable mechanism
+--        with a small set of behavioural guarantees the tests prove: a faithful
+--        write-then-read round-trip, absence of a value for an unwritten key,
+--        all-or-nothing batch writes, and read liveness under heavy concurrent
+--        access from many threads. There is no domain model. The boundary is a
+--        Store contract carrying those guarantees; the put/get/batch behaviour
+--        is also stated as rules over a StoredEntry binding so the round-trip is
+--        expressed as observable state, not only as contract prose. Keys and
+--        values are opaque to the store and are modelled as Any.
+--
+-- Includes:
+--   - open / close lifecycle: the store must be opened before any read or write
+--     and closed to release its backing; reads and writes are valid only while
+--     it is open
+--   - put / get: a value written under a key is later read back unchanged, and
+--     a key that was never written reads back as absent
+--   - put-batch: a set of entries is written in a single atomic unit -- either
+--     all of them become visible or none do
+--   - durability: a written value persists and remains readable until
+--     overwritten -- the store is backed by durable local file storage, not
+--     process memory (the suite proves persistence within an open store; cross
+--     -restart survival is a property of the durable backing, not a test)
+--   - concurrent-read liveness: many threads may read at once; the store does
+--     not fail a read merely because earlier reader threads have exhausted the
+--     reader capacity -- exhausted slots from dead threads are reclaimed and the
+--     read retried
+--   - two capacity boundaries the caller configures at open time: the maximum
+--     total stored size, and the ceiling on concurrent reader threads
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the storage engine itself (LMDB), its file/memory-map layout, byte buffers
+--   - the read/write transaction mechanism and reader-slot bookkeeping (the
+--     reader reclaim-and-retry is captured behaviourally as ConcurrentReadLiveness,
+--     not as transaction plumbing)
+--   - how keys and values are serialized into bytes by callers (the store treats
+--     both as opaque byte sequences -- Any in this spec)
+--   - the on-disk directory, database name and which OS/native binding is loaded
+--   - logging and metrics
+--
+-- Most guarantees below are proven by the component's test suite
+-- (interface_test.clj): put-and-get-round-trip, get-missing-key-returns-nil,
+-- put-batch-writes-all-entries, put-batch-is-atomic-on-success,
+-- put-batch-empty-entries, concurrent-readers-across-threads,
+-- custom-max-readers-config. Durability beyond an open store, and the
+-- max_stored_size capacity boundary, are properties of the durable backing that
+-- the suite does not directly exercise (see Durability and the Open Questions).
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- One key/value pair offered to a batch write. A batch is an ordered list of
+-- these; the store applies the whole list as a single atomic unit. Key and value
+-- are opaque bytes to the store, hence Any.
+value Entry {
+    key: Any
+    value: Any
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The key/value boundary the store offers. The store has an open/close
+-- lifecycle: it must be opened before any read or write and closed to release
+-- its resources. Reads return the value previously written under a key, or
+-- nothing when the key is unknown. Writes are either a single put or an atomic
+-- batch. These signatures are the whole of the component's observable surface;
+-- keys and values are opaque (Any).
+contract Store {
+    -- Make the store ready to serve reads and writes (allocating its durable
+    -- backing). No read or write is valid until the store has been opened.
+    open: () -> Any
+    -- Release the store and its resources. After close, no read or write is
+    -- valid until the store is opened again.
+    close: () -> Any
+    -- Read the value last written under a key, or nothing if none was written.
+    get: (key: Any) -> Any
+    -- Write a single value under a key, replacing any previous value there.
+    put: (key: Any, value: Any) -> Any
+    -- Write a list of entries as one atomic unit.
+    put_batch: (entries: List<Entry>) -> Any
+
+    @invariant WriteThenReadConsistency
+        -- A value written under a key is read back unchanged by a subsequent
+        -- get of that same key: the bytes returned are byte-for-byte the bytes
+        -- written. A later put under the same key replaces the earlier value, so
+        -- get always returns the most recent write.
+
+    @invariant AbsentKeyYieldsNothing
+        -- get of a key that was never written returns nothing. Absence is a
+        -- first-class result, not an error: the caller distinguishes "no value"
+        -- from any stored value.
+
+    @invariant BatchAtomicity
+        -- put_batch applies its entries as a single all-or-nothing unit. Either
+        -- every entry becomes visible to subsequent reads, or none does. A
+        -- partially applied batch is never observable. An empty batch is a
+        -- well-formed no-op that changes nothing.
+
+    @invariant UsableOnlyWhileOpen
+        -- get, put and put_batch are defined only between an open and the next
+        -- close. The store must be opened before its first read or write, and
+        -- close releases its backing resources; operations before open or after
+        -- close are outside the contract and the store guarantees nothing about
+        -- them.
+
+    @invariant Durability
+        -- A written value is held in durable local storage rather than in
+        -- process memory: once a put or put_batch has committed, the value
+        -- remains readable for the life of the store until it is overwritten,
+        -- and is not lost between reads. Persistence does not depend on the
+        -- writer retaining the value after the call returns. (The tests prove
+        -- persistence within an open store; survival across a full process
+        -- restart is a property of the durable backing rather than something the
+        -- suite exercises.)
+
+    @invariant ConcurrentReadLiveness
+        -- Many threads may read concurrently. A read does not fail merely because
+        -- the store's reader capacity is momentarily exhausted by slots held for
+        -- threads that have since died: such stale capacity is reclaimed and the
+        -- read is retried, so reads from up to config.max_reader_threads live
+        -- threads succeed. Beyond that ceiling, concurrent live readers may
+        -- contend.
+
+    @guidance
+        -- The store is single-node and local; it carries no tenant scope and no
+        -- authorization. Keys and values are opaque bytes -- the store never
+        -- inspects them. config.max_stored_size bounds total stored bytes; a
+        -- write that would exceed it fails (the write does not silently truncate,
+        -- drop the entry, or overwrite unrelated data) rather than succeeding. The
+        -- failure propagates to the caller as a write error; whether it is a
+        -- distinct capacity error is left open (see Open Questions). Atomicity is
+        -- guaranteed only within a single put_batch, not across separate put /
+        -- put_batch calls.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The host process that opens and drives the store. It is code, not a person:
+-- whatever component embeds the store and issues reads and writes. Modelled as a
+-- party so the surface has a facing actor; it carries no fields of its own.
+entity Host {}
+
+-- An entry currently committed to the store: a key bound to its most-recent
+-- value. The set of StoredEntries is the store's whole readable state -- it
+-- stands in for "what a get would return", letting the put/get behaviour be
+-- stated as rules over observable state rather than left implicit in prose.
+entity StoredEntry {
+    key: Any
+    value: Any
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The maximum total size the store may hold. A capacity ceiling chosen by
+    -- the caller when the store is opened; writes that would exceed it fail
+    -- rather than overwrite unrelated data.
+    max_stored_size: Integer = 10_485_760
+    -- The ceiling on distinct reader threads that may hold read capacity at once.
+    -- Sized for workloads that spread reads across many short-lived threads
+    -- (thread pools, futures); a low ceiling would reject concurrent readers
+    -- once exhausted, even after the holding threads have died.
+    max_reader_threads: Integer = 1024
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A single put binds a key to a value. If the key was already bound, the value
+-- is replaced; otherwise a new binding is created. After the put, a get of that
+-- key returns exactly this value -- this is the write-then-read guarantee stated
+-- over observable state.
+rule PutValue {
+    when: PutRequested(host, key, value)
+    let existing = StoredEntry{key: key}
+    ensures:
+        if exists existing:
+            existing.value = value
+        else:
+            StoredEntry.created(key: key, value: value)
+}
+
+-- A batch put applies its entries as one unit: every entry becomes a current
+-- binding together, or none does. The all-or-nothing nature is the
+-- BatchAtomicity contract invariant; here the rule states the successful
+-- outcome -- each entry left bound to its value. An empty batch binds nothing
+-- and changes no state.
+rule PutBatch {
+    when: BatchRequested(host, entries)
+    ensures:
+        for entry in entries:
+            let existing = StoredEntry{key: entry.key}
+            if exists existing:
+                existing.value = entry.value
+            else:
+                StoredEntry.created(key: entry.key, value: entry.value)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A key is bound to at most one value at a time: a put replaces rather than
+-- accumulates, so a get is never ambiguous about which value to return.
+invariant SingleBindingPerKey {
+    for a in StoredEntries:
+        for b in StoredEntries:
+            a != b implies a.key != b.key
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The single boundary this component exposes: a host puts byte values, writes
+-- atomic batches, and reads them back from a durable local store.
+surface KeyValueAccess {
+    facing host: Host
+
+    contracts:
+        fulfils Store
+
+    provides:
+        PutRequested(host, key, value)
+        BatchRequested(host, entries)
+
+    @guarantee WrittenValuesAreReadable
+        -- A value handed to put (or to put_batch) is later recoverable, byte-for
+        -- byte, by a get of its key; an unwritten key reads back as absent; and a
+        -- batch is visible all-or-nothing.
+
+    @guarantee ConcurrentReadsDoNotStarve
+        -- Reads issued concurrently across many threads succeed up to the
+        -- configured reader-thread ceiling; capacity held by dead threads is
+        -- reclaimed rather than permanently lost.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The store exposes no delete operation: callers can only overwrite a key, never remove its binding. Is delete genuinely out of scope, or is it an unfilled gap in the boundary?"
+open question "On exceeding max_stored_size, is the failure surfaced to the caller as a distinct capacity error, or does it manifest as a generic write failure? The tests size the store generously and do not exercise the boundary."

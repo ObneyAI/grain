@@ -1,0 +1,188 @@
+-- allium: 3
+-- clj-dspy.allium
+--
+-- Distilled from components/clj-dspy (grain).
+--
+-- Status: this component is marked DEPRECATED in its public interface
+--         (ai.obney.grain.clj-dspy.interface) and is no longer maintained.
+--
+-- Scope: A thin authoring convenience that turns a declarative field
+--        specification (input fields and output fields, each with an
+--        optional human-readable description and default) into a named,
+--        documented DSPy "signature" usable from an embedded Python LLM
+--        runtime. It is infrastructure: a schema-to-signature translator
+--        with essentially no domain behaviour of its own.
+--
+-- Includes:
+--   - The single observable guarantee: the meaning of a field
+--     specification survives translation into the generated signature.
+--     A field's value shape (text, number, boolean, optional, list,
+--     map/record, union), its description and its default carry through to
+--     the generated signature. One shape is deliberately lossy: an
+--     enumeration narrows to text, dropping its set of permitted values, and
+--     an unrecognised shape becomes the open `any` shape rather than being
+--     rejected.
+--   - Namespacing: a generated signature is addressable both by its bare
+--     name and by a name qualified with the defining module. Only the
+--     module-qualified name keeps like-named signatures from different modules
+--     distinct; the bare name is shared and last-writer-wins.
+--
+-- Excludes (implementation / environment, governed elsewhere):
+--   - The embedded Python interpreter, the DSPy and Pydantic libraries,
+--     and the bridge between the host language and Python.
+--   - The exact Python source text emitted (class layout, import lines,
+--     attribute registration) — an implementation detail that could change
+--     wholesale while preserving the guarantee above.
+--   - The Malli schema library, its registry, and reference/cycle
+--     expansion mechanics used to normalise the input specification.
+--   - How the resulting signature is subsequently invoked against a
+--     language model (prompting, completion, evaluation) — that is DSPy's
+--     concern, not this component's.
+--   - There is no persisted state, no lifecycle, no tenant scoping and no
+--     authorization here; this is a compile-time authoring helper.
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The one guarantee worth stating: translation is meaning-preserving.
+-- A field specification is a declarative description of a field — its value
+-- shape, an optional description and an optional default. compile_signature
+-- produces a named signature whose input and output fields correspond,
+-- one-for-one, to the supplied specifications, with their descriptions and
+-- defaults attached and addressable under both bare and module-qualified
+-- names.
+contract SignatureCompilation {
+    -- Translate one declared field into the generated signature's
+    -- representation of that field.
+    translate_field: (spec: FieldSpec) -> Any
+    -- Build a complete, namespaced signature from its input and output fields.
+    compile_signature: (
+        name: String,
+        module: String,
+        description: String?,
+        inputs: Set<FieldSpec>,
+        outputs: Set<FieldSpec>
+    ) -> Any
+
+    @invariant MeaningPreserved
+        -- Every input and output field declared in the specification appears
+        -- in the generated signature exactly once, with its description and its
+        -- default value carried across when supplied. Translation neither adds
+        -- nor drops fields. The composite value shapes — optional, list,
+        -- map/record and union — are carried across structurally, recursing
+        -- into their element shapes; the scalar shapes text, number and boolean
+        -- are carried across directly. An unrecognised shape becomes the open
+        -- `any` shape rather than being rejected.
+
+    @invariant EnumerationNarrowsToText
+        -- An enumeration shape is recognised but is NOT carried across as a
+        -- distinct enumerated category: it is narrowed to text, and the set of
+        -- permitted values is dropped entirely at this boundary. The generated
+        -- signature retains no record of the allowed members, so no downstream
+        -- runtime can enforce membership from it — the only surviving guarantee
+        -- is that the field carries text.
+
+    @invariant DescribesWithoutEnforcing
+        -- A field's description and default are documentation carried onto the
+        -- generated field, not constraints this component evaluates. Whether a
+        -- value satisfies the declared shape is decided by the downstream
+        -- runtime, not here.
+
+    @invariant ModuleQualifiedNaming
+        -- A generated signature is reachable both by its bare name and by a
+        -- name qualified with its defining module. Distinctness across modules
+        -- is guaranteed only for the module-qualified name: two signatures of
+        -- the same bare name defined in different modules keep distinct
+        -- qualified names and do not overwrite one another. The bare name is
+        -- shared across modules and is last-writer-wins; it is not a stable way
+        -- to disambiguate like-named signatures from different modules.
+
+    @guidance
+        -- This contract abstracts a compile-time macro: the field
+        -- specification is authored in the host language and the signature is
+        -- generated when that source is loaded. There is no runtime request
+        -- path, no state and nothing to retry.
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A single declared field: its name, the shape its value should take, and the
+-- optional human-readable description and default that travel with it into the
+-- generated signature. Modelled as a value type because it has no identity or
+-- lifecycle — it is pure authored data consumed once at compile time.
+value FieldSpec {
+    name: String
+    shape: FieldShape
+    description: String?
+    default: String?
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The value-shape categories the translator recognises on input. Anything it
+-- does not recognise is treated as the open `any` shape rather than rejected.
+-- Note that `enumeration` is recognised but does not survive as a distinct
+-- output category: it narrows to text (see EnumerationNarrowsToText).
+enum FieldShape {
+    text
+    number
+    boolean
+    optional
+    list
+    record
+    union
+    enumeration
+    any
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The party that authors a signature: application code, at build time,
+-- declaring the input and output fields for a language-model interaction.
+-- It is code rather than a person and has no lifecycle of its own; it exists
+-- only to name the side that drives the authoring boundary, identified by the
+-- module it is defined in (which is also what namespaces the result).
+entity Author {
+    module: String
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The authoring boundary: an author declares a named signature with its input
+-- and output fields, and receives a signature whose fields preserve the
+-- declared shapes, descriptions and defaults, addressable under its module.
+surface SignatureAuthoring {
+    facing author: Author
+
+    exposes:
+        -- The defining module, which namespaces every signature the author
+        -- produces and keeps like-named signatures from colliding.
+        author.module
+
+    contracts:
+        fulfils SignatureCompilation
+
+    @guarantee FieldFidelity
+        -- What you declare is what you get: each declared input and output
+        -- field appears in the generated signature with its description and
+        -- default intact and its shape carried across structurally (an
+        -- enumeration narrows to text — see EnumerationNarrowsToText), and the
+        -- signature gets a module-qualified name so a like-named signature from
+        -- another module remains separately addressable (see
+        -- ModuleQualifiedNaming).
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "This component is marked DEPRECATED and has no tests. Should it be retired from the spec set entirely rather than maintained as a distilled spec?"

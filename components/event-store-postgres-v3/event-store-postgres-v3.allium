@@ -1,0 +1,525 @@
+-- allium: 3
+-- event-store-postgres-v3.allium
+--
+-- Distilled from components/event-store-postgres-v3 (grain).
+--
+-- Scope: The durable, Postgres-backed implementation of grain's tenant-scoped,
+--        append-only event store. It is the system of record: events are
+--        immutable facts written into a tenant's stream and later read back in
+--        a stable order. This component is the concrete backend behind the
+--        abstract event-store-v3 boundary; it owns the guarantees an
+--        event-sourced system relies on — tenant isolation, ordered durable
+--        appends, optimistic concurrency, and faithful round-tripping of event
+--        bodies — without exposing how any of it is stored.
+--
+-- Includes: per-tenant append with an automatic transaction marker; optimistic
+--           concurrency via compare-and-swap (CAS) against a filtered view of
+--           the existing stream; strict per-tenant serialization of conflicting
+--           appends; tenant isolation so one tenant can never read or write
+--           another's stream; a durable per-tenant high-watermark (the id of
+--           the last committed event); filtered, ordered, streaming reads
+--           (by tag, type, position window, direction and limit), including a
+--           merged-and-deduplicated batch read; and faithful round-tripping of
+--           event identity, type, tags, timestamp and arbitrary body data.
+--
+-- Excludes (implementation / plumbing, governed elsewhere):
+--   - the relational schema, tables, indexes, row-level-security policy and
+--     advisory-lock mechanics; these are HOW the guarantees below are met
+--   - the connection pool, transactions, fetch sizes and streaming cursor
+--     mechanics; reads expose a reducible, an implementation concern
+--   - the pluggable datasource / credential strategy (password, IAM, ...); a
+--     deployment connection concern with no event-store behaviour
+--   - the body serialization format (Fressian) and the tag/type wire encoding;
+--     captured only as the Roundtrip guarantee, not the byte layout
+--   - UUID-v7 as the concrete ordered-id scheme; modelled as an abstract
+--     stream position that is monotonic in append order
+--   - logging, tracing and metrics
+--
+-- The conformance points below correspond to the component's test suite
+-- (integration_test.clj). Where each is captured:
+--   append + read back, fields round-trip            -> contract EventCodec.Roundtrip + rule AppendEvents
+--   grain/tx marker created automatically per append  -> rule AppendEvents (TransactionMarker) + AtomicAppend
+--   tx-metadata carried on the marker                 -> rule AppendEvents ensures
+--   ordering preserved by event id (uuid-v7)          -> invariant + rule guidance + StreamOrdered
+--   filtered reads (tags/types/after/as-of)           -> contract StreamReader.read + ReadIsFilteredAndOrdered
+--   reverse + limit (newest-first seek)               -> contract StreamReader.read @invariant
+--   batch read merges + dedupes by id                 -> contract StreamReader.read_batch @invariant
+--   CAS true stores / false -> conflict, nothing kept -> rules AppendUnderCas* + OptimisticConcurrency
+--   CAS reads the correct filtered subset             -> contract StreamReader + rule guidance
+--   tenant isolation (no cross-tenant read/write)     -> surface guarantee TenantIsolation + invariant
+--   auto tenant registration + last_event_id bump     -> rule AppendEvents ensures + WatermarkReflectsCommitted
+--   concurrent appends serialize, none lost           -> surface guarantee AppendsSerializePerTenant
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A domain tenant. Every event, append, read and watermark is scoped to exactly
+-- one tenant. A tenant comes into existence the first time events are committed
+-- for it (auto-registration on append); thereafter it carries a durable
+-- high-watermark. The reserved control-plane coordination tenant is itself just
+-- a tenant key from this component's point of view — the store imposes no policy
+-- on which tenants exist, only that streams never mix.
+external entity Tenant {
+    -- The id of the last event committed for this tenant: a durable
+    -- high-watermark maintained on every successful append. Absent when the
+    -- tenant row exists but no events have yet been committed.
+    last_event_id: Position?
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A position within a tenant's stream. Positions are totally ordered and
+-- strictly increasing in append order, so "later in the stream" is "greater
+-- position". Used as event identity, as the read window bounds (after / as_of)
+-- and as the durable per-tenant watermark. The concrete scheme (a time-ordered
+-- UUID) is an implementation detail; what matters is the total order.
+value Position {
+    -- The ordinal of this position in append order. Strictly increasing.
+    ordinal: Integer
+}
+
+-- A reference attaching an event to a domain entity. An event may carry several
+-- tags; reads can filter to events that carry all of a requested set. A tag is
+-- the pairing of an entity kind and that entity's identity.
+value Tag {
+    entity_type: String
+    entity_id: String
+}
+
+-- The description of a read window over a tenant's stream. It selects events by
+-- tag membership and by type, narrows them to an open position window, chooses
+-- the stream direction, and optionally caps how many are returned. Every field
+-- is optional: an empty filter selects the whole stream in ascending order.
+value ReadFilter {
+    -- Keep only events carrying all of these tags. Empty means no tag filter.
+    tags: Set<Tag>
+    -- Keep only events of these types. Empty means no type filter.
+    types: Set<String>
+    -- Keep only events strictly after this position (a lower bound).
+    after: Position?
+    -- Keep only events at or before this position (an upper bound). Supplying
+    -- both bounds at once is not permitted.
+    as_of: Position?
+    -- Whether to walk the window oldest-first or newest-first.
+    direction: ReadDirection
+    -- Cap on the number of events returned; absent means uncapped.
+    limit: Integer?
+}
+
+-- A compare-and-swap guard for a guarded append: a filtered view of the existing
+-- stream and a predicate that decides, from that view, whether the append may
+-- proceed. The guard is how a caller expresses an optimistic-concurrency
+-- precondition without taking a global lock.
+value CasGuard {
+    -- The filtered view of the existing stream the predicate is evaluated over.
+    filter: ReadFilter
+    -- The caller-supplied predicate, evaluated over the observed view, that
+    -- decides whether the append may proceed. It is opaque domain logic: the
+    -- store calls it with the events the filter selects and proceeds only when
+    -- it accepts.
+    accepts(observed): predicate_accepts(observed)
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- Faithful round-tripping of an event across a durable write and read. The store
+-- DEMANDS that whatever it persists, it returns unchanged: identity, type, tags,
+-- timestamp and an arbitrary structured body survive a write/read cycle intact.
+-- This is the serialization guarantee, stated behaviourally and independently of
+-- the encoding used.
+contract EventCodec {
+    -- Persist an event's body for durable storage.
+    encode: (event: Event) -> ByteArray
+    -- Reconstruct an event's body from durable storage.
+    decode: (bytes: ByteArray) -> Event
+
+    @invariant Roundtrip
+        -- An event read back from the store equals the event that was appended:
+        -- its id, type, the set of tags, and the full body (including nested
+        -- collections and rich temporal values, whose original zone offset is
+        -- preserved) are returned exactly. Round-tripping does not normalise,
+        -- reorder or coerce body data; an empty body round-trips to an empty body.
+
+    @invariant TimestampPreserved
+        -- An event's recorded timestamp survives the round-trip as the same
+        -- instant, without losing precision. It is returned as an absolute point
+        -- in time normalised to a UTC offset; the store does not claim to preserve
+        -- the wall-clock zone the append happened in. (Zone offsets carried inside
+        -- the body are preserved verbatim — that is the Roundtrip guarantee.)
+}
+
+-- Durable, atomic, optimistically-concurrent appends to a tenant's stream. The
+-- store FULFILS this: each call commits a unit of events (with its transaction
+-- marker and watermark bump) as a whole, or — when guarded — refuses as a
+-- conflict, all under per-tenant serialization.
+contract AppendWriter {
+    -- Commit a unit of domain events to a tenant's stream, returning the
+    -- transaction marker that records the unit.
+    append: (tenant: Tenant, events: Set<Event>, metadata: ByteArray?) -> Event
+    -- Commit a unit only if the guard's predicate accepts the filtered view of
+    -- the existing stream; otherwise refuse without writing anything.
+    append_guarded: (tenant: Tenant, events: Set<Event>, guard: CasGuard) -> Event
+
+    @invariant AppendIsAtomic
+        -- A unit's domain events, its transaction marker and the tenant
+        -- watermark bump commit together or not at all. A partial unit is never
+        -- observable, and the watermark never names an event from a unit that
+        -- did not commit.
+
+    @invariant GuardIsAllOrNothing
+        -- A guarded append evaluates its predicate against the same filtered view
+        -- a read would return, decided inside the serialized critical section for
+        -- the tenant. If the predicate accepts, the whole unit commits; if it
+        -- rejects, nothing is written and the caller is told it was a conflict.
+
+    @invariant AppendsSerialize
+        -- Concurrent appends to one tenant are serialized so each observes a
+        -- settled stream and none is lost; appends to different tenants proceed
+        -- independently.
+}
+
+-- Ordered, filtered, streaming reads of a tenant's committed events. The store
+-- FULFILS this: a read describes a filtered window over one tenant's stream and
+-- yields the matching events in a defined order, without loading the whole match
+-- set eagerly.
+contract StreamReader {
+    -- Read one tenant's committed events matching a filter, in stream order
+    -- (ascending position by default, descending when reversed), optionally
+    -- capped to the newest/oldest matching events by a limit.
+    read: (tenant: Tenant, filter: ReadFilter) -> Sequence<Event>
+    -- Read a tenant's events matching ANY of several filters, merged into a
+    -- single ascending stream.
+    read_batch: (tenant: Tenant, filters: Set<ReadFilter>) -> Sequence<Event>
+
+    @invariant ReadIsFilteredAndOrdered
+        -- A read returns exactly the tenant's events satisfying the filter — by
+        -- tag membership, by type, and by an open position window (strictly
+        -- after a lower bound, at-or-before an upper bound) — in ascending
+        -- position order. An empty match yields an empty stream. Two reads with
+        -- the same filter return the same events.
+
+    @invariant ReverseAndLimitSeekNewest
+        -- A reversed read returns matches in descending position order; combined
+        -- with a limit it yields the newest matching events (e.g. reverse with
+        -- limit one yields the single newest match). A limit without reverse
+        -- yields the oldest matches. Direction and limit apply to single reads.
+
+    @invariant BatchMergesAndDeduplicates
+        -- A batch read returns the union of its filters' matches, with each
+        -- distinct event appearing once even when several filters match it, in a
+        -- single ascending position order. A batch with no matches yields an
+        -- empty stream. Direction and limit are single-read concerns: a batch
+        -- always merges in ascending order and applies no cap, so any direction
+        -- or limit carried by an individual filter has no effect in a batch.
+
+    @invariant ReadIsStreaming
+        -- A read does not eagerly materialise the whole match set; it can be
+        -- reduced incrementally and terminated early, having observed only a
+        -- prefix of the matches.
+}
+
+-- The durable per-tenant watermark, read back across all known tenants. Unlike a
+-- stream read this is administrative metadata, not an event read: it enumerates
+-- every tenant the store knows of and reports each one's high-watermark, and it
+-- is not scoped to a single tenant. Downstream consumers use it as an
+-- authoritative resume point — the last event committed for a tenant.
+contract WatermarkRegistry {
+    -- The high-watermark of every tenant known to the store, keyed by tenant.
+    watermarks: () -> Set<Tenant>
+
+    @invariant WatermarksAreCommitted
+        -- Each reported watermark names the last event that actually committed
+        -- for that tenant, or is absent for a tenant that exists but has no
+        -- committed events. It never names an event from a rejected or partial
+        -- append.
+
+    @invariant RegistryEnumeratesAllTenants
+        -- Every tenant that has ever had events committed appears in the result;
+        -- enumerating watermarks crosses no tenant's stream and reads no events.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Whether a read window walks the stream oldest-first or newest-first.
+enum ReadDirection { ascending | descending }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A single immutable fact committed to a tenant's stream. Once written an event
+-- is never modified or removed; it is identified by its position, which also
+-- fixes its order within the tenant. An event is exactly one of two kinds: a
+-- DomainEvent carrying caller payload, or a TransactionMarker the store writes
+-- itself to record an append as a unit.
+entity Event {
+    -- The tenant whose stream this event belongs to.
+    tenant: Tenant
+    -- This event's position: its identity and its place in stream order.
+    position: Position
+    -- When the event was recorded.
+    timestamp: Timestamp
+    -- The domain entities this event references; reads may filter on these.
+    tags: Set<Tag>
+    -- Which kind of event this is.
+    kind: DomainEvent | TransactionMarker
+}
+
+-- A caller-supplied fact: an application event with a type and an arbitrary
+-- structured body. These are the events domain logic appends and reads back.
+variant DomainEvent : Event {
+    -- The event's type, used both to interpret its body and to filter reads.
+    event_type: String
+    -- The arbitrary structured payload, round-tripped verbatim. May be empty.
+    body: ByteArray
+}
+
+-- A store-written record marking one append as a transaction: it names the
+-- events committed together and optionally carries caller metadata about the
+-- append. It is part of the stream (and so is read like any other event) but is
+-- bookkeeping, not a domain fact; consumers distinguish it by kind.
+variant TransactionMarker : Event {
+    -- The positions of the domain events committed in the same append.
+    committed: Set<Position>
+    -- Optional caller-supplied metadata describing the append as a whole.
+    metadata: ByteArray?
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A tenant comes into existence the first time events are committed for it:
+-- there is no separate provisioning step. A freshly registered tenant has no
+-- committed events yet, so its durable watermark is initially absent and is
+-- established only by the append that registered it.
+rule TenantRegistered {
+    when: tenant: Tenant.created
+    ensures: tenant.last_event_id = null
+
+    @guidance
+        -- Registration is a side effect of the first append, not an independent
+        -- operation. The store imposes no policy on which tenants may exist; it
+        -- only guarantees their streams never mix.
+}
+
+-- The unconditional append. A caller commits one or more domain events for a
+-- tenant as a single unit. The store writes the domain events, writes one
+-- transaction marker naming them (and carrying any append metadata), and
+-- advances the tenant's durable watermark to the last committed event. The
+-- whole append is atomic: either all of it commits or none of it does.
+rule AppendEvents {
+    when: AppendRequested(tenant, events, metadata?)
+
+    ensures:
+        let marker = TransactionMarker.created(
+            tenant: tenant,
+            committed: events.position,
+            metadata: metadata
+        )
+        tenant.last_event_id = marker.position
+
+    @guidance
+        -- The committed positions on the marker are the domain events appended
+        -- in this unit; the marker is itself the last event of the append, so
+        -- the watermark advances to the marker. Appending against a
+        -- not-yet-seen tenant registers that tenant as a side effect of the
+        -- first commit — there is no separate "create tenant" step.
+        --
+        -- Atomicity covers the domain events, the marker and the watermark bump
+        -- together: a partial append is never observable, and the watermark
+        -- only ever names an event that actually committed.
+}
+
+-- The optimistic-concurrency append. The caller supplies a guard: a filtered
+-- view of the tenant's existing stream and a predicate over it. The append
+-- proceeds only if the predicate accepts that view; otherwise it is rejected as
+-- a conflict and nothing is written. This is how callers enforce invariants
+-- ("no later event of this type exists", "the stream is unchanged since I read
+-- it") without a global lock.
+rule AppendUnderCasAccepted {
+    when: AppendRequestedWithGuard(tenant, events, guard, metadata?)
+
+    let observed = read(tenant, guard.filter)
+    requires: guard.accepts(observed)
+
+    ensures:
+        let marker = TransactionMarker.created(
+            tenant: tenant,
+            committed: events.position,
+            metadata: metadata
+        )
+        tenant.last_event_id = marker.position
+
+    @guidance
+        -- The guard observes exactly the events the filter selects (same
+        -- filtering as an ordinary read), evaluated inside the same serialized
+        -- critical section as the write, so the decision is made against a
+        -- stream that cannot change underneath it before this append commits.
+}
+
+-- The rejected CAS append. When the guard predicate rejects the observed view,
+-- the append is refused as a conflict: no domain events, no marker and no
+-- watermark change result. The caller learns the append did not happen.
+rule AppendUnderCasRejected {
+    when: AppendRequestedWithGuard(tenant, events, guard, metadata?)
+
+    let observed = read(tenant, guard.filter)
+    requires: not guard.accepts(observed)
+
+    ensures: AppendRejectedAsConflict(tenant: tenant)
+
+    @guidance
+        -- A rejected CAS leaves the tenant's stream and watermark exactly as
+        -- they were; in particular the watermark never names an event from a
+        -- failed append. The two CAS rules partition on the predicate result,
+        -- so exactly one fires for a given guarded append.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Positions are unique within a tenant: no two of a tenant's events share a
+-- position. This is what makes position both a stable identity and a total order
+-- for the tenant's stream.
+invariant PositionsUniquePerTenant {
+    for a in Events:
+        for b in Events:
+            a != b and a.tenant = b.tenant implies a.position != b.position
+}
+
+-- The durable watermark always names an event that actually committed for the
+-- tenant: it is never set to the position of an event from a rejected or partial
+-- append. (Stated for tenants that have committed at least one event; a tenant
+-- with no committed events has no watermark.)
+invariant WatermarkNamesACommittedEvent {
+    for t in Tenants:
+        t.last_event_id != null
+            implies Events.any(e => e.tenant = t and e.position = t.last_event_id)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The party on the other side of the store boundary: application code (commands,
+-- read-model rebuilds, processors) that appends and reads events. It is code,
+-- not a person, so it carries no identifying condition; it always acts within
+-- some single tenant.
+actor Client {
+    identified_by: Tenant where true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The write boundary: a client commits events to a tenant's stream, optionally
+-- guarded by a compare-and-swap predicate. This component FULFILS durable,
+-- atomic, serialized, tenant-scoped appends and DEMANDS faithful encoding of
+-- event bodies from the codec.
+surface EventAppend {
+    facing client: Client
+    context tenant: Tenant
+
+    exposes:
+        tenant.last_event_id
+
+    provides:
+        AppendRequested(client, events, metadata?)
+        AppendRequestedWithGuard(client, events, guard, metadata?)
+
+    contracts:
+        fulfils AppendWriter
+        demands EventCodec
+
+    @guarantee AtomicAppend
+        -- An append is all-or-nothing: its domain events, the transaction marker
+        -- that names them, and the tenant watermark bump commit together or not
+        -- at all. A partial append is never observable.
+
+    @guarantee OptimisticConcurrency
+        -- A guarded append commits only if its predicate accepts the filtered
+        -- view of the existing stream; otherwise it is rejected as a conflict
+        -- and nothing — no events, no marker, no watermark change — is written.
+
+    @guarantee AppendsSerializePerTenant
+        -- Concurrent appends to the same tenant are serialized: each commits as
+        -- a whole and none is lost, so the tenant's stream is a single
+        -- well-ordered sequence even under contention. Appends to different
+        -- tenants do not contend with each other.
+
+    @guarantee WatermarkReflectsCommitted
+        -- The tenant's durable high-watermark always names the last event that
+        -- actually committed for it, and advances only on a successful append.
+
+    @guarantee TenantIsolation
+        -- An append writes only into its own tenant's stream; it can neither
+        -- read nor write any other tenant's events.
+}
+
+-- The read boundary: a client streams a filtered, ordered window of a tenant's
+-- events. This component FULFILS ordered, filtered, streaming reads and DEMANDS
+-- faithful decoding of event bodies from the codec.
+surface EventRead {
+    facing client: Client
+    context tenant: Tenant
+
+    exposes:
+        tenant.last_event_id
+
+    contracts:
+        fulfils StreamReader
+        demands EventCodec
+
+    @guarantee StreamOrdered
+        -- Events are read in stream order: ascending position by default,
+        -- descending when reversed. Within a tenant this order matches the order
+        -- in which the events were appended, so replaying the stream reconstructs
+        -- state deterministically.
+
+    @guarantee ReadIsTenantScoped
+        -- A read returns only the events of its own tenant. One tenant's events
+        -- never appear in, or leak through a filter on, another tenant's read.
+
+    @guarantee TransactionMarkersAreVisible
+        -- Transaction markers are part of the stream and are returned by reads
+        -- like any other event; consumers that want only domain facts
+        -- distinguish them by kind. Reads do not silently hide them.
+}
+
+-- The administrative boundary: a client reads back the durable per-tenant
+-- watermarks across all tenants the store knows of. This is metadata about the
+-- streams, not the streams themselves — it reads no events and is not scoped to
+-- a single tenant.
+surface WatermarkAdmin {
+    facing client: Client
+
+    contracts:
+        fulfils WatermarkRegistry
+
+    @guarantee WatermarksReadBack
+        -- The watermark a successful append established for a tenant is the
+        -- watermark this boundary reports for that tenant, so a consumer can use
+        -- it to resume from the last committed event.
+
+    @guarantee EnumerationIsNotAnEventRead
+        -- Enumerating watermarks does not read, expose or leak any tenant's
+        -- events; it reports only each tenant's high-watermark.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "CAS evaluates its predicate against a filtered read taken inside the per-tenant critical section, but the filter is caller-supplied. Should the contract bound which filters make a guard sound (e.g. require the filter to cover exactly the events the invariant depends on), or is that wholly the caller's responsibility?"
+open question "The durable watermark (last_event_id) is the only per-tenant durable cursor exposed. Is it intended purely as administrative metadata, or do downstream components (processors, notifiers) rely on it as an authoritative resume point — and if so should its monotonicity be part of this contract rather than an implementation property?"
+open question "Reads and CAS accept an upper position bound (as_of) and a lower bound (after) but forbid supplying both at once. Is the single-bound restriction an intrinsic part of the read contract, or an implementation limitation that callers should not depend on?"

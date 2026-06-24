@@ -1,0 +1,631 @@
+-- allium: 3
+-- read-model-processor-v2.allium
+--
+-- Distilled from components/read-model-processor-v2 (grain).
+--
+-- Scope: The read side of grain's CQRS model. A read model is a pure reducer
+--        `(state, event) -> state` that folds a tenant's event stream into a
+--        queryable state map. This processor turns that reducer plus a query
+--        into a current projection, and makes repeated reads cheap by caching
+--        the folded state and resuming from a watermark rather than re-folding
+--        from the beginning. This spec captures the behavioural guarantees the
+--        engine promises: projection correctness and determinism, incremental
+--        catch-up from a stored watermark, cache transparency across tiers,
+--        tenant and scope isolation, partition correctness (including
+--        cross-partition moves), and serialization round-trip.
+--
+-- Includes: deterministic projection as a fold over the matching event stream;
+--           a stored (state, watermark) cache advanced incrementally as new
+--           events arrive; a fast in-process tier (L1) layered over a durable
+--           tier (L2) that must agree with a from-scratch projection; TTL-gated
+--           freshness for L1; per-tenant and per-scope cache isolation; size-
+--           transparent storage (monolithic vs segmented) and partitioned
+--           projection with single-partition reads and automatic cross-partition
+--           move detection; the registry of named read models; reducer purity
+--           and resilience of the speculative relevance probe.
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the event store itself (querying, ordering, watermarks as event ids):
+--     this spec demands the EventStream contract and owns only how a read model
+--     consumes it
+--   - the durable cache backend (LMDB key/value store) and its keying scheme:
+--     only the (state, watermark) round-trip and tier-agreement guarantees are
+--     specified, not the byte layout or key bytes
+--   - serialization / wire format (Fressian) — only the round-trip guarantee
+--   - the precise eviction policy (LRU by entry count), segment count (64),
+--     hash-segmentation thresholds and write-back batching counts: these are
+--     performance tunings recorded as config, not behavioural promises
+--   - CloudWatch / mulog metrics and the cache-tier trace labels
+--   - threads, atoms, transients and other in-process mechanics
+--
+-- Conformance properties RM1..RM11 correspond to the interface test suite
+-- (interface_test.clj). Where each is captured:
+--   RM1  fold correctness        -> contract Projection.FoldOverMatchingEvents
+--   RM2  determinism             -> contract Projection.Deterministic
+--   RM3  incremental catch-up    -> rule ProjectReadModel + Cache.watermark
+--   RM4  no reprocessing         -> contract Projection.NoReprocessing
+--   RM5  cache transparency      -> contract Cache.TierAgreement
+--   RM6  L1 TTL freshness        -> rule ProjectReadModel + invariant FreshWhenZeroTtl
+--   RM7  tenant isolation        -> invariant CachePerTenant + surface guarantee
+--   RM8  scope isolation         -> invariant CachePerScope
+--   RM9  size transparency       -> contract Cache.SizeTransparent
+--   RM10 partition correctness   -> contract Partitioning.* + invariant EntityInOnePartition
+--   RM11 serialization roundtrip -> contract StateCodec.Roundtrip
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A domain tenant. Tenants are governed by the event store / control plane, not
+-- here; every projection is scoped to exactly one tenant and the processor only
+-- ever folds and caches that tenant's events.
+external entity Tenant {}
+
+-- An immutable fact in a tenant's event stream, supplied by the event store. A
+-- read model subscribes to a subset of event types and folds the matching ones.
+-- Only the attributes a reducer and the engine actually observe are modelled.
+external entity Event {
+    tenant: Tenant
+    -- The event's position in the tenant's total order. The cache stores the id
+    -- of the last folded event as its watermark, so the next read resumes
+    -- strictly after it.
+    id: EventId
+    -- The domain meaning of the event; a read model declares which types it
+    -- subscribes to.
+    event_type: String
+
+    -- An event is foldable by a read model when its type is one the read model
+    -- subscribes to. The engine only ever folds foldable events.
+    is_subscribed_by(rm): event_type in rm.event_types
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- An opaque event identifier supplied by the event store. The processor never
+-- inspects its structure: it uses it only as a cursor ("after this id") that the
+-- cache advances on each catch-up. Total ordering of ids within a tenant's stream
+-- is a guarantee of the EventStream contract, not something this processor derives.
+value EventId {
+    value: String
+}
+
+-- A description of which of a tenant's events a read model folds: the subscribed
+-- event types, plus an optional scope that narrows the set further (a tag filter
+-- or an explicit set of sub-queries). Two reads whose effective query differs
+-- are cached independently.
+value Query {
+    -- The event types this read model subscribes to.
+    types: Set<String>
+    -- An optional narrowing of the stream (e.g. by entity tag). Absent means the
+    -- whole subscribed stream for the tenant.
+    scope: Scope?
+}
+
+-- A narrowing applied on top of a read model's subscribed types. Distinct scopes
+-- produce distinct cache entries even for the same read model and tenant.
+value Scope {
+    -- An opaque description of the narrowing (tag set or override sub-queries).
+    -- The engine does not interpret it beyond using it to key the cache and to
+    -- constrain which events are folded.
+    descriptor: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The event stream the processor reads. The processor demands these guarantees
+-- from the event store; it does not provide them. Catch-up correctness depends
+-- on the store returning, for a tenant, exactly the matching events strictly
+-- after a given watermark, in ascending id order.
+contract EventStream {
+    -- All matching events for a tenant in ascending id order.
+    read: (tenant: Tenant, query: Query) -> Sequence<Event>
+    -- The matching events for a tenant strictly after a watermark, ascending.
+    read_after: (tenant: Tenant, query: Query, watermark: EventId) -> Sequence<Event>
+
+    @invariant TenantScopedAscending
+        -- read and read_after return only the named tenant's events, ascending
+        -- by event id (chronological). read_after returns exactly the events the
+        -- corresponding read would, minus those up to and including the
+        -- watermark — so concatenating successive catch-ups reconstructs the
+        -- full stream with no gap and no overlap.
+}
+
+-- The reducer a read model is built from: a pure fold step. This is a property
+-- of caller-supplied code, so it lives as a contract the processor demands
+-- rather than as entity state.
+contract Reducer {
+    -- Fold one event into the accumulated state.
+    step: (state: Any, event: Event) -> Any
+
+    @invariant Pure
+        -- RM2: step is pure and deterministic — no I/O, no clock, no mutable
+        -- state outside its arguments. The same (state, event) always yields the
+        -- same next state. The engine relies on this to cache and incrementally
+        -- replay folds.
+
+    @invariant ReceivesFullEvents
+        -- RM1: step is called with the whole event (its id, type, timestamp and
+        -- body), never a projection of it, so a reducer can branch on event type
+        -- and read any field.
+
+    @invariant NilStateTolerant
+        -- The engine probes step speculatively against empty state to decide
+        -- whether a not-yet-seen event is relevant to a partition. A reducer that
+        -- assumes prior state may itself fail on such a probe; the engine treats
+        -- a failed probe as "not relevant" and must not let it abort the read.
+        -- (Captured as @guarantee ProbeIsResilient on the projection surface.)
+}
+
+-- The state serialization guarantee for the durable tier. Folded state survives
+-- a store-and-read cycle unchanged. The encoding is an implementation choice;
+-- only the round-trip identity is promised.
+contract StateCodec {
+    serialize: (state: Any) -> ByteArray
+    deserialize: (bytes: ByteArray) -> Any
+
+    @invariant Roundtrip
+        -- RM11: deserialize(serialize(state)) reproduces the state exactly,
+        -- including rich value types a reducer may place in it (e.g. timestamps),
+        -- with no loss. A projection served from the durable tier equals the same
+        -- projection held in memory.
+}
+
+-- The projection guarantee: what the engine computes, independent of caching.
+contract Projection {
+    @invariant FoldOverMatchingEvents
+        -- RM1: the projection for a (read model, tenant, scope) is the reducer
+        -- folded, in event-id order, over exactly the tenant's events that match
+        -- the read model's query — starting from empty state. Events that do not
+        -- match are never folded.
+
+    @invariant Deterministic
+        -- RM2: the projection depends only on the matching event stream and the
+        -- reducer. The same events and reducer always yield the same state,
+        -- regardless of how many intermediate reads occurred or which tier
+        -- served them.
+
+    @invariant NoReprocessing
+        -- RM4: across successive reads, each event is folded at most once. A read
+        -- that finds new events folds only those past the stored watermark onto
+        -- the cached state; a read that finds none folds nothing. The cumulative
+        -- result equals a from-scratch fold over all events seen so far.
+}
+
+-- The cache guarantee: the two tiers are an optimisation, never a source of
+-- truth that can disagree with the projection.
+contract Cache {
+    @invariant TierAgreement
+        -- RM5: whatever tier serves a read — the in-process tier, the durable
+        -- tier, or a from-scratch projection on a cold cache — the returned state
+        -- is the projection defined by contract Projection. Caches change cost
+        -- and latency, never the answer.
+
+    @invariant SizeTransparent
+        -- RM9: state is stored monolithically when small and split into a fixed
+        -- set of hash segments when large, migrating between the two as it grows.
+        -- The choice and the segment boundaries are invisible to a reader: the
+        -- reassembled state equals the projection either way, and on an
+        -- incremental update only the segments that actually changed are
+        -- rewritten.
+}
+
+-- The partitioning guarantee for read models that shard their state by a
+-- partition key derived from entity state.
+contract Partitioning {
+    -- The partition an entity belongs to, derived from its current state.
+    partition_of: (entity: Any) -> PartitionKey
+    -- The entity an event concerns, used to route the event to a partition.
+    entity_of: (event: Event) -> EntityId
+
+    @invariant FullEqualsMergedPartitions
+        -- RM10: a full projection (no partition key) equals the merge of every
+        -- partition's state. Reading one partition returns exactly that
+        -- partition's slice of the full projection — no other partition's
+        -- entities, none of its own missing.
+
+    @invariant CrossPartitionMove
+        -- RM10: when folding an event changes an entity's partition key, the
+        -- entity leaves its old partition and appears in the new one, exactly
+        -- once. A single-partition read can both shed an entity that moved out
+        -- and adopt one that moved in, without a full reprojection — and a later
+        -- read of either partition sees the move.
+
+    @invariant PartitionIsolation
+        -- RM10: appending events to one partition does not alter another. Each
+        -- partition is cached and caught up independently from its own watermark.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How long the in-process tier may serve a cached projection without
+    -- re-checking the event store. Zero means always re-check, so reads are
+    -- never stale; a positive window trades freshness for sub-millisecond reads
+    -- during rapid interaction (pagination, filter changes). Defaulted per read
+    -- model; the engine default is zero.
+    l1_ttl: Duration = 0.seconds
+
+    -- Soft cap on the number of distinct projections held in process; the least
+    -- recently used are dropped past this point. A capacity knob, not a
+    -- behavioural promise — a dropped entry is simply recomputed on next read.
+    l1_max_entries: Integer = 10000
+
+    -- A durable-tier write-back happens only when a single catch-up read folds
+    -- at least this many new events, to amortise serialization cost. The count is
+    -- per catch-up, not cumulative across reads: several reads each folding fewer
+    -- than the threshold leave the durable copy untouched even though their total
+    -- exceeds it. Below the threshold the in-process tier still reflects the new
+    -- events; only the durable copy lags, and a cold read re-folds the remainder.
+    write_back_threshold: Integer = 10
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A registered read model: a named reducer plus the event types it folds and a
+-- cache version. Registration is by qualified name; bumping the version
+-- invalidates all cached state for that read model (it is part of the cache
+-- identity). Partition functions are present only for partitioned read models.
+entity ReadModel {
+    -- The qualified name a projection is requested by. Together with the version
+    -- it forms the read model's cache identity.
+    name: String
+    -- The event types this read model subscribes to. The engine folds exactly
+    -- the matching events.
+    event_types: Set<String>
+    -- Bump to invalidate previously cached state.
+    version: Integer
+    -- Present only for partitioned read models: when true the read model shards
+    -- its state by a partition key derived from entity state. When false a single
+    -- monolithic-or-segmented projection is kept.
+    is_partitioned: Boolean
+    -- How long in-process state may be served before re-checking the store.
+    l1_ttl: Duration
+
+    -- The cached projections derived from this read model.
+    caches: Cache with read_model = this
+}
+
+-- The engine's cached projection for one (read model, tenant, scope, partition)
+-- combination. It is a memo of the fold: the accumulated state plus the
+-- watermark up to which it was folded. A read advances it by folding the events
+-- after its watermark; it is never authoritative over the event stream, which
+-- can always re-derive it from scratch.
+entity Cache {
+    read_model: ReadModel
+    -- The tenant whose events this projection folds. Part of the cache identity:
+    -- no two tenants ever share a cache entry.
+    tenant: Tenant
+    -- The scope that narrowed the stream, if any. Part of the cache identity.
+    scope: Scope?
+    -- For a partitioned read model, which partition this entry holds. Absent for
+    -- a full or unpartitioned projection. Part of the cache identity.
+    partition_key: PartitionKey?
+    -- The accumulated projection state.
+    state: Any
+    -- The identifiers of the domain entities held in this cached state. For a
+    -- partitioned read model this is the entity set of one partition; the engine
+    -- routes each event to a partition by the entity it concerns and detects a
+    -- move when an entity's partition key changes.
+    entity_ids: Set<EntityId>
+    -- The id of the last event folded into state. The next read resumes strictly
+    -- after this id. Absent only before the first event is folded.
+    watermark: EventId?
+    -- When the in-process copy was last confirmed against the event store (folded
+    -- or revalidated). The freshness window is measured from here.
+    validated_at: Timestamp
+    -- Whether this entry was last served only after catching up against the
+    -- store, rather than from the stale fast path. Always true for a zero-TTL
+    -- read model, which never takes the fast path.
+    served_after_catch_up: Boolean
+    -- Whether a matching event has been committed since this entry was last
+    -- folded, so its state lags the stream. A stale entry is not eagerly
+    -- recomputed; the next read that does not take the fast path catches it up.
+    stale: Boolean
+
+    -- The entry's state reflects the stream exactly when it is not stale.
+    is_current: not stale
+}
+
+------------------------------------------------------------
+-- Value Types (partition keys and ids)
+------------------------------------------------------------
+
+-- The key identifying a partition of a partitioned read model's state. Opaque to
+-- the engine; derived from entity state by the read model's partition function.
+value PartitionKey {
+    descriptor: String
+}
+
+-- The identifier of a domain entity within a read model's state map, extracted
+-- from an event. Used to route events to partitions and to detect moves.
+value EntityId {
+    value: String
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A caller requests the current projection of a read model for a tenant, with an
+-- optional scope and (for partitioned models) an optional partition key. The
+-- engine returns the projection, caching it. Whether it folds from scratch,
+-- resumes from the durable tier, or returns the in-process copy is an
+-- optimisation: the value returned is the projection over the matching events.
+rule ProjectReadModel {
+    when: ProjectRequested(read_model, tenant, scope?, partition_key?)
+
+    let cache = Cache{read_model: read_model, tenant: tenant, scope: scope, partition_key: partition_key}
+    let known_watermark = if exists cache: cache.watermark else: null
+    let fresh =
+        exists cache
+        and read_model.l1_ttl > 0.seconds
+        and now - cache.validated_at < read_model.l1_ttl
+
+    ensures:
+        if fresh:
+            -- Within the in-process freshness window: serve the cached state
+            -- without touching the event store. No catch-up occurred.
+            cache.served_after_catch_up = false
+            ProjectionServed(tenant: tenant, state: cache.state)
+        else:
+            -- Otherwise catch up: fold the events past the known watermark onto
+            -- the cached state (the whole stream when there is no cache yet).
+            let new_events =
+                if exists cache:
+                    read_after(tenant, effective_query(read_model, scope), known_watermark)
+                else:
+                    read(tenant, effective_query(read_model, scope))
+            let folded = fold_events(read_model, current_state(cache), new_events)
+
+            -- The projection now reflects every matching event; the watermark
+            -- advances to the last one folded (or stays put when none arrived).
+            Cache.created(
+                read_model: read_model,
+                tenant: tenant,
+                scope: scope,
+                partition_key: partition_key,
+                state: folded.state,
+                watermark: folded.watermark,
+                validated_at: now,
+                served_after_catch_up: true,
+                stale: false
+            )
+            ProjectionServed(tenant: tenant, state: folded.state)
+
+    @guidance
+        -- The two tiers and the size-transparent / partitioned storage layouts
+        -- are all variations on one idea: memoise the fold and resume from a
+        -- watermark. The Cache entity is that memo regardless of where it
+        -- physically lives. read_after over the matching query is what makes
+        -- catch-up gapless and reprocessing-free; the event store contract
+        -- (EventStream.TenantScopedAscending) is what makes read_after correct.
+        --
+        -- For a partitioned read model the per-partition entries are independent
+        -- memos keyed by partition_key; a cross-partition move is observed as the
+        -- moved entity being shed from one partition's state and adopted into
+        -- another's during the fold (see contract Partitioning.CrossPartitionMove).
+        --
+        -- `validated_at` and the freshness window are an in-process concept; with
+        -- l1_ttl = 0 the `fresh` branch is never taken and every read re-checks
+        -- the store, so a read is never stale (invariant FreshWhenZeroTtl).
+}
+
+-- A new fact in a tenant's stream makes any cached projection that subscribes to
+-- the event's type lag the stream: its watermark now precedes the event. The
+-- engine does not recompute eagerly — it marks the entry stale, and the next
+-- read that is not served from the freshness window folds the new event in.
+rule EventCommittedStalesCaches {
+    when: event: Event.created
+    ensures:
+        for c in Caches where tenant = event.tenant and event.is_subscribed_by(read_model):
+            c.stale = true
+
+    @guidance
+        -- This is the truthful, pull-based staleness relationship, not an eager
+        -- projection: it explains why a zero-TTL read re-checks the store on every
+        -- request (it must, or it could serve a stale entry) and why a positive
+        -- TTL may serve a stale entry for the duration of the window. The
+        -- subscription guard means an event of a type the read model ignores
+        -- never stales its caches — it would not have been folded anyway.
+}
+
+-- A tenant the engine has not seen before starts with no cached projections, so
+-- its first projection request is necessarily a from-scratch fold. The cache set
+-- is built lazily on demand, never provisioned ahead of a read.
+rule TenantFirstSeen {
+    when: tenant: Tenant.created
+    ensures: not exists Cache{tenant: tenant}
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- RM7: a cache entry belongs to exactly one tenant. No two tenants ever share an
+-- entry, so one tenant's events can never leak into another's projection — even
+-- when the same read model, scope and partition are read for both.
+invariant CachePerTenant {
+    for a in Caches:
+        for b in Caches:
+            (a != b
+             and a.read_model = b.read_model
+             and a.scope = b.scope
+             and a.partition_key = b.partition_key)
+                implies a.tenant != b.tenant
+}
+
+-- RM8: distinct scopes of the same read model and tenant are distinct cache
+-- entries. A scoped projection and the unscoped one (or two differently scoped
+-- ones) never share accumulated state.
+invariant CachePerScope {
+    for a in Caches:
+        for b in Caches:
+            (a != b
+             and a.read_model = b.read_model
+             and a.tenant = b.tenant
+             and a.partition_key = b.partition_key)
+                implies a.scope != b.scope
+}
+
+-- RM10: for a partitioned read model, an entity belongs to at most one partition
+-- at a time. Two cache entries for the same read model, tenant and scope are
+-- different partitions, and their entity sets are disjoint — no entity id is
+-- held by two partitions at once, which is exactly what a cross-partition move
+-- preserves.
+invariant EntityInOnePartition {
+    for a in Caches:
+        for b in Caches:
+            (a != b
+             and a.read_model = b.read_model
+             and a.tenant = b.tenant
+             and a.scope = b.scope)
+                implies
+                    a.partition_key != b.partition_key
+                    and not a.entity_ids.any(e => e in b.entity_ids)
+}
+
+-- A cache's watermark, once set, is the id of a real event that the read model
+-- subscribes to in the same tenant's stream. The watermark is therefore the
+-- fold cursor over the matching events, never an id from another tenant or an
+-- event type the read model ignores.
+invariant WatermarkNamesAFoldedEvent {
+    for c in Caches:
+        c.watermark != null implies
+            Events.any(e =>
+                e.id = c.watermark
+                and e.tenant = c.tenant
+                and e.event_type in c.read_model.event_types)
+}
+
+-- Every cache belongs to a tenant the engine knows; a cache cannot exist for a
+-- tenant outside the set the store admits. This pins the projection's scope to
+-- a real tenant.
+invariant CacheTenantIsKnown {
+    for c in Caches:
+        Tenants.any(t => t = c.tenant)
+}
+
+-- RM6: with the freshness window disabled (l1_ttl = 0), every read re-checks the
+-- event store, so no cache can serve state that omits an already-committed
+-- matching event. Stated as a lower bound on freshness: a zero-TTL read model's
+-- cache is only ever served after catching up against the store, never from the
+-- stale fast path. (A matching commit still marks such an entry stale until the
+-- next read folds it in — see EventCommittedStalesCaches — so currency is restored
+-- on the next read rather than held continuously; that catch-up-then-current
+-- sequence is a temporal property, not a single-point-in-time assertion.)
+invariant FreshWhenZeroTtl {
+    for c in Caches:
+        c.read_model.l1_ttl = 0.seconds implies c.served_after_catch_up
+}
+
+-- A read model is identified by its name and version together; that pair is its
+-- cache identity. Two distinct registered read models never collide on both, so
+-- a version bump yields a fresh identity whose caches are necessarily empty
+-- until refolded.
+invariant ReadModelIdentity {
+    for a in ReadModels:
+        for b in ReadModels:
+            a != b implies (a.name != b.name or a.version != b.version)
+}
+
+-- A cache entry's shape follows its read model: only a partitioned read model's
+-- entries name a partition, and an unpartitioned read model's entries never do.
+-- This pins the partition_key field's presence to the read model's kind, so the
+-- per-partition isolation guarantee only ever applies where partitioning is in
+-- effect. Stated over each read model's own cache set, the relation that defines
+-- which entries a version bump orphans.
+invariant CacheShapeFollowsReadModel {
+    for rm in ReadModels:
+        rm.caches.all(c => rm.is_partitioned implies c.partition_key != null)
+        and rm.caches.all(c => not rm.is_partitioned implies c.partition_key = null)
+}
+
+-- A projection just served after catching up against the store is current: it
+-- reflects every matching event committed up to that read. Currency is the
+-- absence of staleness (Cache.is_current), and a catch-up clears staleness, so
+-- the freshly served entry is not lagging the stream at the moment it is read.
+invariant CaughtUpEntriesAreCurrent {
+    for c in Caches:
+        c.served_after_catch_up implies c.is_current
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The party on the other side of this boundary is code, not a person: a query
+-- handler asking for a projection, and the application code that defines and
+-- registers read models. Both are tenant-scoped, so the surfaces face the
+-- Tenant the caller operates on.
+
+-- The registration boundary: how application code declares a read model the
+-- engine can later project.
+surface ReadModelRegistration {
+    facing tenant: Tenant
+
+    exposes:
+        -- The set of read models the engine knows how to project.
+        ReadModels
+
+    provides:
+        RegisterReadModel(tenant, read_model)
+
+    @guarantee VersionInvalidatesCache
+        -- A read model's version is part of its cache identity. Bumping it makes
+        -- previously cached state unreachable, so the next read re-folds from
+        -- scratch — the supported way to evolve a reducer.
+}
+
+-- The projection boundary: how a tenant-scoped caller obtains the current state
+-- of a read model.
+surface ReadModelProjection {
+    facing tenant: Tenant
+
+    provides:
+        ProjectRequested(read_model, tenant, scope?, partition_key?)
+
+    contracts:
+        demands EventStream
+        demands Reducer
+        demands StateCodec
+        fulfils Projection
+        fulfils Cache
+        fulfils Partitioning
+
+    @guarantee CacheIsTransparent
+        -- The state returned is the reducer folded over the matching event
+        -- stream for this tenant, whichever tier answered. Caching changes
+        -- latency and cost, never the value.
+
+    @guarantee TenantIsolation
+        -- RM7: a projection folds and returns only the requesting tenant's
+        -- events; cache entries are keyed by tenant and never shared across
+        -- tenants.
+
+    @guarantee ScopeIsolation
+        -- RM8: a scoped projection reflects only the events its scope selects,
+        -- and is cached separately from the unscoped projection and from other
+        -- scopes.
+
+    @guarantee ProbeIsResilient
+        -- To route a not-yet-seen event to a partition the engine probes the
+        -- reducer against empty state. A reducer that assumes prior state may
+        -- fail that probe; the engine treats a failed probe as "not relevant"
+        -- and the read still completes correctly.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "A read model's reducer can evolve only by bumping its version, which orphans the old cached state. Should the engine model reclamation of orphaned cache entries, or is that left to operational tooling?"
+open question "The durable write-back is deferred until write_back_threshold new events, so the durable tier can lag the in-process tier. Is the only consequence a colder cold-read (re-fold the remainder), or are there durability expectations on the cache worth stating explicitly?"
+open question "Cross-partition move detection relies on the reducer's partition function being stable for an unchanged entity. Should the spec state a contract that partition_of is deterministic and depends only on entity state, beyond the prose in contract Partitioning?"

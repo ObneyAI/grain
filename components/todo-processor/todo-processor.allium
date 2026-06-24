@@ -1,0 +1,309 @@
+-- allium: 3
+-- todo-processor.allium
+--
+-- Distilled from components/todo-processor (grain).
+--
+-- DEPRECATED COMPONENT. This is the first-generation todo-processor, superseded
+-- by todo-processor-v2. The interface namespace is marked deprecated in code.
+-- The behavioural difference that motivated v2 is recorded here as an explicit
+-- non-guarantee (see contract Delivery.TransientAtMostOnce): v1 has no
+-- checkpointing, no offsets and no replay, so it cannot recover events that were
+-- in flight when a node stopped.
+--
+-- Scope: A reactive event-handler runtime. A processor subscribes to a set of
+--        event topics on an in-process publish/subscribe bus, and for every
+--        event published on those topics it invokes a single application-
+--        supplied handler. The handler may emit further events, which are
+--        appended to the event store the processor is bound to. This is the
+--        "react to events, optionally emit derived events" half of CQRS, before
+--        durable checkpointing was added.
+--
+-- This is a LIBRARY/FRAMEWORK spec: there is no domain state machine here. The
+-- real guarantees — per-event delivery, atomic append of handler output, fault
+-- isolation, bounded backpressure and the at-most-once / no-replay character —
+-- live in module-level contracts and surface guarantees. The single Processor
+-- entity exists only to give a running subscription a place to hang.
+--
+-- This component carries no tenant dimension of its own. A processor is wired to
+-- exactly one event store instance (handed in through the handler context), and
+-- all of its handler output lands in that one stream. Tenant isolation, when an
+-- application needs it, is achieved structurally by the consuming layer running
+-- one store (hence one processor) per tenant — the same boundary event-store-v2
+-- draws. There is no tenant id on an event, on the append call, or on the
+-- processor.
+--
+-- Includes: subscription to topics, per-event handler invocation, the handler
+--           context (the triggering event plus the means to emit), atomic
+--           append of handler-produced events, fault isolation (a failing
+--           handler must not stop the processor or append partial output),
+--           bounded buffering with backpressure (no event silently dropped once
+--           accepted), and the at-most-once / no-replay delivery character.
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the event store internals and its append/read API (event-store-v2)
+--   - the publish/subscribe bus internals and its topic routing (pubsub)
+--   - the worker pool, channels, thread counts and buffer sizing
+--     (core-async-thread-pool, core.async)
+--   - how an event's topic is derived from the event (topic-fn)
+--   - event serialization, schema validation and the event wire shape
+--   - logging, tracing and metrics
+--   - integrant lifecycle wiring (start/stop)
+--
+-- Conformance properties TP1..TP7 correspond to the interface test suite
+-- (interface_test.clj). Where each is captured:
+--   TP1 happy path / context shape -> contract EventHandler + surface
+--   TP2 emitted events appended    -> rule HandlerEmitsEvents + EventAppend.AtomicAppend
+--   TP3 empty result appends none  -> rule HandlerEmitsNothing
+--   TP4 nil / anomaly / throw      -> rule HandlerFails + EventHandler.HandlerFailureIsContained
+--   TP5 append failure surfaced    -> contract EventAppend.AppendFailureSurfaced
+--   TP6 backpressure, no drops     -> contract Delivery.BoundedBackpressure
+--   TP7 independent invocations    -> contract EventHandler.IndependentInvocations
+--   no replay / at-most-once       -> contract Delivery.TransientAtMostOnce
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- An immutable fact. Source events are delivered to the handler; result events
+-- the handler returns are appended back to the store. Both are governed by the
+-- event store's schema, not here, so this is a structural placeholder carrying
+-- only what the runtime observes: the event's type, used to match a topic.
+external entity Event {
+    -- The event's type. A processor reacts only to events whose type matches one
+    -- of its subscribed topics.
+    event_type: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The application boundary the runtime drives. The runtime DEMANDS that the
+-- consumer-supplied handler behave as a function of the event it is handed. These
+-- are guarantees about consumer-supplied code, so they live as contract
+-- invariants rather than entity state.
+contract EventHandler {
+    -- Invoked once per delivered event. Returns the events to append, or no
+    -- events to append nothing. (In code the handler also receives the means to
+    -- emit — the processor's event store — through its context.)
+    handle: (triggering_event: Event) -> Set<Event>
+
+    @invariant HandlerReceivesTriggeringEvent
+        -- TP1: each invocation receives exactly the event that triggered it,
+        -- together with the means to emit further events into the processor's
+        -- store. The handler does not see other in-flight events.
+
+    @invariant HandlerMayDeclineToEmit
+        -- TP3: a handler may legitimately produce no events. An empty result is a
+        -- success, not an error, and results in no append.
+
+    @invariant HandlerFailureIsContained
+        -- TP4: a handler that returns nothing usable, signals a fault, or raises
+        -- is the handler's own concern. The runtime observes the failure without
+        -- letting it append partial output or stop further delivery. The three
+        -- failure shapes (nil, anomaly, exception) collapse to the same outcome:
+        -- nothing appended, the worker survives.
+
+    @invariant IndependentInvocations
+        -- TP7: distinct deliveries are independent. The events appended for one
+        -- invocation are derived solely from that invocation's triggering event;
+        -- one invocation neither sees nor perturbs another's output. (This is a
+        -- property of separate executions, not of stored event state, so it lives
+        -- here as prose rather than as an expression-bearing invariant.)
+}
+
+-- The event store the runtime appends handler output to. The runtime is bound to
+-- one store instance (handed in through the handler context) and DEMANDS an
+-- all-or-nothing append: a single handler invocation's emitted events land
+-- together or not at all.
+contract EventAppend {
+    -- Append every event a single handler invocation emitted, as one unit, to the
+    -- store this processor is bound to. The store instance is the scope; there is
+    -- no tenant parameter at this layer.
+    append: (events: Set<Event>) -> Any
+
+    @invariant AtomicAppend
+        -- TP2: all events emitted by one handler invocation are appended
+        -- together. There is no partial-append state in which some of an
+        -- invocation's events are durable and others are not.
+
+    @invariant AppendFailureSurfaced
+        -- TP5: if the store rejects the append (e.g. a malformed event), the
+        -- failure is surfaced as a fault for that invocation rather than being
+        -- silently swallowed. The triggering event's own delivery is still
+        -- consumed (no automatic retry at this layer).
+}
+
+-- The in-process delivery channel between the publish/subscribe bus and the
+-- handler. The runtime DEMANDS bounded, backpressured delivery so that a fast
+-- producer cannot overrun a slow handler by dropping events.
+contract Delivery {
+    -- Subscribe the runtime to a topic; thereafter every event published on that
+    -- topic is delivered to the handler.
+    subscribe: (topic: String) -> Any
+
+    @invariant BoundedBackpressure
+        -- TP6: delivery into the processor is buffered with a bounded capacity.
+        -- Once an event is accepted onto that bounded buffer it is not dropped:
+        -- it is eventually delivered to the handler while the processor runs, and
+        -- a slow handler exerts backpressure on the buffer rather than discarding
+        -- buffered work. The no-drop property is bounded by the buffer's capacity
+        -- and holds for the in-flight window the runtime owns; what the upstream
+        -- bus does when that backpressure propagates past the buffer is the bus's
+        -- concern, not this runtime's (the bus is excluded; see the file header).
+
+    @invariant TransientAtMostOnce
+        -- Delivery is transient and in-memory: no durable log, no offset, no
+        -- acknowledgement. An accepted event is delivered at most once and is
+        -- never re-delivered; an event buffered but not yet handled when the
+        -- processor stops is lost. This is the property todo-processor-v2 replaces
+        -- with durable, checkpointed, replayable delivery.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How many handler invocations may run concurrently. One in the shipped
+    -- default, so events on a topic are effectively handled in arrival order;
+    -- raising it trades ordering for throughput.
+    worker_count: Integer = 1
+    -- The bounded buffer capacity between the bus and the handler. Once this many
+    -- events are awaiting handling the buffer is full and exerts backpressure;
+    -- events already on it are not dropped.
+    delivery_buffer: Integer = 1024
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A running processor instance: a subscription to a set of topics, draining
+-- events from a bounded buffer onto a pool of workers, appending handler output
+-- to the single event store it is bound to. It exists for the lifetime between
+-- start and stop.
+entity Processor {
+    -- The topics whose events this processor reacts to.
+    topics: Set<String>
+    -- Whether the processor is currently draining and handling events.
+    running: Boolean
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- An event published on a subscribed topic is delivered to the handler, which
+-- runs against the triggering event. This is the entry point every other rule
+-- chains from; the runtime guarantees one invocation per accepted event.
+rule EventDelivered {
+    when: EventPublished(processor, event)
+    requires: processor.running
+    requires: event.event_type in processor.topics
+    ensures: HandlerInvoked(processor: processor, event: event)
+
+    @guidance
+        -- "Accepted" is the operative word: an event is enqueued on the
+        -- processor's bounded delivery buffer, and once enqueued there it is not
+        -- dropped — it is delivered to the handler exactly once while the
+        -- processor runs, with a slow handler holding the buffer full rather than
+        -- discarding buffered events. If the processor stops with events still
+        -- buffered, those events are lost — there is no replay (see contract
+        -- Delivery.TransientAtMostOnce).
+}
+
+-- A handler that emits events has those events appended to the processor's store
+-- as a single unit. Nothing observable is produced beyond the durable events.
+rule HandlerEmitsEvents {
+    when: HandlerInvoked(processor, event)
+    let emitted = handle(event)
+    requires: emitted.count > 0
+    ensures:
+        for e in emitted:
+            Event.created(event_type: e.event_type)
+
+    @guidance
+        -- The emitted events are appended as one atomic unit
+        -- (EventAppend.AtomicAppend) to the single store this processor is bound
+        -- to. If the store rejects them the failure is surfaced, not swallowed
+        -- (EventAppend.AppendFailureSurfaced).
+}
+
+-- A handler that emits nothing produces no append. The triggering event is still
+-- considered handled.
+rule HandlerEmitsNothing {
+    when: HandlerInvoked(processor, event)
+    let emitted = handle(event)
+    requires: emitted.count = 0
+    ensures: EventHandled(processor: processor, event: event)
+}
+
+-- A handler that fails — returns nothing usable, signals a fault, or raises — is
+-- isolated: no events are appended for it, and the processor keeps draining
+-- subsequent events. The failure is observed (logged) but does not propagate.
+rule HandlerFails {
+    when: HandlerFailed(processor, event)
+    requires: processor.running
+    ensures: EventHandled(processor: processor, event: event)
+
+    @guidance
+        -- Three distinct failure shapes collapse to the same outcome: a handler
+        -- returning nil, a handler returning an anomaly, and a handler throwing.
+        -- In every case nothing is appended and the worker survives to handle the
+        -- next event. This containment is what keeps one bad event from stalling
+        -- the whole subscription (EventHandler.HandlerFailureIsContained).
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The application runtime that starts a processor against a set of topics and a
+-- store, then drives delivery. It is code, not a person, so the actor has a
+-- minimal identity: any running processor.
+actor ApplicationRuntime {
+    identified_by: Processor where running = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary the application drives: register a handler against a set of topics
+-- and a store, observe whether it is running, and tear it down. The runtime
+-- supplies delivery, append and fault-isolation guarantees; the application
+-- supplies the handler.
+surface ProcessorLifecycle {
+    facing runtime: ApplicationRuntime
+    context processor: Processor
+
+    exposes:
+        processor.topics
+        processor.running
+
+    contracts:
+        demands EventHandler
+        demands EventAppend
+        demands Delivery
+
+    @guarantee AtMostOnceReaction
+        -- An event published on a subscribed topic is delivered to the handler at
+        -- most once. Events emitted by the handler are appended atomically to the
+        -- processor's store; a failing handler appends nothing and does not stop
+        -- the processor.
+
+    @guarantee NoReplayAfterStop
+        -- Delivery is in-process and transient. Events buffered but not yet
+        -- handled when the processor stops are lost; there is no offset to resume
+        -- from. Durable, replayable delivery is provided by todo-processor-v2, not
+        -- by this component.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should a handler that emits events into the same store risk an append loop (its emitted events re-triggering the same processor)? v1 leaves topic discipline to the consumer; v2's offsets bound this. Is loop avoidance a runtime responsibility or a consumer one?"
+open question "On append failure (TP5) the triggering delivery is consumed with no retry. Is dropping the derived work on a transient store error acceptable, or should append failures be retried or dead-lettered? v2's checkpointing changes the answer."
+open question "worker_count > 1 trades arrival-order handling for throughput. Should ordering within a topic be a stated guarantee at worker_count = 1, or is it incidental and not to be relied upon?"

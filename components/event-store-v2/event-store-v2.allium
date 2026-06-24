@@ -1,0 +1,555 @@
+-- allium: 3
+-- event-store-v2.allium
+--
+-- Distilled from components/event-store-v2 (grain).
+--
+-- Scope: The event-store FACADE layer of the event-sourced system. It is the
+--        boundary callers actually use to construct, append and read events. It
+--        sits above a pluggable storage backend (in-memory, and elsewhere
+--        relational): it validates what is handed in, delegates the durable work
+--        to a backend, and — on a successful append — publishes each stored
+--        event so downstream subscribers (projections, todo-processors) can
+--        react. The durable storage guarantees themselves (atomic batch append,
+--        total ordering, compare-and-swap, filtered/streamed reads) are demanded
+--        of the backend and re-stated here as the contract the facade upholds.
+--
+-- This is a LIBRARY / FRAMEWORK component: a reusable mechanism with
+-- behavioural guarantees, not a domain. It is modelled as module-level
+-- contracts (event construction, the validating append boundary, the read
+-- boundary, the storage backend it delegates to, and the publish fan-out), an
+-- Event entity placeholder for the fact being stored, and surfaces describing
+-- the writer and reader boundaries. The domain meaning of any given event lives
+-- in the consuming service; this component only validates, stores, retrieves
+-- and announces them.
+--
+-- Includes (the guarantees the code and tests actually prove):
+--   - construction stamping: a constructed event receives a fresh time-ordered
+--     identity and an issued-at timestamp; the caller supplies type, tags, body
+--   - argument validation at the boundary: malformed append/read arguments, and
+--     events whose type has no registered schema or whose body fails it, are
+--     rejected before anything is stored — a rejected append stores nothing
+--   - atomic batch append delegated to a backend: a batch is stored
+--     all-or-nothing and concurrent appends serialise (never interleave)
+--   - a synthesised transaction-marker event per plain append, recording exactly
+--     the set of event identities written together, plus optional metadata
+--   - compare-and-swap append: an optional predicate over a filtered view of the
+--     current stream gates the write; a failing predicate stores nothing and is
+--     reported as a conflict, distinct from any other failure
+--   - publish-after-append: once an append succeeds (plain or guarded), each of
+--     its events is published to subscribers; a rejected or conflicted append
+--     publishes nothing. The synthesised marker is stored but not published.
+--   - read filtering: by tag containment, by event type, and by position
+--     (strictly after an id, or at-or-before an id), in any conjunctive
+--     combination; the two positional filters are mutually exclusive per query
+--   - batch read: several queries merged into one ordered, duplicate-free stream
+--     keyed by event identity, each query carrying its own filters
+--   - faithful round-trip of an event's identity, type, tags, timestamp and
+--     opaque body
+--   - streaming reads: the result is consumed incrementally and may be
+--     terminated early without reading the whole matching set
+--
+-- Excludes (implementation / governed elsewhere):
+--   - the storage backend internals: the in-memory ref/atom, the relational
+--     schema, indexes, the global-lock row, transactions, connection pooling
+--   - serialization / wire format and identity generation (UUID v7) and the
+--     clock — captured here only as the abstract "time-ordered identity",
+--     "issued-at timestamp" and faithful round-trip guarantees, not byte formats
+--   - the pubsub mechanism itself (topics, delivery semantics) — captured here
+--     only as the abstract "each stored event is published after a successful
+--     append" obligation; delivery guarantees belong to the pubsub component
+--   - the event-schema registry and the malli/EDN machinery that backs
+--     validation — captured here only as the abstract "validated before stored"
+--     obligation, not the schema language
+--   - anomaly category taxonomy, logging, tracing and metrics
+--   - tenancy: tenant isolation is achieved by the consuming layer running one
+--     store (or scope) per tenant; a single store instance here is a single
+--     stream and draws no cross-tenant distinction of its own
+--
+-- NOTE: this is the v2 store and is DEPRECATED in favour of v3; the behavioural
+-- contract is captured here for the record.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- An opaque tag attaching an event to some domain entity: a pair of an entity
+-- type and that entity's identity. Tags are how readers select the events
+-- relevant to a particular entity. They are structured data without identity;
+-- their meaning is governed by the event model, not by the store, which only
+-- matches on them by equality and containment.
+value Tag {
+    entity_type: String
+    entity_id: String
+}
+
+-- A read query: a filter selecting a subset of the stream. Every field is
+-- optional; an empty query selects the entire stream. Positional filters use
+-- event identity (which is time-ordered), so "after" and "as_of" are time
+-- windows expressed against the same total order the store imposes.
+value ReadQuery {
+    -- Keep only events carrying ALL of these tags (tag containment). Absent
+    -- means do not filter by tag.
+    tags: Set<Tag>
+    -- Keep only events of one of these types. Absent means any type.
+    types: Set<String>
+    -- Keep only events strictly after this identity in the total order.
+    after: String?
+    -- Keep only events at or before this identity in the total order. A single
+    -- query may not constrain both after and as_of.
+    as_of: String?
+}
+
+-- The optional compare-and-swap precondition on an append. The predicate is
+-- evaluated against the events the query selects from the current stream; the
+-- append proceeds only if it holds. This is the optimistic-concurrency knob:
+-- a writer asserts "store my events only if the stream still looks like this".
+value AppendGuard {
+    -- The view of the stream the predicate inspects.
+    query: ReadQuery
+}
+
+-- The result a writer observes from an append: whether the batch was stored,
+-- rejected by validation, or conflicted on a failing compare-and-swap guard.
+value AppendResult {
+    outcome: AppendOutcome
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- How an event is constructed before it is appended. The facade stamps each new
+-- event with a fresh time-ordered identity and an issued-at timestamp; the
+-- caller supplies the type, tags and opaque body. The identity is what gives
+-- the stream its single total order.
+contract EventFactory {
+    -- Build an event ready to append from a caller-supplied type, tag set and
+    -- opaque body. Construction arguments are themselves validated; a malformed
+    -- request yields no event.
+    new_event: (type: String, tags: Set<Tag>, body: Any) -> Event
+
+    @invariant TimeOrderedIdentity
+        -- Every constructed event receives a unique identity that sorts in
+        -- issue order: an event constructed later sorts after one constructed
+        -- earlier. The total order the store reads back is this identity order;
+        -- it is intrinsic to the event, not assigned at storage time.
+
+    @invariant StampedAtConstruction
+        -- The identity and the issued-at timestamp are assigned when the event
+        -- is constructed, not when it is stored. Two backends reading the same
+        -- event observe the same identity, type, tags, timestamp and body.
+}
+
+-- The validation gate this facade interposes between callers and the storage
+-- backend. Owned by this component. Every append and read passes its arguments
+-- through validation first; events are additionally checked against the schema
+-- registered for their type. A rejected request never reaches the backend.
+contract InputValidation {
+    -- Whether an append request is well-formed (argument shape, and every event
+    -- structurally valid and matching the schema registered for its type).
+    append_well_formed: (events: Set<Event>, guard: AppendGuard, metadata: Any) -> Boolean
+    -- Whether a read request (single query or batch) is well-formed.
+    read_well_formed: (queries: List<ReadQuery>) -> Boolean
+
+    @invariant RejectBeforeStore
+        -- Validation runs before any storage work. An append that fails
+        -- validation — bad argument shape, or an event whose type has no
+        -- registered schema or whose body fails it — stores nothing and is
+        -- reported as a rejection, distinct from a compare-and-swap conflict.
+
+    @invariant MutuallyExclusivePositionalFilters
+        -- A single query may constrain position by "after" or by "as_of" but not
+        -- both; a query that supplies both is malformed and rejected.
+}
+
+-- The write boundary the facade exposes: appending a batch of events through
+-- validation, then delegating the durable, atomic, serialised write to the
+-- backend. Owned by this component.
+contract EventAppend {
+    -- Append a batch of events, optionally guarded by a compare-and-swap
+    -- precondition and optionally annotated with transaction metadata.
+    append: (events: Set<Event>, guard: AppendGuard, metadata: Any) -> AppendResult
+
+    @invariant ValidatedBeforeStored
+        -- The batch is validated before any of it is stored. A batch that fails
+        -- validation stores nothing; the outcome is a rejection.
+
+    @invariant AtomicBatch
+        -- A stored append stores every event in the batch or none of them. A
+        -- partial batch is never observable: a reader sees either all the events
+        -- of an append or none.
+
+    @invariant SerialisedWrites
+        -- Appends are totally serialised against one another, so two concurrent
+        -- appends never interleave their events and every appended event lands.
+        -- The order in which events were appended is preserved in the stream's
+        -- total order.
+
+    @invariant TransactionMarker
+        -- A plain (unguarded) append also records exactly one transaction-marker
+        -- event naming the set of identities written in that batch (and any
+        -- caller-supplied metadata), as part of the same atomic batch, so the
+        -- record of "these events were written together" can never be lost or
+        -- separated from the events it describes.
+
+    @invariant CompareAndSwapGuards
+        -- When an append carries a guard, the backend reads the events the
+        -- guard's query selects from the current stream and evaluates the
+        -- predicate against them. If it holds, the batch is stored; if it does
+        -- not, nothing is stored and the outcome is a conflict, distinct from a
+        -- validation rejection. The read, the decision and the write are atomic
+        -- with respect to other appends.
+
+    @invariant GuardSeesSelectedSubset
+        -- The guard predicate inspects exactly the subset the guard's query
+        -- selects (by tag and/or type), never the whole stream when the query is
+        -- narrower. A guard scoped to one entity's events does not see another's.
+}
+
+-- The publish fan-out the facade performs after a successful append. Owned by
+-- this component; the delivery mechanism is the pubsub component's concern.
+contract EventPublishing {
+    -- Publish a single stored event to subscribers.
+    publish: (event: Event) -> Any
+
+    @invariant PublishAfterStore
+        -- Publishing happens only after the events are durably stored. Each
+        -- event of a successful append is published exactly once, whether the
+        -- append was plain or guarded — the facade publishes the appended events
+        -- after any append the backend does not reject. An append that fails
+        -- validation (rejected) or whose guard does not hold (conflict) stores
+        -- nothing and publishes nothing. The synthesised transaction marker is
+        -- stored but never itself published; only the caller's events are.
+
+    @invariant PublishIsBestEffortSignal
+        -- Publication is a downstream-reaction signal, not part of the storage
+        -- guarantee: a stored event is durable whether or not its publication is
+        -- observed. Catch-up readers therefore never depend on having seen the
+        -- publication; the stream itself is the source of truth.
+}
+
+-- The read boundary the facade exposes: validating the query then delegating to
+-- the backend to retrieve an ordered, filtered stream of events. Owned by this
+-- component. Reads never block writes and observe the events committed at the
+-- time the stream is consumed.
+contract EventRead {
+    -- Read the events matching a single query, in total order.
+    read: (query: ReadQuery) -> Sequence<Event>
+    -- Read the events matching any of several queries, merged into one ordered,
+    -- duplicate-free stream.
+    read_batch: (queries: List<ReadQuery>) -> Sequence<Event>
+
+    @invariant TotalOrderByIdentity
+        -- Read results are ordered by event identity, which is the single total
+        -- order the store imposes. An empty query reads the whole stream in that
+        -- order; any filter reads the matching subset in the same relative order.
+
+    @invariant FilteringIsConjunctive
+        -- Within one query the filters combine conjunctively: an event is
+        -- returned only if it carries all requested tags AND is of a requested
+        -- type AND falls in the requested positional window. Tag matching is
+        -- containment — the event may carry tags beyond those requested.
+
+    @invariant BatchMergeDeduplicates
+        -- A batch read is the union of its queries' results: an event matching
+        -- more than one query appears exactly once, and the merged stream is
+        -- ordered by identity just like a single read. A single-query batch is
+        -- equivalent to the plain read of that query.
+
+    @invariant StreamedAndTerminable
+        -- The result is consumed incrementally rather than materialised in full,
+        -- and consumption may stop early without reading the remainder of the
+        -- matching events.
+}
+
+-- The pluggable storage backend the facade delegates to. The facade DEMANDS
+-- these guarantees of whatever backend is configured (in-memory here; durable
+-- backends elsewhere). The facade adds validation and publishing on top; the
+-- backend supplies the actual ordering, atomicity and durability.
+contract StorageBackend {
+    -- Start a backend instance from configuration, yielding a handle ready to
+    -- serve appends and reads.
+    start: (config: Any) -> Any
+    -- Release a backend instance and its resources.
+    stop: (store: Any) -> Any
+    -- Durably append a (already-validated) batch, honouring any guard.
+    backend_append: (events: Set<Event>, guard: AppendGuard, metadata: Any) -> AppendResult
+    -- Stream the events matching a query (or batch of queries) in total order.
+    backend_read: (queries: List<ReadQuery>) -> Sequence<Event>
+
+    @invariant BackendOwnsDurability
+        -- The backend is the sole owner of ordering, atomicity, serialisation,
+        -- compare-and-swap and the transaction marker. Multiple backends are
+        -- interchangeable: the same sequence of validated appends produces the
+        -- same observable stream regardless of which backend stores it.
+
+    @invariant InitialisationIsSafe
+        -- Starting a backend is idempotent with respect to pre-existing storage:
+        -- starting against an already-initialised store is a no-op for existing
+        -- structure and never destroys stored events.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The observable outcome of an append at the facade boundary.
+enum AppendOutcome {
+    -- The batch (and, for a plain append, its transaction marker) was stored,
+    -- and its events were published (publication happens for any stored append,
+    -- plain or guarded).
+    stored
+    -- A compare-and-swap guard's predicate did not hold; nothing was stored.
+    conflict
+    -- The request failed validation (bad arguments, or an event failing its
+    -- registered schema); nothing was stored and nothing was published.
+    rejected
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A single immutable fact in the stream. Once appended it is never modified or
+-- removed. Its identity is time-ordered and defines its place in the total
+-- order; its body is opaque to the store. The store guarantees these fields
+-- round-trip faithfully but never interprets the body.
+entity Event {
+    -- Time-ordered identity; defines position in the stream's total order.
+    id: String
+    -- The kind of fact. Readers may filter on it; an event's type must have a
+    -- registered schema for the event to be appendable.
+    type: String
+    -- When the fact was issued (assigned at construction).
+    issued_at: Timestamp
+    -- The entities this fact concerns. Readers may filter by tag containment.
+    tags: Set<Tag>
+    -- Whether this event is the synthesised transaction marker for an append
+    -- (as opposed to a domain event). Markers record which events were written
+    -- together; consumers typically read them separately from domain events.
+    is_transaction_marker: Boolean
+    -- For a transaction marker, the identities of the events written in the
+    -- same batch. Present only on markers (absent on domain events).
+    batch_event_ids: Set<String>?
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A batch whose arguments and event schemas fail validation is rejected at the
+-- facade before any storage work: nothing is stored and nothing is published.
+-- This is distinct from a compare-and-swap conflict.
+rule BatchRejected {
+    when: BatchSubmitted(events, guard, metadata)
+    requires: not append_well_formed(events, guard, metadata)
+    ensures:
+        let result = AppendResult{outcome: rejected}
+        AppendResolved(result: result)
+}
+
+-- A well-formed plain (unguarded) append stores every event in the batch
+-- atomically via the backend, together with a single transaction marker
+-- recording the identities written. Once stored, each event is published to
+-- subscribers. Concurrent appends serialise against one another, so the batch
+-- lands whole and the marker is never separated from its events.
+rule BatchAppended {
+    when: BatchSubmitted(events, guard, metadata)
+    requires: append_well_formed(events, guard, metadata)
+    requires: not has_guard(guard)
+    ensures:
+        for e in events:
+            Event.created(
+                id: e.id,
+                type: e.type,
+                issued_at: e.issued_at,
+                tags: e.tags,
+                is_transaction_marker: false
+            )
+        TransactionMarkerRecorded(events: events, metadata: metadata)
+        for e in events:
+            EventPublished(event: e)
+        let result = AppendResult{outcome: stored}
+        AppendResolved(result: result)
+
+    @guidance
+        -- The append runs under the backend's single global write lock, so the
+        -- storage effect is atomic and serialised against every other append:
+        -- either all of these Event.created assertions and the marker hold, or
+        -- none do. Identity ordering (assigned at construction) gives the stored
+        -- batch its place in the stream's total order. Publication happens after
+        -- the store commits; it is a downstream signal, not part of durability.
+}
+
+-- A well-formed compare-and-swap append first reads the subset the guard selects
+-- from the current stream and evaluates the predicate against it. When it holds,
+-- the batch is stored via the backend and the outcome is reported as stored.
+rule GuardedAppendStored {
+    when: BatchSubmitted(events, guard, metadata)
+    requires: append_well_formed(events, guard, metadata)
+    requires: has_guard(guard)
+    requires: guard_holds(guard)
+    ensures:
+        for e in events:
+            Event.created(
+                id: e.id,
+                type: e.type,
+                issued_at: e.issued_at,
+                tags: e.tags,
+                is_transaction_marker: false
+            )
+        for e in events:
+            EventPublished(event: e)
+        let result = AppendResult{outcome: stored}
+        AppendResolved(result: result)
+
+    @guidance
+        -- The guard predicate inspects only the events its query selects from
+        -- the current stream (GuardSeesSelectedSubset), and the read, decision
+        -- and write are atomic with respect to other appends
+        -- (CompareAndSwapGuards). guard_holds is that predicate, evaluated by the
+        -- backend. A guarded append in this v2 facade does NOT synthesise a
+        -- transaction marker (unlike a plain append), but its events ARE
+        -- published on success: the facade publishes the appended events after
+        -- any append the backend does not reject, whether or not it carried a
+        -- guard. So the marker is the only plain/guarded asymmetry; publication
+        -- is symmetric. See the open question on the missing guarded marker.
+}
+
+-- A well-formed compare-and-swap append whose predicate does not hold stores
+-- nothing — no events and no marker — and is reported to the caller as a
+-- conflict, distinct from a validation rejection so the writer can retry or
+-- reconcile.
+rule GuardedAppendConflicted {
+    when: BatchSubmitted(events, guard, metadata)
+    requires: append_well_formed(events, guard, metadata)
+    requires: has_guard(guard)
+    requires: not guard_holds(guard)
+    ensures:
+        let result = AppendResult{outcome: conflict}
+        AppendResolved(result: result)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Every event carries a unique identity. Identities are the basis of the total
+-- order and of batch deduplication, so no two distinct events may share one.
+invariant UniqueEventIdentity {
+    for a in Events:
+        for b in Events:
+            a != b implies a.id != b.id
+}
+
+-- A transaction marker's recorded batch is non-empty: a marker exists because an
+-- append happened, and every append writes at least the events it was given.
+invariant TransactionMarkerHasBatch {
+    for e in Events:
+        e.is_transaction_marker implies e.batch_event_ids.count >= 1
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The party on both boundaries is upstream code — a command handler appending
+-- the events a command produced, a projection or todo-processor reading the
+-- stream — rather than an end user. It is modelled as a writer/reader that holds
+-- events to append or a query to read.
+actor StreamClient {
+    identified_by: Event where id != null
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The write boundary: a client constructs events, hands in a batch (optionally
+-- guarded), and receives an outcome. The facade validates, delegates the atomic
+-- serialised store to the backend, and publishes each stored event.
+surface EventWriting {
+    facing client: StreamClient
+
+    exposes:
+        client.id
+        client.type
+        client.tags
+
+    provides:
+        BatchSubmitted(client)
+
+    contracts:
+        demands EventFactory
+        demands StorageBackend
+        fulfils InputValidation
+        fulfils EventAppend
+        fulfils EventPublishing
+
+    @guarantee ValidatedOrRejected
+        -- A submitted batch is validated before any of it is stored. A malformed
+        -- batch — bad arguments, or an event whose type has no registered schema
+        -- or whose body fails it — stores nothing, publishes nothing, and is
+        -- reported as a rejection distinct from a compare-and-swap conflict.
+
+    @guarantee AtomicSerialisedAppend
+        -- A stored batch is stored all-or-nothing and serialised against every
+        -- other append, so concurrent writers never interleave their events and
+        -- every appended event lands in the single total order.
+
+    @guarantee SelfDescribingBatch
+        -- Each plain append records one transaction marker naming exactly the
+        -- events written together (and any metadata), as part of the same atomic
+        -- batch.
+
+    @guarantee CompareAndSwapOrConflict
+        -- A guarded append stores the batch only if its predicate holds against
+        -- the selected subset of the current stream; otherwise nothing is stored
+        -- and a conflict is reported, distinct from a validation rejection.
+
+    @guarantee PublishedAfterStore
+        -- Once an append is stored — plain or guarded — each of its events is
+        -- published to subscribers; a rejected or conflicted append publishes
+        -- nothing.
+}
+
+-- The read boundary: a client supplies a query (or a batch of queries) and,
+-- after validation, receives an ordered, filtered, duplicate-free stream
+-- consumed incrementally.
+surface EventReading {
+    facing client: StreamClient
+
+    exposes:
+        client.id
+        client.type
+        client.tags
+        client.issued_at
+
+    contracts:
+        demands StorageBackend
+        fulfils InputValidation
+        fulfils EventRead
+
+    @guarantee OrderedFilteredStream
+        -- Results are ordered by event identity (the total order). A single
+        -- query returns the conjunctive match of its tag, type and positional
+        -- filters; an empty query returns the whole stream. A batch of queries
+        -- returns their union, deduplicated by identity and ordered the same way.
+
+    @guarantee FaithfulRoundTrip
+        -- An event read back carries the same identity, type, tags, issued-at
+        -- timestamp and opaque body it was appended with; the store never alters
+        -- or interprets the body.
+
+    @guarantee StreamingReads
+        -- The stream is consumed incrementally and may be terminated early,
+        -- without materialising or scanning the entire matching set.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "In this v2 facade a guarded (compare-and-swap) append does not synthesise a transaction marker, whereas a plain append does. (Publication is symmetric: both publish their events on success.) Is the missing guarded marker intended, or should a guarded append also record one so the 'these events were written together' record is never lost?"
+open question "Publication happens after a successful append, but if publishing fails the events are already durably stored. Is publish failure swallowed (relying on catch-up readers of the stream), or should it surface to the caller? The stream-as-source-of-truth stance assumes the former."
+open question "Tenant isolation is achieved by running one store (or scope) per tenant in the consuming layer; this single-stream spec draws no cross-tenant distinction itself. Should a tenant scope be modelled explicitly here, or is per-tenant instantiation the right boundary to leave it at?"

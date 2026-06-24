@@ -1,0 +1,286 @@
+-- allium: 3
+-- behavior-tree-v2-dspy-extensions.allium
+--
+-- Distilled from components/behavior-tree-v2-dspy-extensions (grain).
+--
+-- NOTE: the component is marked DEPRECATED in code. This spec records the
+--       behaviour it still exhibits, at the boundary, for reference.
+--
+-- Scope: A single reusable behaviour-tree leaf node, `Dspy`, that runs an LLM
+--        agent operation against the tree's working memory and records the
+--        outcome. It bridges a behaviour-tree tick to an LLM call: it gathers
+--        the inputs the call needs from memory, runs the call, writes the
+--        results back into memory, and emits an observability fact.
+--
+-- Includes:
+--   - the leaf node's binary tick outcome (Success / Failure, never Running)
+--   - input gathering: which values the node reads from short-term memory,
+--     overlaid with the latest long-term-memory read model when one is present.
+--     Gathering is best-effort: the node keeps whichever declared inputs it finds
+--     and always runs the operation; it does NOT withhold the call when some
+--     declared input is absent (see the fidelity note on ResolveRun)
+--   - the two supported operations (predict; chain-of-thought, which also yields
+--     a reasoning trace) and the distinct fact each records
+--   - the working-memory effect: outputs are merged into short-term memory, and
+--     only on success
+--   - best-effort observability: a fact is recorded only when both an event sink
+--     and a node identity are available
+--   - failure containment: any error raised while running the tick is caught and
+--     reported as a Failure outcome rather than propagating out of the tick. A
+--     raised error is in fact the only way a tick fails (the realistic source is
+--     the operation call, but gathering and the memory write are inside the same
+--     contained scope); the missing-input branch never fires (see ResolveRun)
+--
+-- Excludes (implementation / mechanism, governed elsewhere):
+--   - Python / DSPy / libpython interop and module construction
+--   - the behaviour-tree engine itself (build / run / tick dispatch) — owned by
+--     the behavior-tree-v2 component
+--   - the event store's append/serialization mechanics — owned by event-store-v2
+--   - short-term memory being an atom, and long-term memory read-model wiring
+--   - DSPy signature representation (vars, Python objects) and how input/output
+--     keys are discovered from signature metadata
+--   - console progress output, logging and metrics
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The signature of the LLM operation: the named inputs it consumes and the
+-- named outputs it produces. Structured data without identity — here it is only
+-- the source of the input/output key sets the node reads and writes.
+value AgentSignature {
+    input_keys: Set<String>
+    output_keys: Set<String>
+}
+
+-- The observability fact a run of the node records: which node ran, what it was
+-- given and what it produced. For the reasoning operation it also carries the
+-- reasoning trace; for prediction it does not.
+value AgentFact {
+    node_id: String
+    operation: AgentOperationKind
+    inputs: Set<String>
+    outputs: Set<String>
+    reasoning: String? when operation = chain_of_thought
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The event sink each tree run may carry. The Dspy node DEMANDS only that a
+-- recorded fact is durably accepted; everything about how is out of scope.
+contract AgentEventSink {
+    -- Record an agent outcome fact for later observation.
+    record: (fact: AgentFact) -> Any
+
+    @invariant BestEffortObservability
+        -- A fact is recorded only when both an event sink and a node identity
+        -- are present on the run. When either is absent the operation still
+        -- proceeds and still affects memory; only the recorded fact is skipped.
+        -- Recording is for observation; it never gates the node's outcome.
+}
+
+-- The LLM call the node delegates to. The node DEMANDS that, given the gathered
+-- inputs, the operation yields the signature's declared outputs (and, for the
+-- reasoning operation, a reasoning trace alongside them).
+contract AgentOperation {
+    -- Run the operation for a signature against the gathered inputs.
+    invoke: (operation: AgentOperationKind, signature: AgentSignature, inputs: Set<String>) -> AgentFact
+
+    @invariant OutputsMatchSignature
+        -- The produced outputs are exactly the signature's declared output keys.
+
+    @invariant ReasoningOnlyWhenReasoned
+        -- A reasoning trace accompanies the outputs precisely when the operation
+        -- is chain_of_thought; predict yields outputs only.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The two LLM operations this node supports. predict yields outputs directly;
+-- chain_of_thought yields outputs plus a reasoning trace explaining them.
+enum AgentOperationKind { predict | chain_of_thought }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- One leaf node in a behaviour tree that runs an LLM agent operation. A node
+-- has a stable identity, the operation it performs and the signature describing
+-- its inputs and outputs. The same node is ticked repeatedly as the tree runs;
+-- each tick is an independent run against the current working memory.
+entity DspyNode {
+    -- Stable identity of this node within its tree. Used to attribute recorded
+    -- facts; when absent (no identity supplied at run time) no fact is recorded.
+    node_id: String?
+    operation: AgentOperationKind
+    signature: AgentSignature
+
+    -- The values this node needs before it can run, taken from its signature.
+    required_inputs: signature.input_keys
+}
+
+-- One run (tick) of a node. It records which inputs that tick managed to gather
+-- from working memory and how the run turned out.
+entity DspyRun {
+    node: DspyNode
+
+    -- The inputs actually gathered for this run: the node's required inputs that
+    -- are present in working memory (short-term overlaid with the latest
+    -- long-term read model). Gathering is best-effort — only the keys found are
+    -- kept — and the run proceeds with whatever subset was gathered; it is NOT a
+    -- precondition that this cover every required input.
+    gathered_inputs: Set<String>
+
+    -- How this run resolved.
+    status: pending | succeeded | failed
+
+    -- The fact recorded for this run, present once it has succeeded.
+    fact: AgentFact when status = succeeded
+
+    transitions status {
+        pending -> succeeded
+        pending -> failed
+        terminal: succeeded, failed
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- The engine ticks a node: this starts a fresh, unresolved run, recording the
+-- node's required inputs that are present in working memory at tick time.
+rule TickNode {
+    when: TickDspyNode(node, gathered_inputs)
+    ensures: DspyRun.created(
+        node: node,
+        gathered_inputs: gathered_inputs,
+        status: pending
+    )
+}
+
+-- A tick resolves to exactly one outcome. The operation is always run against
+-- whatever inputs were gathered, leaving two mutually exclusive paths:
+--   * the operation raised an error -> Failure, the error is contained
+--   * otherwise                     -> Success
+-- Only the success branch touches working memory and records a fact; the
+-- recorded fact distinguishes the two operations (chain_of_thought carries a
+-- reasoning trace, predict does not).
+--
+-- FIDELITY NOTE: the node does NOT gate the call on inputs_complete. It gathers
+-- whatever declared inputs it can find and invokes the operation regardless, so
+-- a run with some required input missing still calls the LLM. Such a run fails
+-- only if the call itself raises (e.g. the operation rejects a partial input);
+-- incomplete inputs are not, by themselves, a Failure. This is the behaviour the
+-- code exhibits, not necessarily the behaviour it appears to intend.
+rule ResolveRun {
+    when: run: DspyRun.created
+    requires: run.status = pending
+
+    let node = run.node
+
+    ensures:
+        let result = invoke(node.operation, node.signature, run.gathered_inputs)
+        if errored(result):
+            -- Any error from the underlying call is contained as a Failure; it
+            -- never propagates out of the tick and tears down the tree.
+            run.status = failed
+        else:
+            run.status = succeeded
+            -- The run's outcome fact mirrors what the operation produced.
+            run.fact = result
+            -- The outputs become visible to downstream nodes via memory.
+            OutputsWritten(run: run, outputs: node.signature.output_keys)
+
+    @guidance
+        -- Inputs are gathered by overlaying the latest long-term-memory read
+        -- model (when one is wired in) onto short-term memory, then keeping only
+        -- the keys the signature declares as inputs whose value is present. The
+        -- gathered map can be partial; the operation is invoked on it as-is. The
+        -- guard that would short-circuit a missing-input run never engages in the
+        -- code, so the only Failure path that fires is a raised error. Outputs are
+        -- written back to short-term memory only on the success branch, so a
+        -- failed run leaves memory untouched. errored(result) abstracts a
+        -- try/catch wrapping the whole tick body — gathering, the operation call
+        -- and the memory write — so an error raised anywhere within it (in
+        -- practice, the operation call) is the Failure, never a propagated throw.
+}
+
+-- Recording an outcome fact is best-effort: it is attempted only when the run
+-- carries both an event sink and a node identity. The fact has already been
+-- determined by the run; this only forwards it to the sink.
+rule RecordOutcomeFact {
+    when: run: DspyRun.status transitions_to succeeded
+    requires: run.status = succeeded
+    requires: run.node.node_id != null
+    ensures: AgentFactForwarded(node_id: run.node.node_id, fact: run.fact)
+
+    @guidance
+        -- Recording keys off a run reaching success: the fact a successful run
+        -- produced is forwarded to the sink. When the node has no identity (or no
+        -- event sink is wired into the run) this rule does not fire and nothing is
+        -- recorded — the run's success or failure is unaffected.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A recorded fact reports the operation its node performed, keeping the two
+-- operations' facts distinguishable.
+invariant FactMatchesOperation {
+    for r in DspyRuns:
+        r.status = succeeded implies r.fact.operation = r.node.operation
+}
+
+-- NOTE: there is deliberately NO "success implies inputs_complete" invariant.
+-- The node does not enforce input completeness, so a run can succeed with only
+-- a subset of its required inputs gathered (see ResolveRun's fidelity note).
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary the behaviour-tree engine drives when ticking a Dspy leaf. The
+-- engine ticks the node, supplying the inputs it gathered from working memory;
+-- the node yields a binary outcome and, on success, leaves its outputs in
+-- working memory. The node in turn demands an operation to run and an event sink
+-- to record into.
+surface DspyTick {
+    facing leaf: DspyNode
+
+    exposes:
+        leaf.operation
+        leaf.required_inputs
+
+    provides:
+        -- A tick: the engine supplies the inputs it found in memory for this
+        -- node. The node runs the operation on whatever was gathered, even if
+        -- some required input is absent.
+        TickDspyNode(leaf, gathered_inputs)
+
+    contracts:
+        demands AgentOperation
+        demands AgentEventSink
+
+    @guarantee BinaryContainedOutcome
+        -- Every tick resolves to exactly Success or Failure and never escapes as
+        -- an error: an error raised by the operation is caught and surfaces as
+        -- Failure. The node is never left Running.
+
+    @guarantee OutputsVisibleOnlyOnSuccess
+        -- Working memory is changed only when the run succeeds; a failed run
+        -- (a raised, contained error) leaves memory as it was.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The component is marked DEPRECATED. Should this spec be retired alongside the code, or kept as a record of the agent-node pattern for a successor component?"
+open question "Recording a fact requires both an event sink and a node identity; the two conditions are conflated in code. Should a node without an identity be a configuration error rather than a silent skip of observability?"
+open question "Today a tick with some required input missing still runs the operation rather than failing fast (the intended missing-input guard never engages). Should the node short-circuit on incomplete inputs — and if so, should that be Failure or a distinct 'not ready' outcome, so the tree can tell 'prerequisites absent' from 'the call failed'?"

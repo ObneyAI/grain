@@ -1,0 +1,175 @@
+-- allium: 3
+-- core-async-thread-pool.allium
+--
+-- Distilled from components/core-async-thread-pool (grain).
+--
+-- Scope: A reusable worker-pool mechanism. A fixed number of workers pull jobs
+--        from a single shared input queue and run a caller-supplied handler on
+--        each, with errors isolated so one bad job cannot tear down a worker.
+--
+-- This component is infrastructure / thin plumbing. It owns no domain entities,
+-- no persistence and no real state machine; its only specifiable behaviour is
+-- the handful of liveness and isolation guarantees below. The spec is
+-- deliberately brief and models the job lifecycle only as far as the pool can
+-- observe it (arrival -> handled or failed).
+--
+-- Includes:
+--   - bounded concurrency: at most a configured number of jobs run at once
+--   - per-job error isolation: a handler that fails with an ordinary exception
+--     does not kill its worker; the failure is reported to a caller-supplied
+--     error handler and the worker continues with the next job. Isolation is
+--     limited to ordinary exceptions: a fatal error or other non-exception
+--     throwable escapes and kills the worker
+--   - clean shutdown: closing the queue drains in-flight work and stops all
+--     workers
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the concurrency primitive (core.async channels, go-loops, JVM threads)
+--   - how jobs are enqueued, serialized or shaped
+--   - the meaning of any individual job (the handler is opaque to the pool)
+--   - ordering and fairness across workers (the queue is shared; which worker
+--     picks up a given job, and in what order across workers, is unspecified)
+--   - backpressure / buffering policy of the queue itself
+--   - logging and metrics
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A unit of work handed to the pool. Its content and lifecycle are owned by the
+-- caller, not this component; the pool only observes a job arriving and then
+-- being handled or failing. A type placeholder the consumer substitutes with
+-- its own job type.
+external entity Job {}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The handlers the caller supplies when starting a pool. They are opaque to the
+-- pool: it invokes execute on each job and, if that throws, hands the error to
+-- report_error. Neither is implemented by this component.
+contract JobHandling {
+    -- Run one job. May throw. Supplied by the caller; opaque to the pool.
+    execute: (job: Job) -> Any
+    -- Report a job that threw while executing. Supplied by the caller.
+    report_error: (error: Any) -> Any
+
+    @invariant ErrorIsolation
+        -- A handler that fails with an ordinary exception does not terminate its
+        -- worker: the exception is passed to report_error and the worker proceeds
+        -- to the next job, so one failing job cannot reduce the pool's capacity or
+        -- strand the queue. Isolation covers ordinary exceptions only -- a
+        -- non-exception failure (a fatal error such as out-of-memory, or any
+        -- throwable outside the ordinary-exception family) is NOT caught, escapes
+        -- the worker and silently kills it, permanently lowering capacity. See the
+        -- open question.
+
+    @guidance
+        -- report_error is itself caller code. If it throws, the worker has no
+        -- further guard; see the open question. The pool's only contract is that
+        -- an ordinary exception from execute is caught and routed to report_error;
+        -- fatal errors and other non-exception throwables are not contained.
+}
+
+-- The pool's own lifecycle, offered to whatever embeds it.
+contract PoolLifecycle {
+    -- Start a pool of workers draining a shared queue with the given handlers.
+    start: (handlers: JobHandling) -> Any
+    -- Begin draining the queue and stop all workers once it is empty.
+    stop: () -> Any
+
+    @invariant BoundedConcurrency
+        -- At most config.worker_count jobs run concurrently: the pool runs a
+        -- fixed number of workers and each handles one job at a time, so the
+        -- handler never sees more than that many simultaneous invocations.
+
+    @invariant DrainsThenStops
+        -- stop closes the queue. No new job is accepted afterwards, but every job
+        -- already in the queue is still drained -- both the jobs currently in
+        -- flight and those waiting behind them -- and each runs to completion
+        -- (handled or reported as failed). Only once the queue is empty does each
+        -- worker exit. Shutdown is graceful, not abrupt.
+
+    @invariant NoOrderingGuarantee
+        -- Jobs are pulled from a single shared queue by whichever worker is
+        -- free, so completion order across workers is unspecified. Callers that
+        -- need ordering must enforce it outside the pool (one worker, or per-key
+        -- serialisation upstream).
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How many workers run in parallel, and therefore the ceiling on concurrent
+    -- job execution. The caller must supply this at startup; the pool imposes no
+    -- default and does not validate it.
+    worker_count: Integer
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A job taken off the queue is run by exactly one worker. If the handler
+-- succeeds the job is handled; if it throws, the failure is reported and the
+-- worker carries on. This is the whole of the pool's observable behaviour.
+rule HandleJob {
+    when: job: Job.created
+    ensures:
+        if succeeds(job):
+            JobHandled(job: job)
+        else:
+            JobFailed(job: job, error: error_of(job))
+
+    @guidance
+        -- succeeds / error_of stand in for "did the caller's execute throw".
+        -- The pool does not interpret the result of a successful execute; it
+        -- only distinguishes "returned" from "threw". A failed job does not
+        -- stop the worker, retry, or block the queue.
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Whatever embeds the pool: it supplies the handlers and drives shutdown. The
+-- party here is code, not a person. There is no entity in this spec that
+-- represents the embedder (it is owned entirely by the consuming component), so
+-- the actor is bound to the one type that does flow across the boundary -- the
+-- Job placeholder -- with a trivial predicate. The binding name documents the
+-- intent; the underlying type carries no meaning here.
+actor Host {
+    identified_by: Job where true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The single boundary this component exposes: a host starts a pool with its
+-- handlers and later stops it, while the pool demands the handler contract.
+surface PoolControl {
+    facing host: Host
+
+    contracts:
+        demands JobHandling
+        fulfils PoolLifecycle
+
+    @guarantee FailureContained
+        -- A job that fails with an ordinary exception is contained: it is reported
+        -- and the pool keeps running at full capacity. Only an explicit stop ends
+        -- the pool -- with the one exception that a fatal error or other
+        -- non-exception throwable from a handler is not contained and silently
+        -- removes that worker (see contract JobHandling.ErrorIsolation).
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Error isolation only catches ordinary exceptions; a fatal error or other non-exception throwable from a handler escapes and silently kills the worker, permanently lowering capacity. Is catching only ordinary exceptions the intended boundary, or should the pool also contain (or at least report) non-exception throwables?"
+open question "If the error handler itself throws, the worker would die. Is that an accepted contract (callers must supply a non-throwing error handler), or should the pool guard against it?"
+open question "On stop, in-flight jobs run to completion but jobs still queued behind them are also drained and run. Is draining-to-empty the intended shutdown semantics, or should stop be able to discard the remaining backlog?"

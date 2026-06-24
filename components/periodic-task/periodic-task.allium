@@ -1,0 +1,462 @@
+-- allium: 3
+-- periodic-task.allium
+--
+-- Distilled from components/periodic-task (grain).
+--
+-- Scope: A reusable scheduling mechanism. A registered periodic trigger fires
+--        on a recurring schedule and, on each fire, runs its handler once per
+--        domain tenant. Each handler run may emit events into that tenant's
+--        event stream, optionally guarded by a compare-and-swap predicate so
+--        that when several nodes run the same trigger concurrently, the events
+--        for a given fire commit at most once.
+--
+-- This is a LIBRARY/FRAMEWORK spec: there is no domain state machine here. The
+-- boundary is modelled as module-level contracts with typed signatures and
+-- prose invariants, plus external-entity placeholders and surfaces. The few
+-- entities (PeriodicTrigger, ScheduledFire, TenantFire) exist only to give the
+-- recurring fan-out a place to hang; the real guarantees live in the contracts.
+--
+-- Includes:
+--   - recurring schedules: a fixed interval (every N seconds/minutes/hours) or
+--     a cron expression, optionally evaluated in a named timezone
+--   - the monotonic forward sequence of fire times a schedule produces
+--   - per-fire fan-out across exactly the domain tenants
+--   - exclusion of the reserved control-plane coordination tenant (isolation)
+--   - handler-supplied events appended to the firing tenant's stream, with an
+--     optional compare-and-swap predicate for cross-node dedup
+--   - fault isolation: a handler failure on one fire is contained and does not
+--     halt the schedule or affect other triggers
+--   - start / stop lifecycle: after stop, a trigger fires no more
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the event store and the read-model projection mechanism (this spec only
+--     DEMANDS an append-with-CAS capability and a tenant enumeration)
+--   - cron-expression grammar, the scheduling library, threads and timers
+--   - serialization, wire formats, storage backends
+--   - the separate event processor that consumes the emitted events
+--   - logging and metrics
+--
+-- Conformance notes correspond to the periodic-task test suite (core_test.clj).
+-- Where each guarantee is captured:
+--   schedule produces correctly-spaced instants (interval + cron + timezone)
+--       -> contract Schedule.MonotonicFireSequence / IntervalSpacing /
+--          CronAdherence
+--   invalid / empty schedule config rejected
+--       -> contract Schedule.WellFormedSchedule
+--   start runs the handler on tick, stop halts further ticks
+--       -> rule TriggerFires + surface TriggerLifecycle
+--   control-plane tenant excluded from fan-out
+--       -> contract EventAppend (domain_tenants excludes the reserved tenant)
+--          + surface PeriodicProcessing @guarantee TenantIsolation
+--   handler events appended under CAS
+--       -> contract EventAppend.CompareAndSwapDedup / AppendIsForFiringTenant
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A domain tenant whose stream a periodic trigger may write to. Tenants are
+-- created and governed by the event store, not by this component; the periodic
+-- scheduler only enumerates them and fans out across them. The reserved
+-- control-plane coordination tenant is deliberately NOT a Tenant instance, so
+-- it is naturally excluded from the fan-out.
+external entity Tenant {}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- An immutable fact a handler produces for appending to a tenant's stream.
+-- Modelled as a value, not an entity: this component never assigns events
+-- identity, never reads them and never reacts to their lifecycle — it only
+-- carries handler output through to the append boundary. Its internal shape is
+-- governed by the event store, so it is opaque here.
+value Event {}
+
+-- A fixed-interval schedule: fire every `count` units of the given granularity
+-- (e.g. every 30 seconds, every 5 minutes, every 2 hours). The first fire is
+-- one interval after the schedule starts; subsequent fires are evenly spaced.
+value Interval {
+    count: Integer
+    granularity: IntervalGranularity
+}
+
+-- A cron schedule: a cron expression evaluated in a timezone. When the timezone
+-- is absent the host's default zone is used. The expression names the wall-clock
+-- instants at which the trigger fires (e.g. daily at 09:00).
+value Cron {
+    expression: String
+    timezone: String?
+}
+
+-- The compare-and-swap predicate a handler attaches to its events. It names the
+-- expected prior state of the tenant's stream; the append commits only if that
+-- expectation still holds. When two nodes run the same fire concurrently, only
+-- the first append satisfies the predicate, so the fire's events land at most
+-- once. Opaque to this component: a handler that returns no predicate appends
+-- unconditionally.
+value CasPredicate {}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The schedule a trigger runs on. A schedule is exactly one of an interval or a
+-- cron expression; either way it yields an ordered, strictly-increasing sequence
+-- of future fire instants. These are properties of pure schedule computation, so
+-- they live as contract invariants rather than entity state.
+contract Schedule {
+    -- The next fire instants at or after `from`, in increasing order.
+    fire_times: (schedule: Any, from: Timestamp) -> Sequence<Timestamp>
+    -- The single next fire instant strictly after `after`. Used to advance a
+    -- trigger to its following scheduled instant once a fire completes.
+    next_instant: (schedule: Any, after: Timestamp) -> Timestamp
+
+    @invariant WellFormedSchedule
+        -- A schedule config must be exactly one of an interval (a positive
+        -- count with a seconds/minutes/hours granularity) or a cron expression.
+        -- Config that is neither, or a cron expression that does not parse, is
+        -- rejected when the schedule is built — a malformed schedule never runs.
+
+    @invariant MonotonicFireSequence
+        -- fire_times is strictly increasing: each fire instant is strictly later
+        -- than the previous. A schedule never fires twice for the same instant
+        -- and never moves backwards in time.
+
+    @invariant IntervalSpacing
+        -- For an interval schedule, consecutive fire instants are separated by
+        -- exactly the configured interval (e.g. a 10-second interval yields
+        -- instants 10 seconds apart).
+
+    @invariant CronAdherence
+        -- For a cron schedule, fire instants fall exactly on the wall-clock
+        -- times the cron expression names, evaluated in the configured timezone
+        -- (or the host default when none is given). A daily expression yields
+        -- instants 24 hours apart in that zone.
+}
+
+-- The event-store capability this component DEMANDS so that a handler's output
+-- can be recorded. The scheduler enumerates tenants and appends events; it never
+-- reads or projects state itself.
+contract EventAppend {
+    -- The domain tenants currently known. The reserved control-plane
+    -- coordination tenant is excluded from this set for fan-out purposes.
+    domain_tenants: () -> Set<Tenant>
+    -- Append events to one tenant's stream under an optional CAS predicate.
+    append: (tenant: Tenant, events: Set<Event>, cas: CasPredicate?) -> Any
+
+    @invariant AppendIsForFiringTenant
+        -- Events produced by a handler run for a given tenant are appended to
+        -- that same tenant's stream and no other. Fan-out keeps tenant streams
+        -- disjoint: one tenant's periodic work never lands in another's stream.
+
+    @invariant CompareAndSwapDedup
+        -- When a handler supplies a CAS predicate, the append commits only if the
+        -- tenant's stream still matches the expected prior state. If several
+        -- nodes run the same trigger for the same fire and tenant concurrently,
+        -- only the first append satisfies the predicate; the rest are rejected,
+        -- so the fire's events are recorded at most once. With no predicate the
+        -- append is unconditional and this dedup guarantee does not apply.
+
+    @invariant EmptyOutputAppendsNothing
+        -- A handler run that produces no events causes no append. A tick over a
+        -- tenant with nothing to do leaves that tenant's stream untouched.
+}
+
+-- The per-fire, per-tenant work a registered trigger performs. Supplied by the
+-- consumer of this component; the framework DEMANDS only that it is a pure
+-- function of the tenant and the fire instant.
+contract TriggerHandler {
+    -- Compute the events (and optional CAS predicate) for one tenant at one
+    -- fire instant.
+    handle: (tenant: Tenant, fire_time: Timestamp) -> TenantFire
+
+    @invariant DeterministicPerFire
+        -- handle is a pure function of (tenant, fire_time): the same tenant and
+        -- the same instant yield the same events and predicate. It performs no
+        -- appends itself — it returns its output and the framework records it —
+        -- so two nodes computing the same fire produce identical CAS-guarded
+        -- appends, which the CAS dedup then collapses to one.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The time units a fixed-interval schedule may be expressed in.
+enum IntervalGranularity { seconds | minutes | hours }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A named, registered periodic trigger: a schedule paired with a handler. A
+-- trigger is registered once, then started; while running it fires on its
+-- schedule. The schedule is exactly one of an interval or a cron expression.
+entity PeriodicTrigger {
+    -- Stable name the trigger is registered and reported under.
+    name: String
+    -- Whether this trigger is currently running (firing on its schedule).
+    running: Boolean
+
+    -- The recurring schedule. Exactly one of these is set.
+    interval: Interval?
+    cron: Cron?
+
+    -- The schedule's next fire instant. Reaching it is what fires the trigger;
+    -- after a fire it advances to the schedule's following instant. Absent until
+    -- the trigger is started.
+    next_fire_at: Timestamp?
+
+    -- The fires this trigger has produced.
+    fires: ScheduledFire with trigger = this
+}
+
+-- One occurrence of a trigger firing at a particular instant. A fire fans out
+-- across the domain tenants: for each, the handler runs and its events (if any)
+-- are appended to that tenant's stream under the handler's CAS predicate.
+entity ScheduledFire {
+    trigger: PeriodicTrigger
+    -- The scheduled instant this fire corresponds to.
+    fire_time: Timestamp
+
+    -- The per-tenant portions this fire produced, one per domain tenant.
+    tenant_fires: TenantFire with fire = this
+}
+
+-- One tenant's portion of a fire: the events the handler produced for that
+-- tenant at that instant, the optional CAS predicate guarding their append, and
+-- the tenant they are destined for. This is what the framework records, never a
+-- handler result discarded mid-flight. The tenant is always a domain tenant —
+-- the control-plane tenant is excluded before fan-out — so no TenantFire ever
+-- targets the coordination stream.
+entity TenantFire {
+    fire: ScheduledFire
+    tenant: Tenant
+    events: Set<Event>
+    cas: CasPredicate?
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The reserved tenant under which cluster-coordination state lives. It is
+    -- never a domain tenant and is always excluded from periodic fan-out, so a
+    -- domain trigger never writes to the coordination stream.
+    control_plane_tenant: String = "00000000-0000-0000-0000-000000000001"
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A newly created domain tenant joins the fan-out set: from the next fire
+-- onward, every running trigger runs its handler for that tenant too. This is an
+-- observable consequence of the fan-out, not a dedicated code path — see the
+-- guidance.
+rule TenantEntersFanOut {
+    when: tenant: Tenant.created
+    ensures: TenantBecameEligible(tenant: tenant)
+
+    @guidance
+        -- There is no per-tenant-creation handler in the implementation. The
+        -- scheduler re-enumerates the live domain tenants (EventAppend
+        -- .domain_tenants, which already excludes the control-plane tenant) on
+        -- every fire, so a tenant created between two fires is simply present in
+        -- the next enumeration. This rule records that observable fact; it does
+        -- not imply an event subscription. A tenant that ceases to exist
+        -- symmetrically drops out of the next enumeration.
+}
+
+-- A trigger is registered with a schedule and a handler before it can run. It
+-- starts not yet running; starting it (see the lifecycle surface) is what begins
+-- the schedule.
+rule TriggerRegistered {
+    when: RegisterTrigger(name, schedule)
+    ensures: PeriodicTrigger.created(
+        name: name,
+        running: false,
+        interval: null,
+        cron: null,
+        next_fire_at: null
+    )
+
+    @guidance
+        -- `schedule` is recorded as supplied: it resolves to exactly one of the
+        -- interval or cron value types per Schedule.WellFormedSchedule. Registration
+        -- itself does not evaluate the schedule; the well-formedness check happens
+        -- when the trigger is started and the fire sequence is built (see
+        -- Schedule.WellFormedSchedule). A malformed schedule is rejected at that
+        -- point, so it never fires, but a malformed registration is not refused on
+        -- the spot.
+}
+
+-- Starting a registered trigger begins its schedule: it becomes running and is
+-- armed for its first fire instant.
+rule TriggerStarted {
+    when: StartTrigger(_, trigger)
+    requires: not trigger.running
+    ensures:
+        trigger.running = true
+        trigger.next_fire_at = Schedule.next_instant(trigger, now)
+}
+
+-- Stopping a running trigger halts its schedule: it produces no further fires
+-- until started again. Its next fire instant is cleared so a stale instant does
+-- not fire after a restart.
+rule TriggerStopped {
+    when: StopTrigger(_, trigger)
+    requires: trigger.running
+    ensures:
+        trigger.running = false
+        trigger.next_fire_at = null
+}
+
+-- A running trigger fires when its schedule reaches the next instant. Each fire
+-- fans out over exactly the domain tenants: for each, the handler runs and any
+-- events it returns are appended to that tenant's stream under its CAS predicate.
+-- The reserved control-plane tenant is never in the fan-out set.
+rule TriggerFires {
+    when: trigger: PeriodicTrigger.next_fire_at <= now
+    requires: trigger.running
+
+    let domain_tenants = EventAppend.domain_tenants()
+
+    ensures:
+        -- Advance to the schedule's following instant so this fire instant is
+        -- not re-triggered; the strictly-increasing schedule guarantees forward
+        -- progress.
+        trigger.next_fire_at = Schedule.next_instant(trigger, now)
+        let fire = ScheduledFire.created(trigger: trigger, fire_time: now)
+        for tenant in domain_tenants:
+            let result = TriggerHandler.handle(tenant, now)
+            if result.events.count > 0:
+                let recorded = TenantFire.created(
+                    fire: fire,
+                    tenant: tenant,
+                    events: result.events,
+                    cas: result.cas
+                )
+                EventAppend.append(tenant: tenant, events: recorded.events, cas: recorded.cas)
+
+    @guidance
+        -- The schedule guarantees a strictly-increasing fire sequence
+        -- (Schedule.MonotonicFireSequence), so this temporal trigger advances
+        -- one instant at a time and never re-fires the same instant; next_fire_at
+        -- is the schedule's next instant after the last fire. domain_tenants
+        -- already excludes the control-plane tenant (see
+        -- ControlPlaneTenantExcluded). When the same trigger runs on several
+        -- nodes, every node computes the same handler output for a tenant and
+        -- guards its append with the handler's CAS predicate; the event store's
+        -- compare-and-swap (EventAppend.CompareAndSwapDedup) lets exactly one of
+        -- those appends commit per fire.
+}
+
+-- A handler that throws is contained at the fire boundary: the failing fire is
+-- abandoned, but the trigger keeps running and later fires (and other triggers)
+-- are unaffected. Failure isolation is per fire, not per schedule. It is NOT
+-- per tenant within a fire: a throw abandons the rest of that fire's fan-out.
+rule HandlerFailureIsContained {
+    when: HandlerRaised(trigger, tenant, fire_time)
+    requires: trigger.running
+    ensures: trigger.running = true
+
+    @guidance
+        -- A raised handler aborts the current fire's whole fan-out: it is caught
+        -- once at the fire boundary and reported, so the tenant whose handler
+        -- threw AND any domain tenants not yet reached in that same fire are
+        -- skipped, appending nothing for them on this fire. Isolation is at the
+        -- granularity of a fire, not of an individual tenant within it. The
+        -- schedule is not torn down, so the trigger fires again at its next
+        -- scheduled instant and re-fans-out over all domain tenants. This rule
+        -- asserts only that a failure leaves the trigger running; the absence of
+        -- an append for the skipped tenants is covered by
+        -- EventAppend.EmptyOutputAppendsNothing applied to the empty result the
+        -- abandoned fire effectively yields for them.
+}
+
+-- The control-plane coordination tenant is never written to by a periodic
+-- trigger: it is excluded from the fan-out set, so no fire ever targets it.
+-- This is captured as the contract guarantee EventAppend.domain_tenants
+-- (which excludes config.control_plane_tenant) and restated as the
+-- PeriodicProcessing surface's TenantIsolation guarantee. There is no
+-- point-in-time entity state to assert, so it stays a contract/surface property
+-- rather than an expression-bearing invariant.
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The runtime that owns and drives a trigger's lifecycle. It is code, not a
+-- person, so the actor has a minimal identity.
+actor TriggerRuntime {
+    identified_by: PeriodicTrigger where running = true or running = false
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary the host runtime drives to register a trigger and control its
+-- running state. Starting a registered trigger begins its schedule; stopping it
+-- halts further fires.
+surface TriggerLifecycle {
+    facing runtime: TriggerRuntime
+    context trigger: PeriodicTrigger
+
+    exposes:
+        trigger.name
+        trigger.running
+
+    provides:
+        StartTrigger(runtime, trigger) when not trigger.running
+        StopTrigger(runtime, trigger) when trigger.running
+
+    @guarantee StopHaltsFiring
+        -- Once a trigger is stopped it produces no further fires until started
+        -- again; a stopped trigger's handler is never invoked. Starting a
+        -- registered trigger begins firing on its configured schedule.
+}
+
+-- The integration boundary toward the event store and the trigger handler. This
+-- component DEMANDS a way to enumerate domain tenants and append events under
+-- CAS, and DEMANDS that each registered handler is a pure per-fire function.
+surface PeriodicProcessing {
+    facing runtime: TriggerRuntime
+    context trigger: PeriodicTrigger
+
+    exposes:
+        trigger.name
+
+    contracts:
+        demands Schedule
+        demands EventAppend
+        demands TriggerHandler
+
+    @guarantee TenantIsolation
+        -- Each fire fans out over exactly the domain tenants and the reserved
+        -- control-plane tenant is excluded; one tenant's periodic events are
+        -- appended only to that tenant's stream.
+
+    @guarantee AtMostOncePerFire
+        -- When a trigger runs on multiple nodes, the events a fire produces for
+        -- a tenant are recorded at most once, via the handler's CAS predicate
+        -- and the event store's compare-and-swap.
+
+    @guarantee FailuresAreIsolated
+        -- A handler failure is contained at the fire boundary: it abandons the
+        -- rest of that fire's fan-out (the throwing tenant and any domain tenants
+        -- not yet reached in that fire record nothing) but does not halt the
+        -- schedule or affect other triggers. Isolation is per fire, not per
+        -- tenant within a fire.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "When a trigger fires on multiple nodes but a handler omits its CAS predicate, the events are appended unconditionally and may be recorded more than once. Should the framework require a CAS predicate for multi-node safety, or is unconditional append an intentional escape hatch?"
+open question "Schedules are computed per node from the local clock with no cross-node coordination of fire instants. Should the spec model clock skew between nodes, or is per-fire CAS dedup considered sufficient to absorb it?"
+open question "If a fire is missed (node down, long pause) the schedule resumes at the next future instant rather than catching up missed instants. Is skip-and-resume the intended semantics, or should missed fires be replayed?"

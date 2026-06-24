@@ -1,0 +1,324 @@
+-- allium: 3
+-- event-model.allium
+--
+-- Distilled from components/event-model (grain).
+--
+-- Scope: The vocabulary and well-formedness rules for *describing* a grain
+--        application as an event model. An event model is a structured
+--        catalogue of the building blocks of an event-sourced CQRS system —
+--        commands, events, views, todo-processors, periodic-tasks and screens —
+--        together with named flows that wire those blocks into the canonical
+--        data-flow shape. This component does not run the system; it defines
+--        what a valid description of the system looks like, so that tooling can
+--        validate, render and reason about an application's design.
+--
+-- Includes: the kinds of building block an event model recognises; the naming
+--           discipline that classifies each block by kind; the grammar of legal
+--           connections between blocks within a flow; the Given/When/Then
+--           acceptance examples a command may carry.
+--
+-- Excludes (implementation or governed elsewhere):
+--   - the runtime behaviour of any building block: command validation, event
+--     persistence, projection/read-model reduction, todo-processor delivery and
+--     checkpointing, periodic-task scheduling/dedup, screen rendering. Each of
+--     those is a separate component with its own behavioural guarantees.
+--   - the concrete payload schema of any command, event or view: its field
+--     structure is opaque to this model. The model does, however, oblige each
+--     such block to carry a well-formed schema (see the PayloadSchema contract).
+--   - serialization, the schema registry mechanism, the schema language, and the
+--     macro that registers these shapes.
+--   - tenancy, authorization and any cross-tenant concern (these belong to the
+--     processors that consume an event model, not to the model itself).
+--
+-- An event model is a design-time artefact. The "actor" on its boundary is the
+-- application author (and the tooling acting on their behalf) who declares the
+-- blocks and flows; the obligations below are the rules that author must honour
+-- for the description to be well-formed.
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The kinds of building block an event model recognises. This is the closed
+-- vocabulary; an event model cannot introduce a new kind without extending it.
+-- It is also the sum-type discriminator for Block below.
+enum BlockKind {
+    command
+    event
+    view
+    todo_processor
+    screen
+    periodic_task
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The classification rule. An event model is a catalogue keyed by block name,
+-- and a name's kind tag is what assigns a block to its part of the catalogue.
+-- This is a pure well-formedness obligation on names, not entity state, so it
+-- lives as a contract invariant.
+contract KindNaming {
+    -- The kind a given block's name claims to identify.
+    kind_of: (block: Block) -> BlockKind
+
+    @invariant KindTagMatchesBlock
+        -- A block's name must carry the kind tag for the kind of block it is:
+        -- a command is named in the command kind, an event in the event kind,
+        -- and so on. The catalogue is therefore partitioned by kind with no
+        -- ambiguity about which collection a name belongs to.
+
+    @invariant NamesUniquePerKind
+        -- Within a single kind, a name identifies at most one block; no two
+        -- blocks of the same kind share a name. Names need only be distinct
+        -- within their kind — a command and a view may share a local name
+        -- because their kind tags keep them apart.
+}
+
+-- The connection grammar. A flow strings building blocks together, and only
+-- certain block-to-block connections are meaningful in an event-sourced CQRS
+-- system. This contract states the legal adjacency relation; the FlowStep
+-- entity and its invariant make the same rule machine-checkable per step.
+contract ConnectionGrammar {
+    -- Whether a directed connection from one kind of block to another is legal.
+    connects: (from: BlockKind, to: BlockKind) -> Boolean
+
+    @invariant CanonicalDataFlow
+        -- The legal connections form the canonical CQRS cycle:
+        --   command   -> event                  (a command emits events)
+        --   event     -> view                   (events update read views)
+        --   view      -> todo_processor         (a view drives an async reactor)
+        --   view      -> screen                 (a view is shown on a screen)
+        --   view      -> periodic_task          (a view informs a scheduled task)
+        --   todo_processor -> command           (a reactor issues a command)
+        --   screen    -> command                (a user action issues a command)
+        --   periodic_task  -> command           (a schedule issues a command)
+        -- No other adjacency is legal. The relation is not symmetric: a
+        -- command may connect to an event but never the reverse.
+
+    @invariant ConnectionsRespectDeclaredKinds
+        -- Both endpoints of a connection are classified by their kind (see
+        -- KindNaming); the grammar is applied to those declared kinds, not to
+        -- anything inferred at runtime.
+}
+
+-- The payload-schema obligation. The three data-carrying kinds — command, event
+-- and view — each carry a payload schema describing the shape of their data. The
+-- model keeps that schema opaque (its field structure is governed elsewhere) but
+-- does validate one thing: the schema must be well-formed. The other three kinds
+-- (todo-processor, screen, periodic-task) carry no payload schema at all.
+contract PayloadSchema {
+    -- Whether a given block carries a payload schema.
+    carries_schema: (block: Block) -> Boolean
+    -- Whether a block's carried schema is well-formed.
+    schema_well_formed: (block: Block) -> Boolean
+
+    @invariant DataBlocksCarrySchema
+        -- Every command, event and view carries a payload schema; it is a
+        -- required part of the declaration, not optional. Todo-processors,
+        -- screens and periodic-tasks carry none.
+
+    @invariant CarriedSchemaIsWellFormed
+        -- A carried payload schema must be a well-formed schema. A declaration
+        -- whose schema does not parse is rejected as malformed; this is the one
+        -- guarantee the model makes about schema content, the shape itself being
+        -- opaque to the model.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A building block named and catalogued by an event model. The six kinds are
+-- placeholders: each block's runtime behaviour is governed by its own grain
+-- component (command/event/view processors, the todo-processor, periodic-task
+-- and screen runtimes). An event model only asserts that a block exists, what
+-- kind it is and a human description; the discriminator carries the kind.
+entity Block {
+    -- A bare local name, unique within the block's kind (see KindNaming).
+    name: String
+    description: String
+    kind: Command | Event | View | TodoProcessor | Screen | PeriodicTask
+}
+
+-- A request to change the system. A command validates business rules and, on
+-- success, emits one or more events. It carries a well-formed payload schema
+-- (see the PayloadSchema contract) and may carry Given/When/Then acceptance
+-- examples.
+variant Command : Block {
+    -- The Given/When/Then acceptance examples catalogued for this command.
+    -- Optional: a command may carry none.
+    examples: AcceptanceExample with command = this
+
+    -- A command is documented with acceptance examples when it carries at least
+    -- one. Carrying examples is optional; a command with none is still
+    -- well-formed (see CommandExamples.ExamplesAreDesignTimeOnly).
+    is_specified: examples.count > 0
+}
+
+-- An immutable fact recorded in the event store. Carries a well-formed payload
+-- schema describing the fact's shape (see the PayloadSchema contract).
+variant Event : Block {}
+
+-- A read-side projection: queryable state derived from events. Carries a
+-- well-formed payload schema describing the projected shape (see the
+-- PayloadSchema contract).
+variant View : Block {}
+
+-- An asynchronous reactor that observes views and issues commands in response.
+variant TodoProcessor : Block {}
+
+-- A user-facing surface that reads views and issues commands on user action.
+variant Screen : Block {}
+
+-- A scheduled reactor that issues commands on a recurring schedule.
+variant PeriodicTask : Block {
+    schedule: String
+}
+
+-- A single Given/When/Then acceptance example catalogued against a command.
+-- These are design-time specifications of intended behaviour — readable, not
+-- executable — and exist only as part of an event model's documentation of a
+-- command, never seen by the runtime command processor. All three clauses are
+-- present in every example; there is no notion of a partially filled stub.
+entity AcceptanceExample {
+    command: Command
+    precondition: String   -- the "given" clause
+    stimulus: String       -- the "when" clause
+    expectation: String    -- the "then" clause
+}
+
+-- A named, ordered description of how a chain of building blocks collaborates to
+-- deliver one slice of system behaviour. A flow is the readable unit of design:
+-- "user acts on a screen, which issues a command, which emits an event, which
+-- updates a view". The flow itself carries no behaviour; it is documentation of
+-- intended wiring, constrained to legal connections.
+entity Flow {
+    name: String
+    description: String
+
+    -- The connections that make up this flow.
+    steps: FlowStep with flow = this
+}
+
+-- A single directed connection within a flow: this block leads to that block.
+-- A step with no source marks an entry point; a step with no target marks a
+-- terminus. A step's legality is governed entirely by the connection grammar.
+entity FlowStep {
+    flow: Flow
+
+    -- The block this step leads from. Absent for a leading step that marks an
+    -- entry point with no predecessor.
+    source: Block?
+    -- The block this step leads to. Absent marks a terminus.
+    target: Block?
+
+    -- Whether this step's connection is one the grammar permits. A step missing
+    -- a source or a target is vacuously legal (it is an endpoint marker, not a
+    -- connection). Otherwise the adjacency must be in the canonical data flow
+    -- (see the ConnectionGrammar contract's connects relation).
+    is_legal:
+        source = null
+        or target = null
+        or connects(source.kind, target.kind)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Every block name is unique within its kind. The catalogue is keyed by
+-- (kind, name); two distinct blocks of the same kind cannot share a name.
+-- This is the machine-checkable counterpart of KindNaming.NamesUniquePerKind.
+invariant BlockNamesUniquePerKind {
+    for a in Blocks:
+        for b in Blocks:
+            a != b and a.kind = b.kind implies a.name != b.name
+}
+
+-- Every step in every flow must be a legal connection. This is the machine-
+-- checkable counterpart of the ConnectionGrammar contract: the grammar states
+-- the relation, this asserts that no event model contains a step outside it.
+invariant AllFlowStepsLegal {
+    for step in FlowSteps:
+        step.is_legal
+}
+
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The party on the boundary of an event model is its author: the application
+-- designer (or the tooling acting for them) who declares the catalogue of
+-- blocks and the flows that wire them. There is no per-instance identity
+-- distinction to draw, so the actor is identified trivially.
+actor Author {
+    identified_by: Flow where description != null
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The design-time boundary: what an author declares and what well-formedness
+-- the model guarantees in return. The author supplies blocks and flows; the
+-- model classifies them by kind and enforces the connection grammar.
+surface EventModelAuthoring {
+    facing author: Author
+    context flow: Flow
+
+    exposes:
+        flow.name
+        flow.description
+        flow.steps
+
+    contracts:
+        fulfils KindNaming
+        fulfils ConnectionGrammar
+        fulfils PayloadSchema
+
+    @guarantee WellFormedByKindAndConnection
+        -- A declared event model is well-formed when every block is classified
+        -- by its kind, names are unique within their kind, every data-carrying
+        -- block (command, event, view) carries a well-formed payload schema, and
+        -- every flow step is a connection the canonical CQRS data flow permits.
+        -- Tooling can validate, render and reason about any model satisfying
+        -- these guarantees.
+
+    @guidance
+        -- The six block kinds are placeholders here; each is fully governed by
+        -- its own grain component (command/event/view processors, the
+        -- todo-processor, periodic-task and screen runtimes). An event model
+        -- references them by classified name only — it asserts what blocks exist
+        -- and how they connect, never how any of them behaves at runtime.
+}
+
+-- A command's acceptance examples are part of its design-time description. Each
+-- catalogued example is surfaced to the author and to tooling that renders or
+-- checks the model, distinct from the runtime command processor (which never
+-- sees them).
+surface CommandExamples {
+    facing author: Author
+    context example: AcceptanceExample
+
+    exposes:
+        example.command.name
+        example.command.description
+        example.precondition
+        example.stimulus
+        example.expectation
+
+    @guarantee ExamplesAreDesignTimeOnly
+        -- Acceptance examples document intended behaviour for the author and
+        -- tooling. They are not executed and place no obligation on the runtime
+        -- command processor; a command with no examples is still well-formed.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should a flow's chain be required to be continuous (each step's target is the next step's source), or may a flow legitimately list disconnected segments (e.g. two independent entry points documented under one named slice)?"
+open question "Acceptance examples (Given/When/Then) attach only to commands today. Should views or todo-processors also be able to carry behavioural examples, or is the command the canonical home for them?"

@@ -1,0 +1,178 @@
+-- allium: 3
+-- anomalies.allium
+--
+-- Distilled from components/anomalies (grain).
+--
+-- Scope: The codebase-wide convention for representing recoverable failures as
+--        in-band data values rather than thrown exceptions. A failed operation
+--        returns an "anomaly" — a value tagged with a failure category — that
+--        callers test for with a single predicate and branch on.
+--
+-- This is INFRASTRUCTURE / THIN PLUMBING: the whole component is one predicate
+-- (anomaly?) over the cognitect.anomalies category convention. There is no
+-- domain, no lifecycle, no persistent state. The honest specifiable content is
+-- the discrimination guarantee of the predicate, the shared category
+-- vocabulary, and the success-or-anomaly branch protocol every caller follows.
+--
+-- Includes:
+--   - the anomaly? predicate: how callers distinguish a failure value from a
+--     successful result without exceptions
+--   - the shared category vocabulary every grain component uses to classify
+--     failures (fault, conflict, not-found, incorrect, forbidden, ...)
+--   - the in-band failure-signalling protocol: an operation yields a result,
+--     and the caller branches on success vs anomaly
+--
+-- Excludes (implementation / out of scope, governed elsewhere):
+--   - the concrete shape of an anomaly value (it is a tagged map keyed by
+--     :cognitect.anomalies/category, plus an optional message) — a serialization
+--     and language-type detail
+--   - the cognitect.anomalies library that defines the namespaced category keys
+--   - how individual components decide WHICH category applies (that belongs to
+--     each component's own spec, e.g. event-store conflict on optimistic-lock
+--     failure, command/query authorization producing forbidden)
+--   - exception handling, logging, metrics and retry policy built on top of
+--     anomaly detection
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- An arbitrary value produced by any grain operation: either a successful
+-- result or an anomaly. It has no identity and no lifecycle — it is just the
+-- value a fallible call returns, compared by structure. The consuming spec
+-- substitutes its own successful-result shape; this component governs only the
+-- one structural fact every such value shares: it may carry an in-band failure.
+value Result {
+    -- The failure this value carries, when it is an anomaly; absent when the
+    -- value is a successful result. Presence of this is the discriminant: a
+    -- value is an anomaly exactly when it carries a failure.
+    failure: Anomaly?
+
+    -- The single discrimination every caller performs in band, with no throw
+    -- and no state outside the value: a value is an anomaly exactly when it
+    -- carries a failure category.
+    is_anomaly: failure != null
+}
+
+-- The guaranteed shape of a failure value: a category drawn from the shared
+-- vocabulary, and an optional human-readable message. A producing component may
+-- attach further failure detail beyond these two; the category is the only
+-- field every anomaly is guaranteed to carry and is the discriminant the
+-- protocol branches on. The in-band carrier and any extra detail are
+-- implementation concerns and are deliberately not modelled.
+value Anomaly {
+    category: AnomalyCategory
+    message: String?
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The sole behavioural surface of this component: deciding whether a returned
+-- value is a failure. This lets the whole system signal recoverable errors as
+-- ordinary return values, so callers compose operations and branch on failure
+-- without try/catch.
+contract AnomalyDiscrimination {
+    -- The single discrimination operation. Given any returned value, it yields
+    -- the anomaly carried by that value, or nothing when the value is a
+    -- success. The result is the value itself: there is no separate accessor —
+    -- a value that classifies as an anomaly already exposes its own category
+    -- and optional message, which callers read directly. Callers therefore wrap
+    -- every fallible call in this one test, treating a present anomaly as the
+    -- failure branch and an absent one as the success branch.
+    discriminate: (value: Result) -> Anomaly?
+
+    @invariant Discrimination
+        -- discriminate(value) yields an anomaly exactly when the value carries a
+        -- failure category, and nothing otherwise. A successful result is never
+        -- reported as an anomaly, and a failure value is never mistaken for a
+        -- success. The test inspects the value in band — it neither throws nor
+        -- depends on any state outside the value itself.
+
+    @invariant SingleCategory
+        -- An anomalous value carries exactly one category from the shared
+        -- vocabulary, so callers can branch on a single discriminant (its
+        -- category). The value may carry further failure detail beyond the
+        -- modelled category and message; only the category is guaranteed
+        -- present and is the discriminant the protocol relies on.
+
+    @invariant DiscriminationPureAndTotal
+        -- Discrimination is pure and total: the same value always yields the
+        -- same answer, with no side effects. It is defined over any returned
+        -- value whatsoever — a value that carries no failure category, of any
+        -- shape, classifies as a success rather than raising — so every call
+        -- site can wrap every result with the one test and never has to guard
+        -- the test itself.
+
+    @guidance
+        -- Components produce anomalies, they do not throw, for failures a caller
+        -- might reasonably recover from or branch on (validation rejection,
+        -- authorization denial, optimistic-concurrency conflict, missing
+        -- entity). Truly exceptional faults may still propagate as exceptions;
+        -- the choice of category is each producing component's responsibility
+        -- and is specified there, not here.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The shared failure-classification vocabulary: the complete set of
+-- cognitect.anomalies categories. Every grain component that reports a
+-- recoverable failure tags it with exactly one of these, so callers across the
+-- system branch on a common set rather than per-component error codes. This is
+-- the full standard vocabulary; in practice grain currently produces only five
+-- of them — fault, conflict, not_found, incorrect and forbidden — but any
+-- category is a valid discriminant a caller may receive.
+--
+--   fault       — an internal error the caller cannot correct (a bug, a
+--                 backend that misbehaved).
+--   conflict    — the operation lost a race or violated a uniqueness / version
+--                 constraint (e.g. an optimistic-concurrency or checkpoint
+--                 compare-and-swap loss).
+--   not_found   — the addressed thing does not exist.
+--   incorrect   — the caller's input failed validation.
+--   forbidden   — the caller is not authorized for this operation
+--                 (deny-by-default authorization rejection).
+--   unavailable — a dependency is temporarily down; retry may succeed.
+--   interrupted — the operation was cancelled before completing.
+--   unsupported — the operation is not supported in this context.
+--   busy        — the resource is overloaded; back off and retry.
+enum AnomalyCategory {
+    fault | conflict | not_found | incorrect | forbidden
+    | unavailable | interrupted | unsupported | busy
+}
+
+-- This component has no entities, lifecycle or persistent state: there is no
+-- "operation outcome" record and nothing transitions. A fallible call computes
+-- the success-or-anomaly branch inline at each call site (short-circuiting a
+-- pipeline on the first anomaly, or proceeding with the successful value) and
+-- then discards the decision. The whole specifiable content is therefore the
+-- pure-function discrimination guarantee, homed in the AnomalyDiscrimination
+-- contract above, and the system-wide boundary it imposes, stated below.
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Every grain component that can fail meets this boundary: it returns either a
+-- successful result or an anomaly, and every caller discriminates the returned
+-- value with the same shared predicate (reading the category, on failure)
+-- before proceeding.
+surface FailureSignalling {
+    facing result: Result
+
+    exposes:
+        result.is_anomaly
+        result.failure
+
+    contracts:
+        fulfils AnomalyDiscrimination
+
+    @guarantee InBandFailures
+        -- Recoverable failures are returned as values, not thrown. A caller can
+        -- always tell a success from a failure by testing the returned value,
+        -- and a failure tells the caller which category it is, uniformly across
+        -- every component in the system.
+}
