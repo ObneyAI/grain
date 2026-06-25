@@ -93,6 +93,20 @@ See `bases/example-base` and `components/example-service` for a complete example
 
 For multi-instance deployments, add the [control plane](docs/distributed-coordination.md) package.
 
+## Example App: Grain Todo List
+
+[`grain-todo-list`](https://github.com/ObneyAI/grain-todo-list) is a compact teaching app for learning how to build with Grain. It demonstrates command handlers, event schemas, read models, query handlers, todo processors, periodic tasks, server-rendered Datastar UI, auth/session flow, and Integrant system composition in a small Clojure project.
+
+The app repository includes its own [README](https://github.com/ObneyAI/grain-todo-list/blob/main/README.md), agent notes in [`AGENTS.md`](https://github.com/ObneyAI/grain-todo-list/blob/main/AGENTS.md), and a deeper architecture reference in [`doc/pattern-compendium.md`](https://github.com/ObneyAI/grain-todo-list/blob/main/doc/pattern-compendium.md).
+
+Grain Sessions walks through the app as a teaching series:
+
+- [Episode 1](https://youtu.be/tO--joFrYUE)
+- [Episode 2](https://youtu.be/plMAG4FASdk)
+- [Episode 3](https://youtu.be/weAsNioiEnI)
+- [Episode 4](https://youtu.be/XRo49q6yCeo)
+- [Episode 5](https://youtu.be/JdQtSLHoCQk)
+
 ## Packages
 
 > Full package details and deps.edn snippets: [docs/packages.md](docs/packages.md)
@@ -114,7 +128,7 @@ Grain is MIT licensed. We use it in production, but it's actively evolving. The 
 ## More Information
 
 - **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
-- **Examples**: `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
+- **Examples**: [`grain-todo-list`](https://github.com/ObneyAI/grain-todo-list), `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
 - **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians
 - **Issues**: [GitHub Issues](https://github.com/ObneyAI/grain/issues)
