@@ -9,6 +9,7 @@
         cat/todo-processor-v2 {:local/root "../todo-processor-v2"}
         cat/periodic-task {:local/root "../periodic-task"}
         cat/event-store-v3 {:local/root "../event-store-v3"}
+        cat/event-model {:local/root "../event-model"}
         cat/fressian-util {:local/root "../fressian-util"}
         cat/kv-store {:local/root "../kv-store"}
         cat/pubsub {:local/root "../pubsub"}
@@ -17,7 +18,7 @@
         cat/control-plane {:local/root "../control-plane"}
         metosin/malli {:mvn/version "0.16.4"}}
 
- :aliases {:test {:extra-paths ["test"]
+ :aliases {:test {:extra-paths ["test" "test/resources"]
                   :extra-deps {cat/example-base {:local/root "../../bases/example-base"}
                                cat/example-service {:local/root "../example-service"}
                                cat/kv-store {:local/root "../kv-store"}

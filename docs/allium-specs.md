@@ -83,9 +83,9 @@ The datastar component is the server-driven reactive-UI boundary for grain's CQR
 
 ### [`event-model`](../components/event-model/event-model.allium)
 
-The spec captures event-model as the design-time vocabulary and well-formedness grammar for describing a grain CQRS application: six classified building-block kinds (command, event, view, todo-processor, screen, periodic-task), names unique per kind, the canonical connection grammar wiring blocks into flows, payload-schema obligations on data-carrying kinds, and Given/When/Then acceptance examples on commands. It models behavioural guarantees as contracts, variants and invariants rather than runtime mechanics.
+The spec captures event-model as the design-time vocabulary and well-formedness grammar for describing a grain CQRS application **service-area-first**: a model is a map of service areas, each owning seven classified building-block kinds (command, event, read-model, query, todo-processor, periodic-task, screen) keyed `:<area>/<name>` with the kind coming from structural position, the canonical connection grammar wiring blocks into flows, kind-typed dependency edges between blocks, payload-schema obligations matched against the live registry, and Given/When/Then examples on commands. Its companion `code-agent-tools/validate-event-model` reconciles a declared model against a live grain runtime over the REPL (see [docs/event-model.md](event-model.md)).
 
-<sub>entities 4 · rules 0 · contracts 3 · invariants 5 · surfaces 2</sub>
+<sub>entities 4 · variants 7 · contracts 3 · invariants 3 · surfaces 2 · actors 2</sub>
 
 ### [`event-notifier-postgres`](../components/event-notifier-postgres/event-notifier-postgres.allium)
 

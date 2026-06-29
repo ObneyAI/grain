@@ -1,128 +1,170 @@
 (ns ai.obney.grain.event-model.interface
-  (:require [ai.obney.grain.schema-util.interface :refer [defschemas]]
-            [malli.core :as m]))
+  "Service-area-first event model: the design-time vocabulary and well-formedness
+   schema for describing a grain application.
+
+   An *event model* is a map of service areas, keyed by area (a simple keyword
+   such as :example). A *service area* owns its building blocks — commands,
+   events, read-models, queries, todo-processors, periodic-tasks and screens —
+   together with the flows that wire them into the canonical CQRS data-flow shape.
+
+   Two conventions make this model join 1:1 with a running grain system:
+
+   - Blocks are keyed by the RUNTIME convention :<area>/<name>
+     (e.g. :example/create-counter), exactly as defcommand/defquery/defreadmodel/
+     defprocessor/defperiodic register their handlers. The keyword NAMESPACE is
+     the area; the block's KIND comes from its structural position (which catalogue
+     map it lives in), not from the keyword. A single :<area>/<name> is therefore
+     NOT unique across kinds — e.g. :example/counters is both a read-model and a
+     query — so identity is the pair (kind, :area/name) and flow endpoints are
+     kind-qualified.
+
+   - The kinds are 1:1 with grain's def* macros. (Renamed from the prior flat
+     model: `view` -> `read-model`; added `query`; `schedule` is a map, not a
+     string; keys are :<area>/<name>, not :<kind>/<name>.)
+
+   This component defines what a valid description looks like; it does not run the
+   system. Each block's runtime behaviour is governed by its own grain component.
+
+   Because the kind is positional, the CQRS connection grammar, referential
+   integrity, continuity and spec<->runtime reconciliation cannot be expressed as
+   pure malli predicates over a keyword — malli here checks SHAPE only. Those
+   structural rules are enforced by the code-agent-tools validators
+   (`validate-event-model`) against the live catalog. See docs/event-model.md.
+
+   All schema keys are namespaced `:event-model/*` so they are self-describing and
+   never collide in grain's shared global malli registry. A model INSTANCE is plain
+   data validated with `(m/validate :event-model instance)`; it is never registered."
+  (:require [ai.obney.grain.schema-util.interface :refer [defschemas]]))
 
 #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
 (defschemas event-model
-  {:command-name [:fn #(and (qualified-keyword? %)
-                            (= "command" (namespace %)))]
+  {;; ---- names ----------------------------------------------------------------
+   ;; A block name is a qualified keyword :<area>/<name>; the namespace is the
+   ;; area, the name is the block's local name. An area name is a simple keyword.
+   :event-model/block-name :qualified-keyword
+   :event-model/area-name  [:and :keyword [:fn #(nil? (namespace %))]]
 
-   :event-name [:fn #(and (qualified-keyword? %)
-                          (= "event" (namespace %)))]
+   ;; ---- payload schema: must be schema-SHAPED data here (keyword/vector/map/
+   ;; symbol). Authoritative well-formedness (does it actually parse? does it
+   ;; reference an unregistered name?) is classified by the validator's C6, so a
+   ;; malformed-but-shaped schema yields a precise :schema/malformed finding
+   ;; rather than collapsing into a generic model-shape error.
+   :event-model/malli-schema
+   [:fn #(or (keyword? %) (vector? %) (map? %) (symbol? %))]
 
-   :view-name [:fn #(and (qualified-keyword? %)
-                         (= "view" (namespace %)))]
-
-   :todo-processor-name [:fn #(and (qualified-keyword? %)
-                                   (= "todo-processor" (namespace %)))]
-
-   :screen-name [:fn #(and (qualified-keyword? %)
-                           (= "screen" (namespace %)))]
-
-   :periodic-task-name [:fn #(and (qualified-keyword? %)
-                                  (= "periodic-task" (namespace %)))]
-
-   :flow-name [:fn #(and (qualified-keyword? %)
-                         (= "flow" (namespace %)))]
-
-   :malli-schema [:fn #(m/schema?
-                        (try
-                          (m/schema %)
-                          (catch Exception _e)))]
-
-   :given-when-then [:map
-                     [:given :string]
-                     [:when :string]
-                     [:then :string]]
-
-   :given-when-thens [:vector :given-when-then]
-
-   :command [:map
-             [:name :command-name]
-             [:description :string]
-             [:given-when-thens {:optional true} :given-when-thens]
-             [:schema :malli-schema]]
-
-   :event [:map
-           [:name :event-name]
-           [:description :string]
-           [:schema :malli-schema]]
-
-   :view [:map
-          [:name :view-name]
-          [:description :string]
-          [:schema :malli-schema]]
-
-   :todo-processor [:map
-                    [:name :todo-processor-name]
-                    [:description :string]]
-   
-   :periodic-task [:map
-                   [:name :periodic-task-name]
-                   [:description :string]
-                   [:schedule :string]]
-
-   :screen [:map
-            [:name :screen-name]
-            [:description :string]]
-
-   :commands [:map-of :command-name :command]
-
-   :events [:map-of :event-name :event]
-
-   :views [:map-of :view-name :view]
-
-   :todo-processors [:map-of :todo-processor-name :todo-processor]
-
-   :periodic-tasks [:map-of :periodic-task-name :periodic-task]
-
-   :screens [:map-of :screen-name :screen]
-
-   :valid-step [:fn #(let [connect-from-type (when (:from %) (namespace (:from %)))
-                           connect-to-type (when (:to %) (namespace (:to %)))]
-                       (case connect-from-type
-                         "view" (contains? #{"todo-processor" "screen" "periodic-task" nil} connect-to-type)
-                         "todo-processor" (contains? #{"command" nil} connect-to-type)
-                         "screen" (contains? #{"command" nil} connect-to-type)
-                         "command" (contains? #{"event" nil} connect-to-type)
-                         "event" (contains? #{"view" nil} connect-to-type)
-                         "periodic-task" (contains? #{"command" nil} connect-to-type)
-                         nil true))]
-
-   :step [:and
-          :valid-step
-          [:map
-           [:from [:or
-                   :command-name
-                   :event-name
-                   :view-name
-                   :todo-processor-name
-                   :screen-name
-                   :periodic-task-name
-                   :nil]]
-           [:to [:or
-                 :command-name
-                 :event-name
-                 :view-name
-                 :todo-processor-name
-                 :periodic-task-name
-                 :screen-name
-                 :nil]]]]
-
-   :flow [:map
-          [:name :flow-name]
-          [:description :string]
-          [:steps [:vector :step]]]
-
-   :flows [:map-of :flow-name :flow]
-
-   :event-model
+   ;; ---- design-time acceptance examples: carried as DATA, never executed ------
+   :event-model/given-when-then
    [:map
-    [:commands {:optional true} :commands]
-    [:events {:optional true} :events]
-    [:views {:optional true} :views]
-    [:todo-processors {:optional true} :todo-processors]
-    [:periodic-tasks {:optional true} :periodic-tasks]
-    [:screens {:optional true} :screens]
-    [:flows {:optional true} :flows]]})
+    [:given :string]
+    [:when :string]
+    [:then :string]]
+   :event-model/given-when-thens [:vector :event-model/given-when-then]
 
+   ;; ---- schedule: grain's MAP form (defperiodic), not a string ---------------
+   :event-model/schedule
+   [:or
+    [:map [:cron :string] [:timezone {:optional true} :string]]
+    [:map [:every :int] [:duration :keyword]]]
+
+   ;; ===========================================================================
+   ;; BLOCK KINDS — 1:1 with grain's def* macros.
+   ;; "Intent edges" (:reads/:produces/:consumes/:subscribes/:queries/:commands)
+   ;; are OPTIONAL design-time declarations of the dependency graph; the validator
+   ;; type-checks each (target exists AND is of the expected kind).
+   ;; ===========================================================================
+
+   ;; defcommand — validates business rules and emits events; carries a params
+   ;; schema (registered live under :<area>/<name>). May compose read-models.
+   :event-model/command
+   [:map
+    [:description :string]
+    [:schema :event-model/malli-schema]
+    [:reads {:optional true} [:set :event-model/block-name]]            ; read-models composed (e.g. for validation)
+    [:produces {:optional true} [:set :event-model/block-name]]         ; events emitted
+    [:given-when-thens {:optional true} :event-model/given-when-thens]]
+
+   ;; an immutable recorded fact; carries an event-body schema (registered live).
+   :event-model/event
+   [:map
+    [:description :string]
+    [:schema :event-model/malli-schema]]
+
+   ;; defreadmodel — a pure (state,event)->state projection; subscribes to events
+   ;; via :consumes (cross-checked against the live :events set). Carries no own
+   ;; schema by convention (its key collides with the same-named query's slot).
+   :event-model/read-model
+   [:map
+    [:description :string]
+    [:consumes [:set :event-model/block-name]]                          ; events consumed
+    [:schema {:optional true} :event-model/malli-schema]                ; optional, design-time only
+    [:version {:optional true} :int]]
+
+   ;; defquery — reads the projected state; carries a params schema (registered
+   ;; live under :<area>/<name>). Composes read-models via :reads.
+   :event-model/query
+   [:map
+    [:description :string]
+    [:schema :event-model/malli-schema]
+    [:reads {:optional true} [:set :event-model/block-name]]]           ; read-models read
+
+   ;; defprocessor — an async reactor subscribing to event :topics
+   ;; (cross-checked against the live :topics set) and issuing commands.
+   :event-model/todo-processor
+   [:map
+    [:description :string]
+    [:subscribes [:set :event-model/block-name]]                        ; event topics subscribed
+    [:produces {:optional true} [:set :event-model/block-name]]]        ; commands issued
+
+   ;; defperiodic — a scheduled reactor; the handler returns :result/events, so
+   ;; it produces EVENTS (and/or commands) on a schedule.
+   :event-model/periodic-task
+   [:map
+    [:description :string]
+    [:schedule :event-model/schedule]
+    [:produces {:optional true} [:set :event-model/block-name]]]        ; events/commands emitted
+
+   ;; a user-facing surface. Design-time only — grain has no defscreen, so a
+   ;; screen's existence is not runtime-verifiable, but its declared dependencies
+   ;; ARE (their targets are real queries/commands). A screen is commonly 1:1 with
+   ;; a single query, but :queries is a set so 0..n is allowed.
+   :event-model/screen
+   [:map
+    [:description :string]
+    [:queries {:optional true} [:set :event-model/block-name]]          ; queries depended on
+    [:commands {:optional true} [:set :event-model/block-name]]]        ; commands issued on user action
+
+   ;; ---- flows: endpoints are KIND-QUALIFIED [kind name] or nil (entry/terminus)
+   :event-model/kind
+   [:enum :command :event :read-model :query :todo-processor :periodic-task :screen]
+
+   :event-model/endpoint
+   [:maybe [:tuple :event-model/kind :event-model/block-name]]
+
+   :event-model/step
+   [:map
+    [:from :event-model/endpoint]
+    [:to :event-model/endpoint]]
+
+   :event-model/flow
+   [:map
+    [:description :string]
+    [:steps [:vector :event-model/step]]]
+
+   ;; ===========================================================================
+   ;; SERVICE AREA — the central construct. Owns its blocks and flows.
+   ;; ===========================================================================
+   :event-model/service-area
+   [:map
+    [:description {:optional true} :string]
+    [:commands {:optional true} [:map-of :event-model/block-name :event-model/command]]
+    [:events {:optional true} [:map-of :event-model/block-name :event-model/event]]
+    [:read-models {:optional true} [:map-of :event-model/block-name :event-model/read-model]]
+    [:queries {:optional true} [:map-of :event-model/block-name :event-model/query]]
+    [:todo-processors {:optional true} [:map-of :event-model/block-name :event-model/todo-processor]]
+    [:periodic-tasks {:optional true} [:map-of :event-model/block-name :event-model/periodic-task]]
+    [:screens {:optional true} [:map-of :event-model/block-name :event-model/screen]]
+    [:flows {:optional true} [:map-of :qualified-keyword :event-model/flow]]]
+
+   ;; ---- ROOT: a model is a map of service areas, keyed by area ----------------
+   :event-model
+   [:map-of :event-model/area-name :event-model/service-area]})

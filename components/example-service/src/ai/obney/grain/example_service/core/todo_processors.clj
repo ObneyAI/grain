@@ -19,7 +19,8 @@
             [ai.obney.grain.time.interface :as time]))
 
 (defprocessor :example calculate-average-counter-value
-  {:topics #{:example/counter-incremented :example/counter-decremented}}
+  {:topics #{:example/counter-incremented :example/counter-decremented}
+   :grain.event-model/produces #{:example/calculate-average-counter-value}}
   "Recomputes the average counter value whenever a counter changes."
   [context]
   (command-processor/process-command

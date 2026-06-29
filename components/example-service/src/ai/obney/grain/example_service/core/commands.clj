@@ -20,7 +20,9 @@
             [cognitect.anomalies :as anom]))
 
 (defcommand :example create-counter
-  {:authorized? (constantly true)}
+  {:authorized? (constantly true)
+   :grain.event-model/produces #{:example/counter-created}
+   :grain.event-model/reads #{:example/counters}}
   "Creates a new counter. Counter name must be unique."
   [context]
   (let [counter-name (get-in context [:command :name])
@@ -39,7 +41,9 @@
                          :name counter-name}})]})))
 
 (defcommand :example increment-counter
-  {:authorized? (constantly true)}
+  {:authorized? (constantly true)
+   :grain.event-model/produces #{:example/counter-incremented}
+   :grain.event-model/reads #{:example/counters}}
   "Increments an existing counter by 1."
   [{{:keys [counter-id]} :command :as context}]
   (let [state (read-models/root context)]
@@ -52,7 +56,9 @@
        ::anom/message (format "Counter with ID '%s' not found." counter-id)})))
 
 (defcommand :example decrement-counter
-  {:authorized? (constantly true)}
+  {:authorized? (constantly true)
+   :grain.event-model/produces #{:example/counter-decremented}
+   :grain.event-model/reads #{:example/counters}}
   "Decrements an existing counter by 1."
   [{{:keys [counter-id]} :command :as context}]
   (let [state (read-models/root context)]
@@ -65,7 +71,9 @@
        ::anom/message (format "Counter with ID '%s' not found." counter-id)})))
 
 (defcommand :example calculate-average-counter-value
-  {:authorized? (constantly true)}
+  {:authorized? (constantly true)
+   :grain.event-model/produces #{:example/average-calculated}
+   :grain.event-model/reads #{:example/counters}}
   "Calculates the average value of all initialized counters."
   [context]
   (let [state (->> (read-models/root context)
