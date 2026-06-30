@@ -27,6 +27,7 @@
                                poly/periodic-task {:local/root "components/periodic-task"}
                                poly/mulog-aws-cloudwatch-emf-publisher {:local/root "components/mulog-aws-cloudwatch-emf-publisher"}
                                poly/event-model {:local/root "components/event-model"}
+                               poly/event-model-validator {:local/root "components/event-model-validator"}
                                poly/behavior-tree-v2 {:local/root "components/behavior-tree-v2"}
                                poly/behavior-tree-v2-dspy-extensions {:local/root "components/behavior-tree-v2-dspy-extensions"}
                                poly/clj-dspy {:local/root "components/clj-dspy"}

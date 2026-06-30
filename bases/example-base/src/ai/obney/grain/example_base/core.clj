@@ -16,6 +16,7 @@
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.event-model-validator.interface :as event-model-validator]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [ai.obney.grain.webserver.interface :as ws]
@@ -26,12 +27,15 @@
             [nrepl.server :as nrepl]
 
             ;; Requiring the example-service interface namespaces loads their
-            ;; core namespaces, whose def* macros register the handlers.
+            ;; core namespaces, whose def* macros register the handlers. The
+            ;; event-model ns registers the :example service model so the boot
+            ;; guard can mandate it.
             [ai.obney.grain.example-service.interface
              [commands]
              [queries]
              [todo-processors]
              [periodic-tasks]
+             [event-model]
              [schemas :as service-schemas]]))
 
 ;; --------------------- ;;
@@ -160,6 +164,10 @@
   []
   (u/set-global-context!
    {:app-name "example-app" :env "dev"})
+  ;; MANDATE: reconcile the registered event model against the live registries
+  ;; (populated by the def* macros at namespace load) and refuse to start if the
+  ;; model is invalid or incomplete. Throws ex-info with the verdict on failure.
+  (event-model-validator/verify-or-throw!)
   (ig/init system))
 
 (defn stop

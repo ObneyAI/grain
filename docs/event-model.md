@@ -110,10 +110,11 @@ the validator never claims a producer actually produces.
 
 ## Validating against the live runtime
 
-The validators live in [code-agent-tools](code-agent-tools.md) and run over
-nREPL. They are **structural only** (no command invocation, no Given/When/Then
-execution), build on `catalog`, need **no `install!`**, degrade to spec-internal
-checks when no registries are loaded, and never throw.
+The validator is the shippable `event-model-validator` component (re-exported by
+the dev-only [code-agent-tools](code-agent-tools.md) for the REPL/agent loop). It
+is **structural only** (no command invocation, no Given/When/Then execution),
+builds on `catalog`, needs **no `install!`**, degrades to spec-internal checks
+when no registries are loaded, and never throws (except the explicit boot-guard).
 
 ```clojure
 (require '[ai.obney.grain.code-agent-tools.interface :as tools])
@@ -155,6 +156,9 @@ checks when no registries are loaded, and never throw.
 | `:wiring/mismatch` | warning | a spec `:consumes`/`:subscribes`/`:schedule` diverges from live wiring |
 | `:produces/mismatch` | warning | spec `:produces` diverges from a def-site `:grain.event-model/produces` declaration |
 | `:reads/mismatch` | warning | spec `:reads` diverges from a def-site `:grain.event-model/reads` declaration |
+| `:produces/undeclared` | error (strict) | a live command/processor/periodic does not declare `:grain.event-model/produces` |
+| `:reads/undeclared` | error (strict) | a live command/query does not declare `:grain.event-model/reads` |
+| `:gwt/missing` | error (strict) | a command in the model has no Given/When/Then |
 | `:flow/discontinuous` | warning | a step's `:from` has no producing prior step |
 | `:auth/missing` | warning | a live command/query has no `:authorized?` predicate |
 | `:runtime/design-only`, `:runtime/absent` | info | notices, not failures |
@@ -193,6 +197,49 @@ This confirms **spec ↔ code-declaration** agreement (catching drift, and givin
 the catalog a production graph). Proving the handler *actually* emits those events
 is the **declaration ↔ behaviour** gap — closed only by executable Given/When/Then
 (a planned follow-on). `example-service` is annotated as the worked example.
+
+## Mandating the model (boot-guard)
+
+An app can **mandate** the model — refuse to boot unless every running block is
+described by a valid, complete model. This is a capability on the existing stack
+(no new core version); an app opts in with two steps:
+
+1. **Register the model** with `defeventmodel` (in the `event-model` component) —
+   shape-checked against `:event-model` at load and stored, exactly as handlers
+   self-register:
+
+   ```clojure
+   (require '[ai.obney.grain.event-model.interface :refer [defeventmodel]])
+   (defeventmodel :example { :commands {...} :events {...} ... })
+   ```
+
+2. **Wire the boot-guard** before the system starts:
+
+   ```clojure
+   (require '[ai.obney.grain.event-model-validator.interface :as event-model-validator])
+   (defn start []
+     (event-model-validator/verify-or-throw!)   ; throws → won't boot
+     (ig/init system))
+   ```
+
+`verify-or-throw!` reconciles the registered model against the live catalog in
+**strict mode** and throws `ex-info` (with the verdict) on any fatal finding.
+Strict mode (the strictest tier) makes the model a *complete* description:
+- **full coverage** — every live block must be in the model (`:block/uncovered` fatal);
+- **declared edges** — every command/processor/periodic must declare
+  `:grain.event-model/produces`, every command/query `:reads` (`:produces/undeclared`,
+  `:reads/undeclared`);
+- **GWT** — every command in the model must carry Given/When/Then (`:gwt/missing`);
+- plus all structural errors and spec↔runtime mismatches (schema/wiring/produces/reads).
+`:auth/missing` is *not* fatal by default (deny-by-default is not a model defect);
+tune via `:fatal-types`/`:error-severities` opts.
+
+The capability ships as the **`grain-event-model`** project (`event-model` +
+`event-model-validator`) — add it to an app to get `defeventmodel` +
+`verify-or-throw!`. `example-base` wires the guard and ships a complete `:example`
+model as the worked demonstration: it won't boot if the model and the running
+system disagree. The default (non-strict) `validate-event-model` used in the
+dev/REPL loop is unchanged — strict mode is opt-in via the guard.
 
 ## REPL-served instructions
 

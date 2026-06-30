@@ -1,0 +1,184 @@
+-- allium: 3
+-- event-model-validator.allium
+--
+-- Distilled from components/event-model-validator (grain).
+--
+-- Scope: The structural validator and boot-guard for a service-area-first event
+--        model. It reconciles a declared event model (see event-model.allium)
+--        against the LIVE grain runtime — the command/query/read-model/processor/
+--        periodic registries and the schema registry — and reports a total verdict
+--        of typed findings. In strict mode it additionally enforces completeness
+--        (full coverage, declared production/read edges, Given/When/Then) and acts
+--        as a boot-guard that refuses to start a system whose model is invalid or
+--        incomplete.
+--
+-- Includes: the reconciliation contract (what is checked and the finding it
+--           emits), the totality guarantee (pure, never throws — except the
+--           explicit boot-guard), the strict-mode completeness obligations, and
+--           the boot-mandate boundary.
+--
+-- Excludes (governed elsewhere): the event model vocabulary/well-formedness
+--   (event-model.allium); the runtime behaviour of the building blocks; command
+--   execution and any Given/When/Then EXECUTION (this validator is structural
+--   only — examples are checked as data, never run).
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum Severity {
+    error
+    warning
+    info
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The declared event model under validation (a map of service areas). Its
+-- vocabulary and well-formedness are governed by event-model.allium.
+external entity EventModel {}
+
+-- The live grain runtime, observed through the building-block registries. The
+-- validator reads it but never mutates it.
+external entity LiveRuntime {}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A single typed result of reconciliation.
+value Finding {
+    type: String
+    severity: Severity
+}
+
+-- The total result of validating a model against the runtime.
+value Verdict {
+    valid: Boolean
+    findings: List<Finding>
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The structural reconciliation. Compares a declared model against the live
+-- runtime and returns a verdict; it does not execute behaviour.
+contract StructuralValidation {
+    validate: (model: EventModel, runtime: LiveRuntime) -> Verdict
+
+    @invariant Total
+        -- validate always returns a Verdict and never throws: a malformed model,
+        -- an unparseable schema, or an unexpected internal error is reported as a
+        -- finding, not raised. Verdicts are inert data.
+
+    @invariant StructuralOnly
+        -- Validation never invokes a command and never executes a Given/When/Then
+        -- example; examples are checked as data. It needs no installed runtime —
+        -- it reads only the process-wide registries — and degrades to
+        -- spec-internal checks when no registries are loaded.
+
+    @invariant AreaScoped
+        -- Coverage, missing-schema and authorization findings are scoped to the
+        -- areas the model declares, so validating one area never reports on blocks
+        -- of another.
+
+    @invariant ValidityByErrorFindings
+        -- A verdict is valid when no finding is fatal. By default a finding is
+        -- fatal when its severity is error; callers may additionally mark finding
+        -- types fatal (the strict boot-guard does so for coverage and mismatch
+        -- warnings).
+}
+
+-- Strict mode promotes the model to a COMPLETE description of the running system.
+contract StrictCompleteness {
+    @invariant FullCoverage
+        -- Every block present in the live runtime (within a declared area) must
+        -- appear in the model; an uncovered live block is fatal.
+
+    @invariant DeclaredEdges
+        -- Every live command, todo-processor and periodic-task must declare what
+        -- it produces, and every command and query what it reads; an undeclared
+        -- production or read edge is fatal.
+
+    @invariant ExamplesPresent
+        -- Every command in the model must carry at least one Given/When/Then
+        -- example; a command without examples is fatal. (Presence only — examples
+        -- are not executed.)
+}
+
+-- The boot mandate. The one place the validator throws: a guard that refuses to
+-- start a system whose registered model does not pass strict validation.
+contract BootGuard {
+    verify: (runtime: LiveRuntime) -> Verdict
+
+    @invariant RefusesInvalidStart
+        -- verify reconciles the registered model against the live runtime in
+        -- strict mode and raises when the verdict is not valid, so a system
+        -- cannot start with an invalid or incomplete model. On success it returns
+        -- the verdict.
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- A coding harness or developer running validation over the REPL.
+actor Harness {
+    identified_by: LiveRuntime
+}
+
+-- An application starting up under the mandate.
+actor Application {
+    identified_by: LiveRuntime
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The dev/agent validation boundary: submit a model, get a verdict.
+surface Validation {
+    facing harness: Harness
+    context runtime: LiveRuntime
+
+    contracts:
+        fulfils StructuralValidation
+
+    @guarantee VerdictReconcilesModelAgainstRuntime
+        -- For each declared area, the verdict reports blocks declared but absent
+        -- from the runtime, live blocks missing from the model, schema/wiring/
+        -- production/read drift, and illegal or dangling flow connections —
+        -- structurally, never by executing behaviour.
+}
+
+-- The boot mandate boundary: a system that will not start unless its model is
+-- valid and (in strict mode) complete.
+surface BootMandate {
+    facing app: Application
+    context runtime: LiveRuntime
+
+    contracts:
+        fulfils BootGuard
+        fulfils StrictCompleteness
+
+    @guarantee WontStartOnInvalidModel
+        -- A system wired to the guard refuses to start while any fatal finding
+        -- remains: a missing/incomplete model, an uncovered live block, an
+        -- undeclared production/read edge, a command without Given/When/Then, or
+        -- any structural error or spec-vs-runtime mismatch.
+
+    @guidance
+        -- The mandate is opt-in per application (the app wires the guard); it is a
+        -- capability on the existing stack, not a forced framework-wide break.
+        -- Authorization gaps are not treated as model defects by default.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Given/When/Then is mandated as PRESENT data in strict mode but never executed. Should a future tier EXECUTE examples (invoke the command, assert the emitted events) to close the declaration-versus-behaviour gap?"
+open question "Should the strict fatal set be configurable per finding type beyond the current defaults (e.g. make authorization gaps fatal), or fixed by the tier?"

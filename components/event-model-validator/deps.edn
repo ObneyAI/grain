@@ -1,0 +1,11 @@
+{:paths ["src"]
+ :deps {cat/event-model {:local/root "../event-model"}
+        cat/command-processor-v2 {:local/root "../command-processor-v2"}
+        cat/query-processor {:local/root "../query-processor"}
+        cat/read-model-processor-v2 {:local/root "../read-model-processor-v2"}
+        cat/todo-processor-v2 {:local/root "../todo-processor-v2"}
+        cat/periodic-task {:local/root "../periodic-task"}
+        cat/schema-util {:local/root "../schema-util"}
+        metosin/malli {:mvn/version "0.16.4"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {}}}}

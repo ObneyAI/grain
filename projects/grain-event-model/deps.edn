@@ -1,0 +1,32 @@
+{:paths []
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+
+        ;; The service-area-first event model + the shippable structural
+        ;; validator/boot-guard. Add this project to an app to gain the mandate
+        ;; capability: defeventmodel your area(s) and call
+        ;; event-model-validator.interface/verify-or-throw! at startup.
+        gem/event-model {:local/root "../../components/event-model"}
+        gem/event-model-validator {:local/root "../../components/event-model-validator"}
+
+        ;; Registry interfaces the validator reads (already present in any grain
+        ;; app; listed for standalone resolution).
+        gem/command-processor-v2 {:local/root "../../components/command-processor-v2"}
+        gem/query-processor {:local/root "../../components/query-processor"}
+        gem/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        gem/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
+        gem/periodic-task {:local/root "../../components/periodic-task"}
+        gem/schema-util {:local/root "../../components/schema-util"}
+
+        ;; Transitive components the processor interfaces pull in (required by
+        ;; Polylith's project closure check).
+        gem/anomalies {:local/root "../../components/anomalies"}
+        gem/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}
+        gem/event-store-v3 {:local/root "../../components/event-store-v3"}
+        gem/fressian-util {:local/root "../../components/fressian-util"}
+        gem/kv-store {:local/root "../../components/kv-store"}
+        gem/pubsub {:local/root "../../components/pubsub"}
+        gem/query-schema {:local/root "../../components/query-schema"}
+        gem/time {:local/root "../../components/time"}}
+
+ :aliases {:test {:extra-paths []
+                  :extra-deps {}}}}

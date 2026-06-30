@@ -139,7 +139,16 @@ there are no :error-severity findings. Each finding has :type, :severity and a
                                    (fires only when the def site declares :grain.event-model/reads).
   :flow/discontinuous    (warning) a step's :from has no producing prior step.
   :auth/missing          (warning) a live command/query has no :authorized? predicate.
-  :runtime/design-only / :runtime/absent (info) notices, not failures."})
+  :runtime/design-only / :runtime/absent (info) notices, not failures.
+
+STRICT MODE (validate-event-model with {:strict true}; used by the boot-guard
+event-model-validator/verify-or-throw!): :block/uncovered, :wiring/mismatch,
+:produces/mismatch and :reads/mismatch become FATAL, and these are added:
+  :produces/undeclared   (error) a live command/processor/periodic does not declare
+                                 :grain.event-model/produces (full declaration required).
+  :reads/undeclared      (error) a live command/query does not declare :grain.event-model/reads.
+  :gwt/missing           (error) a command in the model has no Given/When/Then.
+A system using verify-or-throw! at boot refuses to start while any fatal finding remains."})
 
 (core/register-guide!
  {:id :authoring-blocks

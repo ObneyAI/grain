@@ -10,6 +10,7 @@
         cat/periodic-task {:local/root "../periodic-task"}
         cat/event-store-v3 {:local/root "../event-store-v3"}
         cat/event-model {:local/root "../event-model"}
+        cat/event-model-validator {:local/root "../event-model-validator"}
         cat/fressian-util {:local/root "../fressian-util"}
         cat/kv-store {:local/root "../kv-store"}
         cat/pubsub {:local/root "../pubsub"}

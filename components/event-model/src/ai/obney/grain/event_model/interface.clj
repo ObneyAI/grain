@@ -34,7 +34,9 @@
    All schema keys are namespaced `:event-model/*` so they are self-describing and
    never collide in grain's shared global malli registry. A model INSTANCE is plain
    data validated with `(m/validate :event-model instance)`; it is never registered."
-  (:require [ai.obney.grain.schema-util.interface :refer [defschemas]]))
+  (:require [ai.obney.grain.schema-util.interface :refer [defschemas]]
+            [malli.core :as m]
+            [malli.error :as me]))
 
 #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
 (defschemas event-model
@@ -168,3 +170,44 @@
    ;; ---- ROOT: a model is a map of service areas, keyed by area ----------------
    :event-model
    [:map-of :event-model/area-name :event-model/service-area]})
+
+;; ===========================================================================
+;; Model registration
+;; ===========================================================================
+;;
+;; A service registers its area's event model with `defeventmodel`, exactly as
+;; handlers self-register via the def* macros and schemas via defschemas. The
+;; registered models are what the boot-guard (event-model-validator) reconciles
+;; against the live runtime. Registration shape-validates the area against the
+;; :event-model meta-schema and throws on a malformed model at load.
+
+#_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
+(def event-model-registry*
+  "Global registry of registered area models: {area -> service-area-map}. The map
+   itself is a well-formed :event-model value (a map of areas)."
+  (atom {}))
+
+(defn register-event-model!
+  "Shape-validates `area-map` (as the single-area model `{area area-map}`) against
+   the :event-model meta-schema and registers it under `area`. Throws ex-info with
+   humanized errors when the area model is malformed."
+  [area area-map]
+  (let [model {area area-map}]
+    (when-let [err (m/explain :event-model model)]
+      (throw (ex-info (str "Invalid event model for area " area)
+                      {:area area :explain/humanized (me/humanize err)})))
+    (swap! event-model-registry* assoc area area-map)
+    area))
+
+(defmacro defeventmodel
+  "Registers a service area's event model. `area` is a simple keyword (e.g.
+   :example); `area-map` is its service-area map (commands/events/read-models/
+   queries/todo-processors/periodic-tasks/screens/flows). Shape-validated at load."
+  [area area-map]
+  `(register-event-model! ~area ~area-map))
+
+(defn registered-model
+  "The merged event model across all registered areas — a well-formed :event-model
+   value the validator/boot-guard can check against the live runtime."
+  []
+  @event-model-registry*)
