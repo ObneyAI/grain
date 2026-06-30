@@ -85,6 +85,7 @@
    {:example/calculate-average-counter-value
     {:description "Recomputes the average counter value whenever a counter changes."
      :subscribes #{:example/counter-incremented :example/counter-decremented}
+     :reads #{:example/counters}
      :produces #{:example/calculate-average-counter-value}}}
 
    :periodic-tasks
@@ -106,6 +107,6 @@
      :steps [{:from [:screen :example/dashboard]          :to [:command :example/increment-counter]}
              {:from [:command :example/increment-counter] :to [:event :example/counter-incremented]}
              {:from [:event :example/counter-incremented] :to [:read-model :example/counters]}
-             {:from [:event :example/counter-incremented] :to [:todo-processor :example/calculate-average-counter-value]}
              {:from [:read-model :example/counters]        :to [:query :example/counters]}
+             {:from [:query :example/counters]             :to [:todo-processor :example/calculate-average-counter-value]}
              {:from [:query :example/counters]             :to [:screen :example/dashboard]}]}}})

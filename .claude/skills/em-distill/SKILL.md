@@ -64,7 +64,7 @@ data flow**, not implementation. Typical source → kind mappings:
 | a domain fact / "X happened" record; rows appended to an event/audit table; a message published to a bus/topic; a webhook emitted | **event** (`:schema` = the fact's payload) |
 | a materialized view / denormalized/read table / cache / projection rebuilt from events or write-side changes | **read-model** (`:consumes` = the events that update it) |
 | a read endpoint / GET / query handler / report that returns view data | **query** (`:schema` = params; `:reads` = the read-models it serves from) |
-| a background worker / message consumer / reactor / saga / process-manager that responds to events and triggers more work | **todo-processor** (`:subscribes` = events; `:produces` = commands it issues) |
+| a background worker / message consumer / reactor / saga / process-manager that responds to events and triggers more work | **todo-processor** (`:subscribes` = event topics it triggers on; `:reads` = the **query** "TODO list" it works from — its modeled input edge; `:produces` = commands it issues) |
 | a cron job / scheduled task / timer | **periodic-task** (`:schedule` map; `:produces`) |
 | a UI page / screen / view template | **screen** (design-only; `:queries` shown, `:commands` issued) |
 | an end-to-end user or system journey across the above | **flow** (kind-qualified `[kind :area/name]` step chain) |

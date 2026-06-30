@@ -130,21 +130,26 @@ contract ConnectionGrammar {
         -- The legal connections, reconciled to grain's actual def* contracts:
         --   command        -> event              (a command emits events)
         --   event          -> read_model         (a read-model consumes events)
-        --   event          -> todo_processor     (a processor subscribes to events)
+        --   read_model     -> command            (a command reads a projection for validation)
         --   read_model     -> query              (a query reads a projection)
-        --   read_model     -> command            (a command reads a projection)
-        --   read_model     -> screen             (a screen reads a projection)
         --   query          -> screen             (a screen displays a query)
+        --   query          -> todo_processor     (an automation reads its TODO-list query)
         --   screen         -> command            (a user action issues a command)
         --   todo_processor -> command            (a reactor issues a command)
         --   periodic_task  -> command            (a schedule issues a command)
         --   periodic_task  -> event              (a schedule emits events directly)
-        -- No other adjacency is legal. The relation is not symmetric.
+        -- Read-models are INTERNAL projections: they feed only commands and
+        -- queries, never a screen, todo_processor or periodic_task directly.
+        -- Everything user/automation-facing reads through a query. A
+        -- todo_processor's INPUT edge is therefore a query (the "TODO list"), NOT
+        -- a raw event or a read_model: event -> todo_processor and read_model ->
+        -- todo_processor are both rejected. (The processor still SUBSCRIBES to
+        -- event topics at runtime; that is trigger wiring, :subscribes, not a flow edge.)
 
     @invariant OnlySubscriptionEdgesAreConfirmableFromWiring
-        -- Only event -> read_model and event -> todo_processor can be confirmed
-        -- from observed live wiring (a read-model declares the events it consumes;
-        -- a processor declares the topics it subscribes to). Every other edge is a
+        -- Only event -> read_model (a read-model declares the events it consumes)
+        -- and a processor's event subscription (it declares the topics it
+        -- subscribes to) can be confirmed from observed live wiring. Every other edge is a
         -- production edge that lives inside handler code and is invisible to
         -- runtime introspection; by default the validator checks such edges for
         -- endpoint existence and grammar only. A service MAY opt in to confirming
@@ -242,7 +247,11 @@ variant Query : Block {
 -- An asynchronous reactor that subscribes to event topics (confirmed against the
 -- live runtime) and issues commands.
 variant TodoProcessor : Block {
+    -- The event topics it subscribes to at runtime (the trigger; confirmed
+    -- against the live :topics). This is trigger wiring, not the flow input edge.
     subscribes: Event with processor_subscriber = this
+    -- The queries it works from — the "TODO list", and its modeled INPUT edge.
+    reads: Query with processor_reader = this
     produces: Command with processor_producer = this
 }
 

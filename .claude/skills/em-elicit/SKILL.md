@@ -91,7 +91,8 @@ create-invoice command and an invoice-created event"), skip to Phase 2.
 
 Translate as you listen: a thing that HAPPENS by decision -> a **command**; a fact
 that gets RECORDED -> an **event**; a thing you READ -> a **query** over a
-**read-model**; a reaction to a fact -> a **todo-processor**; a schedule -> a
+**read-model**; an automation that works a "TODO list" (reads a query
+and issues a command) -> a **todo-processor**; a schedule -> a
 **periodic-task**; a user surface -> a **screen**.
 
 ### Phase 1 — Scope (the area)
@@ -155,13 +156,18 @@ The legal adjacency (`(tools/guide :flows)`):
 
 ```
 command        -> event
-event          -> read-model | todo-processor
-read-model     -> query | command | screen
-query          -> screen
+event          -> read-model
+read-model     -> command | query
+query          -> screen | todo-processor
 screen         -> command
 todo-processor -> command
 periodic-task  -> command | event
 ```
+Read-models feed only commands and queries (never a screen/processor directly). A
+todo-processor's input is a query (the "TODO list"), NOT a read-model or a raw
+event (`event -> todo-processor` and `read-model -> todo-processor` are rejected);
+the processor's event `:subscribes` is its runtime trigger, recorded as wiring,
+not a flow edge.
 
 Trace the happy path first ("if we built one path through this area, what is
 it?"), then add reaction and scheduled flows. Validate:
@@ -177,7 +183,8 @@ it?"), then add reaction and scheduled flows. Validate:
 Declare each block's dependency edges so the graph is explicit and matches the
 def-site annotations the runtime carries:
 - command/query `:reads` (read-models); command `:produces` (events);
-- read-model `:consumes`; todo-processor `:subscribes` [+ `:produces` commands];
+- read-model `:consumes`; todo-processor `:subscribes` (event trigger) + `:reads`
+  (its TODO-list query — the modeled input) [+ `:produces` commands];
   periodic `:produces`;
 - screen `:queries`/`:commands`.
 
@@ -191,9 +198,9 @@ Validate:
 (tools/event-model-coverage model)   ; bidirectional drift: in-model-not-live, and vice-versa
 ```
 
-Only `event -> read-model` and `event -> todo-processor` are confirmable against
-real wiring (read-model `:consumes` / processor `:topics`); `:wiring/mismatch`
-flags drift there. Every other edge is a production edge inside a handler body —
+Only `event -> read-model` (read-model `:consumes`) and a processor's event
+`:subscribes` (vs live `:topics`) are confirmable against real wiring;
+`:wiring/mismatch` flags drift there. Every other edge is a production edge inside a handler body —
 checked for endpoint existence + grammar only (the validator never claims a
 producer actually produces).
 

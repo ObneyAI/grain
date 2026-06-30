@@ -109,12 +109,15 @@
     [:schema :event-model/malli-schema]
     [:reads {:optional true} [:set :event-model/block-name]]]           ; read-models read
 
-   ;; defprocessor — an async reactor subscribing to event :topics
-   ;; (cross-checked against the live :topics set) and issuing commands.
+   ;; defprocessor — an async reactor. At runtime it SUBSCRIBES to event :topics
+   ;; (the trigger, cross-checked against the live :topics set); the modeled INPUT
+   ;; edge, however, is the read-model/query it works from (the "TODO list") — see
+   ;; the connection grammar. It issues commands.
    :event-model/todo-processor
    [:map
     [:description :string]
-    [:subscribes [:set :event-model/block-name]]                        ; event topics subscribed
+    [:subscribes [:set :event-model/block-name]]                        ; event topics subscribed (runtime trigger)
+    [:reads {:optional true} [:set :event-model/block-name]]            ; queries it works from (the TODO list — its modeled input)
     [:produces {:optional true} [:set :event-model/block-name]]]        ; commands issued
 
    ;; defperiodic — a scheduled reactor; the handler returns :result/events, so

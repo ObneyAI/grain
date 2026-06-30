@@ -66,7 +66,7 @@ kind-partitioned and flow endpoints are kind-qualified.
 | `event` | `->event` | `:schema` (body) | schema registry + consumption sets |
 | `read-model` | `defreadmodel` | `:consumes`, optional `:schema`/`:version` | read-model registry + `:events` |
 | `query` | `defquery` | `:schema` (params), `:reads` | query registry + schema + `:authorized?` |
-| `todo-processor` | `defprocessor` | `:subscribes`, `:produces` | processor registry + `:topics` |
+| `todo-processor` | `defprocessor` | `:subscribes` (event trigger), `:reads` (the TODO-list **query** — its modeled input), `:produces` | processor registry + `:topics` |
 | `periodic-task` | `defperiodic` | `:schedule` (a map), `:produces` | periodic registry + `:schedule` |
 | `screen` | — (design-only) | `:queries`, `:commands` | none (deps checkable) |
 
@@ -79,8 +79,9 @@ document intent and are never executed.
 Each block declares its dependencies as **kind-typed intent edges**, so the graph
 is expressible without authoring full flows: a screen's `:queries`/`:commands`; a
 command's/query's `:reads` (read-models); a command's `:produces` (events); a
-read-model's `:consumes` (events); a todo-processor's `:subscribes` (events) and
-`:produces` (commands); a periodic-task's `:produces`. The validator type-checks
+read-model's `:consumes` (events); a todo-processor's `:subscribes` (event
+trigger), `:reads` (the **query** "TODO list" it works from — its modeled input
+edge) and `:produces` (commands); a periodic-task's `:produces`. The validator type-checks
 each edge — the target must exist *and* be of the expected kind. A screen is
 commonly 1:1 with a single query but may compose several or none.
 
@@ -94,17 +95,27 @@ Legal CQRS adjacency:
 
 ```
 command        -> event
-event          -> read-model | todo-processor
-read-model     -> query | command | screen
-query          -> screen
+event          -> read-model
+read-model     -> command | query
+query          -> screen | todo-processor
 screen         -> command
 todo-processor -> command
 periodic-task  -> command | event
 ```
 
-Only `event -> read-model` and `event -> todo-processor` are **confirmable
-against live wiring** (read-model `:consumes` / processor `:topics`). Every other
-edge is a *production* edge that lives inside handler bodies and is invisible to
+**Read-models are internal projections**: they feed only **commands** (read for
+validation) and **queries** (the read API) — never a screen, todo-processor, or
+periodic-task directly. Everything user- or automation-facing reads through a
+**query**: `query -> screen`, and `query -> todo-processor` (an automation's
+"TODO list" is a query). A **todo-processor's modeled input is therefore a
+query**, never a raw event — the processor still **subscribes** to event `:topics`
+at runtime (recorded as `:subscribes`, confirmed against the live `:topics`), but
+that is trigger wiring, **not a flow edge** (`event -> todo-processor` and
+`read-model -> todo-processor` are both rejected as `:flow/illegal-connection`).
+
+Only `event -> read-model` (read-model `:consumes`) and a processor's event
+`:subscribes` (vs live `:topics`) are **confirmable against live wiring**. Every
+other edge is a *production* edge that lives inside handler bodies and is invisible to
 runtime introspection, so it is checked for endpoint existence + grammar only —
 the validator never claims a producer actually produces.
 

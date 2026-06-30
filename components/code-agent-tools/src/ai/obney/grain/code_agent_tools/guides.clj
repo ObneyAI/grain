@@ -7,8 +7,28 @@
 
    These are the part an agent cannot reconstruct from docstrings alone: the
    end-to-end workflow, the event-model spec format, the flow grammar, and how to
-   resolve each validation finding."
-  (:require [ai.obney.grain.code-agent-tools.core :as core]))
+   resolve each validation finding.
+
+   The flow grammar is rendered FROM the validator's connection-grammar (the
+   single source of truth) so the guide cannot drift from what is enforced."
+  (:require [ai.obney.grain.code-agent-tools.core :as core]
+            [ai.obney.grain.event-model-validator.interface :as emv]
+            [clojure.string :as str]))
+
+(def ^:private kind-order
+  [:command :event :read-model :query :screen :todo-processor :periodic-task])
+
+(defn- render-adjacency
+  "Render the validator's connection-grammar as an aligned `from -> a | b` table,
+   so the guide is generated from the enforcer and can never disagree with it."
+  [grammar]
+  (let [present (filter #(seq (get grammar %)) kind-order)
+        w (apply max 0 (map (comp count name) present))
+        ord (fn [k] (.indexOf kind-order k))]
+    (str/join "\n"
+              (for [k present]
+                (str "  " (format (str "%-" w "s") (name k)) " -> "
+                     (str/join " | " (map name (sort-by ord (get grammar k)))))))))
 
 (core/register-guide!
  {:id :getting-started
@@ -66,9 +86,12 @@ query (read side of CQRS), todo-processor, periodic-task, screen.
 
 Dependency graph as kind-typed intent edges (optional, design-time): command
 `:reads` read-models + `:produces` events; query `:reads` read-models; read-model
-`:consumes` events; todo-processor `:subscribes` events + `:produces` commands;
+`:consumes` events; todo-processor `:subscribes` events (the runtime trigger) +
+`:reads` a query (its TODO list — the modeled input) + `:produces` commands;
 periodic-task `:produces` events/commands; screen `:queries` queries + `:commands`
 commands. The validator checks each target exists AND is the expected kind.
+(Read-models feed only commands and queries; screens and todo-processors read
+through a query — see `(guide :flows)`.)
 
 `:schedule` is a MAP: {:every N :duration :seconds} or {:cron \"...\"}.
 Given/When/Then go on commands as DATA ({:given :when :then}); they are not
@@ -80,7 +103,8 @@ executed. See `(guide :flows)` and `(guide :findings)`."})
   :summary "How to wire blocks into flows and which connections are legal."
   :applies-to :concept
   :body
-  "A flow is a named, ordered chain of steps under an area's :flows
+  (str
+   "A flow is a named, ordered chain of steps under an area's :flows
 (keyed :<area>/<flow>). Each step is {:from <endpoint> :to <endpoint>}. An
 endpoint is KIND-QUALIFIED — [kind :<area>/<name>] — or nil for an entry
 point / terminus marker:
@@ -91,20 +115,30 @@ point / terminus marker:
             {:from [:command :example/increment-counter] :to [:event :example/counter-incremented]}
             {:from [:event :example/counter-incremented]  :to [:read-model :example/counters]}]}}
 
-Legal CQRS adjacency (validated):
-  command        -> event
-  event          -> read-model | todo-processor
-  read-model     -> query | command | screen
-  query          -> screen
-  screen         -> command
-  todo-processor -> command
-  periodic-task  -> command | event
+Legal CQRS adjacency (rendered from the validator's connection-grammar — the
+single source of truth, so this never drifts from what is enforced):
 
-Only event->read-model and event->todo-processor are confirmable against live
-wiring (read-model :consumes / processor :topics). Production edges
-(command->event etc.) are checked for endpoint existence + grammar only — the
-runtime cannot confirm a producer actually produces. A flow should be a connected
-chain: a step's :from must be a prior step's :to (or nil to mark an entry)."})
+" (render-adjacency emv/connection-grammar) "
+
+Read-models are INTERNAL projections: they feed only commands (validation reads)
+and queries (the read API) — never a screen, todo-processor, or periodic-task
+directly. Everything user/automation-facing reads through a QUERY. So the
+automation pattern is:
+
+  command -> event -> read-model -> query -> todo-processor -> command
+
+A todo-processor's INPUT edge is a query (its \"TODO list\"); its event :subscribes
+is the runtime TRIGGER (recorded as wiring, confirmed against the live :topics),
+NOT a flow edge — event -> todo-processor and read-model -> todo-processor are
+both rejected. Screens are fed by a query (query -> screen), never a read-model
+directly.
+
+Only event -> read-model (read-model :consumes) and a processor's event
+:subscribes (vs live :topics) are confirmable against live wiring. Production
+edges (command -> event, todo-processor -> command, periodic -> event) are
+checked for endpoint existence + grammar only — the runtime cannot confirm a
+producer actually produces. A flow should be a connected chain: a step's :from
+must be a prior step's :to (or nil to mark an entry).")})
 
 (core/register-guide!
  {:id :findings
@@ -167,7 +201,8 @@ A system using verify-or-throw! at boot refuses to start while any fatal finding
   query    (defquery)     — reads projections. Spec: :description, :schema (params),
             :reads (read-models). Live: query registry + param schema + :authorized?.
   todo-processor (defprocessor) — async reactor. Spec: :description, :subscribes
-            (event topics), :produces (commands). Live: processor registry + :topics.
+            (event topics — the runtime trigger), :reads (the query TODO list — its
+            modeled input edge), :produces (commands). Live: processor registry + :topics.
   periodic-task (defperiodic) — scheduled reactor. Spec: :description, :schedule
             (map), :produces. Live: periodic-trigger registry + :schedule.
   screen   (design-only — no grain macro) — Spec: :description, :queries, :commands.

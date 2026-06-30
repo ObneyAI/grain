@@ -15,6 +15,15 @@
   "Source metadata (var/ns/file/line/doc/arglists) for a var, or nil." [x]
   (core/source-info x))
 
+(def connection-grammar
+  "The legal CQRS flow adjacency {from-kind -> #{to-kinds}} the validator enforces.
+   The single source of truth — render docs/guides FROM this so they can't drift."
+  core/connection-grammar)
+
+(def intent-edges
+  "Per-kind dependency-edge fields and the kind(s) each target must be."
+  core/intent-edges)
+
 (defn catalog
   "Sanitized EDN view of the live grain registries (commands/queries/read-models/
    processors/periodic-triggers/schemas + missing-schema diagnostics)."

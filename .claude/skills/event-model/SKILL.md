@@ -106,7 +106,8 @@ keyword — so `:<area>/<name>` is *not* unique across kinds (in `:example`,
 
 Kinds and their fields: **command** `:schema :reads :produces :given-when-thens`;
 **event** `:schema`; **read-model** `:consumes` (+ optional `:schema`/`:version`);
-**query** `:schema :reads`; **todo-processor** `:subscribes :produces`;
+**query** `:schema :reads`; **todo-processor** `:subscribes` (event trigger)
+`:reads` (its TODO-list query — the modeled input) `:produces`;
 **periodic-task** `:schedule :produces` (`:schedule` is a **map**: `{:every 30
 :duration :seconds}` or `{:cron "..."}`); **screen** (design-only) `:queries
 :commands`. Given/When/Then are **data**, never executed by the validator.
@@ -116,14 +117,19 @@ Kinds and their fields: **command** `:schema :reads :produces :given-when-thens`
 exists *and* is the expected kind). **Flow** adjacency grammar:
 
 ```
-command -> event       event -> read-model | todo-processor
-read-model -> query | command | screen      query -> screen
+command -> event       event -> read-model
+read-model -> command | query      query -> screen | todo-processor
 screen -> command      todo-processor -> command      periodic-task -> command | event
 ```
 
-Only `event -> read-model` and `event -> todo-processor` are confirmable against
-live wiring (read-model `:consumes` / processor `:topics`); the rest live inside
-handler bodies and are checked for endpoint existence + grammar only.
+**Read-models feed only commands and queries** — never a screen, todo-processor,
+or periodic-task directly; everything user/automation-facing reads through a
+**query**. A **todo-processor's input is a query** (the "TODO list"), never a
+read-model or a raw event — `event -> todo-processor` and `read-model ->
+todo-processor` are rejected. The processor still `:subscribes` event topics at
+runtime (the trigger, confirmed vs live `:topics`), but that is wiring, not a flow edge. Only `event -> read-model` (read-model `:consumes`) and a
+processor's event `:subscribes` (vs `:topics`) are confirmable against live
+wiring; the rest live inside handler bodies, checked for existence + grammar only.
 
 **Def-site declarations** mirror the production/read edges as handler opts —
 required by the strict boot-guard:

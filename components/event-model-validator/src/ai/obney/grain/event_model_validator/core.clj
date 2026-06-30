@@ -121,11 +121,22 @@
 ;; Structural validation
 ;; ===========================================================================
 
-(def ^:private connection-grammar
+;; CQRS data-flow adjacency for FLOW steps. Read-models are INTERNAL projections:
+;; they feed only COMMANDS (read for validation) and QUERIES (the read API) — never
+;; a screen, todo-processor, or periodic-task directly. Everything user- or
+;; automation-facing reads through a QUERY: query -> screen, and query ->
+;; todo-processor (the automation's "TODO list" is a query). A todo-processor's
+;; modeled input is therefore a query, NOT a raw event — the processor still
+;; SUBSCRIBES to event topics at runtime (trigger wiring, recorded as :subscribes
+;; and confirmed against the live :topics), but that is not a flow edge.
+(def connection-grammar
+  "The legal CQRS flow adjacency {from-kind -> #{to-kinds}} the validator enforces
+   (via step-findings -> :flow/illegal-connection). The single source of truth for
+   the grammar — docs/guides should render FROM this, not duplicate it."
   {:command        #{:event}
-   :event          #{:read-model :todo-processor}
-   :read-model     #{:query :command :screen}
-   :query          #{:screen}
+   :event          #{:read-model}
+   :read-model     #{:command :query}
+   :query          #{:screen :todo-processor}
    :screen         #{:command}
    :todo-processor #{:command}
    :periodic-task  #{:command :event}})
@@ -137,11 +148,13 @@
 (def ^:private all-kinds
   [:command :event :read-model :query :todo-processor :periodic-task :screen])
 
-(def ^:private intent-edges
+(def intent-edges
+  "Per-kind dependency-edge fields and the kind(s) each target must be. The
+   companion to connection-grammar for non-flow (intent) edges."
   {:command        {:reads #{:read-model} :produces #{:event}}
    :query          {:reads #{:read-model}}
    :read-model     {:consumes #{:event}}
-   :todo-processor {:subscribes #{:event} :produces #{:command}}
+   :todo-processor {:subscribes #{:event} :reads #{:query} :produces #{:command}}
    :periodic-task  {:produces #{:event :command}}
    :screen         {:queries #{:query} :commands #{:command}}})
 

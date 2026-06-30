@@ -5,9 +5,11 @@
    def* macros populate the global registries at load time — so the validator
    runs against the LIVE :example area with no `install!`."
   (:require [ai.obney.grain.code-agent-tools.interface :as tools]
+            [ai.obney.grain.event-model-validator.interface :as emv]
             [ai.obney.grain.example-base.core]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
 
 (def sample
@@ -96,6 +98,23 @@
                                       conj {:from [:event :example/counter-incremented]
                                             :to [:command :example/increment-counter]})))
                    :flow/illegal-connection)))
+  (testing "a todo-processor's only legal input is a query (not event, not read-model)"
+    (let [illegal? (fn [from]
+                     (contains? (types (tools/validate-event-model
+                                        (update-in sample [:example :flows :example/counter-lifecycle :steps]
+                                                   conj {:from from
+                                                         :to [:todo-processor :example/calculate-average-counter-value]})))
+                                :flow/illegal-connection))]
+      (is (illegal? [:event :example/counter-incremented]))   ; event -> todo-processor illegal
+      (is (illegal? [:read-model :example/counters]))          ; read-model -> todo-processor illegal
+      (is (not (illegal? [:query :example/counters])))))       ; query -> todo-processor legal
+  (testing "read-models feed only commands and queries (not screens)"
+    (let [illegal? (fn [step]
+                     (contains? (types (tools/validate-event-model
+                                        (update-in sample [:example :flows :example/counter-lifecycle :steps] conj step)))
+                                :flow/illegal-connection))]
+      (is (illegal? {:from [:read-model :example/counters] :to [:screen :example/dashboard]}))        ; read-model -> screen illegal
+      (is (not (illegal? {:from [:read-model :example/counters] :to [:command :example/increment-counter]}))))) ; read-model -> command legal
   (testing "flow endpoint names a non-existent block -> :flow/dangling-reference"
     (is (contains? (types (tools/validate-event-model
                            (update-in sample [:example :flows :example/counter-lifecycle :steps]
@@ -158,6 +177,22 @@
   (testing "committed example resource validates"
     (when-let [r (io/resource "example.event-model.edn")]
       (is (true? (:valid? (tools/validate-event-model (edn/read-string (slurp r)))))))))
+
+(deftest flows-guide-is-generated-from-the-connection-grammar
+  ;; Guards against the guide drifting from the enforcer: every adjacency in the
+  ;; validator's connection-grammar must appear on the matching line of the
+  ;; rendered :flows guide (matched at line start, padding-agnostic).
+  (let [lines (str/split-lines (:body (tools/guide :flows)))
+        line-for (fn [from] (some #(when (str/starts-with? (str/trim %) (str (name from) " ")) %) lines))]
+    (doseq [[from tos] emv/connection-grammar]
+      (let [line (line-for from)]
+        (is (some? line) (str "flows guide has no adjacency line for " from))
+        (doseq [to tos]
+          (is (and line (str/includes? line (name to)))
+              (str "flows guide is missing the edge " from " -> " to)))))
+    (testing "the now-illegal event -> todo-processor edge is not presented as legal"
+      (is (not (str/includes? (or (line-for :event) "") "todo-processor"))
+          "flows guide still lists the stale event -> todo-processor edge"))))
 
 (deftest guides-are-served-from-the-runtime
   (let [idx (:guides (tools/guides))]

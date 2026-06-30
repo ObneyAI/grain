@@ -112,14 +112,14 @@ A model edit ripples. Before writing, check the edges your change creates or bre
 **Respect the connection grammar** (the only legal flow adjacencies):
 ```
 command        -> event
-event          -> read-model | todo-processor
-read-model     -> query | command | screen
-query          -> screen
+event          -> read-model
+read-model     -> command | query
+query          -> screen | todo-processor
 screen         -> command
 todo-processor -> command
 periodic-task  -> command | event
 ```
-Only `event -> read-model` and `event -> todo-processor` are confirmable against live wiring; the rest are checked for endpoint existence + grammar only — so a clean flow proves shape, not that a handler emits.
+Read-models feed only commands and queries (never a screen/processor directly). A todo-processor's input is a query (the "TODO list"), NOT a read-model or a raw event — `event -> todo-processor` and `read-model -> todo-processor` are rejected; the processor's event `:subscribes` is its runtime trigger (wiring, not a flow edge). Only `event -> read-model` (read-model `:consumes`) and a processor's event `:subscribes` (vs live `:topics`) are confirmable against live wiring; the rest are checked for endpoint existence + grammar only — so a clean flow proves shape, not that a handler emits.
 
 **Be minimal.** Add what the request needs and nothing more. Do not speculatively add fields, events, or edges. Do not restructure a working model for aesthetics. Preserve the area keyword and existing blocks unless the change requires otherwise.
 
