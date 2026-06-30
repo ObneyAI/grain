@@ -258,12 +258,21 @@ system, so an agent can bootstrap itself without external docs:
 
 Each `catalog` block entry also carries an `:instructions {:guide <name>}` pointer.
 
-## Authoring workflow
+## Authoring workflow — the skill suite
 
-Today specs are hand-authored (or distilled from `catalog`). The format is
-designed so the Allium-style skill suite (elicit / distill / propagate / tend /
-weed) can slot in later: `distill` fills the introspectable skeleton from
-`catalog`; `weed` is the spec↔live drift the validator already reports;
-`tend`/`elicit` target `validate-event-model-var`. Executable Given/When/Then
-(running the example via `invoke-command!` and asserting the emitted events) is a
-planned follow-on; the schema already carries the examples as data.
+A grain-native, Allium-parity skill suite drives the REPL loop. The skills live as
+project skills under `.claude/skills/` and operate on the `defeventmodel` EDN model
+using the validator as the oracle (not a static checker):
+
+| Skill | Does |
+|---|---|
+| `event-model` | entry point / router — the format, the REPL oracle, the loop; points you at a verb |
+| `em-elicit` | build a new service-area model from intent through conversation |
+| `em-distill` | reverse-engineer a model from existing handlers (`catalog` → skeleton, then fill descriptions/GWT/edges) |
+| `em-propagate` | generate tests from the model — structural (strict `validate-event-model`) **and executable** Given/When/Then via `invoke-command!` → `events`/`projection` |
+| `em-tend` | targeted edits to a `defeventmodel`, keeping def-site `produces`/`reads` in sync |
+| `em-weed` | reconcile model ↔ live runtime — the validator already computes the drift |
+
+`em-propagate`'s executable Given/When/Then closes the **declaration ↔ behaviour**
+gap noted above: it turns each command's `:given-when-thens` (carried as data) into
+a real test that exercises the command and asserts the emitted events/projection.
