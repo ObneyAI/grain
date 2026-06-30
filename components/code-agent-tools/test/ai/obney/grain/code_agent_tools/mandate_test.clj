@@ -48,3 +48,17 @@
     (let [v (emv/validate-event-model (em/registered-model))]
       (is (true? (:valid? v)))
       (is (false? (get-in v [:summary :strict]))))))
+
+(deftest structural-only-validates-a-foreign-model
+  (testing "a non-grain model passes structural-only even with the grain runtime loaded"
+    (let [foreign {:billing {:commands {:billing/charge {:description "x" :schema [:map]
+                                                         :reads #{:billing/invoices} :produces #{:billing/charged}}}
+                             :events {:billing/charged {:description "x" :schema [:map]}}
+                             :read-models {:billing/invoices {:description "x" :consumes #{:billing/charged}}}}}
+          with (emv/validate-event-model foreign {:structural-only true})
+          without (emv/validate-event-model foreign)]
+      (is (true? (:valid? with)))
+      (is (false? (get-in with [:summary :runtime/registries-present?])))
+      ;; without the opt, the loaded grain runtime correctly flags the foreign blocks
+      (is (false? (:valid? without)))
+      (is (contains? (set (map :type (:findings without))) :block/undeclared)))))

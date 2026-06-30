@@ -467,7 +467,11 @@
                       model false opts)
        (let [cat (try (catalog) (catch Exception _ nil))
              live (when cat (live-model cat))
-             present? (boolean (and live (registries-present? live)))
+             ;; :structural-only forces spec-internal checks even when grain
+             ;; registries ARE loaded — used to distil/validate a model for a
+             ;; FOREIGN (non-grain) system without the live-comparison checks
+             ;; flagging every block as undeclared.
+             present? (boolean (and live (not (:structural-only opts)) (registries-present? live)))
              strict? (boolean (:strict opts))
              fs (concat
                  (check-namespacing model)

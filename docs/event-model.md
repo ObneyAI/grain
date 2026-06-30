@@ -268,7 +268,7 @@ using the validator as the oracle (not a static checker):
 |---|---|
 | `event-model` | entry point / router — the format, the REPL oracle, the loop; points you at a verb |
 | `em-elicit` | build a new service-area model from intent through conversation |
-| `em-distill` | reverse-engineer a model from existing handlers (`catalog` → skeleton, then fill descriptions/GWT/edges) |
+| `em-distill` | reverse-engineer a model from existing code — **any system, grain or not** (reads source → EDN, validated structurally; grain-enhanced via `catalog` when on grain). Documents a foreign system or seeds a migration to grain |
 | `em-propagate` | generate tests from the model — structural (strict `validate-event-model`) **and executable** Given/When/Then via `invoke-command!` → `events`/`projection` |
 | `em-tend` | targeted edits to a `defeventmodel`, keeping def-site `produces`/`reads` in sync |
 | `em-weed` | reconcile model ↔ live runtime — the validator already computes the drift |

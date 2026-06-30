@@ -52,7 +52,7 @@ where to go. For the actual work, hand off:
 |---|---|---|
 | Understand the model grammar, the REPL oracle, the loop, or which verb to use | **this skill** (`event-model`) | you need vocabulary or a routing decision |
 | Build a new area/model from intent or conversation | `em-elicit` | a feature is described and **no** model exists yet; surface ambiguity before code |
-| Reverse-engineer a model from existing handlers | `em-distill` | handlers exist; fill the introspectable skeleton from `(catalog)` |
+| Reverse-engineer a model from existing code | `em-distill` | a system already exists — **grain or not**. Reads source → EDN model (structural validation); on a grain app, additionally scaffolds from `(catalog)` and validates against the live oracle. Also the migration-blueprint path |
 | Make targeted edits to a `defeventmodel` | `em-tend` | add/rename/restructure blocks, intent edges, flows, or GWT; resolve a finding by editing the model |
 | Turn the model into tests | `em-propagate` | drive Given/When/Then into executable checks via `invoke-command!` / `events` |
 | Reconcile model ↔ live runtime | `em-weed` | `validate-event-model` / `event-model-coverage` shows drift and you must decide model-vs-code |

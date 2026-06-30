@@ -1,314 +1,189 @@
 ---
 name: em-distill
-description: "Extract a grain event model from EXISTING code. Use when the user has running grain handlers (defcommand/defquery/defreadmodel/defprocessor/defperiodic) and wants to reverse-engineer, scaffold, or generate a (defeventmodel :area {...}) from the live catalog; document an undocumented service area; capture what an app already does as an event model; turn implementation into a service-area-first model; or bootstrap a model before mandating it with the boot-guard. The code-from-model counterpart of Allium's /distill, but driven by the live grain REPL oracle instead of static files."
+description: >-
+  Distil a service-area-first event model from an EXISTING system by reading its
+  code — works on ANY codebase, grain or not (a Rails/Node/Java/Clojure service,
+  a monolith, a foreign event-sourced system). Maps what the system does onto the
+  event-model vocabulary (commands / events / read-models / queries /
+  todo-processors / periodic-tasks / screens / flows) and emits an EDN model
+  validated structurally with `validate-event-model`. When the target IS a grain
+  app with a running nREPL, it additionally uses the live `catalog` as an
+  authoritative oracle and writes a `defeventmodel`. Use to understand/document a
+  system's CQRS / event-flow shape, or as the blueprint to (re)implement it in
+  grain. For a NEW model from intent use em-elicit; to reconcile an existing grain
+  model against its runtime use em-weed; for targeted edits use em-tend.
 ---
 
-# em-distill — distill an event model from live grain code
+# Em-Distil — extract an event model from an existing system
 
-## Purpose
+`em-distill` reverse-engineers a **service-area-first event model** from a system
+that already exists, by **reading its code**. It is the grain parity of Allium's
+`/distill`, and like Allium it does **not** require the target to be a grain
+project — any codebase can be distilled into the event-model vocabulary.
 
-Turn a *running* grain service area into a `(defeventmodel :area {...})`. Unlike
-Allium distillation (which reads source text with "no compiler, no runtime"),
-grain hands you a **live oracle**: requiring the app's base loads the handlers and
-populates the registries, and `(catalog)` reports them as structured data. So the
-*structural* skeleton — kinds, schemas, consumed-event wiring, schedules,
-def-site edges — is **read off the runtime mechanically**, not guessed from code.
+There are two modes, and the **source mode is the base** (it works everywhere):
 
-What remains is the same judgement Allium's `/distill` is about: choosing the
-**service area**, writing **domain-level descriptions** (why a stakeholder cares,
-not how the handler works), authoring **Given/When/Then** intent, and drawing the
-**screens and flows** the runtime cannot see. You drive the result to correctness
-with `validate-event-model` / `event-model-coverage` against the live system —
-the grain equivalent of `allium check` / `analyse`.
+| Mode | When | Input / oracle | Output | Validation |
+|---|---|---|---|---|
+| **Source** (default) | any system, grain or not | you READ the code | a plain EDN model `{:area {…}}` in a file | `validate-event-model` — degrades to **structural-only** checks (no runtime) |
+| **Grain-enhanced** | target is a grain app with a running nREPL (:7888) | the live `catalog` registries | a `(defeventmodel :area {…})` form | the **authoritative** oracle (coverage + schema + wiring against the real runtime) |
 
-The output is `defeventmodel` EDN (grain's analogue of a `.allium` file),
-registered in a namespace like `your-app.interface.event-model`.
+If the system isn't grain, you only have the source mode — and that is fine: the
+validator is built to degrade gracefully (it runs shape, connection-grammar,
+referential-integrity, kind-typing and flow-continuity checks with no registries
+loaded, and reports `:runtime/registries-present? false`). What it *cannot* do
+without a runtime is confirm coverage or that schemas match a live registry — for
+a foreign system that is the human's job (review for semantic accuracy).
 
-## When to use
+## When to use this vs a sibling (Boundaries)
 
-- There are live grain handlers but **no model yet**, or a partial/stale one, and
-  you want the model scaffolded from what is actually running.
-- You want to **document a service area** and eventually MANDATE it with
-  `verify-or-throw!` (full coverage + declared edges + GWT).
-- You inherited code and need to see, as data, *what blocks exist and how they
-  wire* before changing anything.
+- **em-distill** — a system already exists and you want its event model *out of
+  the code*. Both for a foreign system (document / migration blueprint) and for a
+  grain app (authoritative distillation from the runtime).
+- **em-elicit** — no system yet; build the model forward from intent/conversation.
+- **em-weed** — a grain model already exists and you must reconcile it against the
+  live runtime (resolve drift). Distil produces the first draft; weed keeps it honest.
+- **em-tend** — targeted edits to an existing model.
+- **em-propagate** — turn a model into tests.
 
-## When NOT to use (boundaries — name the sibling that owns the work)
+## The model you are producing
 
-- **No code yet — designing from intent/conversation** → `em-elicit` (intent →
-  model). Distill needs a populated catalog; elicit does not.
-- **Editing, extending, renaming, or fixing an existing model** → `em-tend`.
-  Distill *creates* a skeleton from runtime; tend *evolves* a model deliberately.
-- **Turning a model into tests / executable Given-When-Then** → `em-propagate`.
-- **A model that has drifted from the running system; reconciling spec ↔ runtime**
-  → `em-weed`. Distill is first-extraction; weed is ongoing reconciliation.
-- **You just need the format, the finding taxonomy, or the entry point** →
-  `event-model` (the suite entry) or `(tools/guide :event-model)` /
-  `(tools/guide :findings)`.
+A map of **service areas** (bounded contexts), each owning its blocks and flows;
+blocks keyed `:<area>/<name>`, kind from structural position (see the
+`event-model` skill for the full grammar). For a non-grain system you write plain
+EDN; for a grain app you write a `(defeventmodel :area {…})`. Same shape either way.
 
-If distillation surfaces genuine gaps (a block whose intent nobody can state),
-hand that block to `em-elicit`, then come back.
+## Mapping a foreign system onto the event-model vocabulary
 
-## The oracle (the key difference from Allium)
+Read the code and classify. The point is to capture **observable behaviour and
+data flow**, not implementation. Typical source → kind mappings:
 
-All calls go through the dev-only re-export
-`ai.obney.grain.code-agent-tools.interface` (aliased `tools`), evaluated in the
-**running app's nREPL (default :7888)** — or a fresh REPL that has
-`(require 'your-app.base)`, which loads the handlers (registries populate at
-namespace load). Validation is **structural only**: no `install!`,
-no `invoke-command!`, no state mutation. The same checks run shippably from
-`ai.obney.grain.event-model-validator.interface` (`verify-event-model!` /
-`verify-or-throw!`).
+| What you find in the code | event-model kind |
+|---|---|
+| a write endpoint / mutation / RPC that changes state; a "do X" use-case / service method / command handler | **command** (`:schema` ≈ the request/params shape; `:produces` = the events it causes; `:reads` = state it consults) |
+| a domain fact / "X happened" record; rows appended to an event/audit table; a message published to a bus/topic; a webhook emitted | **event** (`:schema` = the fact's payload) |
+| a materialized view / denormalized/read table / cache / projection rebuilt from events or write-side changes | **read-model** (`:consumes` = the events that update it) |
+| a read endpoint / GET / query handler / report that returns view data | **query** (`:schema` = params; `:reads` = the read-models it serves from) |
+| a background worker / message consumer / reactor / saga / process-manager that responds to events and triggers more work | **todo-processor** (`:subscribes` = events; `:produces` = commands it issues) |
+| a cron job / scheduled task / timer | **periodic-task** (`:schedule` map; `:produces`) |
+| a UI page / screen / view template | **screen** (design-only; `:queries` shown, `:commands` issued) |
+| an end-to-end user or system journey across the above | **flow** (kind-qualified `[kind :area/name]` step chain) |
+| a bounded context / top-level module / domain package / microservice | a **service area** (the `:<area>` key) |
 
-Calls you will use, exactly as defined (do not invent others):
+If the system is **already event-sourced** (an event store, CQRS, or a message
+bus), this is close to mechanical — its events and commands map almost directly.
+If it is a CRUD monolith, infer the *implied* events: a state-changing operation
+that today just `UPDATE`s a row is a **command** whose **event** is the change it
+represents ("OrderShipped"), and the rows it reads are an implied **read-model**.
 
-```clojure
-(require '[ai.obney.grain.code-agent-tools.interface :as tools])
+## Abstraction discipline (filter implementation)
 
-(tools/catalog)                       ; live blocks (all kinds) + schemas + diagnostics
-(tools/schemas)                       ; the live schema registry
-(tools/explain-schema :area/block)    ; one registered schema, sanitized
-(tools/event-model-coverage {})       ; everything live is :uncovered → the worklist
-(tools/event-model-coverage model)    ; narrows as you fill the area
-(tools/validate-event-model model)             ; lenient verdict {:valid? :summary :findings}
-(tools/validate-event-model model {:strict true}) ; the boot-guard gate
-(tools/validate-event-model-var 'your-app.interface.event-model/...) ; if registered
-(tools/guides) (tools/guide :findings) (tools/guide :event-model)
-(tools/guide :area/block {:spec model}) ; usage card: docstring + live schema + your spec
-```
+Borrow Allium's distillation tests on every block — keep the *what/why*, drop the
+*how*:
 
-## Process
+1. **Why does the stakeholder care?** If the answer is purely technical (a cache, a
+   retry, a serializer), it is implementation — leave it out.
+2. **Could it be implemented differently and still be the same system?** If yes,
+   the differing detail (Postgres vs Mongo, REST vs gRPC, which library) is
+   implementation — exclude it.
+3. **Template vs instance?** Model the *kind* of thing, not one concrete record.
 
-### 1. Connect the oracle and confirm it is live
+Exclude: DB schemas/migrations, framework/transport, auth mechanics, algorithms,
+pagination, logging. Include: the commands a user/other-system can issue, the
+events that result, the read models/queries they feed, the reactors and schedules,
+and how they wire into flows. Name areas after bounded contexts; name blocks for
+domain meaning (`:billing/charge-card`, not `:billing/post-handler`).
 
-In the app's nREPL (:7888), or a REPL where you have required the base:
+## Process — Source mode (any system)
 
-```clojure
-(require '[ai.obney.grain.code-agent-tools.interface :as tools])
-(tools/catalog)        ; non-empty maps of commands/queries/read-models/… ⇒ good
-```
+1. **Scope.** Pick the area(s) to distil (one bounded context at a time). State
+   Scope / Includes / Excludes.
+2. **Sweep the code** for each kind using the mapping table — write endpoints →
+   commands, state changes / published facts → events, views/reports → read-models
+   + queries, workers/consumers → todo-processors, cron → periodic-tasks, UI →
+   screens.
+3. **Apply the abstraction tests**; filter implementation; choose domain names.
+4. **Write the EDN model** to a file, e.g. `<area>.event-model.edn`:
+   ```clojure
+   {:billing
+    {:description "Billing context."
+     :commands {:billing/charge-card {:description "Charge a customer's card for an invoice."
+                                      :schema [:map [:invoice-id :uuid] [:amount :int]]
+                                      :reads #{:billing/invoices}
+                                      :produces #{:billing/card-charged :billing/charge-failed}
+                                      :given-when-thens [{:given "an open invoice" :when "charge-card" :then "a card-charged event"}]}}
+     :events {:billing/card-charged {:description "A card was charged." :schema [:map [:invoice-id :uuid] [:amount :int]]}
+              :billing/charge-failed {:description "A charge failed." :schema [:map [:invoice-id :uuid] [:reason :string]]}}
+     :read-models {:billing/invoices {:description "Invoices and their status." :consumes #{:billing/card-charged :billing/charge-failed}}}
+     :queries {:billing/invoice {:description "One invoice by id." :schema [:map [:invoice-id :uuid]] :reads #{:billing/invoices}}}
+     :flows {:billing/charge {:description "Charge an open invoice."
+                              :steps [{:from [:command :billing/charge-card] :to [:event :billing/card-charged]}
+                                      {:from [:event :billing/card-charged] :to [:read-model :billing/invoices]}]}}}}
+   ```
+   Notes for foreign systems: command/event/query `:schema` is **required** by the
+   format — write a best-effort malli schema (`[:map …]`, or `[:map]` if the shape
+   is unknown); it is checked for well-formedness, not matched against any runtime.
+   GWT is optional (good documentation; not enforced off-grain).
+5. **Validate structurally** over the REPL (no app needed):
+   ```clojure
+   (require '[ai.obney.grain.event-model-validator.interface :as emv])
+   (emv/validate-event-model-file "billing.event-model.edn" {:structural-only true})
+   ;; => {:valid? … :summary {… :runtime/registries-present? false} :findings […]}
+   ```
+   Pass `{:structural-only true}` for a foreign model — it forces the spec-internal
+   checks even if a grain app happens to be loaded in the same JVM (otherwise the
+   live-comparison checks would flag every foreign block as `:block/undeclared`).
+   Fix the structural findings until `:valid?` is true: `:model/malformed` (shape),
+   `:block/misnamespaced` (block ns ≠ area), `:schema/malformed`,
+   `:flow/illegal-connection` / `:flow/dangling-reference`, `:ref/dangling` /
+   `:ref/wrong-kind` (an intent edge naming a non-existent / wrong-kind block),
+   `:flow/discontinuous`. Coverage / schema-match / wiring findings will **not**
+   appear (no runtime) — that limit is expected; `:runtime/registries-present?
+   false` confirms you are in structural-only mode. The human reviews semantic
+   accuracy (did I read the system right?).
+6. **Repeat per area**; cross-area edges in a flow are fine (the validator resolves
+   refs across the whole model). Iterate until a fresh pass finds nothing new.
 
-If `catalog` is empty, the handlers are not loaded — `(require 'your-app.base)`
-(or the namespaces that hold the `def*` forms) and retry. An empty catalog means
-the validator degrades to spec-internal checks only, so distillation is blind.
+The result is a documented event model of the system — useful on its own to
+understand its CQRS/event-flow shape, and ready to serve as a **migration
+blueprint** (below).
 
-### 2. Scope the service area (the "Would we rebuild this?" judgement)
+## Process — Grain-enhanced mode (target is a grain app)
 
-`(catalog)` lists live blocks keyed `:<area>/<name>`. The **area is the keyword
-namespace**; the **kind is the map it sits in** — so `:foo/counters` can be both a
-read-model and a query, and that is correct, not a duplicate.
+When the system you are distilling **is** grain and is running, switch on the
+oracle for an authoritative distillation:
 
-Pick **one area keyword** to distill. Get the raw worklist of everything not yet
-documented:
+1. Connect to the app's nREPL (`:7888`); `(require '[ai.obney.grain.code-agent-tools.interface :as t])`. Requiring the base loads the handlers (registries populate).
+2. `(t/catalog)` enumerates the live blocks; `(t/event-model-coverage {})` shows what is undocumented. Scaffold the **introspectable skeleton** from the registries: block names + kinds, command/event/query `:schema` (from the live schema registry, so they MATCH), read-model `:consumes` (from `:events`), processor `:subscribes` (from `:topics`), periodic `:schedule`, and any def-site `:grain.event-model/produces`/`:reads`.
+3. Read the handler code/docstrings to fill what the runtime can't: `:description`, the production edges (`:produces`/`:reads`), GWT, flows.
+4. Write it as `(defeventmodel :area {…})` and validate against the oracle: `(t/validate-event-model model)` then the gate `(t/validate-event-model model {:strict true})`. Now coverage/schema-match/wiring ARE checked. Drive to clean, then hand to **em-weed** to keep it honest as the code evolves.
 
-```clojure
-(tools/event-model-coverage {})   ; spec declares nothing ⇒ all live blocks :uncovered
-```
+## Migration blueprint (distil foreign → implement in grain)
 
-For each block, apply Allium's test: *"if we rebuilt this system, would this be in
-the description of this area?"* Group blocks by their `:<area>` namespace; exclude
-incidental infra you would not re-derive. Distill area-by-area — validating one
-area never reports on another's blocks.
+The distilled EDN model is the target design for porting the system to grain:
 
-### 3. Scaffold the skeleton from the registries (mechanical — read, don't invent)
-
-Build a `(defeventmodel :area {...})` stub by copying structural truth out of the
-catalog. Per kind:
-
-| kind | map | pull from catalog / def site |
-|---|---|---|
-| `:commands` | `{:area/name {…}}` | `:schema` = live registered schema; `:reads`/`:produces` = def-site `:grain.event-model/reads`/`/produces` if present |
-| `:events` | `{:area/name {…}}` | `:schema` from the event schema summaries |
-| `:read-models` | `{:area/name {…}}` | `:consumes` = the live `:events` (consumed) set; `:version` if recorded |
-| `:queries` | `{:area/name {…}}` | `:schema` = live params schema; `:reads` = def-site `:grain.event-model/reads` |
-| `:todo-processors` | `{:area/name {…}}` | `:subscribes` = the live `:topics` set; `:produces` = def-site `:grain.event-model/produces` |
-| `:periodic-tasks` | `{:area/name {…}}` | `:schedule` = the live schedule map; `:produces` = def-site |
-| `:screens` | `{:area/name {…}}` | **not in catalog** — author by hand (step 4) |
-| `:flows` | `{:area/keyword {…}}` | **not in catalog** — author by hand (step 4) |
-
-Use `(tools/explain-schema :area/block)` to read a schema exactly as registered —
-**copy it verbatim** so it can't drift into a `:schema/mismatch`. `:consumes`,
-`:subscribes`, and `:schedule` are the **only edges the runtime can confirm**
-(read-model `:events`, processor `:topics`, periodic `:schedule`); copy them as
-given or you will get a `:wiring/mismatch` warning.
-
-`command→event` (`:produces`), `command/query→read-model` (`:reads`) and
-`processor→command` (`:produces`) live inside handler bodies and are invisible to
-introspection. They are confirmable only when the def site declares the matching
-`:grain.event-model/produces` / `:reads`. If those annotations are absent, either
-read the handler body to fill the edge (asserted-only) **or** add the annotation
-at the def site so the validator can confirm it (`:produces/mismatch` /
-`:reads/mismatch` flag disagreement). Until annotated, the edge stays asserted.
-
-### 4. Fill the judgement layer (where distillation, not transcription, happens)
-
-This is the Allium "why does the stakeholder care?" pass — the catalog gives
-structure, you give meaning:
-
-- **`:description`** — domain-level, one line, *what it does and why it matters*,
-  not how. Start from the handler's docstring, but cut implementation
-  (`(tools/guide :area/block {:spec model})` shows the docstring + live schema +
-  whatever spec you have so far). "Creates a counter; name must be unique" — yes.
-  "Queries the read-model atom and conj's an event" — no.
-- **`:given-when-thens`** on commands — author the acceptance intent as **data**
-  (`{:given … :when … :then …}`); each rejection branch in the handler (a
-  conflict, a not-found) is one G/W/T. These are never executed here — they are
-  intent, and they are **required** by strict mode (`:gwt/missing`).
-- **`:screens`** — design-only surfaces. Author from the UI: which `:queries` it
-  reads and which `:commands` it issues. The validator only checks those targets
-  exist and are the right kind (`:ref/dangling` / `:ref/wrong-kind`).
-- **`:flows`** — name the end-to-end chains. Each step is `{:from <endpoint> :to
-  <endpoint>}` with **kind-qualified** endpoints `[:kind :area/name]` (or `nil`
-  for entry/terminus). Stay within the CQRS grammar
-  (`command→event`, `event→read-model|todo-processor`,
-  `read-model→query|command|screen`, `query→screen`, `screen→command`,
-  `todo-processor→command`, `periodic-task→command|event`); violations are
-  `:flow/illegal-connection`.
-
-### 5. Validate lenient and clear drift
-
-```clojure
-(tools/validate-event-model model)   ; {:valid? :summary :findings}
-```
-
-`:valid?` is true when there are no `:error`-severity findings. Walk the findings
-(`(tools/guide :findings)` explains and gives the fix for each). Common in a fresh
-distillation:
-
-- `:block/undeclared` (error) — you wrote a block the runtime doesn't have. You
-  invented or mistyped it; delete it or fix the key.
-- `:schema/mismatch` (error) — re-copy from `(tools/explain-schema …)`.
-- `:wiring/mismatch` (warning) — your `:consumes`/`:subscribes`/`:schedule`
-  diverges from the live `:events`/`:topics`/`:schedule`; match the runtime.
-- `:produces/mismatch` / `:reads/mismatch` (warning) — your edge disagrees with
-  the def-site declaration; reconcile spec and annotation.
-- `:ref/dangling` / `:ref/wrong-kind` (error) — an intent edge or flow endpoint
-  names a non-existent block or the wrong kind (e.g. pointed `:reads` at an event
-  instead of a read-model).
-- `:block/misnamespaced` (error) — a block key's namespace ≠ its area.
-
-Use `{:schema-match :lenient}` to triage schema noise while you work; remove it
-before you claim done.
-
-### 6. Close coverage
-
-```clojure
-(tools/event-model-coverage model)   ; {:undeclared {…} :uncovered {…}}
-```
-
-Drive `:uncovered` (live blocks missing from the model) to empty for your area —
-that is "documented everything that runs". `:undeclared` (model blocks with no
-live counterpart) should already be empty if step 5 is clean.
-
-### 7. Register, and (optionally) pass the strict gate
-
-Drop the validated map into a `defeventmodel` form (the grain analogue of saving
-the `.allium` file), conventionally in `your-app/interface/event_model.clj`:
-
-```clojure
-(require '[ai.obney.grain.event-model.interface :refer [defeventmodel]])
-(defeventmodel :area { … })   ; shape-checked against :event-model at load
-```
-
-If the area will be **mandated** (the app refuses to boot unless the model is a
-complete description), make strict pass — it is exactly what the boot-guard runs:
-
-```clojure
-(tools/validate-event-model model {:strict true})   ; == verify-event-model!
-```
-
-Strict additionally requires: **full coverage** (`:block/uncovered` fatal), every
-command/processor/periodic declaring `:grain.event-model/produces` and every
-command/query `:reads` at the def site (`:produces/undeclared` / `:reads/undeclared`),
-and **GWT on every command** (`:gwt/missing`). When it is green, wiring
-`(event-model-validator/verify-or-throw!)` before `ig/init` makes the model
-load-bearing. (`:auth/missing` is a warning, not fatal — deny-by-default is not a
-model defect.)
+1. Distil the source system (source mode) → a validated EDN model per area.
+2. Implement each block: `defcommand`/`defquery`/`defreadmodel`/`defprocessor`/
+   `defperiodic` handlers, annotating def sites with `:grain.event-model/produces`
+   and `:grain.event-model/reads` to match the model's edges.
+3. Turn the EDN model into a `(defeventmodel :area …)` (same data) and register it.
+4. Run **em-weed** / strict `validate-event-model` against the new grain runtime
+   until the model and the implementation agree; wire `verify-or-throw!` to mandate
+   it. Use **em-propagate** to turn the model's GWT into executable tests that
+   prove the new handlers behave like the old system.
 
 ## Guardrails
 
-- **The catalog is the source of truth, not the code text.** Never add a block,
-  schema, or confirmable edge that isn't in `(catalog)` — that's `:block/undeclared`
-  or `:schema/mismatch`. Distill *what runs*.
-- **Kind is positional.** Keep `:area/counters`-the-read-model in `:read-models`
-  and `:area/counters`-the-query in `:queries`; identity is (kind, name). Same
-  name in two kinds is normal, not a duplicate to merge.
-- **Don't over-claim production.** `:produces`/`:reads` are asserted, not proven,
-  unless the def site declares them. Annotate def sites
-  (`:grain.event-model/produces`/`:reads`) to make the validator confirm the
-  edge; otherwise treat it as your hypothesis from reading the handler.
-- **Descriptions are domain-level; GWT is intent.** Strip ORM/atom/event-store
-  mechanics from descriptions. G/W/T is carried as data and is **never executed**
-  in distillation — it states acceptance intent (executable G/W/T is a planned
-  follow-on; `em-propagate` owns test generation).
-- **Screens and flows are hand-authored** and only endpoint/grammar-checked. The
-  runtime cannot see a screen exists.
-- **Structural only — never mutate.** Distillation needs neither `install!` nor
-  `invoke-command!`; do not run them to "see" behaviour. Validation reads
-  registries, not the event store.
-- **Lenient is the loop; strict is the gate.** Reach `:valid? true` lenient with
-  empty `:uncovered`, then opt into `{:strict true}` only when mandating.
-- **One area at a time.** Findings are scoped to declared areas; finishing an area
-  fully beats half-distilling several.
-
-## Worked snippet
-
-Distilling a `:counter` area that is already running, starting from nothing:
-
-```clojure
-(require '[ai.obney.grain.code-agent-tools.interface :as tools])
-
-;; 1–2. Oracle live? What's undocumented?
-(tools/catalog)                     ; => commands/queries/read-models/… for :counter
-(tools/event-model-coverage {})     ; => everything live is :uncovered (the worklist)
-(tools/explain-schema :counter/create-counter)  ; copy the schema verbatim
-
-;; 3–4. Scaffold from registries; fill descriptions + GWT + screens/flows by hand.
-(def model
-  {:counter
-   {:description "Create counters and track their values."
-    :commands
-    {:counter/create-counter
-     {:description "Creates a counter. Name must be unique."   ; domain-level
-      :schema [:map [:name :string]]                            ; from explain-schema
-      :reads #{:counter/counters}                               ; def-site :reads
-      :produces #{:counter/counter-created}                     ; def-site :produces
-      :given-when-thens
-      [{:given "no counter named \"A\" exists"
-        :when  "create-counter with name \"A\""
-        :then  "a counter-created event is recorded"}
-       {:given "a counter named \"A\" already exists"
-        :when  "create-counter with name \"A\""
-        :then  "the command is rejected as a conflict"}]}}
-    :events
-    {:counter/counter-created
-     {:description "A counter was created."
-      :schema [:map [:counter-id :uuid] [:name :string]]}}
-    :read-models
-    {:counter/counters
-     {:description "All counters, projected from counter events."
-      :consumes #{:counter/counter-created}   ; == live read-model :events (confirmable)
-      :version 1}}
-    :queries
-    {:counter/counters
-     {:description "Returns all counters."
-      :schema [:map]
-      :reads #{:counter/counters}}}
-    :screens          ; design-only — not in catalog, authored from the UI
-    {:counter/dashboard
-     {:description "Lists counters and lets the user create them."
-      :queries #{:counter/counters}
-      :commands #{:counter/create-counter}}}}})
-
-;; 5–6. Drive to clean against the live runtime.
-(tools/validate-event-model model)   ; fix :schema/mismatch, :wiring/mismatch, :ref/* …
-(tools/event-model-coverage model)   ; shrink :uncovered to {} for :counter
-
-;; 7. Register; gate strict only if mandating the model at boot.
-;; (defeventmodel :counter { … })  in your-app/interface/event_model.clj
-(tools/validate-event-model model {:strict true})  ; adds coverage + declared-edges + GWT
-```
-
-When lenient is `:valid? true` with empty `:uncovered`, the area is distilled.
-Hand unclear blocks to `em-elicit`; later edits go through `em-tend`; ongoing
-spec↔runtime drift is `em-weed`'s job.
+- **Behaviour, not implementation.** Re-run the three abstraction tests on every
+  block. A distilled model full of `:post-handler`/`:dao`/`:dto` names is a sign
+  you captured the code, not the system.
+- **One area at a time.** Large systems need several passes (a Ralph-style loop):
+  distil an area, validate, review, repeat until a pass finds nothing new.
+- **Off-grain limits are real.** Without a runtime you cannot confirm coverage or
+  schema accuracy — say so; don't imply the model is verified against a system it
+  was only read from. Mark genuinely uncertain blocks/edges and ask.
+- **Prefer command-replay semantics.** When inferring events for a CRUD system,
+  name the event for the *domain change* ("invoice-paid"), not the table write.
+- **Cross-check produces/reads.** Every `:produces`/`:reads`/`:consumes`/
+  `:subscribes` entry must resolve to a real block of the right kind (the validator
+  enforces this even off-grain) — so the dependency graph stays honest.
