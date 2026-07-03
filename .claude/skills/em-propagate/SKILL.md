@@ -1,6 +1,6 @@
 ---
 name: em-propagate
-description: "Generate tests from a grain event model. Use when the user wants to propagate tests, turn an event model into clojure.test, write the boot-guard contract test, make a defeventmodel's Given/When/Then executable, generate command/query integration tests over the live runtime, assert the model strict-validates against the running app, or check which blocks in the model still lack test coverage. The grain-native parity of Allium /propagate: the model is the parent, the tests are the offspring."
+description: "Generate tests from a grain event model. Use when the user wants to propagate tests, turn an event model into clojure.test, write the boot-guard contract test, make a defeventmodel's Given/When/Then executable, generate command/query integration tests over the live runtime, assert the model strict-validates against the running app, or check which blocks in the model still lack test coverage. The model is the parent, the tests are the offspring."
 ---
 
 # em-propagate

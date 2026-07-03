@@ -28,7 +28,7 @@ The model (`defeventmodel :area {...}`) is plain EDN that maps 1:1 onto grain's 
 - **Generating tests from the model** (turning `:gwt/missing` into executable acceptance tests) → `em-propagate`.
 - The entry skill **`event-model`** routes you here.
 
-## The oracle (the key difference from Allium's static `allium check`)
+## The oracle (a live runtime, not a static check)
 
 grain validates against the **running app**, not a text file. Connect to the nREPL, require the app's base so handlers + the registered model load, then:
 

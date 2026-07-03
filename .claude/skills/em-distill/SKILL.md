@@ -17,9 +17,9 @@ description: >-
 # Em-Distil — extract an event model from an existing system
 
 `em-distill` reverse-engineers a **service-area-first event model** from a system
-that already exists, by **reading its code**. It is the grain parity of Allium's
-`/distill`, and like Allium it does **not** require the target to be a grain
-project — any codebase can be distilled into the event-model vocabulary.
+that already exists, by **reading its code**. It does **not** require the target
+to be a grain project — any codebase can be distilled into the event-model
+vocabulary.
 
 There are two modes, and the **source mode is the base** (it works everywhere):
 
@@ -78,7 +78,7 @@ represents ("OrderShipped"), and the rows it reads are an implied **read-model**
 
 ## Abstraction discipline (filter implementation)
 
-Borrow Allium's distillation tests on every block — keep the *what/why*, drop the
+Apply these distillation tests on every block — keep the *what/why*, drop the
 *how*:
 
 1. **Why does the stakeholder care?** If the answer is purely technical (a cache, a
