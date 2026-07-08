@@ -315,14 +315,20 @@
   [query-context prev-result]
   (let [query-registry (or (:query-registry query-context) @qp/query-registry*)
         query-name (get-in query-context [:query :query/name])
-        authorized? (get-in query-registry [query-name :authorized?])]
+        authorized? (get-in query-registry [query-name :authorized?])
+        ;; Opt-in: a query declaring :datastar/emit-signals? may push a one-shot
+        ;; :datastar/signals patch alongside its hiccup (mirrors the command path).
+        emit-signals? (get-in query-registry [query-name :datastar/emit-signals?])]
     (if (and authorized? (true? (authorized? query-context)))
       (let [result (qp/process-query query-context)]
         (when-not (anomaly? result)
           (when-let [hiccup (:datastar/hiccup result)]
             (when (not= hiccup prev-result)
-              {:event (patch-elements (render-html hiccup) {})
-               :result hiccup}))))
+              (cond-> {:event (patch-elements (render-html hiccup) {})
+                       :result hiccup}
+                (and emit-signals? (:datastar/signals result))
+                (assoc :signals-event
+                       (patch-signals (:datastar/signals result) {})))))))
       (do
         (when-not authorized?
           (u/log ::missing-authorized-predicate :query-name query-name))
@@ -356,7 +362,9 @@
         ;; One-shot mode: render once and close
         (let [poll-result (poll-and-render query-context nil)]
           (when poll-result
-            (async/>!! event-ch (:event poll-result))))
+            (async/>!! event-ch (:event poll-result))
+            (when-let [se (:signals-event poll-result)]
+              (async/>!! event-ch se))))
         ;; Polling mode: loop until channel closes or client disconnects
         (loop [prev-result nil]
           (let [start-time (System/currentTimeMillis)
@@ -370,6 +378,8 @@
                             [[event-ch (:event poll-result)]] true
                             :default false)]
                 (when sent?
+                  (when-let [se (:signals-event poll-result)]
+                    (async/>!! event-ch se))
                   (let [elapsed (- (System/currentTimeMillis) start-time)
                         sleep-ms (max 0 (- interval-ms elapsed))]
                     (when (pos? sleep-ms) (Thread/sleep sleep-ms))
@@ -515,7 +525,9 @@
       ;; Initial render
       (let [initial (poll-and-render @context-atom nil)]
         (when initial
-          (async/>!! event-ch (:event initial)))
+          (async/>!! event-ch (:event initial))
+          (when-let [se (:signals-event initial)]
+            (async/>!! event-ch se)))
         (when (:stop? initial)
           (throw (ex-info "stop" {:stop true})))
         ;; Event loop — listens to domain events AND signal updates
@@ -555,7 +567,10 @@
                                   [[event-ch (:event poll-result)]] true
                                   :default false)]
                       (if sent?
-                        (recur (:result poll-result))
+                        (do
+                          (when-let [se (:signals-event poll-result)]
+                            (async/>!! event-ch se))
+                          (recur (:result poll-result)))
                         nil))
 
                     :else
@@ -824,24 +839,31 @@
 
 (defn gate-interceptor
   "Interceptor factory. Calls check-fn with the grain context merged with
-   per-request auth claims. Redirects with 302 on falsy result.
+   per-request auth claims and the request query-params. Redirects with 302 on
+   falsy result.
 
    context  — grain system context (event store, cache, etc.)
    gate-opts:
-     :check    — (fn [context] boolean), receives grain context + auth claims
-     :redirect — path to redirect to on failure"
+     :check    — (fn [gate-ctx] boolean), receives grain context + auth claims +
+                 request params under :query-params
+     :redirect — redirect target on failure. Either a path string, or a fn
+                 (fn [gate-ctx] path) that computes the path per-request (e.g. to
+                 carry a ?id= from the request)."
   [context {:keys [check redirect]}]
   {:name ::gate
    :enter
    (fn [ctx]
      (let [additional (get ctx :grain/additional-context)
-           gate-ctx (merge context additional)
+           gate-ctx (assoc (merge context additional)
+                           :query-params (get-in ctx [:request :query-params]))
            result (check gate-ctx)]
        (if result
          ctx
          (assoc ctx :response
                 {:status 302
-                 :headers {"Location" redirect}}))))})
+                 :headers {"Location" (if (fn? redirect)
+                                        (redirect gate-ctx)
+                                        redirect)}}))))})
 
 ;; ---------------------- ;;
 ;; Auto-Route Generation  ;;

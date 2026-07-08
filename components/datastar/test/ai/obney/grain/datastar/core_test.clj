@@ -45,7 +45,9 @@
                         [:enabled? :boolean]
                         [:status [:enum :draft :published]]
                         [:label :string]]
-   :test/no-signals [:map]})
+   :test/no-signals [:map]
+   :test/signals-emitting-page [:map]
+   :test/signals-ignored-page [:map]})
 
 ;; -------------------- ;;
 ;; Test Query/Command   ;;
@@ -200,6 +202,29 @@
   [context]
   {:query/result {:page :public}
    :datastar/hiccup [:div#app "public content"]})
+
+;; ------------------------------------------------- ;;
+;; Opt-in query :datastar/signals (emit-signals?)    ;;
+;; ------------------------------------------------- ;;
+
+(defquery :test signals-emitting-page
+  {:authorized? (constantly true)
+   :datastar/path "/signals-emitting"
+   :datastar/emit-signals? true
+   :datastar/fps 0}
+  [_context]
+  {:query/result {:page :signals}
+   :datastar/hiccup [:div#app "signals content"]
+   :datastar/signals {:__redirect "/elsewhere"}})
+
+(defquery :test signals-ignored-page
+  {:authorized? (constantly true)
+   :datastar/path "/signals-ignored"
+   :datastar/fps 0}
+  [_context]
+  {:query/result {:page :ignored}
+   :datastar/hiccup [:div#app "ignored content"]
+   :datastar/signals {:__redirect "/elsewhere"}})
 
 ;; =========================== ;;
 ;; Pure Function Tests          ;;
@@ -554,6 +579,36 @@
     (is (= #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
            (:tenant-id @received)))))
 
+(deftest gate-interceptor-sees-query-params-test
+  (let [received (atom nil)
+        interceptor (ds/gate-interceptor
+                     {}
+                     {:check (fn [ctx] (reset! received ctx) true)
+                      :redirect "/blocked"})
+        ctx {:request {:query-params {"id" "42"}}
+             :grain/additional-context {:auth-claims {:user-id (random-uuid)}}}
+        _ ((:enter interceptor) ctx)]
+    (is (= {"id" "42"} (:query-params @received))
+        "the request query-params are exposed to the check fn")))
+
+(deftest gate-interceptor-dynamic-redirect-test
+  (testing ":redirect may be a fn that computes the path per-request"
+    (let [interceptor (ds/gate-interceptor
+                       {}
+                       {:check (fn [_] false)
+                        :redirect (fn [gate-ctx]
+                                    (str "/blocked/" (get-in gate-ctx [:query-params "id"])))})
+          ctx {:request {:query-params {"id" "42"}}
+               :grain/additional-context {:auth-claims {:user-id (random-uuid)}}}
+          result ((:enter interceptor) ctx)]
+      (is (= 302 (get-in result [:response :status])))
+      (is (= "/blocked/42" (get-in result [:response :headers "Location"])))))
+  (testing "a string :redirect still works unchanged (backward compatible)"
+    (let [interceptor (ds/gate-interceptor {} {:check (fn [_] false) :redirect "/blocked"})
+          result ((:enter interceptor) {:request {:query-params {}}
+                                        :grain/additional-context {}})]
+      (is (= "/blocked" (get-in result [:response :headers "Location"]))))))
+
 ;; =========================== ;;
 ;; poll-and-render Tests        ;;
 ;; =========================== ;;
@@ -582,6 +637,25 @@
         (let [second-result (ds/poll-and-render context (:result first-result))]
           (is (some? second-result))
           (is (not= (:result first-result) (:result second-result))))))))
+
+(deftest poll-and-render-opt-in-signals-test
+  (testing ":datastar/emit-signals? query attaches a :signals-event alongside the elements event"
+    (let [context {:query-registry @qp/query-registry*
+                   :query {:query/name :test/signals-emitting-page
+                           :query/id (random-uuid)
+                           :query/timestamp (time/now)}}
+          result (ds/poll-and-render context nil)]
+      (is (= "datastar-patch-elements" (get-in result [:event :name])))
+      (is (= "datastar-patch-signals" (get-in result [:signals-event :name])))
+      (is (re-find #"__redirect" (get-in result [:signals-event :data])))))
+  (testing "a query WITHOUT the flag drops :datastar/signals (backward compatible)"
+    (let [context {:query-registry @qp/query-registry*
+                   :query {:query/name :test/signals-ignored-page
+                           :query/id (random-uuid)
+                           :query/timestamp (time/now)}}
+          result (ds/poll-and-render context nil)]
+      (is (= "datastar-patch-elements" (get-in result [:event :name])))
+      (is (nil? (:signals-event result))))))
 
 (deftest poll-and-render-static-result-dynamic-hiccup-test
   (testing "re-renders when hiccup changes even if :query/result is static"
