@@ -1,0 +1,83 @@
+;; genome-taste.edn — the FROZEN editorial layer of the grain genome.
+;; Everything here is judgement, not fact: cluster assignment, grid placement,
+;; human-readable roles/descriptions, the CQRS framing, macro signatures & purposes.
+;; Facts (loc, deps, which macros/protocols exist, deprecation) come from the repo
+;; via genome.bb and are merged over this. Regenerate/extend with the `grain-genome` skill.
+
+{:clusters
+ [{:key "apps"  :name "Apps & tooling" :var "--c-apps"  :desc "services, UI runtime, dev tooling"}
+  {:key "write" :name "Write side"     :var "--c-write" :desc "commands & reactive processors"}
+  {:key "read"  :name "Read side"      :var "--c-read"  :desc "projections & queries"}
+  {:key "log"   :name "Event log"      :var "--c-log"   :desc "append-only spine + backends"}
+  {:key "found" :name "Foundation"     :var "--c-found" :desc "shared primitives (bedrock)"}
+  {:key "ops"   :name "Clients & ops"  :var "--c-ops"   :desc "terminal UI, observability"}]
+
+ :cols [300 560 820 1080 1340 1600 1860 2120]
+ :rows [180 375 570 765 960 1155]
+
+ :zones [["write" 690 92] ["event log" 1080 92] ["read" 1700 92] ["foundation" 1080 1268]]
+
+ :copy
+ {:kick  "grain · current generation"
+  :title "{{components}} live components,<br><b>one CQRS spine</b>"
+  :lede  "The deprecated v2 lineage and the retired AI/behavior-tree cluster are removed — <b style=\"color:var(--ink)\">{{deprecated}} hidden</b>. What remains is a single generation: <b style=\"color:var(--c-write)\">commands</b> on the left, the <b style=\"color:var(--c-log)\">event log</b> down the middle, <b style=\"color:var(--c-read)\">reads</b> on the right, all on a shared foundation."}
+
+ ;; per-component placement (col row), cluster, short role tag, and description.
+ :nodes
+ {"webserver"                          {:col 0 :row 0 :cluster "apps"  :role "http"         :desc "HTTP server (Ring/Jetty)"}
+  "code-agent-tools"                   {:col 1 :row 0 :cluster "apps"  :role "tooling"      :desc "Dev / agent REPL tooling — drives the validator & building blocks"}
+  "event-model-validator"             {:col 2 :row 0 :cluster "apps"  :role "guard"        :desc "Structural validator + boot-guard that refuses to start on model↔runtime drift"}
+  "example-service"                    {:col 3 :row 0 :cluster "apps"  :role "app"          :desc "Reference counter app — consumes the whole current building-block set"}
+  "datastar"                           {:col 5 :row 0 :cluster "apps"  :role "ui"           :desc "SSE hypermedia UI runtime"}
+  "datastar-v2"                        {:col 6 :row 0 :cluster "apps"  :role "ui · wip"     :desc "Next-gen UI runtime — scaffolded, not yet wired"}
+  "command-request-handler-v2"        {:col 1 :row 1 :cluster "write" :role "entry"        :desc "Command HTTP entrypoint"}
+  "event-model"                        {:col 2 :row 1 :cluster "apps"  :role "spec"         :desc "defeventmodel — the service-area-first spec"}
+  "control-plane"                      {:col 4 :row 1 :cluster "log"   :role "coordination" :desc "Multi-tenant coordination & leader election"}
+  "query-request-handler"             {:col 5 :row 1 :cluster "read"  :role "entry"        :desc "Query HTTP entrypoint"}
+  "tui-client"                         {:col 7 :row 1 :cluster "ops"   :role "tui"          :desc "Terminal-UI client"}
+  "todo-processor-v2"                  {:col 1 :row 2 :cluster "write" :role "defprocessor" :desc "Reactive processor — reacts to events, issues follow-up commands"}
+  "command-processor-v2"              {:col 2 :row 2 :cluster "write" :role "defcommand"   :desc "Command → event handler"}
+  "read-model-processor-v2"           {:col 4 :row 2 :cluster "read"  :role "defreadmodel" :desc "Projection builder — folds events into read models"}
+  "query-processor"                    {:col 5 :row 2 :cluster "read"  :role "defquery"     :desc "Query dispatch — reads projections, never the log"}
+  "query-schema"                       {:col 6 :row 2 :cluster "read"  :role "schema"       :desc "Query schema definitions"}
+  "tui-adapter"                        {:col 7 :row 2 :cluster "ops"   :role "tui"          :desc "Terminal-UI adapter"}
+  "event-store-v3"                     {:col 3 :row 3 :cluster "log"   :role "the spine"    :desc "Current append-only event log — the heart of the system"}
+  "event-tailer"                       {:col 4 :row 3 :cluster "log"   :role "tail"         :desc "Tails the event log into pubsub"}
+  "event-notifier-postgres"           {:col 5 :row 3 :cluster "log"   :role "notify"       :desc "Postgres LISTEN/NOTIFY change feed"}
+  "periodic-task"                      {:col 0 :row 4 :cluster "found" :role "cron"         :desc "Scheduled / periodic task primitive"}
+  "event-store-postgres-v3"           {:col 2 :row 4 :cluster "log"   :role "postgres"     :desc "Postgres backend for the event log"}
+  "event-store-sqlite-v3"             {:col 3 :row 4 :cluster "log"   :role "sqlite"       :desc "SQLite backend for the event log"}
+  "kv-store"                           {:col 5 :row 4 :cluster "found" :role "kv"           :desc "Key-value projection store (protocol)"}
+  "kv-store-lmdb"                      {:col 6 :row 4 :cluster "found" :role "kv · lmdb"    :desc "LMDB-backed kv-store"}
+  "mulog-aws-cloudwatch-emf-publisher" {:col 7 :row 4 :cluster "ops"  :role "metrics"      :desc "μ/log → CloudWatch EMF metrics"}
+  "core-async-thread-pool"            {:col 0 :row 5 :cluster "found" :role "pool"         :desc "Bounded core.async worker pool"}
+  "anomalies"                          {:col 1 :row 5 :cluster "found" :role "errors"       :desc "Typed error / anomaly maps"}
+  "pubsub"                             {:col 2 :row 5 :cluster "found" :role "bus"          :desc "In-process event bus"}
+  "schema-util"                        {:col 3 :row 5 :cluster "found" :role "malli"        :desc "Malli schema helpers — the universal base"}
+  "time"                               {:col 4 :row 5 :cluster "found" :role "clock"        :desc "Clock & time abstraction"}
+  "fressian-util"                      {:col 5 :row 5 :cluster "found" :role "serde"        :desc "Fressian serialization"}}
+
+ ;; macro catalog: grouping + signature + purpose (taste). The defining component
+ ;; is filled in deterministically by genome.bb from the repo.
+ :macro-catalog
+ {:groups
+  [{:g "CQRS building blocks"
+    :macros [{:m "defcommand"    :sig "(defcommand :area/name {…} [ctx] & body)"    :p "Handle a command → append events to the log"}
+             {:m "defquery"      :sig "(defquery :area/name {…} [ctx] & body)"      :p "Answer a read-side query over projections"}
+             {:m "defreadmodel"  :sig "(defreadmodel :area/name {…} [entity] & body)" :p "Fold events into a read-model projection"}
+             {:m "defprocessor"  :sig "(defprocessor :area/name {…} [ctx] & body)"  :p "React to events; issue follow-up commands"}
+             {:m "defperiodic"   :sig "(defperiodic :area/name {…} & body)"          :p "Run work on a schedule / interval"}
+             {:m "defeventmodel" :sig "(defeventmodel :area {area-map})"             :p "Register a service-area event model spec"}]}
+   {:g "Schema & tooling"
+    :macros [{:m "defschemas" :sig "(defschemas sym {schema-map})" :p "Register a set of malli schemas"}
+             {:m "defguide"   :sig "(defguide :id {…})"            :p "Author a dev / agent REPL guide"}]}
+   {:g "UI · datastar"
+    :macros [{:m "defcomponent"      :sig "(defcomponent name [args] & body)" :p "Define a hypermedia component (hiccup)"}
+             {:m "with-signals"      :sig "(with-signals [open? {…}] & body)" :p "Declare reactive Datastar signals"}
+             {:m "with-signal-scope" :sig "(with-signal-scope [scope] & body)" :p "Scope nested signal declarations"}]}]}
+
+ ;; one-line purpose per protocol seam (definer + implementers come from the repo).
+ :protocol-notes
+ {"EventStore" "Append & read the append-only event log — the storage seam behind every write."
+  "KVStore"    "Key-value storage for read-model projections."
+  "PubSub"     "In-process event bus (self-implemented — no external backend)."}}

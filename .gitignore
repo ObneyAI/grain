@@ -42,3 +42,8 @@ projects/**/pom.xml
 **/.portal/*
 
 **/.calva/output-window/output.calva-repl
+
+# genome: generated output & local verify artifacts (regenerate with `bb scripts/genome/genome.bb`)
+scripts/genome/grain-genome.html
+scripts/genome/shot-*.png
+scripts/genome/node_modules/
