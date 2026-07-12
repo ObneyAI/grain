@@ -78,6 +78,34 @@
   "Default command action endpoint emitted as the reserved __grainAction signal."
   "/actions")
 
+;; --------------------------- ;;
+;; Stream Protocol Tokens      ;;
+;; --------------------------- ;;
+
+(def ^:private ds-nonce-param
+  "Query-param (and signal) name carrying the per-page-load stream nonce that
+   keys `active-stream-contexts`, so multiple tabs get independent streams."
+  "dsNonce")
+
+(def ^:private grain-connect-param
+  "Bare URL-param marker identifying a persistent-stream (re)connect. Baked into
+   the shim's data-init URL and replayed verbatim on every SSE auto-reconnect
+   (the same replay that carries dsNonce); never registered as a Datastar signal,
+   so signal-update refreshes never carry it. Its presence routes a request to
+   rebind a fresh stream instead of reusing a prior (possibly silently-dead) one."
+  "__grainConnect")
+
+(defn- request-param
+  "Reads a query/URL param that may arrive keyword- or string-keyed."
+  [raw-query param-name]
+  (or (get raw-query (keyword param-name)) (get raw-query param-name)))
+
+(defn- strip-params
+  "Removes the given protocol params (both keyword and string form) from a raw
+   query map before it is decoded into the domain query."
+  [raw-query & param-names]
+  (reduce (fn [m p] (dissoc m (keyword p) p)) raw-query param-names))
+
 ;; --------------- ;;
 ;; HTML Rendering  ;;
 ;; --------------- ;;
@@ -506,8 +534,9 @@
   [event-ch sse-ctx context query-name event-pubsub event-types debounce-ms additional-context event-tags]
   (let [request (:request sse-ctx)
         raw-query (extract-query-from-request request query-name)
-        nonce (or (:dsNonce raw-query) (get raw-query "dsNonce"))
-        decoded-query (decode-json-query (dissoc raw-query :dsNonce "dsNonce"))
+        nonce (request-param raw-query ds-nonce-param)
+        decoded-query (decode-json-query
+                       (strip-params raw-query ds-nonce-param grain-connect-param))
         initial-context (merge context additional-context {:query decoded-query})
         context-atom (atom initial-context)
         signal-ch (async/chan (async/sliding-buffer 1))
@@ -581,7 +610,15 @@
       (finally
         (when (and event-tailer tenant-id)
           (event-tailer/unsubscribe! event-tailer tenant-id event-types))
-        (swap! active-stream-contexts dissoc session-key)
+        ;; Compare-and-remove: only drop the registry entry if it still points to
+        ;; THIS loop's event-ch. A reconnect (or POST restart) may have already
+        ;; replaced this key with a newer, healthy stream — an unconditional
+        ;; dissoc here would clobber it and break subsequent reuse for that tab.
+        (swap! active-stream-contexts
+               (fn [m]
+                 (if (identical? (:event-ch (get m session-key)) event-ch)
+                   (dissoc m session-key)
+                   m)))
         (async/close! signal-ch)
         (async/close! sub-chan)
         (async/close! event-ch)))))
@@ -598,25 +635,38 @@
       heartbeat-delay)))
 
 (defn- update-or-start-stream-events
-  "If an active event-driven SSE exists for this user+query+nonce, update its
-   context atom with new signals and trigger a re-render via signal-ch, then
-   return an empty SSE that closes immediately. Otherwise start a new SSE.
-   Works for both GET and POST — enables signal updates without reconnecting.
-   For GET requests, session reuse requires a nonce (dsNonce) to avoid
-   accidental collisions; POST always attempts reuse for backward compatibility."
+  "Routes a request to the event-driven stream by INTENT, not HTTP method:
+
+   - A **(re)connect** of the persistent stream carries the `__grainConnect`
+     marker (baked into the shim's data-init URL, replayed verbatim on every SSE
+     auto-reconnect). It always binds a FRESH stream to this socket, evicting any
+     prior entry under the same key — self-healing whether the old connection
+     died loudly or silently. Works identically for GET and POST persistent
+     streams.
+
+   - An unmarked **signal update** reuses the live SSE for this user+query+nonce:
+     it updates the context atom with new signals, pokes signal-ch to re-render,
+     and returns an empty SSE that closes immediately. GET reuse requires a nonce
+     to avoid accidental collisions; POST always attempts reuse (backward compat).
+
+   Reuse is never attempted for a marked request, so a silently-dead persistent
+   stream can never swallow its own reconnect."
   [context query-name event-pubsub event-types debounce-ms heartbeat-delay event-tags pedestal-context]
   (let [additional-context (:grain/additional-context pedestal-context)
         request (:request pedestal-context)
         raw-query (extract-query-from-request request query-name)
-        nonce (or (:dsNonce raw-query) (get raw-query "dsNonce"))
+        nonce (request-param raw-query ds-nonce-param)
+        ;; Marked (re)connect of the persistent stream — bare URL param, never a
+        ;; Datastar signal, so signal-update refreshes never carry it.
+        connect? (boolean (request-param raw-query grain-connect-param))
         is-post? (= :post (:request-method request))
         user-id (get-in additional-context [:auth-claims :user-id])
         session-key [user-id query-name nonce]
-        ;; For GET, only attempt reuse when a nonce is present — nonce is the
-        ;; explicit opt-in for session reuse (generated by shim-page per page load).
-        ;; Without nonce, GET always starts fresh to avoid accidental collisions.
-        ;; POST always attempts reuse for backward compatibility.
-        existing (when (or is-post? nonce)
+        ;; Reuse (signal-update) is attempted only for UNMARKED requests: POST
+        ;; always (backward compat), GET only with a nonce (explicit opt-in,
+        ;; generated by shim-page per page load). A __grainConnect request skips
+        ;; reuse entirely and falls through to rebind.
+        existing (when (and (not connect?) (or is-post? nonce))
                    (get @active-stream-contexts session-key))
         ;; Only use existing if both signal-ch and event-ch are still open.
         ;; event-ch closes when the browser disconnects (page navigation);
@@ -627,17 +677,22 @@
                    existing)]
     (if existing
       ;; Update existing SSE's context with new signals (from :query-params, already parsed by interceptor)
-      (let [new-decoded (decode-json-query (dissoc raw-query :dsNonce "dsNonce"))
+      (let [new-decoded (decode-json-query
+                         (strip-params raw-query ds-nonce-param grain-connect-param))
             {:keys [context-atom signal-ch]} existing]
         (swap! context-atom assoc :query new-decoded)
         (async/put! signal-ch :signal-update)
         ;; Return empty SSE — close immediately. The real re-render happens
         ;; on the existing SSE via signal-ch.
         (sse/start-stream (fn [ch _] (async/close! ch)) pedestal-context heartbeat-delay))
-      ;; No existing SSE (or stale) — clean up stale entry and start fresh.
-      ;; Close old signal-ch so the orphaned event loop exits cleanly.
+      ;; No reusable SSE — either a marked (re)connect, or an unmarked request
+      ;; whose prior stream is stale/absent. Evict any entry under this key
+      ;; (closing its signal-ch so the orphaned/zombie loop exits) and start
+      ;; fresh. For a __grainConnect this is the rebind that heals a silently-
+      ;; dead persistent stream; the compare-and-remove in the loop's finally
+      ;; keeps the old loop's cleanup from clobbering the entry we register next.
       (do
-        (when (or is-post? nonce)
+        (when (or connect? is-post? nonce)
           (when-let [stale (get @active-stream-contexts session-key)]
             (async/close! (:signal-ch stale))))
         (stream-view-enter-events context query-name event-pubsub event-types
@@ -701,9 +756,17 @@
                                              (str resolved-stream-path "?" query-string)
                                              resolved-stream-path)
                                       separator (if (string/includes? base "?") "&" "?")]
-                                  (str base separator "dsNonce=" nonce)))
+                                  ;; __grainConnect marks THIS as the persistent stream's
+                                  ;; (re)connect. It is a bare URL param, never a Datastar
+                                  ;; signal, so it is replayed verbatim on every SSE
+                                  ;; auto-reconnect (the same replay that carries dsNonce)
+                                  ;; but is absent from signal-update refreshes. The stream
+                                  ;; handler treats a marked request as a rebind, not a reuse.
+                                  (str base separator
+                                       ds-nonce-param "=" nonce
+                                       "&" grain-connect-param "=1")))
         reserved-signals (cond-> {"__grainAction" action-path}
-                           effective-stream-path (assoc "dsNonce" nonce))
+                           effective-stream-path (assoc ds-nonce-param nonce))
         page-html (str "<!DOCTYPE html>"
                        (h/html
                          [:html (or html-attrs {})
