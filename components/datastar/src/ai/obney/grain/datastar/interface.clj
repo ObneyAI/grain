@@ -162,9 +162,14 @@
                            :html-attrs {:lang \"en\"} ;; default <html> attributes
                            :datastar-url \"...\"}}    ;; override Datastar CDN URL
       :datastar/action-path \"/actions\"              ;; command endpoint for __grainAction
+      :datastar/heartbeat-delay 1                    ;; SSE heartbeat seconds (default 10)
       :datastar/auth-redirect {:unauthenticated \"/sign-in\"  ;; 302 when no claims
                                 :unauthorized \"/dashboard\"}} ;; 302 when role mismatch
    Per-query `:datastar/shim-opts` (from registry or overrides) take precedence.
+   Likewise a per-query `:datastar/heartbeat-delay` overrides the default. Lower
+   the heartbeat to cap live-update latency on iOS Safari behind an HTTP/2 edge,
+   where WebKit defers small streamed patches until the next bytes (the heartbeat)
+   arrive; see datastar.allium's `config heartbeat_interval`.
    Auth-redirect interceptors are auto-generated from each query's `:authorized?`
    predicate. Public queries (where `(authorized? {})` returns truthy) are skipped.
 

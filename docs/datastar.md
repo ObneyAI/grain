@@ -85,12 +85,14 @@ The `defaults` map applies to all generated routes:
                         :html-attrs  {:lang "en" :data-theme "dark"}
                         :datastar-url "https://cdn.jsdelivr.net/..."}
    :datastar/action-path "/actions"
+   :datastar/heartbeat-delay 1
    :datastar/auth-redirect {:unauthenticated "/auth/sign-in"
                             :unauthorized    "/dashboard"}})
 ```
 
 - **`:datastar/shim-opts`** — default `<head>` content, `<html>` attributes, and Datastar CDN URL. Per-query `:datastar/shim-opts` (from the registry or overrides) take precedence.
 - **`:datastar/action-path`** — default shared action handler route emitted into generated Datastar pages for `ui/dispatch`. Per-query/page `:datastar/action-path` metadata takes precedence.
+- **`:datastar/heartbeat-delay`** — SSE heartbeat interval in seconds (default `10`) for all generated streams. Per-query `:datastar/heartbeat-delay` takes precedence. Lower it to cap live-update latency on iOS behind an HTTP/2 edge — see [SSE Heartbeat & iOS / HTTP-2 latency](#sse-heartbeat--ios--http-2-latency).
 - **`:datastar/auth-redirect`** — auto-generates redirect interceptors from each query's `:authorized?` predicate. Queries where `(authorized? {})` returns truthy (e.g. `(constantly true)`) are treated as public and skipped.
 
 ### Auth Redirect
@@ -161,6 +163,28 @@ For each live SSE stream, Datastar registers the stream's tenant id and event ty
 
 Delivery is treated as at-least-once. Stored events include `:event/id`, so Datastar dedupes duplicate deliveries per SSE stream by `[:grain/tenant-id :event/id]`; manual pub/sub messages without `:event/id` keep their existing behavior.
 
+## SSE Heartbeat & iOS / HTTP-2 latency
+
+Each live SSE stream sends a periodic keep-alive (heartbeat) to hold the connection open. The interval defaults to **10 seconds** and is configurable — globally via the `routes` `defaults` map, or per query:
+
+```clojure
+(ds/routes context {} {:datastar/heartbeat-delay 1})   ;; all generated streams
+
+(defquery :dashboard live-view
+  {:authorized?              (constantly true)
+   :datastar/path            "/dashboard"
+   :datastar/heartbeat-delay 1                          ;; this query only
+   :grain/read-models        {:dashboard/metrics 1}}
+  ...)
+```
+
+The heartbeat is normally just a keep-alive and does not affect *what* is rendered. It can, however, affect *when* an update is seen on **iOS**. Every iOS browser is WebKit, and WebKit behind an HTTP/2-terminating edge (most reverse proxies, load balancers, and CDNs — i.e. most production deployments) defers delivery of a small streamed patch until more bytes arrive on the stream. A live update can therefore sit undelivered on the device until the next heartbeat flushes it, making the observed lag **up to one heartbeat interval**. Non-WebKit browsers and any client on HTTP/1.1 are unaffected, and the server writes each patch immediately (confirmed by reading the raw stream over both protocols) — this is a client/transport quirk, not a grain or server issue. It looks exactly like an app bug, so it is easy to misdiagnose.
+
+Mitigations, cheapest first:
+
+1. **Force the edge to HTTP/1.1.** If the terminating proxy or load balancer lets you constrain the negotiated protocol — typically by restricting the TLS ALPN list to `http/1.1`, or disabling HTTP/2 for the stream route — iOS updates become instant. Usually one config line, no code change.
+2. **Lower `:datastar/heartbeat-delay`** (e.g. `1`), which caps the worst-case iOS latency at ~1s — at the cost of more frequent keep-alive traffic on every stream.
+
 ## UI Flow
 
 ```
@@ -194,6 +218,7 @@ The adapter logs warnings for common misconfigurations that would otherwise caus
 | `:datastar/title` | HTML `<title>` in the shim page | `"Grain App"` |
 | `:datastar/fps` | Polling rate (ignored in event-driven mode; `0` means one-shot) | `0` |
 | `:datastar/debounce-ms` | Debounce before re-render after event | `50` |
+| `:datastar/heartbeat-delay` | SSE heartbeat interval in seconds (also settable in `routes` defaults; lower it for iOS/HTTP-2 — see [above](#sse-heartbeat--ios--http-2-latency)) | `10` |
 | `:datastar/event-tags` | Tag-based event filtering `{:tag-key :query-key}` | — |
 | `:datastar/shim-opts` | Per-query override for shim page options | — |
 | `:datastar/interceptors` | Additional Pedestal interceptors for this query | `[]` |

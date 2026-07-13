@@ -276,7 +276,19 @@ config {
     rerender_debounce: Duration = 50.milliseconds
 
     -- How long the boundary keeps a view alive without traffic before checking
-    -- liveness. Purely a keep-alive concern; it does not change what is shown.
+    -- liveness. Primarily a keep-alive concern; it does not change WHAT is shown.
+    -- Configurable per exposed query and as a global default across all views.
+    --
+    -- It can, however, bound WHEN a change is seen for one client class. iOS
+    -- browsers (all WebKit) behind an HTTP/2-terminating edge defer delivery of a
+    -- small streamed patch until more bytes arrive on the stream, so a live update
+    -- can sit undelivered until the next heartbeat flushes it — making the observed
+    -- lag up to one interval. This is a client/transport behaviour, not a boundary
+    -- one: the server writes each patch immediately (confirmed by reading the raw
+    -- stream, where every patch arrives promptly over both HTTP/1.1 and HTTP/2).
+    -- Deployments that cannot force the edge to HTTP/1.1 can lower this interval to
+    -- cap that worst-case iOS latency (e.g. ~1.second), at the cost of more frequent
+    -- keep-alive traffic on every view.
     heartbeat_interval: Duration = 10.seconds
 
     -- How many recent stored-event identities a view remembers for
