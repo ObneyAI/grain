@@ -106,6 +106,8 @@ Grain Sessions walks through the app as a teaching series:
 - [Episode 3](https://youtu.be/weAsNioiEnI)
 - [Episode 4](https://youtu.be/XRo49q6yCeo)
 - [Episode 5](https://youtu.be/JdQtSLHoCQk)
+- [Episode 6](https://www.youtube.com/watch?v=DapS58hBSI0)
+- [Episode 7](https://www.youtube.com/watch?v=kb7Qc_nafng)
 
 ## Packages
 
