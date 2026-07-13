@@ -59,6 +59,7 @@
 (def vp    (gid "viewport"))
 (def node-els (atom {}))
 (def selected (atom nil))
+(def hud-collapsed (atom false))
 (def edge-els (atom []))
 
 ;; ---------- zones ----------
@@ -289,6 +290,22 @@
 (defn comp-chip [id]
   (let [c (if (by-id id) (cvar (:cluster (by-id id))) "var(--ink-faint)")]
     (str "<span class='en-chip' data-goto='" id "' style='--cc:" c "'><span class='cd'></span>" id "</span>")))
+(defn key-pills [ks]
+  (apply str (for [k ks]
+               (let [tip (when (:tip k) (str " title='" (:tip k) "'"))]
+                 (if (:note k)
+                   (str "<span class='kpill note'" tip ">" (:note k) "</span>")
+                   (str "<span class='kpill" (when (:req k) " req")
+                        (when (:tone k) (str " " (:tone k))) "'" tip ">" (:k k) "</span>"))))))
+(defn key-rows [ks]
+  (if (nil? ks) ""
+    (str "<div class='en-keys'>"
+         (when (seq (:opts ks))      (str "<div class='krow'><span class='klbl'>opts</span>"      (key-pills (:opts ks)) "</div>"))
+         (when (seq (:ds-meta ks))   (str "<div class='krow'><span class='klbl'>datastar</span>"  (key-pills (:ds-meta ks)) "</div>"))
+         (when (seq (:result ks))    (str "<div class='krow'><span class='klbl'>result</span>"    (key-pills (:result ks)) "</div>"))
+         (when (seq (:ds-result ks)) (str "<div class='krow'><span class='klbl'>ds result</span>" (key-pills (:ds-result ks)) "</div>"))
+         (when (seq (:bridge ks))    (str "<div class='krow'><span class='klbl'>bridge</span>"    (key-pills (:bridge ks)) "</div>"))
+         "</div>")))
 (defn build-catalog []
   (let [macro-count (reduce + (map #(count (:items %)) macro-groups))
         definers (count (filter #(seq (:macros %)) nodes))
@@ -309,6 +326,7 @@
                               "<span class='en-name'>" (:m it) "</span></div>"
                               "<div class='en-sig'>" (:sig it) "</div>"
                               "<div class='en-p'>" (:p it) "</div>"
+                              (key-rows (:keys it))
                               "<div class='en-foot'><span class='lbl-defs'>defined in</span>" (comp-chip (:comp it)) "</div></div>")))
                      "</div>")))
             "</div>"
@@ -323,7 +341,7 @@
                      "<div class='pcol'><div class='pl'>implemented by</div><div class='en-foot'>"
                      (if (seq (:impls pr)) (apply str (map comp-chip (:impls pr)))
                          "<span class='lbl-defs'>in-process — no external backend</span>")
-                     "</div></div></div>")))
+                     "</div></div></div></div>")))  ; close en-foot, pcol, en-row, entry.p
             "</div></div>")
         el (gid "catalog")]
     (set! (.-innerHTML el) h)
@@ -336,6 +354,8 @@
 (def MIN 0.16) (def MAX 2.4)
 (def genome-view {:x 170 :y 60 :w 2080 :h 1260})
 (def genome-ins {:l 475 :r 30 :t 96 :b 80})
+;; left inset shrinks when the summary card is collapsed, so the board reclaims the space
+(defn cur-ins [] (assoc genome-ins :l (if @hud-collapsed 60 475)))
 (defn clampv [v] (max MIN (min MAX v)))
 (defn render-tf []
   (let [{:keys [tx ty s]} @view]
@@ -358,7 +378,7 @@
   (let [b (gid "catalog")]
     {:x (- (.-offsetLeft b) 56) :y (- (.-offsetTop b) 56)
      :w (+ (.-offsetWidth b) 112) :h (+ (.-offsetHeight b) 112)}))
-(defn fit [] (frame-rect genome-view false genome-ins))
+(defn fit [] (frame-rect genome-view false (cur-ins)))
 (defn zoom-at [cx cy factor]
   (let [{:keys [tx ty s]} @view ns (clampv (* s factor))
         ntx (- cx (* (- cx tx) (/ ns s))) nty (- cy (* (- cy ty) (/ ns s)))]
@@ -407,8 +427,18 @@
 (set! (.-onclick (gid "zin"))  (fn [_] (let [r (.getBoundingClientRect vp)] (zoom-at (/ (.-width r) 2) (/ (.-height r) 2) 1.2))))
 (set! (.-onclick (gid "zout")) (fn [_] (let [r (.getBoundingClientRect vp)] (zoom-at (/ (.-width r) 2) (/ (.-height r) 2) 0.83))))
 (set! (.-onclick (gid "gocat")) (fn [_] (frame-rect (catalog-rect) true nil) (set! (.. (gid "hint") -style -opacity) "0")))
-(set! (.-onclick (gid "gogenome")) (fn [_] (frame-rect genome-view true genome-ins)))
-(.addEventListener doc "keydown" (fn [e] (when (= (.-key e) "Escape") (deselect) (frame-rect genome-view true genome-ins))))
+(set! (.-onclick (gid "gogenome")) (fn [_] (frame-rect genome-view true (cur-ins))))
+(.addEventListener doc "keydown" (fn [e] (when (= (.-key e) "Escape") (deselect) (frame-rect genome-view true (cur-ins)))))
+
+;; collapse / expand the summary card
+(set! (.-onclick (gid "hud-toggle"))
+  (fn [_]
+    (let [collapsed (not @hud-collapsed)]
+      (reset! hud-collapsed collapsed)
+      (.toggle (.-classList (gid "hud")) "collapsed" collapsed)
+      (set! (.-textContent (gid "hud-toggle")) (if collapsed "+" "–"))
+      (set! (.-title (gid "hud-toggle")) (if collapsed "Show summary" "Hide summary"))
+      (when-not @selected (fit)))))
 
 (set! (.-onclick (gid "theme"))
   (fn [_]

@@ -72,7 +72,8 @@
 (def macro-groups-out
   (vec (for [g (:groups (:macro-catalog taste))]
          {:g (:g g)
-          :items (vec (for [it (:macros g)] {:m (:m it) :comp (macro-def (:m it)) :sig (:sig it) :p (:p it)}))})))
+          :items (vec (for [it (:macros g)]
+                        {:m (:m it) :comp (macro-def (:m it)) :sig (:sig it) :p (:p it) :keys (:keys it)}))})))
 
 (def protocols-out
   (vec (for [c (sort current) p (:protocols (F c))]

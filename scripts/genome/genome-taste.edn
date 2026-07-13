@@ -59,22 +59,66 @@
 
  ;; macro catalog: grouping + signature + purpose (taste). The defining component
  ;; is filled in deterministically by genome.bb from the repo.
+ ;; :keys = the audited key surface. opts = the metadata map you author; result = the
+ ;; body-result keys. {:req true} marks a required key; {:note "…"} is a shape/prose pill.
  :macro-catalog
  {:groups
   [{:g "CQRS building blocks"
-    :macros [{:m "defcommand"    :sig "(defcommand :area/name {…} [ctx] & body)"    :p "Handle a command → append events to the log"}
-             {:m "defquery"      :sig "(defquery :area/name {…} [ctx] & body)"      :p "Answer a read-side query over projections"}
-             {:m "defreadmodel"  :sig "(defreadmodel :area/name {…} [entity] & body)" :p "Fold events into a read-model projection"}
-             {:m "defprocessor"  :sig "(defprocessor :area/name {…} [ctx] & body)"  :p "React to events; issue follow-up commands"}
-             {:m "defperiodic"   :sig "(defperiodic :area/name {…} & body)"          :p "Run work on a schedule / interval"}
-             {:m "defeventmodel" :sig "(defeventmodel :area {area-map})"             :p "Register a service-area event model spec"}]}
+    :macros
+    [{:m "defcommand" :sig "(defcommand :area/name {opts} [ctx] & body)" :p "Handle a command → append events to the log"
+      :keys {:opts [{:k "authorized?"} {:k "grain.event-model/produces"} {:k "grain.event-model/reads"} {:note "open map; no :schema in v2"}]
+             :result [{:k "command-result/events"} {:k "command-result/cas"} {:k "command-result/success"} {:k "command/result"} {:note "or anomaly"}]
+             :ds-result [{:k "datastar/signals" :tone "ds" :tip "signals patched on success (e.g. a __toast)"}
+                         {:note "on failure → :error / :fieldErrors signals"}]}}
+     {:m "defquery" :sig "(defquery :area/name {opts} [ctx] & body)" :p "Answer a read-side query over projections"
+      :keys {:opts [{:k "authorized?"} {:k "auth"} {:k "cache-ttl"} {:note "open — merged verbatim"}]
+             :ds-meta [{:k "datastar/path" :tone "ds" :tip "route path — makes the query datastar-routable"}
+                       {:k "datastar/title" :tone "ds" :tip "HTML title element (default: Grain App)"}
+                       {:k "datastar/fps" :tone "ds" :tip "SSE re-render throttle, frames/sec (default 0)"}
+                       {:k "datastar/gate" :tone "ds" :tip "access guard {:check fn :redirect path}"}
+                       {:k "datastar/interceptors" :tone "ds" :tip "extra Pedestal interceptors on the route"}
+                       {:k "datastar/shim-opts" :tone "ds" :tip "per-query shim-page opts (:head :html-attrs :datastar-url)"}
+                       {:k "datastar/action-path" :tone "ds" :tip "command endpoint emitted as __grainAction"}
+                       {:k "datastar/debounce-ms" :tone "ds" :tip "stream re-render debounce ms (default 50)"}
+                       {:k "datastar/event-tags" :tone "ds" :tip "event tags the stream filters on"}
+                       {:k "grain/read-models" :tone "ds" :tip "read-models the stream watches to re-render"}]
+             :result [{:k "query/result"} {:note "or anomaly"}]
+             :ds-result [{:k "datastar/hiccup" :tone "ds" :tip "the hiccup view datastar renders"}
+                         {:k "datastar/signals" :tone "ds" :tip "signals to patch on the client"}]}}
+     {:m "defreadmodel" :sig "(defreadmodel :area/name {opts} [state event] & body)" :p "Fold events into a read-model projection"
+      :keys {:opts [{:k "events" :req true} {:k "version"} {:k "partition-fn"} {:k "entity-id-fn"} {:k "l1-ttl-ms"}]
+             :result [{:note "{entity-id → entity}"}]}}
+     {:m "defprocessor" :sig "(defprocessor :area/name {opts} [ctx] & body)" :p "React to events; issue follow-up commands"
+      :keys {:opts [{:k "topics" :req true} {:k "grain.event-model/produces"} {:k "grain.event-model/reads"}]
+             :result [{:k "result/events"} {:k "result/effect"} {:k "result/checkpoint"} {:k "result/cas"} {:k "result/on-success"} {:k "result/on-failure"} {:note "{} no-op / anomaly"}]}}
+     {:m "defperiodic" :sig "(defperiodic :area/name {opts} [tenant-id time] & body)" :p "Run work on a schedule / interval"
+      :keys {:opts [{:k "schedule" :req true} {:k "description"}]
+             :result [{:k "result/events"} {:k "result/cas"}]}}
+     {:m "defeventmodel" :sig "(defeventmodel :area {area-map})" :p "Register a service-area event model spec"
+      :keys {:opts [{:k "description"} {:k "commands"} {:k "events"} {:k "read-models"} {:k "queries"} {:k "todo-processors"} {:k "periodic-tasks"} {:k "screens"} {:k "flows"}]
+             :result [{:note "registers the area model"}]}}]}
    {:g "Schema & tooling"
-    :macros [{:m "defschemas" :sig "(defschemas sym {schema-map})" :p "Register a set of malli schemas"}
-             {:m "defguide"   :sig "(defguide :id {…})"            :p "Author a dev / agent REPL guide"}]}
+    :macros
+    [{:m "defschemas" :sig "(defschemas sym {schema-map})" :p "Register a set of malli schemas"
+      :keys {:opts [{:note "schema-name → malli-form (open)"}]
+             :result [{:note "merges into global registry"}]}}
+     {:m "defguide" :sig "(defguide :id {guide-map})" :p "Author a dev / agent REPL guide"
+      :keys {:opts [{:k "id" :req true} {:k "title"} {:k "summary"} {:k "applies-to"} {:k "body"}]
+             :result [{:note "returns :id"}]}}]}
    {:g "UI · datastar"
-    :macros [{:m "defcomponent"      :sig "(defcomponent name [args] & body)" :p "Define a hypermedia component (hiccup)"}
-             {:m "with-signals"      :sig "(with-signals [open? {…}] & body)" :p "Declare reactive Datastar signals"}
-             {:m "with-signal-scope" :sig "(with-signal-scope [scope] & body)" :p "Scope nested signal declarations"}]}]}
+    :macros
+    [{:m "defcomponent" :sig "(defcomponent name [args] & body)" :p "Define a hypermedia component (hiccup). Its :on/* effects bridge to the CQRS DSL."
+      :keys {:opts [{:k "::signals"} {:k "effect"} {:k "bind/*"} {:k "on/*"} {:k "morph/ignore"} {:note "+ raw attrs"}]
+             :result [{:k "data-signals"} {:k "data-bind"} {:k "data-text"} {:k "data-show"} {:k "data-class"} {:k "data-effect"} {:k "data-on:*"} {:k "data-ignore-morph"}]
+             :bridge [{:k "dispatch → command" :tone "write" :tip "issues a defcommand; args statically checked vs the command's malli schema (missing / unknown / nil-required), posted via the __grainAction signal"}
+                      {:k "refresh → query" :tone "read" :tip "streams a defquery result; resolves the route via the query's :datastar/path"}
+                      {:k "href → query" :tone "read" :tip "checked page link to a defquery via the query registry"}]}}
+     {:m "with-signals" :sig "(with-signals [sym opts …] & body)" :p "Declare reactive Datastar signals"
+      :keys {:opts [{:k "init"} {:k "name"} {:k "stable?"}]
+             :result [{:k "::signals"} {:note "→ data-signals"}]}}
+     {:m "with-signal-scope" :sig "(with-signal-scope scope & body)" :p "Scope nested signal declarations"
+      :keys {:opts [{:k "prefix"} {:k "name"} {:k "key"}]
+             :result [{:note "rebinds *signal-scope*"}]}}]}]}
 
  ;; one-line purpose per protocol seam (definer + implementers come from the repo).
  :protocol-notes

@@ -115,6 +115,16 @@
     -webkit-backdrop-filter:blur(16px) saturate(1.4);
     border:1px solid var(--border); border-radius:16px; box-shadow:var(--shadow);}
   #hud{position:fixed; top:20px; left:20px; z-index:60; padding:18px 20px 16px; max-width:346px;}
+  .hud-toggle{position:absolute; top:12px; right:12px; width:24px; height:24px; border-radius:7px;
+    display:flex; align-items:center; justify-content:center; cursor:pointer; color:var(--ink-faint);
+    border:1px solid var(--border); background:var(--surface-solid); font-size:16px; line-height:1; z-index:1;}
+  .hud-toggle:hover{color:var(--ink); border-color:var(--border-str);}
+  #hud.collapsed{padding:11px 46px 11px 18px; max-width:none; width:max-content;}
+  #hud.collapsed #hud-kick{margin:0;}
+  #hud.collapsed #hud-title,
+  #hud.collapsed #hud-lede,
+  #hud.collapsed .stats{display:none;}
+  #hud.collapsed .hud-toggle{top:8px; right:8px;}
   #hud .kick{font-family:var(--font-mono); font-size:11px; letter-spacing:.32em; text-transform:uppercase;
     color:var(--c-log); margin:0 0 5px;}
   #hud h1{margin:0; font-size:25px; font-weight:680; letter-spacing:-.02em;}
@@ -256,7 +266,9 @@
     color:var(--ink-faint); margin:20px 0 12px;}
   .mgrid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
   .entry{padding:15px 17px; border-radius:14px; border:1px solid var(--border);
-    background:color-mix(in srgb,var(--surface-solid) 66%, transparent); border-left:3px solid var(--ec);}
+    background:color-mix(in srgb,var(--surface-solid) 66%, transparent); border-left:3px solid var(--ec);
+    display:flex; flex-direction:column;}
+  .entry > .en-foot{margin-top:auto; padding-top:4px;}   /* pin "defined in" to the card bottom so rows align */
   .entry.m{--ec:var(--macro-c)} .entry.p{--ec:var(--proto-c)}
   .entry .en-top{display:flex; align-items:center; gap:9px;}
   .entry .en-g{font-family:var(--font-mono); font-size:16px; font-weight:700; color:var(--ec);}
@@ -264,7 +276,25 @@
   .entry .en-sig{font-family:var(--font-mono); font-size:12px; color:var(--ink-dim); margin:9px 0 0;
     background:color-mix(in srgb,var(--ink) 5%, transparent); padding:6px 9px; border-radius:7px;
     overflow-x:auto; white-space:nowrap;}
-  .entry .en-p{font-size:13px; line-height:1.45; color:var(--ink-dim); margin:10px 0 12px;}
+  .entry .en-p{font-size:13px; line-height:1.45; color:var(--ink-dim); margin:10px 0 10px;}
+  .en-keys{display:flex; flex-direction:column; gap:6px; margin:0 0 12px;}
+  .krow{display:flex; align-items:flex-start; gap:7px; flex-wrap:wrap;}
+  .krow .klbl{font-family:var(--font-mono); font-size:9.5px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--ink-faint); padding-top:3px; min-width:38px; flex:none;}
+  .kpill{font-family:var(--font-mono); font-size:10.5px; padding:2px 7px; border-radius:6px;
+    color:var(--ink-dim); background:color-mix(in srgb,var(--ink) 6%, transparent);
+    border:1px solid var(--border);}
+  .kpill.req{color:var(--ec); border-color:color-mix(in srgb,var(--ec) 45%, transparent);
+    background:color-mix(in srgb,var(--ec) 12%, transparent); font-weight:600;}
+  .kpill.req::after{content:"*"; opacity:.7;}
+  .kpill.note{font-style:italic; color:var(--ink-faint); background:transparent; border-style:dashed;}
+  .kpill[title]{cursor:help;}
+  .kpill.write{color:var(--c-write); border-color:color-mix(in srgb,var(--c-write) 45%, transparent);
+    background:color-mix(in srgb,var(--c-write) 12%, transparent);}
+  .kpill.read{color:var(--c-read); border-color:color-mix(in srgb,var(--c-read) 45%, transparent);
+    background:color-mix(in srgb,var(--c-read) 12%, transparent);}
+  .kpill.ds{color:var(--c-apps); border-color:color-mix(in srgb,var(--c-apps) 45%, transparent);
+    background:color-mix(in srgb,var(--c-apps) 12%, transparent);}
   .entry .en-foot{display:flex; align-items:center; gap:7px; flex-wrap:wrap; font-size:11px; color:var(--ink-faint);}
   .en-chip{font-family:var(--font-mono); font-size:11.5px; padding:3px 9px; border-radius:7px; cursor:pointer;
     color:var(--ink-dim); background:color-mix(in srgb,var(--surface-solid) 70%, transparent);
@@ -287,6 +317,7 @@
 </div>
 
 <div id="hud" class="glass">
+  <div class="hud-toggle" id="hud-toggle" title="Hide summary">–</div>
   <p class="kick" id="hud-kick">grain · current generation</p>
   <h1 id="hud-title"></h1>
   <p id="hud-lede"></p>
