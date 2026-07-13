@@ -1456,6 +1456,32 @@
     (testing "root path stream route is /__stream (not //__stream)"
       (is (= "/__stream" (first stream-route))))))
 
+(defn- route-pair-heartbeat
+  "Builds routes for a polling query with the given entry + defaults, drives the
+   generated GET stream interceptor, and returns the heartbeat-delay that reaches
+   sse/start-stream. Exercises the query->route-pair -> stream-view plumbing."
+  [entry defaults]
+  (let [[_shim stream-route] (#'ds/query->route-pair {} :test/hb entry defaults)
+        stream-interceptor (last (nth stream-route 2))
+        captured (atom nil)]
+    (with-redefs [sse/start-stream (fn [_callback _ctx heartbeat-delay]
+                                     (reset! captured heartbeat-delay)
+                                     {:status 200})]
+      ((:enter stream-interceptor) {}))
+    @captured))
+
+(deftest heartbeat-delay-configurable-test
+  (let [base {:authorized? (constantly true) :datastar/path "/hb"}]
+    (testing "per-query :datastar/heartbeat-delay reaches sse/start-stream"
+      (is (= 1 (route-pair-heartbeat (assoc base :datastar/heartbeat-delay 1) {}))))
+    (testing "defaults :datastar/heartbeat-delay applies when the query omits it"
+      (is (= 2 (route-pair-heartbeat base {:datastar/heartbeat-delay 2}))))
+    (testing "a per-query value overrides the default"
+      (is (= 1 (route-pair-heartbeat (assoc base :datastar/heartbeat-delay 1)
+                                     {:datastar/heartbeat-delay 2}))))
+    (testing "neither set falls through to stream-view's 10s default (not nil)"
+      (is (= 10 (route-pair-heartbeat base {}))))))
+
 ;; =========================== ;;
 ;; E2E Auto-Routes Test         ;;
 ;; =========================== ;;

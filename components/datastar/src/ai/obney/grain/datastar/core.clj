@@ -979,10 +979,17 @@
           event-types (when (seq read-models) (resolve-events read-models))
           debounce-ms (:datastar/debounce-ms entry 50)
           event-tags (:datastar/event-tags entry)
+          ;; Per-query :datastar/heartbeat-delay wins; else a global default from
+          ;; the defaults map; else nil, leaving stream-view's own default (10s).
+          ;; Only assoc'd when set so the absent case falls through to that
+          ;; default rather than passing nil to sse/start-stream.
+          heartbeat-delay (or (:datastar/heartbeat-delay entry)
+                              (:datastar/heartbeat-delay defaults))
           stream-opts (cond-> {:fps fps}
                         (seq event-types) (assoc :event-types event-types
                                                  :debounce-ms debounce-ms)
-                        event-tags (assoc :event-tags event-tags))]
+                        event-tags (assoc :event-tags event-tags)
+                        heartbeat-delay (assoc :heartbeat-delay heartbeat-delay))]
       (let [with-signals (fn [extra]
                           (into [parse-datastar-signals] (concat interceptors extra)))]
         [;; Shim page route (GET)
@@ -1005,7 +1012,11 @@
    Optional overrides map: {query-name {:datastar/fps 2 :datastar/interceptors [...]}}
    Optional defaults map: {:datastar/shim-opts {:head fn :html-attrs {} :datastar-url str}}
      Defaults are applied to all routes; per-query shim-opts override them.
-     :datastar/action-path sets the command endpoint emitted as __grainAction."
+     :datastar/action-path sets the command endpoint emitted as __grainAction.
+     :datastar/heartbeat-delay sets the SSE heartbeat interval in seconds for all
+       generated streams (default 10); a per-query :datastar/heartbeat-delay
+       overrides it. Lower it to cap live-update latency on iOS Safari behind an
+       HTTP/2 edge — see datastar.allium's config heartbeat_interval note."
   ([context] (routes context {} {}))
   ([context overrides] (routes context overrides {}))
   ([context overrides defaults]
