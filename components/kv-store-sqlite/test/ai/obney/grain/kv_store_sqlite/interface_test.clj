@@ -1,7 +1,7 @@
 (ns ai.obney.grain.kv-store-sqlite.interface-test
   (:require [clojure.test :as test :refer :all]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-sqlite.interface]
+            [ai.obney.grain.kv-store-sqlite.interface :as sqlite]
             [clojure.java.io :as io]))
 
 (def ^:dynamic *cache* nil)
@@ -86,6 +86,21 @@
   (testing ":table-name config is respected"
     (let [file (str "/tmp/kv-sqlite-tablename-" (random-uuid) ".db")
           cache (kv/start {:type :sqlite :database-file file :table-name "custom_kv"})]
+      (try
+        (kv/put! cache {:k (.getBytes "k") :v (.getBytes "v")})
+        (is (= "v" (String. (kv/get! cache {:k (.getBytes "k")}))))
+        (finally
+          (kv/stop cache)
+          (io/delete-file file true))))))
+
+;; ---------------------------------------------------------------------------
+;; Backwards compatibility: direct construction (bypassing {:type ...} dispatch)
+;; ---------------------------------------------------------------------------
+
+(deftest direct-construction-still-works
+  (testing "kv/start accepts an already-constructed record, not just a {:type ...} config"
+    (let [file (str "/tmp/kv-sqlite-direct-" (random-uuid) ".db")
+          cache (kv/start (sqlite/->KV-Store-Sqlite {:database-file file}))]
       (try
         (kv/put! cache {:k (.getBytes "k") :v (.getBytes "v")})
         (is (= "v" (String. (kv/get! cache {:k (.getBytes "k")}))))

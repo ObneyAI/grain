@@ -1,7 +1,7 @@
 (ns ai.obney.grain.kv-store-lmdb.interface-test
   (:require [clojure.test :as test :refer :all]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface]
+            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [clojure.java.io :as io]))
 
 (defn- delete-dir-recursively [dir]
@@ -94,6 +94,21 @@
                             :storage-dir dir
                             :db-name "test"
                             :max-readers 256})]
+      (try
+        (kv/put! cache {:k (.getBytes "k") :v (.getBytes "v")})
+        (is (= "v" (String. (kv/get! cache {:k (.getBytes "k")}))))
+        (finally
+          (kv/stop cache)
+          (delete-dir-recursively dir))))))
+
+;; ---------------------------------------------------------------------------
+;; Backwards compatibility: direct construction (bypassing {:type ...} dispatch)
+;; ---------------------------------------------------------------------------
+
+(deftest direct-construction-still-works
+  (testing "kv/start accepts an already-constructed record, not just a {:type ...} config"
+    (let [dir (str "/tmp/kv-lmdb-direct-" (random-uuid))
+          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
       (try
         (kv/put! cache {:k (.getBytes "k") :v (.getBytes "v")})
         (is (= "v" (String. (kv/get! cache {:k (.getBytes "k")}))))
