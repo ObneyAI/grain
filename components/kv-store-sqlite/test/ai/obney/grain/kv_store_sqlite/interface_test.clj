@@ -1,31 +1,20 @@
-(ns ai.obney.grain.kv-store-lmdb.interface-test
+(ns ai.obney.grain.kv-store-sqlite.interface-test
   (:require [clojure.test :as test :refer :all]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface]
+            [ai.obney.grain.kv-store-sqlite.interface]
             [clojure.java.io :as io]))
-
-(defn- delete-dir-recursively [dir]
-  (let [f (io/file dir)]
-    (when (.exists f)
-      (run! #(when (.isFile %) (io/delete-file %))
-            (file-seq f))
-      (run! #(io/delete-file % true)
-            (reverse (file-seq f))))))
 
 (def ^:dynamic *cache* nil)
 
 (defn test-fixture [f]
-  (let [dir (str "/tmp/kv-lmdb-test-" (random-uuid))
-        cache (kv/start {:type :lmdb
-                          :storage-dir dir
-                          :db-name "test"
-                          :map-size (* 1024 1024 64)})]
+  (let [file (str "/tmp/kv-sqlite-test-" (random-uuid) ".db")
+        cache (kv/start {:type :sqlite :database-file file})]
     (binding [*cache* cache]
       (try
         (f)
         (finally
           (kv/stop cache)
-          (delete-dir-recursively dir))))))
+          (io/delete-file file true))))))
 
 (use-fixtures :each test-fixture)
 
@@ -43,6 +32,12 @@
 
 (deftest get-missing-key-returns-nil
   (is (nil? (kv/get! *cache* {:k (.getBytes "nonexistent")}))))
+
+(deftest put-overwrites-existing-key
+  (let [k (.getBytes "overwrite-key")]
+    (kv/put! *cache* {:k k :v (.getBytes "first-value")})
+    (kv/put! *cache* {:k k :v (.getBytes "second-value")})
+    (is (= "second-value" (String. (kv/get! *cache* {:k k}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; put-batch!
@@ -73,30 +68,27 @@
   (is (nil? (kv/get! *cache* {:k (.getBytes "nothing")}))))
 
 ;; ---------------------------------------------------------------------------
-;; Max readers
+;; Concurrency
 ;; ---------------------------------------------------------------------------
 
 (deftest concurrent-readers-across-threads
-  (testing "200 concurrent thread readers succeed (would fail with old default of 126)"
+  (testing "many concurrent thread readers succeed against the pooled connections"
     (kv/put! *cache* {:k (.getBytes "shared") :v (.getBytes "value")})
     (let [results (doall
                     (pmap (fn [_]
                             (try
                               (String. (kv/get! *cache* {:k (.getBytes "shared")}))
                               (catch Exception e (.getMessage e))))
-                          (range 200)))]
+                          (range 50)))]
       (is (every? #(= "value" %) results)))))
 
-(deftest custom-max-readers-config
-  (testing "max-readers config is respected"
-    (let [dir (str "/tmp/kv-lmdb-maxreaders-" (random-uuid))
-          cache (kv/start {:type :lmdb
-                            :storage-dir dir
-                            :db-name "test"
-                            :max-readers 256})]
+(deftest custom-table-name-config
+  (testing ":table-name config is respected"
+    (let [file (str "/tmp/kv-sqlite-tablename-" (random-uuid) ".db")
+          cache (kv/start {:type :sqlite :database-file file :table-name "custom_kv"})]
       (try
         (kv/put! cache {:k (.getBytes "k") :v (.getBytes "v")})
         (is (= "v" (String. (kv/get! cache {:k (.getBytes "k")}))))
         (finally
           (kv/stop cache)
-          (delete-dir-recursively dir))))))
+          (io/delete-file file true))))))

@@ -1,0 +1,259 @@
+-- allium: 3
+-- kv-store-sqlite.allium
+--
+-- Distilled from components/kv-store-sqlite (grain).
+--
+-- Scope: An embedded, durable key/value store backed by a SQLite file.
+--        Callers write opaque byte values under opaque byte keys, read them
+--        back, and write several entries together as one atomic batch. The
+--        store is local to the node that opens it; there is no tenancy, no
+--        authorization and no event sourcing here -- it is a low-level
+--        building block other components use for local caches and
+--        checkpoints, an alternative backing to kv-store-lmdb for
+--        deployments that already standardize on SQLite.
+--
+-- Classification: LIBRARY / FRAMEWORK. This component is a reusable mechanism
+--        with a small set of behavioural guarantees the tests prove: a
+--        faithful write-then-read round-trip, absence of a value for an
+--        unwritten key, all-or-nothing batch writes, and read liveness under
+--        concurrent access from many threads. There is no domain model. The
+--        boundary is a Store contract carrying those guarantees; the
+--        put/get/batch behaviour is also stated as rules over a StoredEntry
+--        binding so the round-trip is expressed as observable state, not only
+--        as contract prose. Keys and values are opaque to the store and are
+--        modelled as Any.
+--
+-- Includes:
+--   - open / close lifecycle: the store must be opened before any read or
+--     write and closed to release its backing; reads and writes are valid
+--     only while it is open
+--   - put / get: a value written under a key is later read back unchanged,
+--     and a key that was never written reads back as absent
+--   - put-batch: a set of entries is written in a single atomic unit -- either
+--     all of them become visible or none do, using a SQLite transaction
+--   - durability: a written value persists and remains readable until
+--     overwritten -- the store is backed by a durable SQLite file, not
+--     process memory (the suite proves persistence within an open store;
+--     cross-restart survival is a property of the durable backing, not a
+--     test)
+--   - concurrent-read liveness: many threads may read at once via a pooled
+--     set of connections over a WAL-mode database, which allows readers to
+--     proceed concurrently with the single writer
+--   - two capacity boundaries the caller configures at open time: the
+--     connection pool size, and which table within the SQLite file backs the
+--     store
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the storage engine itself (SQLite), its file format and journal mode
+--   - the connection pool mechanism (HikariCP) and the upsert statement
+--     (INSERT ... ON CONFLICT) used to realise put / put-batch
+--   - how keys and values are serialized into bytes by callers (the store
+--     treats both as opaque byte sequences -- Any in this spec)
+--   - the on-disk file path and which table name backs the store
+--   - logging and metrics
+--
+-- Most guarantees below are proven by the component's test suite
+-- (interface_test.clj): put-and-get-round-trip, get-missing-key-returns-nil,
+-- put-batch-writes-all-entries, put-batch-is-atomic-on-success,
+-- put-batch-empty-entries, concurrent-readers-across-threads. Durability
+-- beyond an open store is a property of the durable backing that the suite
+-- does not directly exercise (see Durability and the Open Questions).
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- One key/value pair offered to a batch write. A batch is an ordered list of
+-- these; the store applies the whole list as a single atomic unit. Key and
+-- value are opaque bytes to the store, hence Any.
+value Entry {
+    key: Any
+    value: Any
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The key/value boundary the store offers. The store has an open/close
+-- lifecycle: it must be opened before any read or write and closed to
+-- release its resources. Reads return the value previously written under a
+-- key, or nothing when the key is unknown. Writes are either a single put or
+-- an atomic batch. These signatures are the whole of the component's
+-- observable surface; keys and values are opaque (Any).
+contract Store {
+    -- Make the store ready to serve reads and writes (allocating its
+    -- connection pool and durable backing).
+    open: () -> Any
+    -- Release the store and its resources. After close, no read or write is
+    -- valid until the store is opened again.
+    close: () -> Any
+    -- Read the value last written under a key, or nothing if none was
+    -- written.
+    get: (key: Any) -> Any
+    -- Write a single value under a key, replacing any previous value there.
+    put: (key: Any, value: Any) -> Any
+    -- Write a list of entries as one atomic unit.
+    put_batch: (entries: List<Entry>) -> Any
+
+    @invariant WriteThenReadConsistency
+        -- A value written under a key is read back unchanged by a subsequent
+        -- get of that same key: the bytes returned are byte-for-byte the
+        -- bytes written. A later put under the same key replaces the earlier
+        -- value, so get always returns the most recent write.
+
+    @invariant AbsentKeyYieldsNothing
+        -- get of a key that was never written returns nothing. Absence is a
+        -- first-class result, not an error: the caller distinguishes "no
+        -- value" from any stored value.
+
+    @invariant BatchAtomicity
+        -- put_batch applies its entries as a single all-or-nothing unit
+        -- within one SQLite transaction. Either every entry becomes visible
+        -- to subsequent reads, or none does. A partially applied batch is
+        -- never observable. An empty batch is a well-formed no-op that
+        -- changes nothing.
+
+    @invariant UsableOnlyWhileOpen
+        -- get, put and put_batch are defined only between an open and the
+        -- next close. The store must be opened before its first read or
+        -- write, and close releases its backing resources; operations before
+        -- open or after close are outside the contract and the store
+        -- guarantees nothing about them.
+
+    @invariant Durability
+        -- A written value is held in the durable SQLite file rather than in
+        -- process memory: once a put or put_batch has committed, the value
+        -- remains readable for the life of the store until it is
+        -- overwritten, and is not lost between reads. Persistence does not
+        -- depend on the writer retaining the value after the call returns.
+        -- (The tests prove persistence within an open store; survival across
+        -- a full process restart is a property of the durable backing rather
+        -- than something the suite exercises.)
+
+    @invariant ConcurrentReadLiveness
+        -- Many threads may read concurrently against the pooled connections.
+        -- A read does not fail merely because other reads are in flight;
+        -- WAL mode lets readers proceed without blocking on the single
+        -- writer.
+
+    @guidance
+        -- The store is single-node and local; it carries no tenant scope and
+        -- no authorization. Keys and values are opaque bytes -- the store
+        -- never inspects them. config.max_pool_size bounds the number of
+        -- pooled connections a caller may hold at once; requests beyond that
+        -- ceiling wait for a connection to free up rather than failing
+        -- outright. Atomicity is guaranteed only within a single put_batch,
+        -- not across separate put / put_batch calls.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The host process that opens and drives the store. It is code, not a
+-- person: whatever component embeds the store and issues reads and writes.
+-- Modelled as a party so the surface has a facing actor; it carries no
+-- fields of its own.
+entity Host {}
+
+-- An entry currently committed to the store: a key bound to its most-recent
+-- value. The set of StoredEntries is the store's whole readable state -- it
+-- stands in for "what a get would return", letting the put/get behaviour be
+-- stated as rules over observable state rather than left implicit in prose.
+entity StoredEntry {
+    key: Any
+    value: Any
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The maximum number of pooled connections the store may hold open at
+    -- once. Sized for workloads that read and write from several threads
+    -- concurrently against the WAL-mode database.
+    max_pool_size: Integer = 4
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A single put binds a key to a value. If the key was already bound, the
+-- value is replaced; otherwise a new binding is created. After the put, a
+-- get of that key returns exactly this value -- this is the write-then-read
+-- guarantee stated over observable state.
+rule PutValue {
+    when: PutRequested(host, key, value)
+    let existing = StoredEntry{key: key}
+    ensures:
+        if exists existing:
+            existing.value = value
+        else:
+            StoredEntry.created(key: key, value: value)
+}
+
+-- A batch put applies its entries as one unit: every entry becomes a current
+-- binding together, or none does. The all-or-nothing nature is the
+-- BatchAtomicity contract invariant; here the rule states the successful
+-- outcome -- each entry left bound to its value. An empty batch binds
+-- nothing and changes no state.
+rule PutBatch {
+    when: BatchRequested(host, entries)
+    ensures:
+        for entry in entries:
+            let existing = StoredEntry{key: entry.key}
+            if exists existing:
+                existing.value = entry.value
+            else:
+                StoredEntry.created(key: entry.key, value: entry.value)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A key is bound to at most one value at a time: a put replaces rather than
+-- accumulates, so a get is never ambiguous about which value to return.
+invariant SingleBindingPerKey {
+    for a in StoredEntries:
+        for b in StoredEntries:
+            a != b implies a.key != b.key
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The single boundary this component exposes: a host puts byte values,
+-- writes atomic batches, and reads them back from a durable local SQLite
+-- store.
+surface KeyValueAccess {
+    facing host: Host
+
+    contracts:
+        fulfils Store
+
+    provides:
+        PutRequested(host, key, value)
+        BatchRequested(host, entries)
+
+    @guarantee WrittenValuesAreReadable
+        -- A value handed to put (or to put_batch) is later recoverable, byte
+        -- for byte, by a get of its key; an unwritten key reads back as
+        -- absent; and a batch is visible all-or-nothing.
+
+    @guarantee ConcurrentReadsDoNotStarve
+        -- Reads issued concurrently across many threads succeed against the
+        -- pooled connections; WAL mode keeps readers from blocking on the
+        -- single writer.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The store exposes no delete operation: callers can only overwrite a key, never remove its binding. Is delete genuinely out of scope, or is it an unfilled gap in the boundary shared with kv-store-lmdb?"
+open question "max_pool_size bounds concurrent connections rather than total stored size (kv-store-lmdb bounds total stored size instead). Should both backends expose the same capacity concept, or is this divergence acceptable given SQLite has no comparable fixed map-size limit?"

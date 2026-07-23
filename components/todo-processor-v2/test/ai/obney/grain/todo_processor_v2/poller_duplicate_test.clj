@@ -5,7 +5,7 @@
             [ai.obney.grain.event-store-v3.interface :as es :refer [->event]]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.kv-store-lmdb.interface]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.todo-processor-v2.core :as tp-core]))
 
@@ -15,7 +15,7 @@
 (defn- make-test-infra []
   (let [dir (str "/tmp/poller-dup-test-" (random-uuid))]
     {:event-store (es/start {:conn {:type :in-memory} :event-pubsub nil :logger nil})
-     :cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+     :cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})
      :dir dir}))
 
 (defn- stop-test-infra [{:keys [event-store cache dir]}]

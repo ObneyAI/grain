@@ -12,7 +12,7 @@
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.kv-store-lmdb.interface]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [com.brunobonacci.mulog :as u]
             [nrepl.server :as nrepl]
@@ -192,7 +192,7 @@
                                            :event-pubsub event-pubsub
                                            :poll-interval-ms 100
                                            :batch-size 100})
-        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir cache-dir :db-name "cp-test"}))
+        cache (kv/start {:type :lmdb :storage-dir cache-dir :db-name "cp-test"})
 
         ;; Control plane — include address in node metadata for routing
         cp (control-plane/start {:event-store event-store

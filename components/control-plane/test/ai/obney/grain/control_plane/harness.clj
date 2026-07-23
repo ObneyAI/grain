@@ -5,7 +5,7 @@
   (:require [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.kv-store-lmdb.interface]
             [ai.obney.grain.control-plane.events :as events]
             [ai.obney.grain.control-plane.core :as cp]
             [ai.obney.grain.control-plane.assignment :as assignment]
@@ -25,7 +25,7 @@
    sharing the given event store."
   [shared-store node-id]
   (let [dir (str "/tmp/cp-harness-" node-id)
-        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+        cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})]
     {:node-id node-id
      :event-store shared-store
      :cache cache

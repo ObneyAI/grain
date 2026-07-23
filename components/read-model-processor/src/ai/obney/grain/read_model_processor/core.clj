@@ -69,12 +69,12 @@
 
 (comment
 
-  (require '[ai.obney.grain.kv-store-lmdb.interface :as lmdb])
+  (require '[ai.obney.grain.kv-store-lmdb.interface])
 
   (def cache (kv/start
-              (lmdb/->KV-Store-LMDB
-               {:storage-dir "storage"
-                :db-name "my-db"})))
+              {:type :lmdb
+               :storage-dir "storage"
+               :db-name "my-db"}))
   
   (kv/stop cache)
 

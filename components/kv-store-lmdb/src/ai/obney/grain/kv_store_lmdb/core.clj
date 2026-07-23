@@ -1,6 +1,6 @@
 (ns ai.obney.grain.kv-store-lmdb.core
   (:refer-clojure :exclude [get])
-  (:require [ai.obney.grain.kv-store.interface.protocol :as p])
+  (:require [ai.obney.grain.kv-store.interface.protocol :as p :refer [start-kv-store]])
   (:import [org.lmdbjava DbiFlags Env PutFlags]
            [java.nio ByteBuffer]
            [java.io File]))
@@ -84,3 +84,7 @@
   (get! [this args] (get! this args))
   (put! [this args] (put! this args))
   (put-batch! [this args] (put-batch! this args)))
+
+(defmethod start-kv-store :lmdb
+  [config]
+  (p/start (->KV-Store-LMDB (dissoc config :type))))

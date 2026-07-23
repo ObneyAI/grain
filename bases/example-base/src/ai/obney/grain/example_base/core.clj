@@ -17,7 +17,7 @@
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.kv-store-lmdb.interface]
             [ai.obney.grain.webserver.interface :as ws]
             [ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface :as cloudwatch-emf]
             [clojure.set :as set]
@@ -104,8 +104,9 @@
 
 (defmethod ig/init-key ::cache [_ _]
   (kv/start
-   (lmdb/->KV-Store-LMDB {:storage-dir (str "/tmp/grain-example-" (random-uuid))
-                          :db-name "example"})))
+   {:type :lmdb
+    :storage-dir (str "/tmp/grain-example-" (random-uuid))
+    :db-name "example"}))
 
 (defmethod ig/halt-key! ::cache [_ cache]
   (kv/stop cache))

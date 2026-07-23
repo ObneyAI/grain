@@ -10,7 +10,7 @@
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.kv-store-lmdb.interface]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [clj-uuid :as uuid]
             [clojure.java.io :as io]))
@@ -30,7 +30,7 @@
   (testing "Control plane starts, emits heartbeats, and stops cleanly"
     (let [dir (str "/tmp/cp-lifecycle-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+          cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})]
       (try
         (let [cp-instance (cp/start {:event-store store
                                      :cache cache
@@ -62,7 +62,7 @@
   (testing "Control plane coordinator automatically assigns tenant-processor pairs"
     (let [dir (str "/tmp/cp-coord-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})
           tenant-1 (uuid/v4)]
       (try
         ;; Create a domain tenant
@@ -97,7 +97,7 @@
   (testing "Control plane reactor starts a todo processor when a lease is assigned"
     (let [dir (str "/tmp/cp-reactor-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})
           tenant-1 (uuid/v4)
           processed (atom [])]
       (try
@@ -140,7 +140,7 @@
   (testing "Control plane reactor stops todo processors when the control plane stops"
     (let [dir (str "/tmp/cp-reactor-stop-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})
           tenant-1 (uuid/v4)]
       (try
         (let [prev-registry @tp/processor-registry*]
@@ -179,7 +179,7 @@
   (testing "DR1: departure event is emitted only after in-flight work has drained"
     (let [dir (str "/tmp/cp-dr1-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})
           tenant-1 (uuid/v4)
           effect-started (promise)
           effect-gate (promise)]
@@ -246,7 +246,7 @@
   (testing "DR2: no new heartbeats appear after stop completes"
     (let [dir (str "/tmp/cp-dr2-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+          cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})]
       (try
         (let [cp-instance (cp/start {:event-store store
                                      :cache cache
@@ -296,8 +296,8 @@
     (let [dir-a (str "/tmp/cp-ptcas3-a-" (uuid/v4))
           dir-b (str "/tmp/cp-ptcas3-b-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache-a (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir-a :db-name "test"}))
-          cache-b (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir-b :db-name "test"}))
+          cache-a (kv/start {:type :lmdb :storage-dir dir-a :db-name "test"})
+          cache-b (kv/start {:type :lmdb :storage-dir dir-b :db-name "test"})
           tenant-1 (uuid/v4)
           tenant-2 (uuid/v4)
           cycle-count (atom 0)]

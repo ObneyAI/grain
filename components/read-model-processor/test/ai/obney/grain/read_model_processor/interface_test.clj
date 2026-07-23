@@ -5,7 +5,7 @@
             [ai.obney.grain.event-store-v2.interface :as es]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.kv-store-lmdb.interface]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [clojure.java.io :as io]))
 
@@ -35,7 +35,7 @@
 (defn test-fixture [f]
   (let [dir   (str "/tmp/rmp-test-" (random-uuid))
         store (es/start {:conn {:type :in-memory}})
-        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+        cache (kv/start {:type :lmdb :storage-dir dir :db-name "test"})]
     (binding [*event-store* store
               *cache*       cache]
       (try

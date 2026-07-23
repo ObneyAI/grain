@@ -1,9 +1,10 @@
 (ns ai.obney.grain.kv-store.interface
-  (:require [ai.obney.grain.kv-store.interface.protocol :as p]))
+  (:require [ai.obney.grain.kv-store.interface.protocol :as p]
+            [ai.obney.grain.kv-store.core :as core]))
 
-(defn start 
-  [kv-store]
-  (p/start kv-store))
+(defn start
+  [config]
+  (core/start config))
 
 (defn stop
   [kv-store]
