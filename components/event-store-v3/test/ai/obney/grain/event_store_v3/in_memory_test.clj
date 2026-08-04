@@ -6,7 +6,7 @@
             [cognitect.anomalies :as anom]
             [clojure.core.async :as async]
             [clj-uuid :as uuid])
-  (:import [java.time OffsetDateTime]
+  (:import [java.time OffsetDateTime ZoneOffset]
            [java.util UUID]))
 
 ;; -------------------- ;;
@@ -50,13 +50,11 @@
   ([type tags body]
    (let [event (es/->event (cond-> {:type type :tags tags}
                              body (assoc :body body)))]
-     (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
-     event)))
+     (first (es/append *event-store* {:tenant-id *tenant-id* :events [event]})))))
 
 (defn append-events! [events-data]
   (let [events (mapv es/->event events-data)]
-    (es/append *event-store* {:tenant-id *tenant-id* :events events})
-    events))
+    (es/append *event-store* {:tenant-id *tenant-id* :events events})))
 
 (defn read-events [args]
   (into [] (es/read *event-store* (if (vector? args)
@@ -90,6 +88,20 @@
         (is (pos? (count events))))
       (finally
         (es/stop store)))))
+
+(deftest event-construction-does-not-assign-persistence-metadata
+  (let [event (es/->event {:type :test/alpha :tags #{} :body {:val 1}})]
+    (is (not (contains? event :event/id)))
+    (is (not (contains? event :event/timestamp)))))
+
+(deftest append-rejects-caller-supplied-persistence-metadata
+  (doseq [metadata [{:event/id (uuid/v7)}
+                    {:event/timestamp (OffsetDateTime/now)}]]
+    (let [event (merge (es/->event {:type :test/alpha :tags #{} :body {:val 1}})
+                       metadata)
+          result (es/append *event-store* {:tenant-id *tenant-id* :events [event]})]
+      (is (= ::anom/incorrect (::anom/category result)))))
+  (is (empty? (read-events {}))))
 
 ;; ================================ ;;
 ;; B. Basic Append & Read (8 tests) ;;
@@ -168,9 +180,9 @@
 
 (deftest events-with-empty-body
   (let [event (es/->event {:type :test/alpha :tags #{}})
-        _ (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
+        [persisted] (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
         read (first (non-tx-events (read-events {})))]
-    (is (= (:event/id event) (:event/id read)))
+    (is (= (:event/id persisted) (:event/id read)))
     (is (= :test/alpha (:event/type read)))))
 
 ;; ============================ ;;
@@ -333,13 +345,11 @@
 
 (deftest commit-order-is-established-before-reversing-or-limiting
   (let [tag-id (uuid/v4)
-        low (assoc (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 1}})
-                   :event/id (UUID/fromString "01900000-0000-7000-8000-000000000001"))
-        high (assoc (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 2}})
-                    :event/id (UUID/fromString "01900000-0000-7000-8000-000000000002"))]
-    (let [[persisted-high] (es/append *event-store* {:tenant-id *tenant-id* :events [high]})
-          [persisted-low] (es/append *event-store* {:tenant-id *tenant-id* :events [low]})
-          expected [(:event/id persisted-high) (:event/id persisted-low)]
+        first-event (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 2}})
+        second-event (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 1}})]
+    (let [[persisted-first] (es/append *event-store* {:tenant-id *tenant-id* :events [first-event]})
+          [persisted-second] (es/append *event-store* {:tenant-id *tenant-id* :events [second-event]})
+          expected [(:event/id persisted-first) (:event/id persisted-second)]
           ids #(mapv :event/id (read-events %))]
       (is (= expected (ids {:types #{:test/alpha}})))
       (is (= expected
@@ -347,9 +357,9 @@
                    {:tags #{[:order tag-id]}}])))
       (is (= (vec (reverse expected))
              (ids {:types #{:test/alpha} :reverse? true})))
-      (is (= [(:event/id persisted-high)]
+      (is (= [(:event/id persisted-first)]
              (ids {:types #{:test/alpha} :limit 1})))
-      (is (= [(:event/id persisted-low)]
+      (is (= [(:event/id persisted-second)]
              (ids {:types #{:test/alpha} :reverse? true :limit 1}))))))
 
 (deftest batch-empty-result
@@ -422,7 +432,7 @@
                         :predicate-fn (constantly true)}})]
     (is (not (::anom/category result)))
     (is (= 1 (count (non-tx-events (read-events {:types #{:test/alpha}})))))
-    (is (empty? (tx-events (read-events {}))))))
+    (is (= 1 (count (tx-events (read-events {})))))))
 
 (deftest cas-predicate-false-returns-conflict-anomaly
   (let [event (es/->event {:type :test/alpha :tags #{} :body {:n 1}})
@@ -627,13 +637,22 @@
 
 (deftest timestamp-preserved-as-offsetdatetime
   (let [before (OffsetDateTime/now)
-        _ (append-event! :test/alpha #{} {:n 1})
+        submitted [(es/->event {:type :test/alpha :tags #{} :body {:n 1}})
+                   (es/->event {:type :test/beta :tags #{} :body {:n 2}})]
+        returned (es/append *event-store* {:tenant-id *tenant-id* :events submitted})
         after (OffsetDateTime/now)
-        read (first (non-tx-events (read-events {})))
-        ts (:event/timestamp read)]
+        stored (read-events {})
+        timestamps (mapv :event/timestamp stored)
+        ts (first timestamps)]
     (is (instance? OffsetDateTime ts))
     (is (not (.isBefore ts before)))
-    (is (not (.isAfter ts after)))))
+    (is (not (.isAfter ts after)))
+    (is (= ZoneOffset/UTC (.getOffset ts)) "store timestamps are canonical UTC")
+    (is (zero? (mod (.getNano ts) 1000))
+        "store timestamps use portable microsecond precision")
+    (is (apply = timestamps) "domain events and transaction marker share one timestamp")
+    (is (= (mapv :event/timestamp returned)
+           (mapv :event/timestamp (non-tx-events stored))))))
 
 ;; ======================================== ;;
 ;; J. Tenant Isolation (4 tests)            ;;

@@ -9,7 +9,9 @@
             [cognitect.anomalies :as anom]
             [clj-uuid :as uuid]
             [com.brunobonacci.mulog :as u])
-  (:import [clojure.lang ExceptionInfo]))
+  (:import [clojure.lang ExceptionInfo]
+           [java.time ZoneOffset]
+           [java.time.temporal ChronoUnit]))
 
 (defmethod start-event-store :default
   [{{:keys [type]} :conn}]
@@ -40,7 +42,7 @@
 
          ;; Schema validation issues
          (try (->> events
-                   (mapv #(mc/explain [:and ::schemas/event (:event/type %)] %))
+                   (mapv #(mc/explain [:and ::schemas/appendable-event (:event/type %)] %))
                    (filterv (complement nil?)))
               (catch ExceptionInfo _
                 {::anom/category ::anom/fault
@@ -87,8 +89,42 @@
      ::anom/message "Invalid arguments"
      :explain/data validation-error}
     (merge
-     {:event/id (uuid/v7)
-      :event/timestamp (time/now)
-      :event/type type
+     {:event/type type
       :event/tags tags}
      body)))
+
+(defn- next-event-id [previous]
+  (loop [candidate (uuid/v7)]
+    (if (or (nil? previous) (uuid/< previous candidate))
+      candidate
+      (recur (uuid/v7)))))
+
+(defn prepare-append
+  "Assign persistence metadata for one atomic append after serialization and
+   successful CAS evaluation. Domain events and their transaction marker share
+   one store-controlled timestamp."
+  [last-id events tx-metadata]
+  (let [timestamp (-> (time/now)
+                      (.withOffsetSameInstant ZoneOffset/UTC)
+                      (.truncatedTo ChronoUnit/MICROS))
+        domain-events (loop [remaining events previous last-id assigned []]
+                        (if-let [event (first remaining)]
+                          (let [event-id (next-event-id previous)]
+                            (recur (next remaining)
+                                   event-id
+                                   (conj assigned
+                                         (assoc event
+                                                :event/id event-id
+                                                :event/timestamp timestamp))))
+                          assigned))
+        tx-id (next-event-id (or (:event/id (last domain-events)) last-id))
+        tx (assoc (->event
+                   {:type :grain/tx
+                    :body (cond-> {:event-ids (set (mapv :event/id domain-events))}
+                            tx-metadata (assoc :metadata tx-metadata))})
+                  :event/id tx-id
+                  :event/timestamp timestamp)]
+    {:events domain-events
+     :events-with-tx (conj domain-events tx)
+     :last-event-id tx-id
+     :timestamp timestamp}))

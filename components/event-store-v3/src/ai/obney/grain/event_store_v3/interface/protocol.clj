@@ -18,12 +18,16 @@
 
      :events - A vector of events to append to the event store.
 
-       The store establishes final event IDs at its tenant serialization
-       boundary. Caller-supplied IDs are retained when already strictly after
-       the committed tenant watermark; otherwise the batch is re-IDed.
+       Events supplied to append must not contain :event/id or
+       :event/timestamp. The store assigns both fields after tenant
+       serialization and successful CAS evaluation. Every event and the
+       transaction marker in one append share a single recorded-at timestamp;
+       the timestamp is canonical UTC at portable microsecond precision. IDs
+       are UUIDv7 values strictly ordered after the committed watermark.
 
        On success, returns the persisted domain events, including their final
-       IDs. Callers that retain an event ID must use this returned value.
+       IDs and timestamps. Callers that retain persistence metadata must use
+       this returned value.
 
      :tx-metadata - An optional map of metadata to associate with the transaction.
 

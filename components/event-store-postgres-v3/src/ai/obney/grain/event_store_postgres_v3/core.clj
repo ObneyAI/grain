@@ -1,7 +1,7 @@
 (ns ai.obney.grain.event-store-postgres-v3.core
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
-            [ai.obney.grain.event-store-v3.interface :refer [->event]]
+            [ai.obney.grain.event-store-v3.interface :refer [prepare-append]]
             [ai.obney.grain.event-store-postgres-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [next.jdbc :as jdbc]
@@ -293,36 +293,6 @@
                               tenant-id])
           :tenants/last_event_id))
 
-(defn- strictly-increasing-after?
-  [last-id events]
-  (reduce (fn [previous event]
-            (let [event-id (:event/id event)]
-              (if (and event-id
-                       (or (nil? previous) (uuid/< previous event-id)))
-                event-id
-                (reduced false))))
-          last-id
-          events))
-
-(defn- assign-commit-ordered-ids
-  "Preserve caller IDs when they are already beyond the committed tenant
-   watermark. Reassign the whole batch otherwise. Called only while holding
-   PostgreSQL's per-tenant advisory lock."
-  [last-id events]
-  (if (strictly-increasing-after? last-id events)
-    events
-    (loop [remaining events
-           previous last-id
-           assigned []]
-      (if-let [event (first remaining)]
-        (let [event-id (loop [candidate (uuid/v7)]
-                         (if (or (nil? previous) (uuid/< previous candidate))
-                           candidate
-                           (recur (uuid/v7))))]
-          (recur (next remaining) event-id
-                 (conj assigned (assoc event :event/id event-id))))
-        assigned))))
-
 (defn append
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
@@ -334,19 +304,14 @@
       (jdbc/execute! conn ["SET LOCAL lock_timeout = '5000ms'"])
       (jdbc/execute! conn ["SELECT pg_advisory_xact_lock(?)" (tenant-lock-key tenant-id)])
       (let [last-id (committed-last-event-id conn tenant-id)
-            events (assign-commit-ordered-ids last-id events)
-            tx (->event
-                {:type :grain/tx
-                 :body (cond-> {:event-ids (set (mapv :event/id events))}
-                         tx-metadata (assoc :metadata tx-metadata))})
-            tx-events (assign-commit-ordered-ids (:event/id (last events)) [tx])
-            events* (into events tx-events)
-            max-event-id (:event/id (last events*))
-            upsert-tenant!
-            (fn []
-              (jdbc/execute! conn ["INSERT INTO grain.tenants (id, last_event_id) VALUES (?, ?)
-                                    ON CONFLICT (id) DO UPDATE SET last_event_id = ?"
-                                   tenant-id max-event-id max-event-id]))]
+            persist! (fn []
+                       (let [{:keys [events events-with-tx last-event-id]}
+                             (prepare-append last-id events tx-metadata)]
+                         (jdbc/execute! conn ["INSERT INTO grain.tenants (id, last_event_id) VALUES (?, ?)
+                                               ON CONFLICT (id) DO UPDATE SET last_event_id = ?"
+                                              tenant-id last-event-id last-event-id])
+                         (insert-events conn tenant-id events-with-tx)
+                         events))]
         ;; CAS check + insert. Tenant upsert (including last_event_id bump) runs
         ;; only on successful-insert branches.
         (if cas
@@ -369,19 +334,13 @@
                                             ::none plan)]
                                (if (= r ::none) (f) r))))]
             (if (predicate-fn cas-events)
-              (do
-                (upsert-tenant!)
-                (insert-events conn tenant-id events*)
-                events)
+              (persist!)
               (let [anomaly  {::anom/category ::anom/conflict
                               ::anom/message "CAS failed"
                               ::cas cas}]
                 (u/log ::cas-failed :anomaly anomaly)
                 anomaly)))
-          (do
-            (upsert-tenant!)
-            (insert-events conn tenant-id events*)
-            events)))))
+          (persist!)))))
 
 (defn tenants
   [event-store]

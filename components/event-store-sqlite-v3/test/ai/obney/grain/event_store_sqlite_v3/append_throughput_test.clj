@@ -113,7 +113,7 @@
                                (not (uuid/< watermark initial-watermark)))))
         (is (not (uuid/< watermark (last ids))))))))
 
-(deftest reverse-id-groups-are-reassigned-under-load
+(deftest concurrent-batches-receive-store-assigned-metadata
   (with-store
     (fn [store]
       (let [tenant-id (uuid/v4)
@@ -131,13 +131,12 @@
                          (let [events (mapv #(es/->event {:type :throughput/event
                                                           :body {:writer writer :n %}})
                                             [(* n 2) (inc (* n 2))])
-                               reversed (vec (reverse events))
                                watermark (get-in (es/tenants store)
                                                  [tenant-id :tenant/last-event-id])
                                returned (es/append store {:tenant-id tenant-id
-                                                          :events reversed})]
+                                                          :events events})]
                            (swap! observations conj
-                                  {:submitted reversed :watermark watermark
+                                  {:submitted events :watermark watermark
                                    :returned returned})))))
                    (range writers))]
         (.await ready 10 TimeUnit/SECONDS)
@@ -148,13 +147,15 @@
               returned (mapcat :returned @observations)
               returned-ids (mapv :event/id returned)]
           (when-not completed? (run! future-cancel tasks))
-          (is completed? "forced-reassignment writers complete within 30 seconds")
+          (is completed? "store-assignment writers complete within 30 seconds")
           (is (= (* writers groups-per-writer 2) (count stored)))
           (is (= (count returned-ids) (count (set returned-ids))))
           (is (every? (fn [{:keys [submitted returned watermark]}]
                         (and (= (mapv #(select-keys % [:writer :n]) submitted)
                                 (mapv #(select-keys % [:writer :n]) returned))
                              (not= (mapv :event/id submitted) (mapv :event/id returned))
+                             (every? #(not (contains? % :event/timestamp)) submitted)
+                             (apply = (map :event/timestamp returned))
                              (every? #(or (nil? watermark) (uuid/< watermark %))
                                      (map :event/id returned))))
                       @observations))

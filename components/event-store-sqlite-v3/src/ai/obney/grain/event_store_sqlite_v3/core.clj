@@ -1,7 +1,7 @@
 (ns ai.obney.grain.event-store-sqlite-v3.core
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
-            [ai.obney.grain.event-store-v3.interface :refer [->event]]
+            [ai.obney.grain.event-store-v3.interface :refer [prepare-append]]
             [ai.obney.grain.event-store-sqlite-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [next.jdbc :as jdbc]
@@ -296,36 +296,6 @@
           :tenants/last_event_id
           UUID/fromString))
 
-(defn- strictly-increasing-after?
-  [last-id events]
-  (reduce (fn [previous event]
-            (let [event-id (:event/id event)]
-              (if (and event-id
-                       (or (nil? previous) (uuid/< previous event-id)))
-                event-id
-                (reduced false))))
-          last-id
-          events))
-
-(defn- assign-commit-ordered-ids
-  "Preserve caller IDs when they are already beyond the committed tenant
-   watermark. Reassign the whole batch otherwise. Called only while holding
-   SQLite's tenant-serializing write transaction."
-  [last-id events]
-  (if (strictly-increasing-after? last-id events)
-    events
-    (loop [remaining events
-           previous last-id
-           assigned []]
-      (if-let [event (first remaining)]
-        (let [event-id (loop [candidate (uuid/v7)]
-                         (if (or (nil? previous) (uuid/< previous candidate))
-                           candidate
-                           (recur (uuid/v7))))]
-          (recur (next remaining) event-id
-                 (conj assigned (assoc event :event/id event-id))))
-        assigned))))
-
 (defn- with-immediate-tx
   "Run body-fn inside a BEGIN IMMEDIATE transaction on a fresh connection.
    body-fn receives the connection and returns its result.
@@ -380,31 +350,23 @@
       pool
       (fn [conn]
         (let [last-id (committed-last-event-id conn tenant-id)
-              events (assign-commit-ordered-ids last-id events)
-              tx (->event
-                  {:type :grain/tx
-                   :body (cond-> {:event-ids (set (mapv :event/id events))}
-                           tx-metadata (assoc :metadata tx-metadata))})
-              events* (assign-commit-ordered-ids (:event/id (last events)) [tx])
-              events* (into events events*)
-              max-event-id (:event/id (last events*))]
+              persist! (fn []
+                         (let [{:keys [events events-with-tx last-event-id]}
+                               (prepare-append last-id events tx-metadata)]
+                           (upsert-tenant! conn tenant-id last-event-id)
+                           (insert-events! conn tenant-id events-with-tx)
+                           events))]
           (if cas
             (let [{:keys [sql params]} (build-single-query (assoc cas :tenant-id tenant-id))
                   cas-events (conn-reducible conn sql params)]
               (if (predicate-fn cas-events)
-                (do
-                  (upsert-tenant! conn tenant-id max-event-id)
-                  (insert-events! conn tenant-id events*)
-                  events)
+                (persist!)
                 (let [anomaly {::anom/category ::anom/conflict
                                ::anom/message "CAS failed"
                                ::cas cas}]
                   (u/log ::cas-failed :anomaly anomaly)
                   anomaly)))
-            (do
-              (upsert-tenant! conn tenant-id max-event-id)
-              (insert-events! conn tenant-id events*)
-              events)))))))
+            (persist!)))))))
 
 ;; ----------- ;;
 ;; Tenants     ;;

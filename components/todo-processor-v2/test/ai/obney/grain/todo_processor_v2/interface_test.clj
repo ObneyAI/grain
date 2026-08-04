@@ -54,7 +54,9 @@
 
 (defn make-context
   [event handler-fn]
-  {:event event
+  {:event (if (:event/id event)
+            event
+            (-> (es/prepare-append nil [event] nil) :events first))
    :handler-fn handler-fn
    :event-store *event-store*
    :tenant-id test-tenant-id})
@@ -714,14 +716,16 @@
   (testing "Overlapping pure batches conflict when a later checkpoint already exists"
     (let [tenant-id (random-uuid)
           processor-name :test/overlapping-batch-proc
-          source-events (mapv #(make-event :test/event-1 :body {:num %}) (range 20))
+          source-events (es/append *event-store*
+                                  {:tenant-id tenant-id
+                                   :events (mapv #(make-event :test/event-1 :body {:num %})
+                                                 (range 20))})
           result-events (fn [events]
                           (mapv (fn [event]
                                   (es/->event
                                    {:type :test/batch-result
                                     :body {:source-event-id (:event/id event)}}))
                                 events))]
-      (es/append *event-store* {:tenant-id tenant-id :events source-events})
       (let [full-batch source-events
             overlapping-batch (subvec source-events 0 10)
             full-result (#'core/append-batch-with-checkpoint
@@ -750,14 +754,16 @@
   (testing "Non-overlapping pure batches can commit sequentially"
     (let [tenant-id (random-uuid)
           processor-name :test/adjacent-batch-proc
-          source-events (mapv #(make-event :test/event-1 :body {:num %}) (range 20))
+          source-events (es/append *event-store*
+                                  {:tenant-id tenant-id
+                                   :events (mapv #(make-event :test/event-1 :body {:num %})
+                                                 (range 20))})
           result-events (fn [events]
                           (mapv (fn [event]
                                   (es/->event
                                    {:type :test/batch-result
                                     :body {:source-event-id (:event/id event)}}))
                                 events))]
-      (es/append *event-store* {:tenant-id tenant-id :events source-events})
       (let [batch-1 (subvec source-events 0 10)
             batch-2 (subvec source-events 10 20)
             result-1 (#'core/append-batch-with-checkpoint
@@ -786,7 +792,10 @@
   (testing "Old checkpoint shape still blocks stale overlapping batch commits"
     (let [tenant-id (random-uuid)
           processor-name :test/legacy-overlap-batch-proc
-          source-events (mapv #(make-event :test/event-1 :body {:num %}) (range 20))
+          source-events (es/append *event-store*
+                                  {:tenant-id tenant-id
+                                   :events (mapv #(make-event :test/event-1 :body {:num %})
+                                                 (range 20))})
           result-events (fn [events]
                           (mapv (fn [event]
                                   (es/->event
@@ -819,8 +828,10 @@
                     (swap! processed conj (:event/id event))
                     {})
           tenant-id (random-uuid)
-          events (mapv (fn [_] (make-event :test/event-1 :body {:num 1})) (range 50))]
-      (es/append *event-store* {:tenant-id tenant-id :events events})
+          events (es/append *event-store*
+                           {:tenant-id tenant-id
+                            :events (mapv (fn [_] (make-event :test/event-1 :body {:num 1}))
+                                          (range 50))})]
       (let [processor (core/start-polling
                         {:event-store *event-store*
                          :tenant-id tenant-id
@@ -1084,8 +1095,10 @@
 (deftest pt-cas2-processor-handles-trigger-exactly-once
   (testing "PT-CAS2: Two processors process same trigger — only one checkpoints"
     (let [tenant-id (random-uuid)
-          trigger (es/->event {:type :test/billing-trigger
-                               :body {:period "2026-03-23"}})
+          [trigger] (es/append *event-store*
+                              {:tenant-id tenant-id
+                               :events [(es/->event {:type :test/billing-trigger
+                                                    :body {:period "2026-03-23"}})]})
           billed (atom 0)
           handler (fn [{:keys [event]}]
                     (swap! billed inc)
@@ -1093,8 +1106,6 @@
                      [(es/->event {:type :test/billing-done
                                    :body {:period (:period event)
                                           :billed-by (random-uuid)}})]})]
-      ;; Append the trigger
-      (es/append *event-store* {:tenant-id tenant-id :events [trigger]})
       ;; Two "processors" try to handle it
       (core/process-event {:event trigger :handler-fn handler :event-store *event-store*
                            :tenant-id tenant-id :processor-name :test/billing-proc})

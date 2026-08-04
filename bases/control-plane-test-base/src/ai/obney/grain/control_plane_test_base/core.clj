@@ -337,9 +337,10 @@
      :events [(es/->event {:type :test/counter-incremented :body {}})]}))
 
 (defn append-checkpoint-gap!
-  "Construct A before B, commit and process B, then append stale A.
-   Returns the caller and final IDs. This is a deterministic reproduction of
-   the append/checkpoint ordering gap."
+  "Construct A before B without persistence metadata, commit and process B,
+   then append A. Returns the store-assigned IDs and timestamps. Against the
+   former constructor-owned metadata contract this reproduces the checkpoint
+   ordering gap deterministically."
   [system tenant-id timeout-ms]
   (let [event-a (es/->event {:type :test/counter-incremented :body {:label :a}})
         event-b (es/->event {:type :test/counter-incremented :body {:label :b}})
@@ -359,10 +360,10 @@
         :else (do (Thread/sleep 50) (recur))))
     (let [[persisted-a] (es/append (:event-store system)
                                   {:tenant-id tenant-id :events [event-a]})]
-      {:caller-a-id (:event/id event-a)
-       :caller-b-id (:event/id event-b)
-       :final-a-id (:event/id persisted-a)
-       :final-b-id (:event/id persisted-b)})))
+      {:final-a-id (:event/id persisted-a)
+       :final-a-timestamp (:event/timestamp persisted-a)
+       :final-b-id (:event/id persisted-b)
+       :final-b-timestamp (:event/timestamp persisted-b)})))
 
 (defn submit-slow-work!
   "Append a slow-work event to a tenant."

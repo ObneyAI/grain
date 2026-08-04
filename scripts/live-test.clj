@@ -151,6 +151,7 @@
     "(mapv (fn [e]
              {:event-type (:event/type e)
               :event-id (some-> (:event/id e) str)
+              :event-timestamp (some-> (:event/timestamp e) str)
               :tenant-id (some-> (:grain/tenant-id e) str)
               :triggered-by (some-> (:triggered-by e) str)
               :processed-event-id (some-> (:processed-by/event-id e) str)
@@ -729,25 +730,32 @@
                                                       (:event/type %%)))
                                   (mapv (fn [e] {:type (:event/type e)
                                                  :id (str (:event/id e))
+                                                 :timestamp (str (:event/timestamp e))
                                                  :triggered-by (some-> (:triggered-by e) str)
                                                  :processed-event-id (some-> (:processed-by/event-id e) str)})))"
                            tenant-id))
           observed (wait-for-tail-probe-count primary-port 6 15000)
           increment-ids (set (map :id (filter #(= :test/counter-incremented (:type %)) stored)))
+          stored-increment-times (into {} (map (juxt :id :timestamp)
+                                                (filter #(= :test/counter-incremented (:type %)) stored)))
           processor-refs (set (keep :processed-event-id stored))
-          relevant-ids (set (vals (select-keys result
-                                               [:caller-a-id :caller-b-id
-                                                :final-a-id :final-b-id])))
+          relevant-ids #{final-a final-b}
           checkpoint-refs (->> stored
                                (keep :triggered-by)
                                (filter relevant-ids)
                                set)
           pubsub-increment-ids (set (keep :event-id
-                                          (filter #(= :test/counter-incremented (:event-type %)) observed)))]
+                                          (filter #(= :test/counter-incremented (:event-type %)) observed)))
+          pubsub-increment-times (into {} (map (juxt :event-id :event-timestamp)
+                                                (filter #(= :test/counter-incremented (:event-type %)) observed)))
+          returned-increment-times {final-a (:final-a-timestamp result)
+                                    final-b (:final-b-timestamp result)}]
       (info (str "Final IDs: B=" final-b ", A=" final-a))
       (check "A receives a final ID greater than B" (pos? (compare final-a final-b)))
       (check "Storage contains both final persisted IDs" (= #{final-a final-b} increment-ids))
       (check "Pubsub exposes the final persisted IDs" (= #{final-a final-b} pubsub-increment-ids))
+      (check "Storage and pubsub expose store-assigned timestamps"
+             (= returned-increment-times stored-increment-times pubsub-increment-times))
       (check "Processor output references only final IDs" (= #{final-a final-b} processor-refs))
       (check "Checkpoints reference only final IDs" (= #{final-a final-b} checkpoint-refs))
       (check "Tenant diagnostics report no gaps or anomalies"

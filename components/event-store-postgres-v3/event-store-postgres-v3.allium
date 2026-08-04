@@ -128,8 +128,8 @@ value CasGuard {
 ------------------------------------------------------------
 
 -- Faithful round-tripping of an event across a durable write and read. The store
--- DEMANDS that whatever it persists, it returns unchanged: identity, type, tags,
--- timestamp and an arbitrary structured body survive a write/read cycle intact.
+-- DEMANDS that whatever it persists, it returns unchanged: store-assigned
+-- identity and timestamp plus type, tags and arbitrary body survive a read cycle.
 -- This is the serialization guarantee, stated behaviourally and independently of
 -- the encoding used.
 contract EventCodec {
@@ -181,6 +181,12 @@ contract AppendWriter {
         -- Concurrent appends to one tenant are serialized so each observes a
         -- settled stream and none is lost; appends to different tenants proceed
         -- independently.
+
+    @invariant StoreOwnsPersistenceEnvelope
+        -- Submitted domain events carry neither position nor timestamp. After a
+        -- guard accepts, the store assigns ordered UUID-v7 positions and one
+        -- shared recorded-at timestamp to the complete atomic unit. Supplying
+        -- either field is rejected rather than preserved or overwritten.
 }
 
 -- Ordered, filtered, streaming reads of a tenant's committed events. The store
@@ -274,8 +280,8 @@ entity Event {
     kind: DomainEvent | TransactionMarker
 }
 
--- A caller-supplied fact: an application event with a type and an arbitrary
--- structured body. These are the events domain logic appends and reads back.
+-- A caller-supplied fact: an application event with a type and arbitrary body.
+-- Position and timestamp are absent at submission and assigned by the store.
 variant DomainEvent : Event {
     -- The event's type, used both to interpret its body and to filter reads.
     event_type: String
@@ -321,8 +327,12 @@ rule AppendEvents {
     when: AppendRequested(tenant, events, metadata?)
 
     ensures:
+        let append_time = now
+        for event in events:
+            event.timestamp = append_time
         let marker = TransactionMarker.created(
             tenant: tenant,
+            timestamp: append_time,
             committed: events.position,
             metadata: metadata
         )
