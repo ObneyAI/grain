@@ -7,7 +7,8 @@
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [clj-uuid :as uuid])
-  (:import [java.time OffsetDateTime]))
+  (:import [java.time OffsetDateTime]
+           [java.util UUID]))
 
 ;; -------------------- ;;
 ;; Schema Registration  ;;
@@ -408,6 +409,27 @@
                              (uuid/= a b) 0
                              :else 1))
                      ids)))))
+
+(deftest commit-order-is-established-before-reversing-or-limiting-pg
+  (let [tag-id (uuid/v4)
+        low (assoc (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 1}})
+                   :event/id (UUID/fromString "01900000-0000-7000-8000-000000000001"))
+        high (assoc (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 2}})
+                    :event/id (UUID/fromString "01900000-0000-7000-8000-000000000002"))]
+    (let [[persisted-high] (es/append *event-store* {:tenant-id *tenant-id* :events [high]})
+          [persisted-low] (es/append *event-store* {:tenant-id *tenant-id* :events [low]})
+          expected [(:event/id persisted-high) (:event/id persisted-low)]
+          ids #(mapv :event/id (read-events %))]
+      (is (= expected (ids {:types #{:test/alpha}})))
+      (is (= expected
+             (ids [{:types #{:test/alpha}}
+                   {:tags #{[:order tag-id]}}])))
+      (is (= (vec (reverse expected))
+             (ids {:types #{:test/alpha} :reverse? true})))
+      (is (= [(:event/id persisted-high)]
+             (ids {:types #{:test/alpha} :limit 1})))
+      (is (= [(:event/id persisted-low)]
+             (ids {:types #{:test/alpha} :reverse? true :limit 1}))))))
 
 (deftest batch-empty-result
   (let [events (non-tx-events

@@ -18,6 +18,13 @@
 
      :events - A vector of events to append to the event store.
 
+       The store establishes final event IDs at its tenant serialization
+       boundary. Caller-supplied IDs are retained when already strictly after
+       the committed tenant watermark; otherwise the batch is re-IDed.
+
+       On success, returns the persisted domain events, including their final
+       IDs. Callers that retain an event ID must use this returned value.
+
      :tx-metadata - An optional map of metadata to associate with the transaction.
 
      :cas - An optional map with the following keys:

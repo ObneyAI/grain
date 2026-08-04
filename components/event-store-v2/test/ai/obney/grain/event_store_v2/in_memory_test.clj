@@ -4,7 +4,8 @@
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
             [clj-uuid :as uuid])
-  (:import [java.time OffsetDateTime]))
+  (:import [java.time OffsetDateTime]
+           [java.util UUID]))
 
 ;; -------------------- ;;
 ;; Schema Registration  ;;
@@ -322,6 +323,17 @@
                              (uuid/= a b) 0
                              :else 1))
                      ids)))))
+
+(deftest single-read-orders-by-event-id-not-append-position
+  (let [tag-id (uuid/v4)
+        low (assoc (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 1}})
+                   :event/id (UUID/fromString "01900000-0000-7000-8000-000000000001"))
+        high (assoc (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 2}})
+                    :event/id (UUID/fromString "01900000-0000-7000-8000-000000000002"))]
+    (es/append *event-store* {:events [high]})
+    (es/append *event-store* {:events [low]})
+    (is (= [(:event/id low) (:event/id high)]
+           (mapv :event/id (read-events {:types #{:test/alpha}}))))))
 
 (deftest batch-empty-result
   (let [events (non-tx-events

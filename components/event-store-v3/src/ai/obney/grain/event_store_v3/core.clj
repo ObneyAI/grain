@@ -61,9 +61,12 @@
       (let [result (p/append event-store args)]
         (if (anomaly? result)
           result
-          (let [{:keys [tenant-id]} args]
+          (let [{:keys [tenant-id]} args
+                persisted-events (if (sequential? result) result events)]
             (when event-pubsub
-              (run! #(pubsub/pub event-pubsub {:message (assoc % :grain/tenant-id tenant-id)}) events))))))))
+              (run! #(pubsub/pub event-pubsub {:message (assoc % :grain/tenant-id tenant-id)})
+                    persisted-events))
+            result))))))
 
 (defn tenants
   [event-store]

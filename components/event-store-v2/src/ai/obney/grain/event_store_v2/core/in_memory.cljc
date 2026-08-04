@@ -18,6 +18,12 @@
   #?(:clj (dosync (ref-set state nil))
      :cljs (reset! state nil)))
 
+(defn- compare-event-ids [a b]
+  #?(:clj (cond (uuid/< a b) -1
+                (uuid/= a b) 0
+                :else 1)
+     :cljs (compare a b)))
+
 #?(:clj (defn- read-single
           [event-store {:keys [tags types as-of after] :as args}]
           (let [filtered-events (->> (-> event-store :state deref :events)
@@ -32,7 +38,8 @@
                                             as-of (or (uuid/< (:event/id event) as-of)
                                                       (uuid/= (:event/id event) as-of))
                                             after (uuid/> (:event/id event) after)
-                                            :else true)))))]
+                                            :else true))))
+                                      (sort-by :event/id compare-event-ids))]
              (reify
                ;; Support streaming reduction with init value
                clojure.lang.IReduceInit
@@ -67,7 +74,8 @@
                                             as-of (or (< (:event/id event) as-of)
                                                       (= (:event/id event) as-of))
                                             after (> (:event/id event) after)
-                                            :else true)))))]
+                                            :else true))))
+                                      (sort-by :event/id compare-event-ids))]
              (reify
                cljs.core/IReduce
                (-reduce [_ f]
@@ -97,11 +105,7 @@
                                     (update ::events conj event))))
                             {::seen #{} ::events []})
                     ::events
-                    (sort-by :event/id #?(:clj (fn [a b]
-                                                (cond (uuid/< a b) -1
-                                                      (uuid/= a b) 0
-                                                      :else 1))
-                                          :cljs compare)))]
+                    (sort-by :event/id compare-event-ids))]
     #?(:clj (reify
               clojure.lang.IReduceInit
               (reduce [_ f init]

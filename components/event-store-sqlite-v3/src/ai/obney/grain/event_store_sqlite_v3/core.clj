@@ -9,7 +9,8 @@
             [integrant.core :as ig]
             [hikari-cp.core :as hikari]
             [cognitect.anomalies :as anom]
-            [clojure.string :as string])
+            [clojure.string :as string]
+            [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime]
            [java.util UUID]
            [java.sql Connection]))
@@ -287,6 +288,44 @@
                    ON CONFLICT(id) DO UPDATE SET last_event_id = excluded.last_event_id"
                   (str tenant-id) (str last-event-id)]))
 
+(defn- committed-last-event-id
+  [conn tenant-id]
+  (some-> (jdbc/execute-one! conn
+                             ["SELECT last_event_id FROM tenants WHERE id = ?"
+                              (str tenant-id)])
+          :tenants/last_event_id
+          UUID/fromString))
+
+(defn- strictly-increasing-after?
+  [last-id events]
+  (reduce (fn [previous event]
+            (let [event-id (:event/id event)]
+              (if (and event-id
+                       (or (nil? previous) (uuid/< previous event-id)))
+                event-id
+                (reduced false))))
+          last-id
+          events))
+
+(defn- assign-commit-ordered-ids
+  "Preserve caller IDs when they are already beyond the committed tenant
+   watermark. Reassign the whole batch otherwise. Called only while holding
+   SQLite's tenant-serializing write transaction."
+  [last-id events]
+  (if (strictly-increasing-after? last-id events)
+    events
+    (loop [remaining events
+           previous last-id
+           assigned []]
+      (if-let [event (first remaining)]
+        (let [event-id (loop [candidate (uuid/v7)]
+                         (if (or (nil? previous) (uuid/< previous candidate))
+                           candidate
+                           (recur (uuid/v7))))]
+          (recur (next remaining) event-id
+                 (conj assigned (assoc event :event/id event-id))))
+        assigned))))
+
 (defn- with-immediate-tx
   "Run body-fn inside a BEGIN IMMEDIATE transaction on a fresh connection.
    body-fn receives the connection and returns its result.
@@ -336,32 +375,36 @@
 (defn append
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
-  (let [events* (conj
-                 events
-                 (->event
-                  {:type :grain/tx
-                   :body (cond-> {:event-ids (set (mapv :event/id events))}
-                           tx-metadata (assoc :metadata tx-metadata))}))
-        max-event-id (:event/id (last events*))
-        pool (get-in event-store [:state ::connection-pool])]
+  (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
       (fn [conn]
-        (if cas
-          (let [{:keys [sql params]} (build-single-query (assoc cas :tenant-id tenant-id))
-                cas-events (conn-reducible conn sql params)]
-            (if (predicate-fn cas-events)
-              (do
-                (upsert-tenant! conn tenant-id max-event-id)
-                (insert-events! conn tenant-id events*))
-              (let [anomaly {::anom/category ::anom/conflict
-                             ::anom/message "CAS failed"
-                             ::cas cas}]
-                (u/log ::cas-failed :anomaly anomaly)
-                anomaly)))
-          (do
-            (upsert-tenant! conn tenant-id max-event-id)
-            (insert-events! conn tenant-id events*)))))))
+        (let [last-id (committed-last-event-id conn tenant-id)
+              events (assign-commit-ordered-ids last-id events)
+              tx (->event
+                  {:type :grain/tx
+                   :body (cond-> {:event-ids (set (mapv :event/id events))}
+                           tx-metadata (assoc :metadata tx-metadata))})
+              events* (assign-commit-ordered-ids (:event/id (last events)) [tx])
+              events* (into events events*)
+              max-event-id (:event/id (last events*))]
+          (if cas
+            (let [{:keys [sql params]} (build-single-query (assoc cas :tenant-id tenant-id))
+                  cas-events (conn-reducible conn sql params)]
+              (if (predicate-fn cas-events)
+                (do
+                  (upsert-tenant! conn tenant-id max-event-id)
+                  (insert-events! conn tenant-id events*)
+                  events)
+                (let [anomaly {::anom/category ::anom/conflict
+                               ::anom/message "CAS failed"
+                               ::cas cas}]
+                  (u/log ::cas-failed :anomaly anomaly)
+                  anomaly)))
+            (do
+              (upsert-tenant! conn tenant-id max-event-id)
+              (insert-events! conn tenant-id events*)
+              events)))))))
 
 ;; ----------- ;;
 ;; Tenants     ;;

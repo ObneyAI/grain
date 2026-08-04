@@ -2,7 +2,8 @@
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v2.interface :as es]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
-            [clj-uuid :as uuid]))
+            [clj-uuid :as uuid])
+  (:import [java.util UUID]))
 
 (defschemas test-event-schemas
   {:test/a [:map]
@@ -114,6 +115,22 @@
                                (uuid/= a b) 0
                                :else 1))
                        ids))))))
+
+(deftest single-and-batch-reads-agree-when-append-order-differs-from-id-order
+  (let [tag-id (uuid/v4)
+        low (assoc (es/->event {:type :test/x :tags #{[:order tag-id]} :body {:n 1}})
+                   :event/id (UUID/fromString "01900000-0000-7000-8000-000000000001"))
+        high (assoc (es/->event {:type :test/x :tags #{[:order tag-id]} :body {:n 2}})
+                    :event/id (UUID/fromString "01900000-0000-7000-8000-000000000002"))]
+    (es/append *event-store* {:events [high]})
+    (es/append *event-store* {:events [low]})
+    (let [single (non-tx-events (read-events {:types #{:test/x}}))
+          batch (non-tx-events
+                 (read-events [{:types #{:test/x}}
+                               {:tags #{[:order tag-id]}}]))
+          expected [(:event/id low) (:event/id high)]]
+      (is (= expected (mapv :event/id single)))
+      (is (= expected (mapv :event/id batch))))))
 
 (deftest per-query-after-filter
   (testing "Each query in a batch applies its own :after filter"

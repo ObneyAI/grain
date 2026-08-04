@@ -101,11 +101,11 @@ contract EventStream {
         -- name the same tenant.
 
     @invariant AscendingByEventId
-        -- ES4/ES5: results are ordered by event id ascending (oldest first),
-        -- which is also chronological order. A reversed read yields the same
-        -- set in descending id order; a limited read caps the count, taking
-        -- from whichever end the order selects (oldest by default, newest when
-        -- reversed).
+        -- ES4/ES5: results are ordered by event id ascending, independently of
+        -- storage insertion or append order. A reversed read yields the same
+        -- set in descending id order. Ordering happens before limiting, so a
+        -- limited read takes from the selected end (lowest ids by default,
+        -- highest ids when reversed).
 
     @invariant SubsetTagAndTypeMatch
         -- ES5: an event matches a query's tags only if it carries all of them
@@ -419,8 +419,9 @@ surface EventRead {
         -- including across the queries of a batch read.
 
     @guarantee OrderedByEventId
-        -- ES4: events stream in event-id order — chronological, oldest first,
-        -- or newest first when the read is reversed.
+        -- ES4: events stream in event-id order, regardless of append position:
+        -- ascending by default or descending when the read is reversed. A
+        -- limit is applied only after that ordering is established.
 }
 
 -- The administrative boundary: an operator-side caller enumerating every tenant
