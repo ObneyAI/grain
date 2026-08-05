@@ -214,11 +214,12 @@
 (defn cp6-lease-fencing [make-env]
   (testing "CP6: two nodes checkpointing the same event — only one succeeds"
     (let [{:keys [store cleanup]} (make-env)
-          tenant-1 (uuid/v4)
-          event (es/->event {:type :test/domain-event :body {:n 1}})]
+          tenant-1 (uuid/v4)]
       (try
-        (es/append store {:tenant-id tenant-1 :events [event]})
-        (let [processor-name :test/fencing-proc
+        (let [[event] (es/append store
+                        {:tenant-id tenant-1
+                         :events [(es/->event {:type :test/domain-event :body {:n 1}})]})
+              processor-name :test/fencing-proc
               handler (fn [_] {})
               result-a (tp/process-event
                          {:event event :handler-fn handler :event-store store
@@ -247,16 +248,19 @@
   (testing "CP7: after lease transfer, new owner catches up from last checkpoint"
     (let [{:keys [store cleanup]} (make-env)
           tenant-1 (uuid/v4)
-          processor-name :test/catchup-proc
-          events-1 (mapv #(es/->event {:type :test/domain-event :body {:n %}}) (range 1 6))]
+          processor-name :test/catchup-proc]
       (try
-        (es/append store {:tenant-id tenant-1 :events events-1})
-        ;; Node A processes events 1-5
-        (let [handler (fn [_] {})]
-          (doseq [event events-1]
-            (tp/process-event
-              {:event event :handler-fn handler :event-store store
-               :tenant-id tenant-1 :processor-name processor-name})))
+        (let [events-1 (es/append store
+                         {:tenant-id tenant-1
+                          :events (mapv #(es/->event
+                                          {:type :test/domain-event :body {:n %}})
+                                        (range 1 6))})]
+          ;; Node A processes events 1-5
+          (let [handler (fn [_] {})]
+            (doseq [event events-1]
+              (tp/process-event
+                {:event event :handler-fn handler :event-store store
+                 :tenant-id tenant-1 :processor-name processor-name}))))
         ;; Append 5 more events (simulating events during lease transfer)
         (let [events-2 (mapv #(es/->event {:type :test/domain-event :body {:n %}}) (range 6 11))]
           (es/append store {:tenant-id tenant-1 :events events-2})

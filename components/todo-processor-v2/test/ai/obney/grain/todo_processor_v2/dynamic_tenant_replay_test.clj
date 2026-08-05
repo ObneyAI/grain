@@ -48,14 +48,16 @@
                                            {})
                             :topics #{:test/dynamic-replay-trigger}}})
 
-        (let [evts (mapv (fn [i]
-                           (->event {:type :test/dynamic-replay-trigger
-                                     :tags #{}
-                                     :body {:n i}}))
-                         (range 3))
+        (let [evts (es/append
+                    event-store
+                    {:tenant-id tid
+                     :events (mapv (fn [i]
+                                     (->event {:type :test/dynamic-replay-trigger
+                                               :tags #{}
+                                               :body {:n i}}))
+                                   (range 3))})
               cp (make-checkpoint-event proc-name
                                         (:event/id (last evts)))]
-          (es/append event-store {:tenant-id tid :events evts})
           (es/append event-store {:tenant-id tid :events [cp]}))
 
         (let [ts-atom (atom #{})

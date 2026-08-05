@@ -6,6 +6,14 @@
 
 (defn- uuid-v7? [x] (and (uuid? x) (= 7 (uuid/get-version x))))
 
+(defn- no-persistence-metadata? [event]
+  (not (or (contains? event :event/id)
+           (contains? event :event/timestamp))))
+
+(defn- body-has-no-persistence-metadata? [{:keys [body]}]
+  (not (or (contains? body :event/id)
+           (contains? body :event/timestamp))))
+
 (defn- same-tenant-id?
   "Validates that all queries in a batch have the same :tenant-id."
   [queries]
@@ -30,6 +38,14 @@
             [:event/timestamp ::timestamp]
             [:event/tags ::tags]
             [:event/type ::type]]
+
+   ::appendable-event
+   [:and
+    [:fn {:error/message "Event IDs and timestamps are assigned by append"}
+     no-persistence-metadata?]
+    [:map
+     [:event/tags ::tags]
+     [:event/type ::type]]]
 
    ::as-of-or-after
    [:fn {:error/message "Cannot supply both :as-of and :after"} as-of-or-after]
@@ -70,15 +86,18 @@
    ::append-args
    [:map
     [:tenant-id ::tenant-id]
-    [:events [:vector ::event]]
+    [:events [:vector ::appendable-event]]
     [:tx-metadata {:optional true} [:map]]
     [:cas {:optional true} ::cas]]
 
    ::->event-args
-   [:map
-    [:type ::type]
-    [:tags {:optional true} ::tags]
-    [:body {:optional true} [:map]]]
+   [:and
+    [:fn {:error/message "Event body cannot supply persistence metadata"}
+     body-has-no-persistence-metadata?]
+    [:map
+     [:type ::type]
+     [:tags {:optional true} ::tags]
+     [:body {:optional true} [:map]]]]
 
    :grain/tx
    [:map

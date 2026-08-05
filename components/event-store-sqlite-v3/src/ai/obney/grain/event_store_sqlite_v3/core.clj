@@ -1,7 +1,7 @@
 (ns ai.obney.grain.event-store-sqlite-v3.core
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
-            [ai.obney.grain.event-store-v3.interface :refer [->event]]
+            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
             [ai.obney.grain.event-store-sqlite-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [next.jdbc :as jdbc]
@@ -9,7 +9,8 @@
             [integrant.core :as ig]
             [hikari-cp.core :as hikari]
             [cognitect.anomalies :as anom]
-            [clojure.string :as string])
+            [clojure.string :as string]
+            [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime]
            [java.util UUID]
            [java.sql Connection]))
@@ -287,6 +288,14 @@
                    ON CONFLICT(id) DO UPDATE SET last_event_id = excluded.last_event_id"
                   (str tenant-id) (str last-event-id)]))
 
+(defn- committed-last-event-id
+  [conn tenant-id]
+  (some-> (jdbc/execute-one! conn
+                             ["SELECT last_event_id FROM tenants WHERE id = ?"
+                              (str tenant-id)])
+          :tenants/last_event_id
+          UUID/fromString))
+
 (defn- with-immediate-tx
   "Run body-fn inside a BEGIN IMMEDIATE transaction on a fresh connection.
    body-fn receives the connection and returns its result.
@@ -336,32 +345,28 @@
 (defn append
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
-  (let [events* (conj
-                 events
-                 (->event
-                  {:type :grain/tx
-                   :body (cond-> {:event-ids (set (mapv :event/id events))}
-                           tx-metadata (assoc :metadata tx-metadata))}))
-        max-event-id (:event/id (last events*))
-        pool (get-in event-store [:state ::connection-pool])]
+  (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
       (fn [conn]
-        (if cas
-          (let [{:keys [sql params]} (build-single-query (assoc cas :tenant-id tenant-id))
-                cas-events (conn-reducible conn sql params)]
-            (if (predicate-fn cas-events)
-              (do
-                (upsert-tenant! conn tenant-id max-event-id)
-                (insert-events! conn tenant-id events*))
-              (let [anomaly {::anom/category ::anom/conflict
-                             ::anom/message "CAS failed"
-                             ::cas cas}]
-                (u/log ::cas-failed :anomaly anomaly)
-                anomaly)))
-          (do
-            (upsert-tenant! conn tenant-id max-event-id)
-            (insert-events! conn tenant-id events*)))))))
+        (let [last-id (committed-last-event-id conn tenant-id)
+              persist! (fn []
+                         (let [{:keys [events events-with-tx last-event-id]}
+                               (prepare-append last-id events tx-metadata)]
+                           (upsert-tenant! conn tenant-id last-event-id)
+                           (insert-events! conn tenant-id events-with-tx)
+                           events))]
+          (if cas
+            (let [{:keys [sql params]} (build-single-query (assoc cas :tenant-id tenant-id))
+                  cas-events (conn-reducible conn sql params)]
+              (if (predicate-fn cas-events)
+                (persist!)
+                (let [anomaly {::anom/category ::anom/conflict
+                               ::anom/message "CAS failed"
+                               ::cas cas}]
+                  (u/log ::cas-failed :anomaly anomaly)
+                  anomaly)))
+            (persist!)))))))
 
 ;; ----------- ;;
 ;; Tenants     ;;

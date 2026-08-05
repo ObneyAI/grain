@@ -20,7 +20,7 @@
 --
 -- Includes (the guarantees the code and tests actually prove):
 --   - total ordering: every event has a time-ordered identity, and reads
---     return events in that single global order, append order preserved
+--     return events in that single global order regardless of append order
 --   - atomic batch append: a batch is stored all-or-nothing under a global
 --     write lock, so concurrent appends serialise and never interleave
 --   - a synthesised transaction-marker event per append, recording exactly the
@@ -142,8 +142,8 @@ contract EventAppend {
     @invariant SerialisedWrites
         -- Appends are totally serialised: a single global write lock orders
         -- them, so two concurrent appends never interleave their events and
-        -- every appended event lands. The order in which events were appended
-        -- is preserved in the stream's total order.
+        -- every appended event lands. Serialization governs atomic visibility;
+        -- event identity, not append position, defines read order.
 
     @invariant TransactionMarker
         -- Each append also records exactly one transaction-marker event naming
@@ -180,7 +180,8 @@ contract EventRead {
     @invariant TotalOrderByIdentity
         -- Read results are ordered by event identity, which is the single total
         -- order the store imposes. An empty query reads the whole stream in that
-        -- order; any filter reads the matching subset in the same relative order.
+        -- order; any filter reads the matching subset in the same relative order,
+        -- even when append order differs from identity order.
 
     @invariant FilteringIsConjunctive
         -- Within one query the filters combine conjunctively: an event is

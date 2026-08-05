@@ -92,10 +92,9 @@ value ReadQuery {
 -- Contracts
 ------------------------------------------------------------
 
--- The faithful round-trip obligation. An event carries an identity, a type, a
--- timestamp, a set of tags and an arbitrary structured body; all of it must come
--- back out byte-faithful to what went in. This is a property of the encode/decode
--- pair, not of stored entity state, so it lives as a contract invariant.
+-- The faithful round-trip obligation begins after the store assigns the event's
+-- persistence envelope. Identity, recorded-at timestamp, type, tags and body
+-- must then come back out byte-faithful to what was committed.
 contract EventCodec {
     -- Persist an event's body, tags and metadata for later reconstruction.
     encode: (event: Event) -> ByteArray
@@ -128,10 +127,10 @@ contract EventLog {
     read_stream: (tenant: Tenant, filter: ReadQuery) -> Sequence<Event>
 
     @invariant TimeOrdered
-        -- Events are positioned by a time-ordered identity (UUID v7), so the
-        -- order in which they were appended is the order in which they read
-        -- back. A read streams ascending by id by default; a reverse read
-        -- streams descending. Ordering is per tenant.
+        -- Events are positioned by a time-ordered identity (UUID v7). A read
+        -- streams ascending by id by default even when append order differs;
+        -- a reverse read streams descending. Ordering is per tenant and is
+        -- established before any limit is applied.
 
     @invariant AppendOnly
         -- Committed events are immutable facts. The store only ever appends; it
@@ -208,9 +207,9 @@ entity Tenant {
     domain_events: events where is_transaction_marker = false
 }
 
--- A single immutable fact in one tenant's stream. Its id is a time-ordered
--- identity assigned before it reaches the store; that identity fixes both the
--- event's uniqueness within its tenant and its position in the ordered stream.
+-- A single immutable fact in one tenant's stream. The store assigns its id and
+-- timestamp inside the tenant-serialized append; the id fixes uniqueness and
+-- position in the ordered stream.
 -- An event carries zero or more tags (entity references it concerns) and an
 -- arbitrary body, both opaque to the store.
 entity Event {
@@ -218,8 +217,8 @@ entity Event {
     id: String
     -- Owning tenant. Reads and appends are confined to a single tenant.
     tenant: Tenant
-    -- When the fact occurred, as recorded by its producer. Preserved exactly,
-    -- including a non-UTC offset.
+    -- When the store recorded the atomic append. Every domain event and marker
+    -- in one append shares this value.
     timestamp: Timestamp
     -- The event's kind. May be a simple or qualified name; round-trips exactly.
     event_type: String
@@ -266,13 +265,16 @@ rule AppendTransaction {
     when: AppendEvents(tenant, events, tx_metadata?)
 
     ensures:
+        let append_time = now
         let marker = Event.created(
             tenant: tenant,
             event_type: "grain/tx",
+            timestamp: append_time,
             is_transaction_marker: true
         )
         for event in events:
             event.tenant = tenant
+            event.timestamp = append_time
         Transaction.created(
             tenant: tenant,
             marker: marker,
@@ -386,11 +388,10 @@ invariant EventsBelongToOneTenant {
 -- The store's authoritative order within a tenant is event id order. The store
 -- reads events back in id order and treats that as the stream's total order (see
 -- EventLog.TimeOrdered). It relies on ids being UUID v7 (time-ordered) so that id
--- order approximates chronological order, but it does not itself mint ids or
--- timestamps and does not enforce any relationship between an event's id and its
--- producer-supplied timestamp; under cross-node clock skew a larger id may carry
--- an earlier timestamp (see open questions). The guarantee the store makes is the
--- id ordering itself, captured as EventLog.TimeOrdered, not a timestamp coupling.
+-- order approximates chronological order. The store mints ids and one timestamp
+-- per append after tenant serialization. Cross-node wall-clock skew can still
+-- make timestamps non-monotonic across appends, so id ordering remains the sole
+-- authoritative stream order captured by EventLog.TimeOrdered.
 
 -- A transaction marker's committed-id set never includes the marker itself: the
 -- marker records the domain events of its append, not its own id.
@@ -496,10 +497,11 @@ surface EventRead {
         demands EventCodec
 
     @guarantee OrderedAndTenantScoped
-        -- A read returns this tenant's matching events in time order (ascending
-        -- by default, descending on a reverse read), reconstructed faithfully
-        -- from storage, and never includes any other tenant's events. A batch
-        -- read merges its filters and deduplicates by id.
+        -- A read returns this tenant's matching events in id order regardless of
+        -- append position (ascending by default, descending on a reverse read),
+        -- reconstructed faithfully from storage, and never includes any other
+        -- tenant's events. Ordering precedes limiting. A batch read merges its
+        -- filters and deduplicates by id.
 
     @guarantee NewestRetrievedDirectly
         -- Fetching the newest matching event(s) — a reverse read with a small

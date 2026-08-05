@@ -67,6 +67,63 @@
   (reset! running false)
   (.join thread 5000))
 
+(defn percentile [values p]
+  (let [values (vec (sort values))
+        index (max 0 (dec (long (Math/ceil (* p (count values))))))]
+    (nth values (min index (dec (count values))))))
+
+(defn run-contention-load!
+  "Run writers inside the target JVM and return aggregate diagnostics only."
+  [tenant-ids writers appends-per-writer]
+  (eval-read port-a
+    (format
+      "(let [tenant-ids (mapv java.util.UUID/fromString %s)
+             writers %d
+             appends %d
+             ready (java.util.concurrent.CountDownLatch. writers)
+             start (java.util.concurrent.CountDownLatch. 1)
+             outcomes (atom [])
+             tasks (mapv
+                    (fn [writer]
+                      (future
+                        (.countDown ready)
+                        (.await start)
+                        (dotimes [n appends]
+                          (let [tenant-id (nth tenant-ids
+                                               (mod (+ writer n) (count tenant-ids)))
+                                before (System/nanoTime)]
+                            (try
+                              (let [returned (app/increment! @app/app tenant-id)]
+                                (swap! outcomes conj
+                                       {:ok (= 1 (count returned))
+                                        :latency-ns (- (System/nanoTime) before)}))
+                              (catch Throwable t
+                                (swap! outcomes conj
+                                       {:ok false :error (.getMessage t)
+                                        :latency-ns (- (System/nanoTime) before)})))))))
+                    (range writers))]
+         (.await ready 10 java.util.concurrent.TimeUnit/SECONDS)
+         (let [began (System/nanoTime)]
+           (.countDown start)
+           (doseq [task tasks] @task)
+           {:elapsed-ns (- (System/nanoTime) began)
+            :successes (count (filter :ok @outcomes))
+            :errors (count (remove :ok @outcomes))
+            :latencies-ns (mapv :latency-ns @outcomes)}))"
+      (pr-str (vec tenant-ids)) writers appends-per-writer)
+    120000))
+
+(defn report-load! [label result]
+  (let [latencies (:latencies-ns result)
+        elapsed-seconds (/ (:elapsed-ns result) 1.0e9)
+        ms #(/ % 1.0e6)]
+    (metric (format "%s: %.1f writes/s, p50=%.2fms p95=%.2fms p99=%.2fms"
+                    label
+                    (/ (:successes result) elapsed-seconds)
+                    (ms (percentile latencies 0.50))
+                    (ms (percentile latencies 0.95))
+                    (ms (percentile latencies 0.99))))))
+
 ;; -------------------------------- ;;
 ;; Node cycler                      ;;
 ;; -------------------------------- ;;
@@ -117,6 +174,17 @@
       (check (str n-tenants " leases assigned (got " (:leases sa) ")")
              (= n-tenants (:leases sa))))
     tids))
+
+(defn scenario-contention [tenant-ids]
+  (header "Churn: Sustained append contention")
+  (let [hot (run-contention-load! [(first tenant-ids)] 16 100)
+        distributed (run-contention-load! tenant-ids 16 100)]
+    (report-load! "Hot tenant (16x100)" hot)
+    (report-load! "Distributed across 20 tenants (1,600)" distributed)
+    (check "Hot tenant: all 1,600 appends succeeded"
+           (and (= 1600 (:successes hot)) (zero? (:errors hot))))
+    (check "Distributed: all 1,600 appends succeeded"
+           (and (= 1600 (:successes distributed)) (zero? (:errors distributed))))))
 
 (defn scenario-churn [tenant-ids]
   (header (str "Churn: " (/ test-duration-ms 1000) "s of events + node cycling"))
@@ -185,6 +253,7 @@
 
 (try
   (let [tids (scenario-setup)
+        _ (scenario-contention tids)
         tids (scenario-churn tids)]
     (scenario-verify tids))
   (catch Throwable t
