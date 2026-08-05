@@ -1,7 +1,7 @@
 (ns ai.obney.grain.event-store-sqlite-v3.core
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
-            [ai.obney.grain.event-store-v3.interface :refer [prepare-append]]
+            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
             [ai.obney.grain.event-store-sqlite-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [next.jdbc :as jdbc]

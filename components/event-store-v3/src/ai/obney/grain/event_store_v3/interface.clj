@@ -8,10 +8,6 @@
   [{:keys [_type _body _tags] :as args}]
   (core/->event args))
 
-(defn prepare-append
-  [last-id events tx-metadata]
-  (core/prepare-append last-id events tx-metadata))
-
 (defn start
   [config]
   (core/start config))

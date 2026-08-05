@@ -320,7 +320,12 @@
 ;; (for use from REPL) ;;
 ;; ------------------- ;;
 
-(declare all-events)
+(defn all-events
+  "Show all non-tx events for a tenant."
+  [system tenant-id]
+  (into []
+    (remove #(= :grain/tx (:event/type %)))
+    (es/read (:event-store system) {:tenant-id tenant-id})))
 
 (defn create-tenant!
   "Create a tenant by appending an initial event."
@@ -422,13 +427,6 @@
   "Reset the slow-work effect execution counter. Call before each test scenario."
   []
   (reset! slow-work-effect-executions {}))
-
-(defn all-events
-  "Show all non-tx events for a tenant."
-  [system tenant-id]
-  (into []
-    (remove #(= :grain/tx (:event/type %)))
-    (es/read (:event-store system) {:tenant-id tenant-id})))
 
 (defn scheduled-trigger-summary
   "Summary of scheduled triggers and their processing for a tenant."

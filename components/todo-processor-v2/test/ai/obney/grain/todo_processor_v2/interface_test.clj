@@ -8,7 +8,8 @@
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.periodic-task.core :as pt-core]
             [cognitect.anomalies :as anom]
-            [clj-uuid :as uuid]))
+            [clj-uuid :as uuid])
+  (:import [java.time OffsetDateTime]))
 
 (def test-tenant-id (random-uuid))
 
@@ -56,7 +57,9 @@
   [event handler-fn]
   {:event (if (:event/id event)
             event
-            (-> (es/prepare-append nil [event] nil) :events first))
+            (assoc event
+                   :event/id (uuid/v7)
+                   :event/timestamp (OffsetDateTime/now)))
    :handler-fn handler-fn
    :event-store *event-store*
    :tenant-id test-tenant-id})
