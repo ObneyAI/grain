@@ -182,8 +182,8 @@ contract EventAppend {
     @invariant SerialisedWrites
         -- Appends are totally serialised against one another, so two concurrent
         -- appends never interleave their events and every appended event lands.
-        -- The order in which events were appended is preserved in the stream's
-        -- total order.
+        -- Serialization governs atomicity and visibility; it does not define
+        -- read order, which is determined solely by event identity.
 
     @invariant TransactionMarker
         -- A plain (unguarded) append also records exactly one transaction-marker
@@ -243,6 +243,8 @@ contract EventRead {
         -- Read results are ordered by event identity, which is the single total
         -- order the store imposes. An empty query reads the whole stream in that
         -- order; any filter reads the matching subset in the same relative order.
+        -- This holds even when storage insertion or append order differs from
+        -- identity order.
 
     @invariant FilteringIsConjunctive
         -- Within one query the filters combine conjunctively: an event is

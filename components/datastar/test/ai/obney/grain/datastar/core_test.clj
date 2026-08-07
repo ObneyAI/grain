@@ -45,7 +45,9 @@
                         [:enabled? :boolean]
                         [:status [:enum :draft :published]]
                         [:label :string]]
-   :test/no-signals [:map]})
+   :test/no-signals [:map]
+   :test/signals-emitting-page [:map]
+   :test/signals-ignored-page [:map]})
 
 ;; -------------------- ;;
 ;; Test Query/Command   ;;
@@ -200,6 +202,29 @@
   [context]
   {:query/result {:page :public}
    :datastar/hiccup [:div#app "public content"]})
+
+;; ------------------------------------------------- ;;
+;; Opt-in query :datastar/signals (emit-signals?)    ;;
+;; ------------------------------------------------- ;;
+
+(defquery :test signals-emitting-page
+  {:authorized? (constantly true)
+   :datastar/path "/signals-emitting"
+   :datastar/emit-signals? true
+   :datastar/fps 0}
+  [_context]
+  {:query/result {:page :signals}
+   :datastar/hiccup [:div#app "signals content"]
+   :datastar/signals {:__redirect "/elsewhere"}})
+
+(defquery :test signals-ignored-page
+  {:authorized? (constantly true)
+   :datastar/path "/signals-ignored"
+   :datastar/fps 0}
+  [_context]
+  {:query/result {:page :ignored}
+   :datastar/hiccup [:div#app "ignored content"]
+   :datastar/signals {:__redirect "/elsewhere"}})
 
 ;; =========================== ;;
 ;; Pure Function Tests          ;;
@@ -381,7 +406,14 @@
       (is (str/includes? body "@get(&apos;/stream?dsNonce="))
       ;; dsNonce emitted as signal so Datastar includes it in every request
       (is (str/includes? body "data-signals"))
-      (is (str/includes? body "dsNonce"))))
+      (is (str/includes? body "dsNonce"))
+      ;; __grainConnect marks the persistent (re)connect. It must be baked into
+      ;; the data-init URL (replayed on every reconnect → routed to rebind)...
+      (is (str/includes? body "__grainConnect=1"))
+      ;; ...but must NOT be emitted as a signal (data-signals JSON, quotes escaped
+      ;; to &quot;), or signal-update refreshes would carry it and every refresh
+      ;; would be misread as a reconnect.
+      (is (not (str/includes? body "&quot;__grainConnect&quot;")))))
 
   (testing "with stream-method post — nonce in URL and as signal"
     (let [interceptor (ds/shim-page {:stream-path "/stream" :stream-method "post"})
@@ -392,7 +424,11 @@
       (is (str/includes? body "@post(&apos;/stream?dsNonce="))
       ;; AND as data-signals for subsequent @post calls
       (is (str/includes? body "data-signals"))
-      (is (str/includes? body "dsNonce")))))
+      (is (str/includes? body "dsNonce"))
+      ;; Marker is method-agnostic: a POST persistent stream also carries it in
+      ;; the URL (so its reconnect rebinds) but never as a signal.
+      (is (str/includes? body "__grainConnect=1"))
+      (is (not (str/includes? body "&quot;__grainConnect&quot;"))))))
 
 (deftest shim-page-resolves-path-params-test
   (let [interceptor (ds/shim-page {:stream-path "/items/:item-id/__stream"})
@@ -554,6 +590,36 @@
     (is (= #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
            (:tenant-id @received)))))
 
+(deftest gate-interceptor-sees-query-params-test
+  (let [received (atom nil)
+        interceptor (ds/gate-interceptor
+                     {}
+                     {:check (fn [ctx] (reset! received ctx) true)
+                      :redirect "/blocked"})
+        ctx {:request {:query-params {"id" "42"}}
+             :grain/additional-context {:auth-claims {:user-id (random-uuid)}}}
+        _ ((:enter interceptor) ctx)]
+    (is (= {"id" "42"} (:query-params @received))
+        "the request query-params are exposed to the check fn")))
+
+(deftest gate-interceptor-dynamic-redirect-test
+  (testing ":redirect may be a fn that computes the path per-request"
+    (let [interceptor (ds/gate-interceptor
+                       {}
+                       {:check (fn [_] false)
+                        :redirect (fn [gate-ctx]
+                                    (str "/blocked/" (get-in gate-ctx [:query-params "id"])))})
+          ctx {:request {:query-params {"id" "42"}}
+               :grain/additional-context {:auth-claims {:user-id (random-uuid)}}}
+          result ((:enter interceptor) ctx)]
+      (is (= 302 (get-in result [:response :status])))
+      (is (= "/blocked/42" (get-in result [:response :headers "Location"])))))
+  (testing "a string :redirect still works unchanged (backward compatible)"
+    (let [interceptor (ds/gate-interceptor {} {:check (fn [_] false) :redirect "/blocked"})
+          result ((:enter interceptor) {:request {:query-params {}}
+                                        :grain/additional-context {}})]
+      (is (= "/blocked" (get-in result [:response :headers "Location"]))))))
+
 ;; =========================== ;;
 ;; poll-and-render Tests        ;;
 ;; =========================== ;;
@@ -582,6 +648,25 @@
         (let [second-result (ds/poll-and-render context (:result first-result))]
           (is (some? second-result))
           (is (not= (:result first-result) (:result second-result))))))))
+
+(deftest poll-and-render-opt-in-signals-test
+  (testing ":datastar/emit-signals? query attaches a :signals-event alongside the elements event"
+    (let [context {:query-registry @qp/query-registry*
+                   :query {:query/name :test/signals-emitting-page
+                           :query/id (random-uuid)
+                           :query/timestamp (time/now)}}
+          result (ds/poll-and-render context nil)]
+      (is (= "datastar-patch-elements" (get-in result [:event :name])))
+      (is (= "datastar-patch-signals" (get-in result [:signals-event :name])))
+      (is (re-find #"__redirect" (get-in result [:signals-event :data])))))
+  (testing "a query WITHOUT the flag drops :datastar/signals (backward compatible)"
+    (let [context {:query-registry @qp/query-registry*
+                   :query {:query/name :test/signals-ignored-page
+                           :query/id (random-uuid)
+                           :query/timestamp (time/now)}}
+          result (ds/poll-and-render context nil)]
+      (is (= "datastar-patch-elements" (get-in result [:event :name])))
+      (is (nil? (:signals-event result))))))
 
 (deftest poll-and-render-static-result-dynamic-hiccup-test
   (testing "re-renders when hiccup changes even if :query/result is static"
@@ -1370,6 +1455,32 @@
       (is (= "/" (first shim-route))))
     (testing "root path stream route is /__stream (not //__stream)"
       (is (= "/__stream" (first stream-route))))))
+
+(defn- route-pair-heartbeat
+  "Builds routes for a polling query with the given entry + defaults, drives the
+   generated GET stream interceptor, and returns the heartbeat-delay that reaches
+   sse/start-stream. Exercises the query->route-pair -> stream-view plumbing."
+  [entry defaults]
+  (let [[_shim stream-route] (#'ds/query->route-pair {} :test/hb entry defaults)
+        stream-interceptor (last (nth stream-route 2))
+        captured (atom nil)]
+    (with-redefs [sse/start-stream (fn [_callback _ctx heartbeat-delay]
+                                     (reset! captured heartbeat-delay)
+                                     {:status 200})]
+      ((:enter stream-interceptor) {}))
+    @captured))
+
+(deftest heartbeat-delay-configurable-test
+  (let [base {:authorized? (constantly true) :datastar/path "/hb"}]
+    (testing "per-query :datastar/heartbeat-delay reaches sse/start-stream"
+      (is (= 1 (route-pair-heartbeat (assoc base :datastar/heartbeat-delay 1) {}))))
+    (testing "defaults :datastar/heartbeat-delay applies when the query omits it"
+      (is (= 2 (route-pair-heartbeat base {:datastar/heartbeat-delay 2}))))
+    (testing "a per-query value overrides the default"
+      (is (= 1 (route-pair-heartbeat (assoc base :datastar/heartbeat-delay 1)
+                                     {:datastar/heartbeat-delay 2}))))
+    (testing "neither set falls through to stream-view's 10s default (not nil)"
+      (is (= 10 (route-pair-heartbeat base {}))))))
 
 ;; =========================== ;;
 ;; E2E Auto-Routes Test         ;;
@@ -2355,6 +2466,148 @@
         (finally
           (async/close! open-signal-ch)
           (swap! @#'ds/active-stream-contexts dissoc session-key))))))
+
+;; ============================================================ ;;
+;; REPRODUCTIONS — silently-dead SSE reconnect + finally clobber ;;
+;;                                                                ;;
+;; These pin two bugs that the existing stale-session tests miss  ;;
+;; because every one of those simulates a LOUD death (async/close!;;
+;; on a channel). A phone's SSE typically dies SILENTLY: the      ;;
+;; socket is gone but no write has failed yet, so Pedestal has    ;;
+;; not closed either channel — the registry entry still looks     ;;
+;; alive for minutes. Both tests FAIL against current behavior    ;;
+;; and are the executable statement of the defect.                ;;
+;; ============================================================ ;;
+
+(deftest e2e-get-reconnect-into-silently-dead-stream-test
+  (testing "A persistent-stream reconnect (same nonce, __grainConnect marker)
+            into a zombie whose channels are still OPEN must rebind a fresh
+            stream, not reuse-and-swallow it"
+    ;; Silent death: BOTH signal-ch and event-ch remain open (no write has
+    ;; failed yet), mirroring a mobile connection that vanished without a FIN.
+    ;; The liveness guard only checks `closed?`, so it treats this zombie as
+    ;; live. The reconnect carries __grainConnect (baked into the shim's
+    ;; data-init URL and replayed verbatim on every SSE auto-reconnect), which
+    ;; routes it to rebind instead of reuse.
+    (let [user-id (random-uuid)
+          nonce   (str (random-uuid))
+          session-key [user-id :test/filterable-counters nonce]
+          open-signal-ch (async/chan (async/sliding-buffer 1))
+          open-event-ch  (async/chan (async/sliding-buffer 1))]
+      (swap! @#'ds/active-stream-contexts assoc session-key
+             {:context-atom (atom {:query {:query/name :test/filterable-counters}})
+              :signal-ch open-signal-ch
+              :event-ch open-event-ch})
+      (try
+        (let [client (HttpClient/newHttpClient)
+              ;; Exactly the data-init URL the browser reconnects to: same nonce +
+              ;; the __grainConnect marker. A native SSE reconnect replays this URL.
+              get-request (-> (HttpRequest/newBuilder)
+                              (.uri (URI/create (str "http://localhost:" *port*
+                                                     "/filterable/__stream?dsNonce=" nonce
+                                                     "&__grainConnect=1")))
+                              (.header "X-Test-User-Id" (str user-id))
+                              (.GET)
+                              .build)
+              get-response (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+              events (parse-sse-events (.body get-response) 1 5000)]
+          ;; The reconnecting connection must receive its own initial render.
+          ;; Pre-fix: reuse fired and the new connection got an empty closing SSE
+          ;; (0 events — the page silently stopped updating). Post-fix: rebind.
+          (is (= 1 (count events))
+              "reconnect must get a fresh initial render, not an empty closing SSE")
+          (is (= "datastar-patch-elements" (:name (first events)))))
+        (finally
+          (async/close! open-signal-ch)
+          (async/close! open-event-ch)
+          (swap! @#'ds/active-stream-contexts dissoc session-key))))))
+
+(deftest e2e-post-reconnect-into-silently-dead-stream-test
+  (testing "The zombie bug is method-agnostic: a POST persistent-stream reconnect
+            (stream-method \"post\", __grainConnect marker) into an OPEN zombie must
+            also rebind, not reuse-and-swallow"
+    ;; This is the case the report's \"POST always reuses\" rule would leave broken —
+    ;; a stream-method \"post\" app reconnects its persistent stream as a POST, and
+    ;; without intent-based routing that POST is swallowed exactly like the GET bug.
+    ;; The marker routes it to rebind regardless of method.
+    (let [user-id (random-uuid)
+          nonce   (str (random-uuid))
+          session-key [user-id :test/filterable-counters nonce]
+          open-signal-ch (async/chan (async/sliding-buffer 1))
+          open-event-ch  (async/chan (async/sliding-buffer 1))]
+      (swap! @#'ds/active-stream-contexts assoc session-key
+             {:context-atom (atom {:query {:query/name :test/filterable-counters}})
+              :signal-ch open-signal-ch
+              :event-ch open-event-ch})
+      (try
+        (let [client (HttpClient/newHttpClient)
+              ;; POST data-init reconnect: marker + nonce in the URL, signals in body.
+              post-request (-> (HttpRequest/newBuilder)
+                               (.uri (URI/create (str "http://localhost:" *port*
+                                                      "/filterable/__stream?dsNonce=" nonce
+                                                      "&__grainConnect=1")))
+                               (.header "Content-Type" "application/json")
+                               (.header "X-Test-User-Id" (str user-id))
+                               (.POST (HttpRequest$BodyPublishers/ofString ""))
+                               .build)
+              post-response (.send client post-request (HttpResponse$BodyHandlers/ofInputStream))
+              events (parse-sse-events (.body post-response) 1 5000)]
+          (is (= 1 (count events))
+              "POST reconnect must get a fresh initial render, not an empty closing SSE")
+          (is (= "datastar-patch-elements" (:name (first events)))))
+        (finally
+          (async/close! open-signal-ch)
+          (async/close! open-event-ch)
+          (swap! @#'ds/active-stream-contexts dissoc session-key))))))
+
+(deftest e2e-stale-loop-finally-does-not-clobber-newer-entry-test
+  (testing "A stale event loop's finally must not dissoc a NEWER healthy entry
+            that replaced it under the same [user query nonce] key"
+    ;; Drives the real stream-view-loop-events finally:
+    ;;   1. open a live SSE (loop L1) — it registers entry1 under key K
+    ;;   2. a newer stream replaces K with entry2 (simulated directly)
+    ;;   3. L1 exits (its own signal-ch closes) and runs its finally
+    ;; The finally's UNCONDITIONAL `(dissoc K)` then removes entry2 — the
+    ;; healthy stream — breaking all subsequent reuse for that tab.
+    (let [reg #'ds/active-stream-contexts
+          user-id (random-uuid)
+          nonce   (str (random-uuid))
+          session-key [user-id :test/filterable-counters nonce]
+          client (HttpClient/newHttpClient)
+          get-request (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://localhost:" *port*
+                                                 "/filterable/__stream?dsNonce=" nonce)))
+                          (.header "X-Test-User-Id" (str user-id))
+                          (.GET)
+                          .build)]
+      ;; 1. Open the live stream L1 and let it register entry1.
+      (.send client get-request (HttpResponse$BodyHandlers/ofInputStream))
+      (is (eventually? #(contains? @@reg session-key) 5000)
+          "L1 should register its entry")
+      (let [entry1 (get @@reg session-key)
+            l1-signal-ch (:signal-ch entry1)
+            l1-event-ch  (:event-ch entry1)
+            ;; 2. A newer, healthy stream takes over the same key.
+            entry2 {:context-atom (atom {:query {:query/name :test/filterable-counters}})
+                    :signal-ch (async/chan (async/sliding-buffer 1))
+                    :event-ch  (async/chan (async/sliding-buffer 1))}]
+        (swap! @reg assoc session-key entry2)
+        (try
+          ;; 3. Force L1 to exit by closing ITS signal-ch (mirrors the else-branch
+          ;;    in update-or-start that closes a stale signal-ch). L1's finally
+          ;;    closes its own event-ch, which we use as the "finally ran" signal.
+          (async/close! l1-signal-ch)
+          (is (eventually? #(async-protocols/closed? l1-event-ch) 5000)
+              "L1's finally should have run (its event-ch is closed)")
+          ;; The newer, healthy entry2 must still be registered.
+          ;; TODAY: L1's finally dissoc'd the key, so this is nil — reuse for
+          ;; this tab is now broken. That is the bug this test pins.
+          (is (identical? entry2 (get @@reg session-key))
+              "newer healthy entry must survive the stale loop's cleanup")
+          (finally
+            (async/close! (:signal-ch entry2))
+            (async/close! (:event-ch entry2))
+            (swap! @reg dissoc session-key)))))))
 
 (deftest e2e-get-multiple-signal-updates-test
   (testing "Multiple GETs update the same SSE stream, each triggering a re-render"

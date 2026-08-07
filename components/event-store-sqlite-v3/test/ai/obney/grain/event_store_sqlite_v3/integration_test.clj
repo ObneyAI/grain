@@ -12,7 +12,8 @@
             [clojure.string]
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime ZoneOffset Instant]
-           [java.io File]))
+           [java.io File]
+           [java.util UUID]))
 
 ;; -------------------- ;;
 ;; Schema Registration  ;;
@@ -71,13 +72,11 @@
   ([type tags body]
    (let [event (es/->event (cond-> {:type type :tags tags}
                              body (assoc :body body)))]
-     (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
-     event)))
+     (first (es/append *event-store* {:tenant-id *tenant-id* :events [event]})))))
 
 (defn append-events! [events-data]
   (let [events (mapv es/->event events-data)]
-    (es/append *event-store* {:tenant-id *tenant-id* :events events})
-    events))
+    (es/append *event-store* {:tenant-id *tenant-id* :events events})))
 
 (defn read-events [args]
   (into [] (es/read *event-store* (if (vector? args)
@@ -248,9 +247,9 @@
 
 (deftest events-with-empty-body
   (let [event (es/->event {:type :test/alpha :tags #{}})
-        _ (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
+        [persisted] (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
         read (first (non-tx-events (read-events {})))]
-    (is (= (:event/id event) (:event/id read)))
+    (is (= (:event/id persisted) (:event/id read)))
     (is (= :test/alpha (:event/type read)))))
 
 ;; ============================ ;;
@@ -410,6 +409,25 @@
                              (uuid/= a b) 0
                              :else 1))
                      ids)))))
+
+(deftest commit-order-is-established-before-reversing-or-limiting-sqlite
+  (let [tag-id (uuid/v4)
+        first-event (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 2}})
+        second-event (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 1}})]
+    (let [[persisted-first] (es/append *event-store* {:tenant-id *tenant-id* :events [first-event]})
+          [persisted-second] (es/append *event-store* {:tenant-id *tenant-id* :events [second-event]})
+          expected [(:event/id persisted-first) (:event/id persisted-second)]
+          ids #(mapv :event/id (read-events %))]
+      (is (= expected (ids {:types #{:test/alpha}})))
+      (is (= expected
+             (ids [{:types #{:test/alpha}}
+                   {:tags #{[:order tag-id]}}])))
+      (is (= (vec (reverse expected))
+             (ids {:types #{:test/alpha} :reverse? true})))
+      (is (= [(:event/id persisted-first)]
+             (ids {:types #{:test/alpha} :limit 1})))
+      (is (= [(:event/id persisted-second)]
+             (ids {:types #{:test/alpha} :reverse? true :limit 1}))))))
 
 (deftest batch-empty-result
   (let [events (non-tx-events
@@ -634,13 +652,19 @@
 
 (deftest timestamp-preserved-as-offsetdatetime
   (let [before (OffsetDateTime/now)
-        _ (append-event! :test/alpha #{} {:n 1})
+        submitted [(es/->event {:type :test/alpha :tags #{} :body {:n 1}})
+                   (es/->event {:type :test/beta :tags #{} :body {:n 2}})]
+        returned (es/append *event-store* {:tenant-id *tenant-id* :events submitted})
         after (OffsetDateTime/now)
-        read (first (non-tx-events (read-events {})))
-        ts (:event/timestamp read)]
+        stored (read-events {})
+        timestamps (mapv :event/timestamp stored)
+        ts (first timestamps)]
     (is (instance? OffsetDateTime ts))
     (is (not (.isBefore ts before)))
-    (is (not (.isAfter ts after)))))
+    (is (not (.isAfter ts after)))
+    (is (apply = timestamps))
+    (is (= (mapv :event/timestamp returned)
+           (mapv :event/timestamp (non-tx-events stored))))))
 
 ;; ======================================== ;;
 ;; J. Tenant Isolation                      ;;

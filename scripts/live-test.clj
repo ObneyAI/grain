@@ -55,17 +55,21 @@
 ;; nREPL helpers                    ;;
 ;; -------------------------------- ;;
 
-(defn eval-on [port code]
-  (with-open [conn (nrepl/connect :port port)]
-    (let [client (nrepl/client conn 15000)
-          results (nrepl/message client {:op :eval :code code})]
-      (doseq [r results]
-        (when (:err r) (binding [*out* *err*] (print (:err r)))))
-      (some :value results))))
+(defn eval-on
+  ([port code] (eval-on port code 15000))
+  ([port code timeout-ms]
+   (with-open [conn (nrepl/connect :port port)]
+     (let [client (nrepl/client conn timeout-ms)
+           results (nrepl/message client {:op :eval :code code})]
+       (doseq [r results]
+         (when (:err r) (binding [*out* *err*] (print (:err r)))))
+       (some :value results)))))
 
-(defn eval-read [port code]
-  (let [v (eval-on port code)]
-    (when v (read-string v))))
+(defn eval-read
+  ([port code] (eval-read port code 15000))
+  ([port code timeout-ms]
+   (let [v (eval-on port code timeout-ms)]
+     (when v (read-string v)))))
 
 (defn setup-node! [port]
   ;; nREPL is opened inside (start) before (reset! app (start)) completes, so
@@ -126,11 +130,15 @@
     (format "(count (filter (fn [e] (= :test/counter-incremented (:event/type e)))
                             (app/all-events @app/app (java.util.UUID/fromString \"%s\"))))" tenant-id)))
 
-(defn start-tail-probe! [port tenant-id]
-  (eval-on port
-    (format "(app/start-tail-probe! @app/app
-                (java.util.UUID/fromString \"%s\")
-                #{:test/counter-incremented})" tenant-id)))
+(defn start-tail-probe!
+  ([port tenant-id]
+   (start-tail-probe! port tenant-id #{:test/counter-incremented}))
+  ([port tenant-id event-types]
+   (eval-on port
+     (format "(app/start-tail-probe! @app/app
+                 (java.util.UUID/fromString \"%s\")
+                 %s)"
+             tenant-id (pr-str event-types)))))
 
 (defn stop-tail-probe! [port]
   (eval-on port "(app/stop-tail-probe! @app/app)"))
@@ -142,7 +150,11 @@
   (eval-read port
     "(mapv (fn [e]
              {:event-type (:event/type e)
+              :event-id (some-> (:event/id e) str)
+              :event-timestamp (some-> (:event/timestamp e) str)
               :tenant-id (some-> (:grain/tenant-id e) str)
+              :triggered-by (some-> (:triggered-by e) str)
+              :processed-event-id (some-> (:processed-by/event-id e) str)
               :n (:n e)})
            (app/tail-probe-events @app/app))"))
 
@@ -552,18 +564,28 @@
                                          %s))"
                           (pr-str tids)))
           new-per-tenant (map (fn [tid] (- (get after tid 0) (get before tid 0))) tids)
-          total-new (reduce + new-per-tenant)]
+          total-new (reduce + new-per-tenant)
+          duplicate-periods (eval-read primary-port
+                              (format
+                                "(into {}
+                                   (map (fn [tid-str]
+                                          (let [events (app/all-events @app/app
+                                                         (java.util.UUID/fromString tid-str))
+                                                periods (map :period
+                                                          (filter #(= :test/scheduled-trigger
+                                                                      (:event/type %%))
+                                                                  events))]
+                                            [tid-str (- (count periods)
+                                                        (count (set periods)))]))
+                                        %s))"
+                                (pr-str tids)))]
       (info (str "New triggers per tenant: " (pr-str new-per-tenant)))
       (info (str "Total new: " total-new))
       (check "New triggers created" (pos? total-new))
-      ;; CAS dedup check: each tenant should get the same number of new triggers
-      ;; (one per cycle, not one per node per cycle)
-      ;; With 3 nodes and ~3 cycles, without dedup = ~9 per tenant.
-      ;; With dedup = ~3 per tenant.
-      (let [max-new (apply max new-per-tenant)]
-        (check (str "CAS dedup working (max " max-new " per tenant, not " (* 3 max-new) ")")
-               ;; Each tenant should have roughly the same count (within 1)
-               (<= (- (apply max new-per-tenant) (apply min new-per-tenant)) 1))))))
+      ;; Directly check the CAS invariant. Count comparisons are sensitive to
+      ;; events landing between the per-tenant baseline/final reads.
+      (check "CAS dedup working (no duplicate tenant/period triggers)"
+             (every? zero? (vals duplicate-periods))))))
 
 (defn scenario-15 []
   (header "Scenario 15: Blocking handlers don't starve other tenants")
@@ -668,6 +690,81 @@
         (check (str "Post-failover tenant " (subs tid 0 8) ": has local owner among survivors")
                (= 1 (count local-owners)))))))
 
+(defn scenario-17 []
+  (header "Scenario 17: Checkpoint gap uses final persisted IDs")
+  (restart-victim!)
+  (Thread/sleep 6000)
+  ;; A fresh tenant keeps every storage/reference assertion specific to the
+  ;; two events in this scenario. B's append also registers the tenant.
+  (let [tenant-id (str (java.util.UUID/randomUUID))]
+    (reset-tail-probe-events! primary-port)
+    (start-tail-probe! primary-port tenant-id
+                       #{:test/counter-incremented
+                         :test/counter-processed
+                         :grain/todo-processor-checkpoint})
+    (let [result (eval-read primary-port
+                   (format "(let [r (app/append-checkpoint-gap!
+                                      @app/app (java.util.UUID/fromString \"%s\") 15000)]
+                              (update-vals r str))" tenant-id)
+                   30000)
+          final-a (:final-a-id result)
+          final-b (:final-b-id result)
+          deadline (+ (System/currentTimeMillis) 15000)
+          diagnostic (loop []
+                       (let [d (eval-read primary-port
+                                 (format "(app/diagnose-tenant @app/app
+                                            (java.util.UUID/fromString \"%s\"))" tenant-id))]
+                         (if (or (and (>= (:processed d) 2)
+                                      (zero? (:missing-count d))
+                                      (zero? (:unexpected-count d))
+                                      (zero? (:uncheckpointed-count d)))
+                                 (>= (System/currentTimeMillis) deadline))
+                           d
+                           (do (Thread/sleep 100) (recur)))))
+          stored (eval-read primary-port
+                   (format "(->> (app/all-events @app/app
+                                   (java.util.UUID/fromString \"%s\"))
+                                  (filter #(contains? #{:test/counter-incremented
+                                                        :test/counter-processed
+                                                        :grain/todo-processor-checkpoint}
+                                                      (:event/type %%)))
+                                  (mapv (fn [e] {:type (:event/type e)
+                                                 :id (str (:event/id e))
+                                                 :timestamp (str (:event/timestamp e))
+                                                 :triggered-by (some-> (:triggered-by e) str)
+                                                 :processed-event-id (some-> (:processed-by/event-id e) str)})))"
+                           tenant-id))
+          observed (wait-for-tail-probe-count primary-port 6 15000)
+          increment-ids (set (map :id (filter #(= :test/counter-incremented (:type %)) stored)))
+          stored-increment-times (into {} (map (juxt :id :timestamp)
+                                                (filter #(= :test/counter-incremented (:type %)) stored)))
+          processor-refs (set (keep :processed-event-id stored))
+          relevant-ids #{final-a final-b}
+          checkpoint-refs (->> stored
+                               (keep :triggered-by)
+                               (filter relevant-ids)
+                               set)
+          pubsub-increment-ids (set (keep :event-id
+                                          (filter #(= :test/counter-incremented (:event-type %)) observed)))
+          pubsub-increment-times (into {} (map (juxt :event-id :event-timestamp)
+                                                (filter #(= :test/counter-incremented (:event-type %)) observed)))
+          returned-increment-times {final-a (:final-a-timestamp result)
+                                    final-b (:final-b-timestamp result)}]
+      (info (str "Final IDs: B=" final-b ", A=" final-a))
+      (check "A receives a final ID greater than B" (pos? (compare final-a final-b)))
+      (check "Storage contains both final persisted IDs" (= #{final-a final-b} increment-ids))
+      (check "Pubsub exposes the final persisted IDs" (= #{final-a final-b} pubsub-increment-ids))
+      (check "Storage and pubsub expose store-assigned timestamps"
+             (= returned-increment-times stored-increment-times pubsub-increment-times))
+      (check "Processor output references only final IDs" (= #{final-a final-b} processor-refs))
+      (check "Checkpoints reference only final IDs" (= #{final-a final-b} checkpoint-refs))
+      (check "Tenant diagnostics report no gaps or anomalies"
+             (and (zero? (:missing-count diagnostic))
+                  (zero? (:unexpected-count diagnostic))
+                  (empty? (:duplicate-processed diagnostic))
+                  (zero? (:uncheckpointed-count diagnostic))))
+      (stop-tail-probe! primary-port))))
+
 ;; -------------------------------- ;;
 ;; Main runner                      ;;
 
@@ -700,6 +797,7 @@
     (scenario-14)
     (scenario-15)
     (scenario-16)
+    (scenario-17)
 
     (catch Throwable t
       (swap! results update :error inc)
