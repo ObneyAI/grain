@@ -29,4 +29,6 @@
         gem/time {:local/root "../../components/time"}}
 
  :aliases {:test {:extra-paths []
-                  :extra-deps {}}}}
+                  ;; read-model-processor-v2's shared brick tests exercise its
+                  ;; LMDB implementation when this project is the test runner.
+                  :extra-deps {gem/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}}}}}

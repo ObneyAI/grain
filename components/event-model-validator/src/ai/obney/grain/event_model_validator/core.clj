@@ -435,14 +435,6 @@
                {:kind kind :block nm
                 :message (str (name kind) " " nm " does not declare :grain.event-model/reads (required in strict mode).")}))))
 
-(defn- check-gwt-required [model]
-  (for [[area area-map] model
-        [block-key block] (:commands area-map)
-        :when (empty? (:given-when-thens block))]
-    (finding :gwt/missing :error
-             {:area area :kind :command :block block-key
-              :message (str "Command " block-key " has no Given/When/Then examples (required in strict mode).")})))
-
 ;; ---- verdict + entrypoints ------------------------------------------------
 
 (defn- design-notices [model present?]
@@ -500,7 +492,6 @@
                  (when present? (check-auth model live))
                  (when (and present? strict?) (check-produces-required model live))
                  (when (and present? strict?) (check-reads-required model live))
-                 (when strict? (check-gwt-required model))
                  (design-notices model present?))]
          (total-verdict (remove nil? fs) model present? opts)))
      (catch Exception e
@@ -532,7 +523,7 @@
 ;; ===========================================================================
 
 (def strict-defaults
-  "Strictest tier: full coverage + declared produces/reads + GWT, and spec↔runtime
+  "Strictest tier: full coverage + declared produces/reads, and spec↔runtime
    mismatches are fatal. :auth/missing is intentionally NOT fatal (deny-by-default
    is not a model defect); add it to :fatal-types to change that."
   {:strict true

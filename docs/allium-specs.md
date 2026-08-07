@@ -83,7 +83,7 @@ The datastar component is the server-driven reactive-UI boundary for grain's CQR
 
 ### [`event-model`](../components/event-model/event-model.allium)
 
-The spec captures event-model as the design-time vocabulary and well-formedness grammar for describing a grain CQRS application **service-area-first**: a model is a map of service areas, each owning seven classified building-block kinds (command, event, read-model, query, todo-processor, periodic-task, screen) keyed `:<area>/<name>` with the kind coming from structural position, the canonical connection grammar wiring blocks into flows, kind-typed dependency edges between blocks, payload-schema obligations matched against the live registry, and Given/When/Then examples on commands. Its companion `code-agent-tools/validate-event-model` reconciles a declared model against a live grain runtime over the REPL (see [docs/event-model.md](event-model.md)).
+The spec captures event-model as the topology vocabulary and well-formedness grammar for describing a Grain CQRS application **service-area-first**: a model is a map of service areas, each owning seven classified building-block kinds keyed `:<area>/<name>`, the canonical connection grammar wiring blocks into flows, kind-typed dependency edges, payload-schema obligations matched against the live registry, and explicit links from commands/screens to behavioural rules/surfaces in companion Allium specs. Runtime validation reconciles topology against a live Grain catalog; dev/CI composition validation resolves the Allium links (see [docs/event-model.md](event-model.md)).
 
 <sub>entities 4 · variants 7 · contracts 3 · invariants 3 · surfaces 2 · actors 2</sub>
 
@@ -246,4 +246,3 @@ The time component is the system clock: a single source of the current instant p
 A thin HTTP-server lifecycle wrapper: a host starts a single server over a caller-supplied route set on a configured port (port 0 binds an OS-chosen ephemeral port readable back from the instance) and later stops it. All request semantics — routing, authorization, tenant scoping, command/query dispatch — belong to the route-providing components, not here.
 
 <sub>entities 0 · rules 0 · contracts 1 · invariants 4 · surfaces 1</sub>
-

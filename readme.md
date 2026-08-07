@@ -51,6 +51,22 @@ See `bases/example-base` and `components/example-service` for a complete example
 
 For multi-instance deployments, add the [control plane](docs/distributed-coordination.md) package.
 
+### Specifications and agent workflow
+
+Grain projects keep two complementary specifications: [Allium](https://github.com/juxt/allium)
+for observable behaviour and Grain [Event Models](docs/event-model.md) for CQRS
+service topology. Install Allium separately, then install this repository's
+`grain` plugin or its portable skills:
+
+```sh
+npx skills add juxt/allium
+npx skills add ObneyAI/grain
+```
+
+Claude Code and Codex plugin manifests are included at the repository root. Use
+`/grain` as the composed entry point; it delegates behavioural phases to Allium
+and adds topology, runtime, and trace-link verification.
+
 ## Example App: Grain Todo List
 
 [`grain-todo-list`](https://github.com/ObneyAI/grain-todo-list) is a compact teaching app for learning how to build with Grain. It demonstrates command handlers, event schemas, read models, query handlers, todo processors, periodic tasks, server-rendered Datastar UI, auth/session flow, and Integrant system composition in a small Clojure project.
@@ -77,6 +93,7 @@ Grain Sessions walks through the app as a teaching series:
 | **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
 | **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE, including distributed live updates |
 | **grain-code-agent-tools** | Dev-only nREPL tools for coding agents working against live Grain apps |
+| **grain-event-model** | Service-area Event Model registration and production boot validation |
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
 | **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |

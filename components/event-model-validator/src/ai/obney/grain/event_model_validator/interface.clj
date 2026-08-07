@@ -43,7 +43,7 @@
 (defn validate-event-model
   "Structurally validate an EDN event model against the live runtime; returns a
    total verdict `{:valid? :summary :findings}`. Never throws. `opts`: `:strict`
-   (adds completeness checks: coverage/produces-reads-required/gwt), `:fatal-types`
+   (adds completeness checks: coverage/produces-reads-required), `:fatal-types`
    (finding types that fail `:valid?` regardless of severity), `:error-severities`,
    `:schema-match :lenient`."
   ([model] (core/validate-event-model model))

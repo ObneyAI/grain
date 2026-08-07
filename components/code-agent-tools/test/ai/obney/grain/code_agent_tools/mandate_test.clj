@@ -35,13 +35,11 @@
       (is (false? (:valid? v)))
       (is (contains? (types v) :block/uncovered)))))
 
-(deftest strict-mandates-gwt-on-commands
-  (testing "removing Given/When/Then from a command -> :gwt/missing -> fatal"
-    (let [model (update-in (em/registered-model) [:example :commands :example/create-counter]
-                           dissoc :given-when-thens)
-          v (emv/verify-event-model! {:model model})]
-      (is (false? (:valid? v)))
-      (is (contains? (types v) :gwt/missing)))))
+(deftest strict-is-topology-only
+  (testing "strict boot validation accepts commands without behavioural examples"
+    (let [v (emv/verify-event-model!)]
+      (is (true? (:valid? v)))
+      (is (not (contains? (types v) :gwt/missing))))))
 
 (deftest lenient-validate-stays-backward-compatible
   (testing "non-strict validate of the registered model has no errors (warnings/info only)"

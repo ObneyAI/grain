@@ -1,0 +1,22 @@
+{
+  "name": "grain",
+  "version": "0.1.0",
+  "description": "Compose Allium behavioural specifications with Grain Event Model topology.",
+  "author": {"name": "ObneyAI"},
+  "repository": "https://github.com/ObneyAI/grain",
+  "license": "EPL-2.0",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Grain",
+    "shortDescription": "Allium behaviour plus Grain Event Model topology",
+    "longDescription": "Coordinate Allium specifications, Grain Event Models, tests, and implementation through one convergence loop.",
+    "developerName": "ObneyAI",
+    "category": "Coding",
+    "capabilities": ["Read", "Write", "Interactive"],
+    "defaultPrompt": [
+      "Use Grain to specify and build this feature.",
+      "Reconcile this Grain project's Allium and Event Model specs."
+    ],
+    "screenshots": []
+  }
+}

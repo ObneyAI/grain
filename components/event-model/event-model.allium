@@ -17,8 +17,8 @@
 --           building block, 1:1 with grain's def* macros; the keying discipline
 --           (:<area>/<name>, kind from structural position); the grammar of legal
 --           connections between blocks within a flow; the kind-typed dependency
---           edges a block may declare; the Given/When/Then acceptance examples a
---           command may carry.
+--           edges a block may declare; and explicit links from behavioural
+--           boundaries to declarations in companion Allium specifications.
 --
 -- Excludes (implementation or governed elsewhere):
 --   - the runtime behaviour of any building block: command validation, event
@@ -54,6 +54,18 @@ enum BlockKind {
     screen
 }
 
+enum AlliumDeclarationKind {
+    actor
+    contract
+    entity
+    enum
+    invariant
+    rule
+    surface
+    value
+    variant
+}
+
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
@@ -76,14 +88,12 @@ value Endpoint {
     block: Block
 }
 
--- A single Given/When/Then acceptance example catalogued against a command.
--- These are design-time specifications of intended behaviour — readable, not
--- executable — and exist only as documentation; the runtime never sees them and
--- validate-event-model never runs them.
-value AcceptanceExample {
-    precondition: String   -- the "given" clause
-    stimulus: String       -- the "when" clause
-    expectation: String    -- the "then" clause
+-- A one-way reference from topology to an existing Allium declaration. The
+-- specification path is repository-relative; resolution is a dev/CI concern.
+value AlliumReference {
+    spec: String
+    kind: AlliumDeclarationKind
+    name: String
 }
 
 ------------------------------------------------------------
@@ -185,6 +195,24 @@ contract PayloadSchema {
         -- registered for that :<area>/<name> in the live malli registry.
 }
 
+contract BehavioralTrace {
+    resolves: (reference: AlliumReference) -> Boolean
+
+    @invariant CommandsTraceRules
+        -- Every command links to at least one rule in a companion Allium spec.
+
+    @invariant ScreensTraceSurfaces
+        -- Every screen links to at least one surface in a companion Allium spec.
+
+    @invariant SuppliedReferencesResolve
+        -- Every supplied reference names an existing declaration of the stated
+        -- kind in a safe repository-relative .allium file.
+
+    @guidance
+        -- Trace resolution is performed in development and CI with the Allium
+        -- CLI. Production boot validates runtime topology without source files.
+}
+
 ------------------------------------------------------------
 -- Entities and Variants
 ------------------------------------------------------------
@@ -212,19 +240,17 @@ entity Block {
     name: String
     description: String
     kind: Command | Event | ReadModel | Query | TodoProcessor | PeriodicTask | Screen
+    allium_references: List<AlliumReference>
 }
 
 -- A request to change the system; validates business rules and, on success,
--- emits events. Carries a params schema. May compose read-models and may carry
--- Given/When/Then acceptance examples.
+-- emits events. Carries a params schema and may compose read-models. Observable
+-- behavioural rules and test obligations live in Allium.
 variant Command : Block {
     -- read-models this command composes (e.g. to enforce a uniqueness rule).
     reads: ReadModel with command_reader = this
     -- events this command emits.
     produces: Event with command_producer = this
-    examples: AcceptanceExample
-
-    is_specified: examples.count > 0
 }
 
 -- An immutable fact recorded in the event store. Carries a body schema.
@@ -356,11 +382,14 @@ surface EventModelAuthoring {
         area.description
         area.blocks
         area.flows
+        for block in area.blocks:
+            block.allium_references
 
     contracts:
         fulfils KindNaming
         fulfils ConnectionGrammar
         fulfils PayloadSchema
+        fulfils BehavioralTrace
 
     @guarantee WellFormedByKindAndConnection
         -- A declared model is well-formed when every block's namespace matches
@@ -397,8 +426,8 @@ surface StructuralValidation {
         -- runtime counterpart and are checked structurally only.
 
     @guidance
-        -- Validation is structural only: it never invokes a command and never
-        -- executes a Given/When/Then. It needs no running system to be installed
+        -- Runtime validation is structural only: it never invokes a command. It
+        -- needs no running system to be installed
         -- — it reads the process-wide registries — and degrades to spec-internal
         -- checks when no registries are loaded.
 }
@@ -407,6 +436,5 @@ surface StructuralValidation {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Production/read edges are now confirmable when a service opts in via def-site declarations (grain.event-model/produces and grain.event-model/reads), which confirms spec-vs-code-declaration agreement. Proving a handler ACTUALLY emits the declared events still requires executable Given/When/Then (or static analysis of handler bodies) — which path should close that last gap?"
-open question "Acceptance examples (Given/When/Then) attach only to commands today. Should read-models, queries or screens also carry behavioural examples?"
+open question "Production/read edges are confirmable when a service opts in via def-site declarations (grain.event-model/produces and grain.event-model/reads). Allium specifies and tests the observable behaviour; should a future validator also derive these topology edges from implementation traces?"
 open question "Event coverage is best-effort (events have no handler registry; existence is inferred from the schema registry and consumption sets). Should events gain an authoritative live registry so coverage can be exact?"

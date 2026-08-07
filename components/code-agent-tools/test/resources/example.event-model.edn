@@ -13,13 +13,7 @@
    {:description "Creates a new counter. Counter name must be unique."
     :schema [:map [:name :string]]
     :reads #{:example/counters}
-    :produces #{:example/counter-created}
-    :given-when-thens [{:given "no counter named \"A\" exists"
-                        :when  "create-counter with name \"A\""
-                        :then  "a counter-created event is recorded for \"A\""}
-                       {:given "a counter named \"A\" already exists"
-                        :when  "create-counter with name \"A\""
-                        :then  "the command is rejected as a conflict"}]}
+    :produces #{:example/counter-created}}
    :example/increment-counter
    {:description "Increments an existing counter by 1."
     :schema [:map [:counter-id :uuid]]

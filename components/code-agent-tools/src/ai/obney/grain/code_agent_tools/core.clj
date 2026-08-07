@@ -9,6 +9,10 @@
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
+            [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [malli.core :as m]
             [malli.error :as me]))
 
@@ -30,6 +34,169 @@
   ([sym] (emv/validate-event-model-var sym))
   ([sym opts] (emv/validate-event-model-var sym opts)))
 (defn event-model-coverage [model] (emv/event-model-coverage model))
+
+;; ==========================================================================
+;; Event Model ↔ Allium composition validation (dev/CI only)
+;; ==========================================================================
+
+(def ^:private event-model-fields
+  [[:commands :command] [:events :event] [:read-models :read-model]
+   [:queries :query] [:todo-processors :todo-processor]
+   [:periodic-tasks :periodic-task] [:screens :screen] [:flows :flow]])
+
+(defn- composition-finding [type data]
+  (merge {:type type :severity :error} data))
+
+(defn- model-elements [model]
+  (for [[area area-map] model
+        [field kind] event-model-fields
+        [id element] (get area-map field)]
+    {:area area :kind kind :block id :element element}))
+
+(defn- required-link-findings [elements]
+  (for [{:keys [area kind block element]} elements
+        :let [required-kind ({:command :rule :screen :surface} kind)]
+        :when (and required-kind
+                   (not-any? #(= required-kind (:kind %)) (:grain/allium element)))]
+    (composition-finding
+     :allium/link-missing
+     {:area area :kind kind :block block :required-kind required-kind
+      :message (str (name kind) " " block " must link to an Allium " (name required-kind) ".")})))
+
+(defn- safe-spec-file [project-root spec]
+  (let [root (.getCanonicalFile (io/file project-root))
+        candidate (.getCanonicalFile (io/file root spec))
+        root-path (.toPath root)
+        candidate-path (.toPath candidate)]
+    (when (and (string? spec)
+               (not (.isAbsolute (io/file spec)))
+               (str/ends-with? spec ".allium")
+               (.startsWith candidate-path root-path))
+      candidate)))
+
+(defn- declaration-index [ast]
+  (reduce
+   (fn [idx declaration]
+     (if-let [block (get declaration "Block")]
+       (let [kind (some-> (get block "kind")
+                          str/lower-case
+                          (str/replace "_" "-")
+                          keyword)
+             name (get-in block ["name" "name"])]
+         (if (and kind name) (conj idx [kind name]) idx))
+       idx))
+   #{}
+   (get-in ast ["module" "declarations"])))
+
+(defn- run-allium [bin command file]
+  (try
+    (shell/sh bin command (.getPath file))
+    (catch java.io.IOException e
+      {:exit 127 :err (.getMessage e) :exception e})))
+
+(defn- load-allium-index [bin file]
+  (let [checked (run-allium bin "check" file)]
+    (cond
+      (= 127 (:exit checked))
+      {:finding (composition-finding
+                 :allium/cli-missing
+                 {:spec (.getPath file)
+                  :message (str "Could not run the Allium CLI: " (:err checked))})}
+
+      (not (contains? #{0 1} (:exit checked)))
+      {:finding (composition-finding
+                 :allium/invalid
+                 {:spec (.getPath file) :allium/output (or (:out checked) (:err checked))
+                  :message "The Allium CLI could not check the referenced specification."})}
+
+      :else
+      (try
+        (let [check-result (json/read-str (:out checked))
+              errors (filter #(= "error" (get % "severity"))
+                             (get check-result "diagnostics"))]
+          (if (seq errors)
+            {:finding (composition-finding
+                       :allium/invalid
+                       {:spec (.getPath file) :allium/diagnostics (vec errors)
+                        :message "The referenced Allium specification has structural errors."})}
+            (let [parsed (run-allium bin "parse" file)]
+              (if (zero? (:exit parsed))
+                {:declarations (declaration-index (json/read-str (:out parsed)))}
+                {:finding (composition-finding
+                           :allium/parse-failed
+                           {:spec (.getPath file) :allium/output (or (:out parsed) (:err parsed))
+                            :message "The Allium CLI could not parse the referenced specification."})}))))
+        (catch Exception e
+          {:finding (composition-finding
+                     :allium/parse-failed
+                     {:spec (.getPath file) :message (.getMessage e)})})))))
+
+(defn- load-spec-result [project-root allium-bin spec]
+  (if-let [file (safe-spec-file project-root spec)]
+    (if (.isFile file)
+      (load-allium-index allium-bin file)
+      {:finding (composition-finding
+                 :allium/spec-missing
+                 {:spec spec :message "Referenced Allium specification does not exist."})})
+    {:finding (composition-finding
+               :allium/spec-path-invalid
+               {:spec spec
+                :message "Allium spec paths must be safe, repository-relative .allium paths."})}))
+
+(defn- summarize-composition [base findings]
+  (let [findings (vec (concat (:findings base) findings))
+        errors (count (filter (comp #{:error} :severity) findings))
+        warnings (count (filter (comp #{:warning} :severity) findings))
+        info (count (filter (comp #{:info} :severity) findings))]
+    (emv/sanitize
+     {:valid? (and (:valid? base) (zero? errors))
+      :summary (merge (:summary base)
+                      {:findings (count findings) :errors errors :warnings warnings
+                       :info info :composition/checked? true})
+      :findings findings})))
+
+(defn validate-spec-composition
+  "Validate Event Model topology plus its explicit links to Allium declarations.
+
+  This dev/CI API shells out to `allium check` and `allium parse`; it is never
+  used by the production boot guard. Options: `:project-root` (default `.`),
+  `:allium-bin` (default `allium`), and `:event-model-opts` passed to the normal
+  Event Model validator. Returns a total verdict and never throws."
+  ([model] (validate-spec-composition model {}))
+  ([model {:keys [project-root allium-bin event-model-opts]
+           :or {project-root "." allium-bin "allium" event-model-opts {}}}]
+   (let [base (emv/validate-event-model model event-model-opts)]
+     (if-not (:valid? base)
+       (summarize-composition base [])
+       (try
+         (let [elements (vec (model-elements model))
+               references (for [{:keys [area kind block element]} elements
+                                reference (:grain/allium element)]
+                            (assoc reference :area area :element-kind kind :block block))
+               path-results
+               (into {}
+                     (for [spec (distinct (map :spec references))]
+                       [spec (load-spec-result project-root allium-bin spec)]))
+               path-findings (keep (comp :finding val) path-results)
+               ref-findings
+               (for [{:keys [spec kind name area element-kind block]} references
+                     :let [loaded (get path-results spec)]
+                     :when (and (:declarations loaded)
+                                (not (contains? (:declarations loaded) [kind name])))]
+                 (composition-finding
+                  :allium/declaration-missing
+                  {:area area :kind element-kind :block block :spec spec
+                   :declaration/kind kind :declaration/name name
+                   :message (str "No Allium " (clojure.core/name kind) " named " name " exists in " spec ".")}))]
+           (summarize-composition
+            base
+            (concat (required-link-findings elements) path-findings ref-findings)))
+         (catch Exception e
+           (summarize-composition
+            base
+            [(composition-finding :allium/validator-error
+                                  {:message (.getMessage e)
+                                   :error/class (.getName (class e))})])))))))
 
 ;; ===========================================================================
 ;; Installed runtime + execution tools (dev-only)
@@ -199,7 +366,7 @@
   [:install! :runtime :catalog :schemas :explain-schema :validate
    :invoke-command! :invoke-query :events :projection :diagnostics
    :validate-event-model :validate-event-model-file :validate-event-model-var
-   :event-model-coverage :guides :guide])
+   :event-model-coverage :validate-spec-composition :guides :guide])
 
 (defn- tool-guide [id]
   (when (or (keyword? id) (symbol? id))
@@ -221,7 +388,7 @@
       (:doc (:source entry)) (assoc :doc (:doc (:source entry)))
       sb (merge {:spec/kind (:kind sb)
                  :spec/description (:description sb)
-                 :spec/given-when-thens (:given-when-thens sb)
+                 :spec/allium (:grain/allium sb)
                  :spec/reads (:reads sb)
                  :spec/produces (:produces sb)
                  :spec/consumes (:consumes sb)

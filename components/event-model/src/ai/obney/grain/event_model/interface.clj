@@ -54,13 +54,17 @@
    :event-model/malli-schema
    [:fn #(or (keyword? %) (vector? %) (map? %) (symbol? %))]
 
-   ;; ---- design-time acceptance examples: carried as DATA, never executed ------
-   :event-model/given-when-then
-   [:map
-    [:given :string]
-    [:when :string]
-    [:then :string]]
-   :event-model/given-when-thens [:vector :event-model/given-when-then]
+   ;; ---- links to the behavioural specification -------------------------------
+   ;; Event Model owns topology; Allium owns observable behaviour. Links point
+   ;; outward without requiring Allium source files or tooling at runtime.
+   :event-model/allium-declaration-kind
+   [:enum :actor :contract :entity :enum :invariant :rule :surface :value :variant]
+   :event-model/allium-reference
+   [:map {:closed true}
+    [:spec :string]
+    [:kind :event-model/allium-declaration-kind]
+    [:name :string]]
+   :event-model/allium-references [:vector :event-model/allium-reference]
 
    ;; ---- schedule: grain's MAP form (defperiodic), not a string ---------------
    :event-model/schedule
@@ -78,18 +82,19 @@
    ;; defcommand — validates business rules and emits events; carries a params
    ;; schema (registered live under :<area>/<name>). May compose read-models.
    :event-model/command
-   [:map
-    [:description :string]
-    [:schema :event-model/malli-schema]
-    [:reads {:optional true} [:set :event-model/block-name]]            ; read-models composed (e.g. for validation)
+   [:map {:closed true}
+   [:description :string]
+   [:schema :event-model/malli-schema]
+   [:reads {:optional true} [:set :event-model/block-name]]            ; read-models composed (e.g. for validation)
     [:produces {:optional true} [:set :event-model/block-name]]         ; events emitted
-    [:given-when-thens {:optional true} :event-model/given-when-thens]]
+    [:grain/allium {:optional true} :event-model/allium-references]]
 
    ;; an immutable recorded fact; carries an event-body schema (registered live).
    :event-model/event
    [:map
     [:description :string]
-    [:schema :event-model/malli-schema]]
+    [:schema :event-model/malli-schema]
+    [:grain/allium {:optional true} :event-model/allium-references]]
 
    ;; defreadmodel — a pure (state,event)->state projection; subscribes to events
    ;; via :consumes (cross-checked against the live :events set). Carries no own
@@ -99,7 +104,8 @@
     [:description :string]
     [:consumes [:set :event-model/block-name]]                          ; events consumed
     [:schema {:optional true} :event-model/malli-schema]                ; optional, design-time only
-    [:version {:optional true} :int]]
+    [:version {:optional true} :int]
+    [:grain/allium {:optional true} :event-model/allium-references]]
 
    ;; defquery — reads the projected state; carries a params schema (registered
    ;; live under :<area>/<name>). Composes read-models via :reads.
@@ -107,7 +113,8 @@
    [:map
     [:description :string]
     [:schema :event-model/malli-schema]
-    [:reads {:optional true} [:set :event-model/block-name]]]           ; read-models read
+    [:reads {:optional true} [:set :event-model/block-name]]            ; read-models read
+    [:grain/allium {:optional true} :event-model/allium-references]]
 
    ;; defprocessor — an async reactor. At runtime it SUBSCRIBES to event :topics
    ;; (the trigger, cross-checked against the live :topics set); the modeled INPUT
@@ -118,7 +125,8 @@
     [:description :string]
     [:subscribes [:set :event-model/block-name]]                        ; event topics subscribed (runtime trigger)
     [:reads {:optional true} [:set :event-model/block-name]]            ; queries it works from (the TODO list — its modeled input)
-    [:produces {:optional true} [:set :event-model/block-name]]]        ; commands issued
+    [:produces {:optional true} [:set :event-model/block-name]]         ; commands issued
+    [:grain/allium {:optional true} :event-model/allium-references]]
 
    ;; defperiodic — a scheduled reactor; the handler returns :result/events, so
    ;; it produces EVENTS (and/or commands) on a schedule.
@@ -126,7 +134,8 @@
    [:map
     [:description :string]
     [:schedule :event-model/schedule]
-    [:produces {:optional true} [:set :event-model/block-name]]]        ; events/commands emitted
+    [:produces {:optional true} [:set :event-model/block-name]]         ; events/commands emitted
+    [:grain/allium {:optional true} :event-model/allium-references]]
 
    ;; a user-facing surface. Design-time only — grain has no defscreen, so a
    ;; screen's existence is not runtime-verifiable, but its declared dependencies
@@ -136,7 +145,8 @@
    [:map
     [:description :string]
     [:queries {:optional true} [:set :event-model/block-name]]          ; queries depended on
-    [:commands {:optional true} [:set :event-model/block-name]]]        ; commands issued on user action
+    [:commands {:optional true} [:set :event-model/block-name]]         ; commands issued on user action
+    [:grain/allium {:optional true} :event-model/allium-references]]
 
    ;; ---- flows: endpoints are KIND-QUALIFIED [kind name] or nil (entry/terminus)
    :event-model/kind
@@ -153,7 +163,8 @@
    :event-model/flow
    [:map
     [:description :string]
-    [:steps [:vector :event-model/step]]]
+    [:steps [:vector :event-model/step]]
+    [:grain/allium {:optional true} :event-model/allium-references]]
 
    ;; ===========================================================================
    ;; SERVICE AREA — the central construct. Owns its blocks and flows.

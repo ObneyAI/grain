@@ -8,7 +8,7 @@
 --        against the LIVE grain runtime — the command/query/read-model/processor/
 --        periodic registries and the schema registry — and reports a total verdict
 --        of typed findings. In strict mode it additionally enforces completeness
---        (full coverage, declared production/read edges, Given/When/Then) and acts
+--        (full coverage and declared production/read edges) and acts
 --        as a boot-guard that refuses to start a system whose model is invalid or
 --        incomplete.
 --
@@ -19,8 +19,7 @@
 --
 -- Excludes (governed elsewhere): the event model vocabulary/well-formedness
 --   (event-model.allium); the runtime behaviour of the building blocks; command
---   execution and any Given/When/Then EXECUTION (this validator is structural
---   only — examples are checked as data, never run).
+--   execution; and dev/CI resolution of links to Allium specifications.
 
 ------------------------------------------------------------
 -- Enumerations
@@ -75,8 +74,7 @@ contract StructuralValidation {
         -- finding, not raised. Verdicts are inert data.
 
     @invariant StructuralOnly
-        -- Validation never invokes a command and never executes a Given/When/Then
-        -- example; examples are checked as data. It needs no installed runtime —
+        -- Validation never invokes a command. It needs no installed runtime —
         -- it reads only the process-wide registries — and degrades to
         -- spec-internal checks when no registries are loaded.
 
@@ -102,11 +100,6 @@ contract StrictCompleteness {
         -- Every live command, todo-processor and periodic-task must declare what
         -- it produces, and every command and query what it reads; an undeclared
         -- production or read edge is fatal.
-
-    @invariant ExamplesPresent
-        -- Every command in the model must carry at least one Given/When/Then
-        -- example; a command without examples is fatal. (Presence only — examples
-        -- are not executed.)
 }
 
 -- The boot mandate. The one place the validator throws: a guard that refuses to
@@ -167,8 +160,8 @@ surface BootMandate {
     @guarantee WontStartOnInvalidModel
         -- A system wired to the guard refuses to start while any fatal finding
         -- remains: a missing/incomplete model, an uncovered live block, an
-        -- undeclared production/read edge, a command without Given/When/Then, or
-        -- any structural error or spec-vs-runtime mismatch.
+        -- undeclared production/read edge, or any structural error or
+        -- spec-vs-runtime mismatch.
 
     @guidance
         -- The mandate is opt-in per application (the app wires the guard); it is a
@@ -180,5 +173,4 @@ surface BootMandate {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Given/When/Then is mandated as PRESENT data in strict mode but never executed. Should a future tier EXECUTE examples (invoke the command, assert the emitted events) to close the declaration-versus-behaviour gap?"
 open question "Should the strict fatal set be configurable per finding type beyond the current defaults (e.g. make authorization gaps fatal), or fixed by the tier?"

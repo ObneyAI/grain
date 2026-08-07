@@ -94,8 +94,9 @@ commands. The validator checks each target exists AND is the expected kind.
 through a query — see `(guide :flows)`.)
 
 `:schedule` is a MAP: {:every N :duration :seconds} or {:cron \"...\"}.
-Given/When/Then go on commands as DATA ({:given :when :then}); they are not
-executed. See `(guide :flows)` and `(guide :findings)`."})
+Observable behaviour and test obligations belong in Allium, not Event Model.
+Commands link to Allium rules and screens link to Allium surfaces through
+`:grain/allium`. See `(guide :flows)` and `(guide :findings)`."})
 
 (core/register-guide!
  {:id :flows
@@ -181,7 +182,6 @@ event-model-validator/verify-or-throw!): :block/uncovered, :wiring/mismatch,
   :produces/undeclared   (error) a live command/processor/periodic does not declare
                                  :grain.event-model/produces (full declaration required).
   :reads/undeclared      (error) a live command/query does not declare :grain.event-model/reads.
-  :gwt/missing           (error) a command in the model has no Given/When/Then.
 A system using verify-or-throw! at boot refuses to start while any fatal finding remains."})
 
 (core/register-guide!
@@ -191,8 +191,8 @@ A system using verify-or-throw! at boot refuses to start while any fatal finding
   :applies-to :concept
   :body
   "command  (defcommand)  — validates rules, emits events. Spec: :description,
-            :schema (params), :reads (read-models), :produces (events),
-            :given-when-thens. Live: command registry + param schema + :authorized?.
+            :schema (params), :reads (read-models), :produces (events), optional
+            :grain/allium links. Live: command registry + param schema + :authorized?.
   event    (->event)      — immutable fact. Spec: :description, :schema (body).
             Live: schema registry (no handler registry for events).
   read-model (defreadmodel) — pure (state,event)->state projection. Spec:
@@ -223,6 +223,5 @@ A system using verify-or-throw! at boot refuses to start while any fatal finding
 
   These optional opts pass through to the catalog (no macro/runtime change);
   validate-event-model then compares them to the spec and reports
-  :produces/mismatch / :reads/mismatch on drift. This confirms spec<->code
-  agreement; proving the handler actually emits those events still requires
-  executable Given/When/Then (a planned follow-on)."})
+  :produces/mismatch / :reads/mismatch on drift. This confirms topology<->code
+  agreement; Allium rules and generated tests specify and verify behaviour."})

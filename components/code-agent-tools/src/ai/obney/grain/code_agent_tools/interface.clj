@@ -117,7 +117,7 @@
 
   `model` is PURE EDN: a map of :<area> -> service-area, with blocks keyed
   :<area>/<name>. Validation is structural only — no command execution, no
-  Given/When/Then. It builds on `catalog`, needs no `install!`, degrades to
+  behavioral-rule execution. It builds on `catalog`, needs no `install!`, degrades to
   spec-internal checks when no registries are loaded, and never throws.
 
   Returns `{:valid? bool :summary {...} :findings [...]}`. `:valid?` is true when
@@ -146,6 +146,16 @@
   read-only subset of `validate-event-model` for quick agent use."
   [model]
   (core/event-model-coverage model))
+
+(defn validate-spec-composition
+  "Validate an Event Model and its `:grain/allium` links in development or CI.
+
+  Commands must link to Allium rules and screens to Allium surfaces. Every link
+  is checked using `allium check` and `allium parse`. This API never participates
+  in production boot. Options include `:project-root`, `:allium-bin`, and
+  `:event-model-opts`. Returns a total verdict and never throws."
+  ([model] (core/validate-spec-composition model))
+  ([model opts] (core/validate-spec-composition model opts)))
 
 (defn guides
   "Returns the index of available REPL-served guides: a vector under `:guides` of

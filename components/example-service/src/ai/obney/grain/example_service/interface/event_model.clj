@@ -6,7 +6,7 @@
 
    This is the worked example of MANDATING the model: the model enumerates every
    live block (full coverage), its produces/reads match the def-site declarations,
-   and every command carries Given/When/Then — the strictest tier."
+   and its behavioural boundaries trace to the companion Allium specification."
   (:require [ai.obney.grain.event-model.interface :refer [defeventmodel]]))
 
 (defeventmodel :example
@@ -18,42 +18,29 @@
      :schema [:map [:name :string]]
      :reads #{:example/counters}
      :produces #{:example/counter-created}
-     :given-when-thens [{:given "no counter named \"A\" exists"
-                         :when  "create-counter with name \"A\""
-                         :then  "a counter-created event is recorded for \"A\""}
-                        {:given "a counter named \"A\" already exists"
-                         :when  "create-counter with name \"A\""
-                         :then  "the command is rejected as a conflict"}]}
+     :grain/allium [{:spec "components/example-service/example-service.allium"
+                     :kind :rule :name "CreateCounter"}]}
     :example/increment-counter
     {:description "Increments an existing counter by 1."
      :schema [:map [:counter-id :uuid]]
      :reads #{:example/counters}
      :produces #{:example/counter-incremented}
-     :given-when-thens [{:given "a counter exists"
-                         :when  "increment-counter for its id"
-                         :then  "a counter-incremented event is recorded"}
-                        {:given "no counter with that id exists"
-                         :when  "increment-counter for an unknown id"
-                         :then  "the command is rejected as not-found"}]}
+     :grain/allium [{:spec "components/example-service/example-service.allium"
+                     :kind :rule :name "IncrementCounter"}]}
     :example/decrement-counter
     {:description "Decrements an existing counter by 1."
      :schema [:map [:counter-id :uuid]]
      :reads #{:example/counters}
      :produces #{:example/counter-decremented}
-     :given-when-thens [{:given "a counter exists"
-                         :when  "decrement-counter for its id"
-                         :then  "a counter-decremented event is recorded"}
-                        {:given "no counter with that id exists"
-                         :when  "decrement-counter for an unknown id"
-                         :then  "the command is rejected as not-found"}]}
+     :grain/allium [{:spec "components/example-service/example-service.allium"
+                     :kind :rule :name "DecrementCounter"}]}
     :example/calculate-average-counter-value
     {:description "Calculates the average value of all initialized counters."
      :schema [:map]
      :reads #{:example/counters}
      :produces #{:example/average-calculated}
-     :given-when-thens [{:given "some counters have values"
-                         :when  "calculate-average-counter-value runs"
-                         :then  "an average-calculated event records the mean value"}]}}
+     :grain/allium [{:spec "components/example-service/example-service.allium"
+                     :kind :rule :name "CalculateAverage"}]}}
 
    :events
    {:example/counter-created     {:description "A counter was created."
@@ -99,7 +86,9 @@
      :queries #{:example/counters}
      :commands #{:example/create-counter
                  :example/increment-counter
-                 :example/decrement-counter}}}
+                 :example/decrement-counter}
+     :grain/allium [{:spec "components/example-service/example-service.allium"
+                     :kind :surface :name "CounterManagement"}]}}
 
    :flows
    {:example/counter-lifecycle
