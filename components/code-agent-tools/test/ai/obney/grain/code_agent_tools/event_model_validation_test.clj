@@ -8,8 +8,10 @@
             [ai.obney.grain.event-model.interface :as em]
             [ai.obney.grain.event-model-validator.interface :as emv]
             [ai.obney.grain.example-base.core]
+            [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
 
@@ -66,6 +68,30 @@
 (defn- types [v] (set (map :type (:findings v))))
 (defn- errors [v] (filter #(= :error (:severity %)) (:findings v)))
 
+(def ^:private example-allium-declarations
+  [[:rule "CreateCounter"]
+   [:rule "IncrementCounter"]
+   [:rule "DecrementCounter"]
+   [:rule "CalculateAverage"]
+   [:surface "CounterManagement"]])
+
+(defn- fake-allium
+  "Hermetic stand-in for the Allium CLI. CLI absence has its own test below; the
+   composition tests should not depend on a globally installed binary in CI."
+  [_ command _]
+  (case command
+    "check" {:exit 0 :out (json/write-str {:diagnostics []}) :err ""}
+    "parse" {:exit 0
+             :out (json/write-str
+                   {:module
+                    {:declarations
+                     (mapv (fn [[kind declaration-name]]
+                             {:Block {:kind (str/capitalize (name kind))
+                                      :name {:name declaration-name}}})
+                           example-allium-declarations)}})
+             :err ""}
+    {:exit 2 :out "" :err (str "unsupported fake Allium command: " command)}))
+
 (deftest valid-spec-matches-live-runtime
   (let [v (tools/validate-event-model sample)]
     (is (true? (:valid? v)))
@@ -76,28 +102,29 @@
   (let [model (em/registered-model)
         validate #(tools/validate-spec-composition
                    % {:project-root "." :event-model-opts {:strict true}})]
-    (testing "the registered example links commands and its screen to valid declarations"
-      (let [v (validate model)]
-        (is (true? (:valid? v)) (str "unexpected findings: " (:findings v)))
-        (is (true? (get-in v [:summary :composition/checked?])))))
-    (testing "commands and screens require their behavioral boundary links"
-      (let [command-v (validate (update-in model [:example :commands :example/create-counter]
-                                           dissoc :grain/allium))
-            screen-v (validate (update-in model [:example :screens :example/dashboard]
-                                          dissoc :grain/allium))]
-        (is (contains? (types command-v) :allium/link-missing))
-        (is (contains? (types screen-v) :allium/link-missing))))
-    (testing "all supplied declarations must resolve with the declared kind"
-      (let [v (validate (assoc-in model
-                                  [:example :commands :example/create-counter :grain/allium 0 :name]
-                                  "MissingRule"))]
-        (is (false? (:valid? v)))
-        (is (contains? (types v) :allium/declaration-missing))))
-    (testing "spec paths cannot escape the project"
-      (let [v (validate (assoc-in model
-                                  [:example :commands :example/create-counter :grain/allium 0 :spec]
-                                  "../outside.allium"))]
-        (is (contains? (types v) :allium/spec-path-invalid))))
+    (with-redefs [shell/sh fake-allium]
+      (testing "the registered example links commands and its screen to valid declarations"
+        (let [v (validate model)]
+          (is (true? (:valid? v)) (str "unexpected findings: " (:findings v)))
+          (is (true? (get-in v [:summary :composition/checked?])))))
+      (testing "commands and screens require their behavioral boundary links"
+        (let [command-v (validate (update-in model [:example :commands :example/create-counter]
+                                             dissoc :grain/allium))
+              screen-v (validate (update-in model [:example :screens :example/dashboard]
+                                            dissoc :grain/allium))]
+          (is (contains? (types command-v) :allium/link-missing))
+          (is (contains? (types screen-v) :allium/link-missing))))
+      (testing "all supplied declarations must resolve with the declared kind"
+        (let [v (validate (assoc-in model
+                                    [:example :commands :example/create-counter :grain/allium 0 :name]
+                                    "MissingRule"))]
+          (is (false? (:valid? v)))
+          (is (contains? (types v) :allium/declaration-missing))))
+      (testing "spec paths cannot escape the project"
+        (let [v (validate (assoc-in model
+                                    [:example :commands :example/create-counter :grain/allium 0 :spec]
+                                    "../outside.allium"))]
+          (is (contains? (types v) :allium/spec-path-invalid)))))
     (testing "a missing CLI is an actionable total verdict"
       (let [v (tools/validate-spec-composition
                model {:project-root "." :allium-bin "definitely-not-an-allium-binary"})]
