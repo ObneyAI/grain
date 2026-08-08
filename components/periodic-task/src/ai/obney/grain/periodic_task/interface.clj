@@ -10,6 +10,12 @@
 ;; Periodic trigger registry
 (def periodic-trigger-registry* core/periodic-trigger-registry*)
 
+(defn next-fire-at
+  "Return the node-local Instant currently armed for a running trigger.
+   Returns nil when the trigger is unknown, unstarted, stopped, or firing."
+  [trigger-name]
+  (core/next-fire-at trigger-name))
+
 (defn register-periodic-trigger!
   [trigger-name handler-fn opts]
   (core/register-periodic-trigger! trigger-name handler-fn opts))

@@ -4,6 +4,14 @@
             [ai.obney.grain.periodic-task.interface :as pt])
   (:import [java.time Instant Duration ZoneId]))
 
+(defn- eventually
+  [f]
+  (loop [remaining 100]
+    (or (f)
+        (when (pos? remaining)
+          (Thread/sleep 10)
+          (recur (dec remaining))))))
+
 ;; 1. Schedule Sequence Tests
 
 (deftest test-periodic-seq-produces-instants-with-correct-interval
@@ -91,3 +99,93 @@
       (is (contains? task ::core/task))
       (is (contains? task ::core/args))
       (pt/stop task))))
+
+;; 4. Registry-backed runtime state
+
+(deftest test-next-fire-at-lifecycle
+  (let [previous @core/periodic-trigger-registry*
+        trigger-name :test/registry-lifecycle]
+    (try
+      (reset! core/periodic-trigger-registry* {})
+      (pt/register-periodic-trigger!
+        trigger-name
+        (fn [_tenant-id _time] {})
+        {:schedule {:cron "0 0 1 1 *" :timezone "UTC"}})
+      (is (nil? (pt/next-fire-at trigger-name)))
+      (is (nil? (pt/next-fire-at :test/unknown)))
+      (let [triggers (pt/start-periodic-triggers!
+                       {:append-fn (fn [_] nil)
+                        :tenant-ids-fn (constantly #{})})]
+        (try
+          (let [next-fire (eventually #(pt/next-fire-at trigger-name))]
+            (is (instance? Instant next-fire))
+            (is (true? (get-in @core/periodic-trigger-registry*
+                               [trigger-name :running?])))
+            (is (= next-fire
+                   (get-in @core/periodic-trigger-registry*
+                           [trigger-name :next-fire-at]))))
+          (pt/register-periodic-trigger!
+            :test/registered-after-start
+            (fn [_tenant-id _time] {})
+            {:schedule {:cron "0 0 1 1 *" :timezone "UTC"}})
+          (is (nil? (pt/next-fire-at :test/registered-after-start)))
+          (finally
+            (pt/stop-periodic-triggers! triggers)))
+        (is (false? (get-in @core/periodic-trigger-registry*
+                            [trigger-name :running?])))
+        (is (nil? (pt/next-fire-at trigger-name))))
+      (finally
+        (reset! core/periodic-trigger-registry* previous)))))
+
+(deftest test-next-fire-at-is-nil-while-firing-and-after-concurrent-stop
+  (let [previous @core/periodic-trigger-registry*
+        trigger-name :test/blocked-handler
+        tenant-id (random-uuid)
+        entered (promise)
+        release (promise)]
+    (try
+      (reset! core/periodic-trigger-registry* {})
+      (pt/register-periodic-trigger!
+        trigger-name
+        (fn [_tenant-id _time]
+          (deliver entered true)
+          @release
+          {})
+        {:schedule {:every 60 :duration :seconds}})
+      (let [triggers (pt/start-periodic-triggers!
+                       {:append-fn (fn [_] nil)
+                        :tenant-ids-fn (constantly #{tenant-id})})]
+        (is (true? (deref entered 1000 false)))
+        (is (nil? (pt/next-fire-at trigger-name)))
+        (pt/stop-periodic-triggers! triggers)
+        (deliver release true)
+        (Thread/sleep 50)
+        (is (nil? (pt/next-fire-at trigger-name)))
+        (is (false? (get-in @core/periodic-trigger-registry*
+                            [trigger-name :running?]))))
+      (finally
+        (deliver release true)
+        (reset! core/periodic-trigger-registry* previous)))))
+
+(deftest test-handler-failure-arms-following-fire
+  (let [previous @core/periodic-trigger-registry*
+        trigger-name :test/failing-handler
+        tenant-id (random-uuid)]
+    (try
+      (reset! core/periodic-trigger-registry* {})
+      (pt/register-periodic-trigger!
+        trigger-name
+        (fn [_tenant-id _time]
+          (throw (ex-info "expected test failure" {})))
+        {:schedule {:every 60 :duration :seconds}})
+      (let [triggers (pt/start-periodic-triggers!
+                       {:append-fn (fn [_] nil)
+                        :tenant-ids-fn (constantly #{tenant-id})})]
+        (try
+          (is (instance? Instant (eventually #(pt/next-fire-at trigger-name))))
+          (is (true? (get-in @core/periodic-trigger-registry*
+                             [trigger-name :running?])))
+          (finally
+            (pt/stop-periodic-triggers! triggers))))
+      (finally
+        (reset! core/periodic-trigger-registry* previous)))))
