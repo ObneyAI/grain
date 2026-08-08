@@ -7,7 +7,7 @@ Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 proc
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -18,7 +18,7 @@ Distributed coordination for multi-instance deployments. Coordinator election, t
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -31,7 +31,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -44,7 +44,7 @@ Dev-only nREPL-facing tools for coding agents working against a live Grain app. 
 ```clojure
 obneyai/grain-code-agent-tools
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
  :deps/root "projects/grain-code-agent-tools"}
 ```
 
@@ -60,7 +60,26 @@ Install it after the app's Grain system starts:
 
 Use it from nREPL to inspect the live catalog, validate command/query payloads
 against the schema registry, read events, inspect projections, and run runtime
-diagnostics. See [Code Agent Tools](code-agent-tools.md) for the full guide.
+diagnostics. It also provides Event Model runtime and Allium composition
+validation. See [Code Agent Tools](code-agent-tools.md) for the full guide.
+
+## grain-event-model
+
+Service-area Event Model registration plus the shippable structural validator
+and strict production boot guard. This package provides `defeventmodel`, runtime
+topology reconciliation, coverage checks, and `verify-or-throw!`. Production
+validation does not require Allium source files or the Allium CLI:
+
+```clojure
+obneyai/grain-event-model
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :deps/root "projects/grain-event-model"}
+```
+
+Use the separate `grain-code-agent-tools` package for the development/CI
+composition gate that resolves Event Model `:grain/allium` links. See
+[Event Model](event-model.md) for setup and the composed specification workflow.
 
 ## grain-event-store-postgres-v3
 
@@ -69,7 +88,7 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
@@ -80,7 +99,7 @@ Embedded SQLite backend implementing the v3 event store protocol for single-proc
 ```clojure
 obneyai/grain-event-store-sqlite-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
  :deps/root "projects/grain-event-store-sqlite-v3"}
 ```
 
@@ -91,7 +110,7 @@ obneyai/grain-event-store-sqlite-v3
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 

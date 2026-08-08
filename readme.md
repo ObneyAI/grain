@@ -128,7 +128,7 @@ Grain is MIT licensed. We use it in production, but it's actively evolving. The 
 
 ## More Information
 
-- **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
+- **Docs**: [Core Concepts](docs/core-concepts.md) | [Event Model](docs/event-model.md) | [Allium Specs](docs/allium-specs.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
 - **Examples**: [`grain-todo-list`](https://github.com/ObneyAI/grain-todo-list), `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
 - **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians

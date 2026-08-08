@@ -167,14 +167,31 @@ EDN verdict without executing commands:
 
 Strict mode requires full live-block coverage and declared production/read edges,
 and makes schema, wiring, production, and read mismatches fatal. Applications may
-mandate this topology before Integrant startup:
+register each service area with the `grain-event-model` package:
 
 ```clojure
+(require '[ai.obney.grain.event-model.interface :refer [defeventmodel]])
+
+(defeventmodel :example
+  {:commands {...}
+   :events {...}
+   :read-models {...}
+   :queries {...}})
+```
+
+`defeventmodel` shape-checks the area at load time and stores it in the process-wide
+Event Model registry. To mandate the complete registered topology, run the strict
+boot guard before Integrant startup:
+
+```clojure
+(require '[ai.obney.grain.event-model-validator.interface :as event-model-validator])
+
 (defn start []
   (event-model-validator/verify-or-throw!)
   (ig/init system))
 ```
 
+The guard throws `ex-info` carrying the verdict when fatal findings remain.
 Production boot requires neither Allium source files nor the Allium CLI.
 
 ## Composed authoring workflow

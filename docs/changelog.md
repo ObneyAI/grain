@@ -5,20 +5,35 @@ AI-native, event-sourced (CQRS) information systems in Clojure, organized as a P
 workspace.
 
 Grain does not adhere to semvar and currently carries no release tags, so this changelog is organized
-**chronologically by month**, newest first. It provides complete coverage of all **302
-commits** from **2025-06-13** (workspace created) through **2026-06-24**, authored
+**chronologically by month**, newest first. It provides narrative coverage of **338
+commits** from **2025-06-13** (workspace created) through **2026-08-08**, authored
 primarily by `cjbarre`, with contributions from Brandon Ringe (`bpringe`) and Cameron
 Barre.
 
 Within each month, changes are grouped into **Added / Changed / Fixed / Removed / Docs /
 Internal**, and every entry cites the short commit hashes it folds in. Backward-
-incompatible changes are marked **Breaking:**. A complete, one-line-per-commit index of
-all 302 commits appears in the [appendix](#appendix-complete-commit-log) at the end, so
-every commit is accounted for whether or not it warranted narrative detail. (There were
-no commits in October 2025, so that month does not appear below.)
+incompatible changes are marked **Breaking:**. (There were no commits in October 2025,
+so that month does not appear below.)
 
 Hashes are short Git SHAs; resolve any of them with `git show <hash>` or at
 `https://github.com/ObneyAI/grain/commit/<hash>`.
+
+---
+
+## August 2026 — Composed Allium and Event Model specification development
+
+### Added
+- Added explicit `:grain/allium` references from Event Model blocks and flows to repository-local Allium declarations, with command-to-rule and screen-to-surface coverage requirements (`7d35b3f`).
+- Added the dev/CI `validate-spec-composition` gate, which combines Event Model validation with `allium check`/`allium parse` resolution and returns typed findings for missing links, unsafe or absent paths, invalid specs, missing tooling, and unresolved declarations (`7d35b3f`).
+- Added Claude Code and Codex plugin manifests plus a composed `grain` skill and portable Event Model extensions for Allium's elicit, distill, tend, propagate, and weed phases (`7d35b3f`).
+- Added `grain-event-model`, packaging Event Model registration and the shippable strict boot validator independently of Allium source/tooling (`7d35b3f`).
+
+### Changed
+- Moved behavioural rules, examples, invariants, and generated behavioural tests fully into Allium; Event Model now remains topology-only and no longer carries or mandates Given/When/Then examples (`7d35b3f`).
+- Updated the example service Event Model with Allium trace links and refreshed package SHA pins (`7d35b3f`, `b7886d4`).
+
+### Docs
+- Reworked the Event Model guide around the Allium/Event Model boundary, trace links, composition validation, production boot separation, and composed agent workflow; added installation guidance to the README (`7d35b3f`).
 
 ---
 
@@ -318,4 +333,3 @@ Hashes are short Git SHAs; resolve any of them with `git show <hash>` or at
 - Added clj-kondo config imports for potemkin and tweaked the Portal VS Code edn config (`6cdb7c6`).
 - Registered the new project alias in workspace.edn (`430263c`) and rebalanced dependency declarations between the event-store-postgres component and its project (`6c028cc`, `038638b`).
 - Extended .gitignore and removed an accidentally committed Calva REPL output file (`2299252`).
-
