@@ -41,6 +41,9 @@ projects/**/pom.xml
 
 **/.portal/*
 
+# Local integration sandboxes
+/.integration/
+
 **/.calva/output-window/output.calva-repl
 
 # genome: generated output & local verify artifacts (regenerate with `bb scripts/genome/genome.bb`)
