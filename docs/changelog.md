@@ -32,6 +32,9 @@ Hashes are short Git SHAs; resolve any of them with `git show <hash>` or at
 - Moved behavioural rules, examples, invariants, and generated behavioural tests fully into Allium; Event Model now remains topology-only and no longer carries or mandates Given/When/Then examples (`7d35b3f`).
 - Updated the example service Event Model with Allium trace links and refreshed package SHA pins (`7d35b3f`, `b7886d4`).
 
+### Fixed
+- Preserved qualified read-model names in read-model-processor-v2 cache keys so registered models with the same local name cannot share L1, persistent, partition, manifest, or entity-index state. Existing ambiguous local-name entries are intentionally left unreachable, and projections rebuild from the event stream after upgrade.
+
 ### Docs
 - Reworked the Event Model guide around the Allium/Event Model boundary, trace links, composition validation, production boot separation, and composed agent workflow; added installation guidance to the README (`7d35b3f`).
 
