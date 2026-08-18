@@ -953,3 +953,30 @@
             "plan uses an index SEARCH/seek")
         (is (not (some #(re-find #"(?i)SCAN .*\bevents\b" %) details))
             "plan does NOT full-scan the events table")))))
+
+(deftest tag-read-drives-from-tag-index
+  ;; A tag-scoped read must drive the join from the event_tags PK so its cost
+  ;; tracks the tag's match set, never the tenant's whole stream. On a fresh
+  ;; database with no statistics the planner would otherwise drive from events
+  ;; (SEARCH on tenant_id alone = full tenant scan); CROSS JOIN pins the order.
+  (let [eid (uuid/v4)]
+    (dotimes [n 20] (append-event! :test/alpha #{[:entity eid]} {:n n}))
+    (let [{:keys [sql params]} (#'sqlite-core/build-single-query
+                                {:tenant-id *tenant-id*
+                                 :tags #{[:entity eid]}})
+          plan-rows (jdbc/execute! (pool)
+                                   (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                   {:builder-fn rs/as-unqualified-maps})
+          details (mapv :detail plan-rows)
+          joined (clojure.string/join " | " details)]
+      (testing (str "query plan: " joined)
+        ;; The outermost (first) access path must be the tag table, seeked on
+        ;; tenant AND tag — not the events table.
+        (is (re-find #"(?i)SEARCH t\b" (first details))
+            "plan drives from event_tags")
+        (is (re-find #"(?i)tag" (first details))
+            "event_tags access seeks on the tag column")
+        ;; events must be probed per tag row on both PK columns, never walked
+        ;; on tenant_id alone (which would visit the whole tenant stream).
+        (is (some #(re-find #"(?i)SEARCH e\b.*\(tenant_id=\? AND id=\?\)" %) details)
+            "events is probed by full (tenant_id, id) key")))))
