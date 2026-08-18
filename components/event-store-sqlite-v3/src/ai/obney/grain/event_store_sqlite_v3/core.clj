@@ -60,7 +60,18 @@
      (jdbc/execute! conn ["PRAGMA foreign_keys = ON"]))
    (jdbc/with-transaction [conn connection-pool]
      (doseq [statement schema-statements]
-       (jdbc/execute! conn [statement])))))
+       (jdbc/execute! conn [statement])))
+   ;; Refresh planner statistics on an existing database so every query gets
+   ;; real cardinality estimates. analysis_limit bounds the row sample per
+   ;; index, keeping ANALYZE cheap enough to run at every start. Plain ANALYZE
+   ;; rather than PRAGMA optimize: optimize only covers tables the current
+   ;; connection has already queried (until SQLite 3.46's 0x10002 mask), so on
+   ;; a fresh connection at start it can no-op. On an empty database this
+   ;; writes no stats — the tag query does not depend on them because CROSS
+   ;; JOIN pins its plan.
+   (with-open [conn (jdbc/get-connection connection-pool)]
+     (jdbc/execute! conn ["PRAGMA analysis_limit = 400"])
+     (jdbc/execute! conn ["ANALYZE"]))))
 
 ;; --------------------------- ;;
 ;; Integrant / Lifecycle Setup ;;
@@ -172,9 +183,14 @@
                      as-of  (conj (str as-of))
                      true   (conj (count tag-strs))
                      limit  (conj limit))
+            ;; CROSS JOIN is a SQLite planner directive: it pins the join order
+            ;; so the query drives from the event_tags PK (tenant_id, tag,
+            ;; event_id) and probes events per matching tag row. A plain JOIN
+            ;; lets the planner drive from events on a database with no
+            ;; statistics, which scans the tenant's entire stream per read.
             sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
-                     "FROM events e "
-                     "JOIN event_tags t ON t.tenant_id = e.tenant_id AND t.event_id = e.id "
+                     "FROM event_tags t CROSS JOIN events e "
+                     "ON e.tenant_id = t.tenant_id AND e.id = t.event_id "
                      "WHERE " (string/join " AND " where-parts) " "
                      "GROUP BY e.id "
                      "HAVING COUNT(DISTINCT t.tag) = ? "

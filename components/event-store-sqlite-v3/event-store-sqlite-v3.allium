@@ -50,6 +50,7 @@
 --   filter by tags (all), types (any), id range  -> rule ReadStream (@guidance filter language)
 --   batch read unions + dedups by id             -> rule BatchReadStream (@guidance dedup by id)
 --   reverse + limit = newest, cost ~ limit        -> contract EventLog.NewestRetrievedDirectly
+--   tag read cost ~ tag's stream, not the store  -> contract EventLog.TagReadsBoundedByTagStream
 --   per-tenant durable last-event-id watermark   -> entity Tenant.last_event_id
 --   tenant registered lazily on first append     -> rule AppendTransaction ensures
 --   persistence across restart, idempotent init  -> contract EventLog.Durable
@@ -153,9 +154,21 @@ contract EventLog {
     @invariant NewestRetrievedDirectly
         -- The newest matching event(s) for a tenant — a reverse read with a
         -- small limit, optionally narrowed by type and tag — are retrieved
-        -- directly, in time proportional to the limit, without examining the
-        -- whole match set. This is the read shape a processor's checkpoint
-        -- lookup relies on, and it stays cheap as a tenant's stream grows.
+        -- directly, never by walking the tenant's whole stream. Narrowed by
+        -- type or id bounds alone, the cost is proportional to the limit;
+        -- narrowed by tag, it is bounded by the events bearing the tag
+        -- (see TagReadsBoundedByTagStream). This is the read shape a
+        -- processor's checkpoint lookup relies on, and it stays cheap as a
+        -- tenant's stream grows.
+
+    @invariant TagReadsBoundedByTagStream
+        -- A tag-narrowed read — forward or reverse, with or without a limit —
+        -- costs in proportion to the events bearing the requested tags (one
+        -- entity's stream, small by design), never to the size of the
+        -- tenant's whole stream, and this holds from the store's very first
+        -- start on a fresh database. Automation handlers that consult an
+        -- entity's tagged history on every step rely on this staying flat as
+        -- the store grows.
 
     @invariant Durable
         -- Committed events survive process restart: a store reopened on the same
@@ -505,9 +518,17 @@ surface EventRead {
 
     @guarantee NewestRetrievedDirectly
         -- Fetching the newest matching event(s) — a reverse read with a small
-        -- limit — costs in proportion to the limit, not to the size of the
-        -- match set. This is the read shape a processor checkpoint lookup
+        -- limit — costs in proportion to the limit (or, when narrowed by tag,
+        -- to the tag's own stream), never to the size of the tenant's whole
+        -- stream. This is the read shape a processor checkpoint lookup
         -- depends on, and it stays cheap as the stream grows.
+
+    @guarantee TagReadsStayFlat
+        -- A tag-scoped read costs in proportion to the events bearing the
+        -- requested tags, never to the tenant's whole stream — including on a
+        -- freshly created store. A client consulting one entity's tagged
+        -- history on every step can rely on that read not degrading as the
+        -- rest of the store grows.
 }
 
 -- The administrative boundary: the per-tenant durable watermark, readable

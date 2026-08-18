@@ -107,7 +107,7 @@ A library spec for grain's durable, Postgres-backed, tenant-scoped append-only e
 
 ### [`event-store-sqlite-v3`](../components/event-store-sqlite-v3/event-store-sqlite-v3.allium)
 
-A library/framework spec for the durable single-file SQLite backend behind grain's event-store-v3 boundary: a per-tenant, append-only, time-ordered event log with atomic batch commits, a synthesized transaction marker per append, compare-and-swap (fenced) conditional appends, filtered/reversed/limited and batch reads, a durable per-tenant watermark, and faithful body/tag/timestamp round-trip. The behavioural guarantees (time-ordering, atomicity, writer serialization, durability, indexed newest-event lookup, tenant isolation, codec round-trip, pubsub tenant-scoping) are modelled as module-level contracts with @invariant guarantees, plus entities, expression-bearing invariants and code-facing surfaces.
+A library/framework spec for the durable single-file SQLite backend behind grain's event-store-v3 boundary: a per-tenant, append-only, time-ordered event log with atomic batch commits, a synthesized transaction marker per append, compare-and-swap (fenced) conditional appends, filtered/reversed/limited and batch reads, a durable per-tenant watermark, and faithful body/tag/timestamp round-trip. The behavioural guarantees (time-ordering, atomicity, writer serialization, durability, indexed newest-event lookup, tag-scoped reads costing the tag's own stream rather than the store, tenant isolation, codec round-trip, pubsub tenant-scoping) are modelled as module-level contracts with @invariant guarantees, plus entities, expression-bearing invariants and code-facing surfaces.
 
 <sub>entities 3 · rules 5 · contracts 3 · invariants 7 · surfaces 3</sub>
 
