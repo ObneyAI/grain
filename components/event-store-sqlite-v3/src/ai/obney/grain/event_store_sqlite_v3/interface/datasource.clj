@@ -23,7 +23,10 @@
             "SQLite datasource requires :database-file (path or \":memory:\")")))
   (hikari/make-datasource
    (-> config
-       (dissoc :database-file :type)
+       (dissoc :database-file :type
+               :busy-timeout-ms :busy-max-retries
+               :busy-retry-backoff-ms :busy-retry-max-backoff-ms
+               :write-queue-capacity :write-shutdown-timeout-ms)
        (assoc :jdbc-url (str "jdbc:sqlite:" database-file)
               :driver-class-name "org.sqlite.JDBC"
               :maximum-pool-size (or (:maximum-pool-size config) 4)
