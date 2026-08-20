@@ -94,7 +94,7 @@ obneyai/grain-event-store-postgres-v3
 
 ## grain-event-store-sqlite-v3
 
-Embedded SQLite backend implementing the v3 event store protocol for single-process deployments where running Postgres is overkill. WAL mode with `BEGIN IMMEDIATE` per append, a tenant-scoped events table plus a normalized `event_tags` join table for indexed superset tag filtering, and Fressian binary serialization. Same tenant-scoped API as the Postgres backend — swap the `:conn` type to move between them:
+Embedded SQLite backend implementing the v3 event store protocol for single-process deployments where running Postgres is overkill. WAL mode with a bounded single-writer queue and `BEGIN IMMEDIATE` per append, a tenant-scoped events table plus a normalized `event_tags` join table for indexed superset tag filtering, and Fressian binary serialization. Reads continue to use the connection pool concurrently; increasing the pool size improves available read concurrency but cannot increase SQLite's single-writer throughput. Same tenant-scoped API as the Postgres backend — swap the `:conn` type to move between them:
 
 ```clojure
 obneyai/grain-event-store-sqlite-v3
@@ -102,6 +102,22 @@ obneyai/grain-event-store-sqlite-v3
  :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
  :deps/root "projects/grain-event-store-sqlite-v3"}
 ```
+
+SQLite contention policy is configured inside `:conn`:
+
+```clojure
+{:type :sqlite
+ :database-file "grain.sqlite"
+ :maximum-pool-size 4
+ :write-queue-capacity 1024
+ :busy-timeout-ms 1000
+ :busy-max-retries 3
+ :busy-retry-backoff-ms 10
+ :busy-retry-max-backoff-ms 250
+ :write-shutdown-timeout-ms 5000}
+```
+
+The queue admits one active write plus `:write-queue-capacity` waiting writes. A full queue returns a `cognitect.anomalies/busy` result immediately. SQLite busy/locked results retry the complete transaction with capped exponential backoff; exhaustion also returns a busy anomaly rather than exposing a raw `SQLITE_BUSY` exception. Keep at least two pooled connections when reads must proceed alongside a writer; the default is four. A larger pool can serve more simultaneous reads, but still cannot create a second SQLite writer. Grain emits μ/log metrics named `SQLiteWriteQueueDepth`, `SQLiteWriteQueueWait`, `SQLiteAppend`, `SQLiteWriteTransaction`, `SQLiteBusyRetry`, `SQLiteBusyExhausted`, and `SQLiteWriteQueueSaturated`.
 
 ## grain-mulog-aws-cloudwatch-emf-publisher
 

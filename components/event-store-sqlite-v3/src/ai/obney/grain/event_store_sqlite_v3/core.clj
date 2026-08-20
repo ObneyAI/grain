@@ -13,7 +13,10 @@
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime]
            [java.util UUID]
-           [java.sql Connection]))
+           [java.sql Connection SQLException]
+           [java.util.concurrent ArrayBlockingQueue Callable CancellationException
+            ExecutionException FutureTask RejectedExecutionException ThreadFactory
+            ThreadPoolExecutor ThreadPoolExecutor$AbortPolicy TimeUnit]))
 
 ;; -------------------------- ;;
 ;; Event Store Initialization ;;
@@ -77,6 +80,8 @@
 ;; Integrant / Lifecycle Setup ;;
 ;; --------------------------- ;;
 
+(declare make-write-coordinator)
+
 (defn start
   [config]
   (u/trace
@@ -86,14 +91,21 @@
                  {::config config
                   ::connection-pool {::config (ig/ref ::config)}})]
      (init-idempotently system)
-     system)))
+     (assoc system ::write-coordinator (make-write-coordinator config)))))
 
 (defn stop
   [event-store]
   (u/trace
    ::stopping-event-store
    []
-   (ig/halt! event-store)))
+   (when-let [^ThreadPoolExecutor coordinator (::write-coordinator event-store)]
+     (.shutdown coordinator)
+     (when-not (.awaitTermination
+                coordinator
+                (long (or (get-in event-store [::config :write-shutdown-timeout-ms]) 5000))
+                TimeUnit/MILLISECONDS)
+       (run! #(.cancel ^FutureTask % true) (.shutdownNow coordinator))))
+   (ig/halt! (dissoc event-store ::write-coordinator))))
 
 (defmethod ig/init-key ::config [_ config]
   config)
@@ -107,6 +119,29 @@
 
 (defmethod ig/halt-key! ::connection-pool [_ connection-pool]
   (hikari/close-datasource connection-pool))
+
+(defn- make-write-coordinator
+  [config]
+  (let [capacity (long (or (:write-queue-capacity config) 1024))
+        thread-number (atom 0)]
+    (when-not (pos? capacity)
+      (throw (IllegalArgumentException. ":write-queue-capacity must be positive")))
+    (doseq [[key default] [[:busy-timeout-ms 1000]
+                           [:busy-max-retries 3]
+                           [:busy-retry-backoff-ms 10]
+                           [:busy-retry-max-backoff-ms 250]
+                           [:write-shutdown-timeout-ms 5000]]]
+      (when (neg? (long (get config key default)))
+        (throw (IllegalArgumentException. (str key " must not be negative")))))
+    (ThreadPoolExecutor.
+     1 1 0 TimeUnit/MILLISECONDS
+     (ArrayBlockingQueue. capacity true)
+     (reify ThreadFactory
+       (newThread [_ runnable]
+         (doto (Thread. runnable
+                        (str "grain-sqlite-writer-" (swap! thread-number inc)))
+           (.setDaemon true))))
+     (ThreadPoolExecutor$AbortPolicy.))))
 
 ;; -------------- ;;
 ;; Encoding       ;;
@@ -319,9 +354,10 @@
 
    We must keep auto-commit = true so that JDBC does not issue an implicit
    DEFERRED BEGIN before our explicit BEGIN IMMEDIATE statement runs."
-  [pool body-fn]
+  [pool busy-timeout-ms body-fn]
   (with-open [conn (jdbc/get-connection pool)]
     (.setAutoCommit ^Connection conn true)
+    (jdbc/execute! conn [(str "PRAGMA busy_timeout = " busy-timeout-ms)])
     (jdbc/execute! conn ["BEGIN IMMEDIATE"])
     (let [completed? (volatile! false)]
       (try
@@ -358,12 +394,33 @@
                     (jdbc/plan conn (into [sql] params)))]
         (if (= result ::none) (f) result)))))
 
-(defn append
+(defn- sqlite-contention?
+  [throwable]
+  (loop [cause throwable]
+    (cond
+      (nil? cause) false
+      (and (instance? SQLException cause)
+           (contains? #{5 6} (.getErrorCode ^SQLException cause))) true
+      :else (recur (.getCause ^Throwable cause)))))
+
+(defn- retry-backoff-ms
+  [config retry-number]
+  (let [initial (long (or (:busy-retry-backoff-ms config) 10))
+        maximum (long (or (:busy-retry-max-backoff-ms config) 250))]
+    (loop [remaining (dec retry-number)
+           delay (min initial maximum)]
+      (if (or (zero? remaining) (= delay maximum))
+        delay
+        (recur (dec remaining)
+               (if (> delay (quot maximum 2)) maximum (* 2 delay)))))))
+
+(defn- append-direct
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
   (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
+      (long (or (get-in event-store [:config :busy-timeout-ms]) 1000))
       (fn [conn]
         (let [last-id (committed-last-event-id conn tenant-id)
               persist! (fn []
@@ -383,6 +440,88 @@
                   (u/log ::cas-failed :anomaly anomaly)
                   anomaly)))
             (persist!)))))))
+
+(defn- append-with-busy-retry
+  [event-store args]
+  (let [config (:config event-store)
+        max-retries (long (or (:busy-max-retries config) 3))]
+    (loop [attempt 0]
+      (let [[status value]
+            (try
+              [:ok (u/trace ::write-transaction
+                     [:metric/name "SQLiteWriteTransaction"
+                      :metric/resolution :high
+                      :attempt (inc attempt)]
+                     (append-direct event-store args))]
+              (catch Throwable t [:error t]))]
+        (if (= :ok status)
+          value
+          (if (and (sqlite-contention? value) (< attempt max-retries))
+            (let [retry-number (inc attempt)
+                  backoff-ms (retry-backoff-ms config retry-number)]
+              (u/log :metric/metric
+                     :metric/name "SQLiteBusyRetry"
+                     :metric/value 1
+                     :metric/resolution :high
+                     :retry retry-number
+                     :backoff-ms backoff-ms)
+              (Thread/sleep backoff-ms)
+              (recur retry-number))
+            (if (sqlite-contention? value)
+              (do
+                (u/log :metric/metric
+                       :metric/name "SQLiteBusyExhausted"
+                       :metric/value 1
+                       :metric/resolution :high
+                       :attempts (inc attempt))
+                {::anom/category ::anom/busy
+                 ::anom/message "SQLite event-store contention limit exhausted"
+                 ::busy-attempts (inc attempt)})
+              (throw value))))))))
+
+(defn append
+  [event-store args]
+  (let [^ThreadPoolExecutor coordinator
+        (get-in event-store [:state ::write-coordinator])
+        queued-at (System/nanoTime)
+        task (FutureTask.
+              ^Callable
+              (reify Callable
+                (call [_]
+                  (let [queue-wait-ns (- (System/nanoTime) queued-at)]
+                    (u/log :metric/metric
+                           :metric/name "SQLiteWriteQueueWait"
+                           :metric/value queue-wait-ns
+                           :metric/resolution :high)
+                    (u/log :metric/metric
+                           :metric/name "SQLiteWriteQueueDepth"
+                           :metric/value (.size (.getQueue coordinator))
+                           :metric/resolution :high)
+                    (u/trace ::append
+                      [:metric/name "SQLiteAppend"
+                       :metric/resolution :high
+                       :queue-wait-ns queue-wait-ns]
+                      (append-with-busy-retry event-store args))))))]
+    (try
+      (.execute coordinator task)
+      (u/log :metric/metric
+             :metric/name "SQLiteWriteQueueDepth"
+             :metric/value (.size (.getQueue coordinator))
+             :metric/resolution :high)
+      (try
+        (.get task)
+        (catch ExecutionException e
+          (throw (.getCause e)))
+        (catch CancellationException e
+          (throw (IllegalStateException. "SQLite event-store writer stopped" e))))
+      (catch RejectedExecutionException _
+        (u/log :metric/metric
+               :metric/name "SQLiteWriteQueueSaturated"
+               :metric/value 1
+               :metric/resolution :high
+               :queue-capacity (or (get-in event-store [:config :write-queue-capacity]) 1024))
+        {::anom/category ::anom/busy
+         ::anom/message "SQLite event-store write queue is full"}))))
 
 ;; ----------- ;;
 ;; Tenants     ;;

@@ -89,6 +89,18 @@
 (defn tx-events [events]
   (filterv #(= :grain/tx (:event/type %)) events))
 
+(defn- with-configured-store [config f]
+  (let [tmp (File/createTempFile "grain-sqlite-policy-" ".sqlite")
+        _ (.delete tmp)
+        path (.getAbsolutePath tmp)
+        store (es/start {:conn (merge {:type :sqlite :database-file path} config)})]
+    (try
+      (f store)
+      (finally
+        (es/stop store)
+        (.delete (File. path))
+        (delete-sidecar-files path)))))
+
 ;; ======================== ;;
 ;; A. Lifecycle             ;;
 ;; ======================== ;;
@@ -892,6 +904,85 @@
     (is (= 1 (count conflicts)))
     (is (= 1 (count (non-tx-events (into [] (es/read store {:tenant-id tenant-id
                                                             :types #{:test/alpha}}))))))))
+
+(deftest transient-external-writer-contention-is-retried
+  (with-configured-store
+    {:busy-timeout-ms 20 :busy-max-retries 10
+     :busy-retry-backoff-ms 5 :busy-retry-max-backoff-ms 20}
+    (fn [store]
+      (let [pool (get-in store [:state ::sqlite-core/connection-pool])
+            tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :body {:n 1}})]
+        (with-open [lock-conn (jdbc/get-connection pool)]
+          (jdbc/execute! lock-conn ["BEGIN IMMEDIATE"])
+          (let [result (future (es/append store {:tenant-id tenant-id :events [event]}))]
+            (Thread/sleep 100)
+            (jdbc/execute! lock-conn ["ROLLBACK"])
+            (is (= 1 (count (deref result 5000 ::timeout))))))
+        (is (= 1 (count (non-tx-events
+                         (into [] (es/read store {:tenant-id tenant-id}))))))))))
+
+(deftest exhausted-external-writer-contention-is-bounded
+  (with-configured-store
+    {:busy-timeout-ms 10 :busy-max-retries 1
+     :busy-retry-backoff-ms 1 :busy-retry-max-backoff-ms 1}
+    (fn [store]
+      (let [pool (get-in store [:state ::sqlite-core/connection-pool])
+            tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :body {:n 1}})]
+        (with-open [lock-conn (jdbc/get-connection pool)]
+          (jdbc/execute! lock-conn ["BEGIN IMMEDIATE"])
+          (let [started (System/nanoTime)
+                result (es/append store {:tenant-id tenant-id :events [event]})
+                elapsed-ms (/ (- (System/nanoTime) started) 1e6)]
+            (is (= ::anom/busy (::anom/category result)))
+            (is (= 2 (::sqlite-core/busy-attempts result)))
+            (is (< elapsed-ms 1000))
+            (jdbc/execute! lock-conn ["ROLLBACK"])))
+        (is (empty? (into [] (es/read store {:tenant-id tenant-id}))))))))
+
+(deftest wal-read-continues-while-writer-lock-is-held
+  (with-configured-store
+    {:busy-timeout-ms 20}
+    (fn [store]
+      (let [pool (get-in store [:state ::sqlite-core/connection-pool])
+            tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :body {:n 1}})]
+        (es/append store {:tenant-id tenant-id :events [event]})
+        (with-open [lock-conn (jdbc/get-connection pool)]
+          (jdbc/execute! lock-conn ["BEGIN IMMEDIATE"])
+          (try
+            (let [read-result (future (into [] (es/read store {:tenant-id tenant-id})))]
+              (is (= 1 (count (non-tx-events
+                               (deref read-result 1000 ::timeout))))))
+            (finally
+              (jdbc/execute! lock-conn ["ROLLBACK"]))))))))
+
+(deftest saturated-write-queue-rejects-deterministically
+  (with-configured-store
+    {:write-queue-capacity 1}
+    (fn [store]
+      (let [tenant-id (uuid/v4)
+            entered (promise)
+            release (promise)
+            blocking-cas {:predicate-fn (fn [_] (deliver entered true) @release true)}
+            event #(es/->event {:type :test/alpha :body {:n %}})
+            active (future (es/append store {:tenant-id tenant-id :events [(event 1)]
+                                             :cas blocking-cas}))]
+        (is (= true (deref entered 5000 ::timeout)))
+        (let [queued (future (es/append store {:tenant-id tenant-id :events [(event 2)]}))
+              coordinator (get-in store [:state ::sqlite-core/write-coordinator])]
+          (loop [remaining 100]
+            (when (and (zero? (.size (.getQueue coordinator))) (pos? remaining))
+              (Thread/sleep 5)
+              (recur (dec remaining))))
+          (let [rejected (es/append store {:tenant-id tenant-id :events [(event 3)]})]
+            (is (= ::anom/busy (::anom/category rejected))))
+          (deliver release true)
+          (is (= 1 (count (deref active 5000 ::timeout))))
+          (is (= 1 (count (deref queued 5000 ::timeout))))
+          (is (= 2 (count (non-tx-events
+                           (into [] (es/read store {:tenant-id tenant-id})))))))))))
 
 ;; ===================================================== ;;
 ;; Reverse / Limit single-read primitive + EXPLAIN       ;;
