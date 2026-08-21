@@ -43,7 +43,7 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395" ;; update to latest commit sha
+ :git/sha "4489099aae74ae5ff2c120299ffe0ca71f5bca51" ;; update to latest commit sha
  :deps/root "projects/grain-core-v2"}
 ```
 

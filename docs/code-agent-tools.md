@@ -19,7 +19,7 @@ Add the package to the application project:
 ```clojure
 obneyai/grain-code-agent-tools
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "382e7adc66ba347fd88e20b66cf02e737370c395"
+ :git/sha "4489099aae74ae5ff2c120299ffe0ca71f5bca51"
  :deps/root "projects/grain-code-agent-tools"}
 ```
 
