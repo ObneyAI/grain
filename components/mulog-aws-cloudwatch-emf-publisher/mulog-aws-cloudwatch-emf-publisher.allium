@@ -1,192 +1,276 @@
 -- allium: 3
 -- mulog-aws-cloudwatch-emf-publisher.allium
 --
--- Distilled from components/mulog-aws-cloudwatch-emf-publisher (grain).
---
--- Scope: A μ/log publisher that turns structured telemetry events into
---        CloudWatch metrics, expressed in AWS Embedded Metric Format (EMF).
---        This is infrastructure / thin plumbing: it observes an existing
---        event stream and re-emits the metric-bearing ones as EMF records.
---        It owns no domain state, no lifecycle and no workflow of its own.
---
--- Includes (the small set of genuine behavioural guarantees):
---   - selection: only events that carry a named metric AND either a metric
---     value (a counter) or a duration (a timer) are published; every other
---     observed event is silently dropped.
---   - measurement translation: a counter publishes its value as a count; a
---     timer publishes its duration in milliseconds. The unit recorded with the
---     metric follows that classification.
---   - storage resolution: a metric is recorded at either high (per-second) or
---     standard (per-minute) granularity; anything else defaults to high.
---   - publish-once: an observed event is considered exactly once and produces
---     at most one measurement; it is never published twice.
---
--- Excludes (implementation, governed elsewhere):
---   - μ/log framework mechanics: the agent buffer, publish-delay polling, the
---     PPublisher protocol, buffer capacity, and the per-flush drain loop.
---   - the EMF wire format itself (JSON shape, the _aws envelope, dimension and
---     namespace string layout) and how/where the record is transported to
---     CloudWatch.
---   - the unit-of-time arithmetic for converting nanoseconds to milliseconds.
---   - the fixed metric namespace and the app-name / env dimension labels,
---     which are deployment metadata, not behaviour.
+-- Normative behaviour for publishing bounded, validated metric measurements
+-- from Grain's telemetry stream. The publisher owns classification, validation,
+-- buffering, aggregation, delivery accounting and shutdown drain.
 
 ------------------------------------------------------------
 -- External Entities
 ------------------------------------------------------------
 
--- A single structured telemetry event observed on the μ/log stream. It carries
--- optional metric annotations; most events on the stream carry none and are not
--- metrics at all. Produced and named entirely outside this component.
 external entity TelemetryEvent {
-    -- The metric this event records, when it records one.
     metric_name: String?
-    -- A directly-measured quantity (a counter sample), when present.
     metric_value: Decimal?
-    -- An elapsed time the event measured, when present (a timer sample).
     duration: Duration?
-    -- The granularity the metric should be stored at, when specified.
+    metric_type: MetricType?
+    unit: MetricUnit?
     resolution: ResolutionRequest?
+    timestamp: Timestamp?
+    dimensions: List<MetricDimension>
+}
 
-    -- Whether this event qualifies as a publishable metric: it must name a
-    -- metric and supply either a counter value or a timed duration. Everything
-    -- else is not a metric and is dropped on observation.
-    is_metric: metric_name != null and (metric_value != null or duration != null)
+-- A name has one stable semantic definition for its lifetime.
+external entity MetricDefinition {
+    name: String
+    metric_type: MetricType
+    unit: MetricUnit
+    default_resolution: StorageResolution
+    allowed_dimension_names: Set<String>
+    allowed_dimension_values: Set<String>
 }
 
 ------------------------------------------------------------
--- Enumerations
+-- Value Types
 ------------------------------------------------------------
 
--- How a published metric's value is interpreted. A counter sample is a count;
--- a timer sample is reported in milliseconds.
-enum MetricUnit { count | milliseconds }
+value MetricDimension {
+    name: String
+    value: String
+}
 
--- The granularity a metric is stored at: per-second (high) or per-minute (low).
-enum StorageResolution { per_second | per_minute }
+value PublicationResult {
+    published_count: Integer
+    invalid_count: Integer
+    failed_count: Integer
+    retained_count: Integer
+}
 
--- The resolution a producer may ask for on an event.
-enum ResolutionRequest { high | low }
+value PublisherHealth {
+    buffered: Integer
+    published: Integer
+    dropped: Integer
+    invalid: Integer
+    flush_failed: Integer
+    buffer_utilization: Decimal
+    last_successful_flush_at: Timestamp?
+}
 
-------------------------------------------------------------
--- Entities and Variants
-------------------------------------------------------------
-
--- A measurement published to CloudWatch for one qualifying telemetry event: the
--- interpreted quantity together with how to read and store it. The event's raw
--- value or duration, the chosen unit and the storage granularity are exactly
--- what crosses the boundary; the EMF envelope around them is excluded.
-entity Measurement {
-    -- The observed event this measurement was published from.
-    source: TelemetryEvent
-    -- count for a counter sample, milliseconds for a timer sample.
-    unit: MetricUnit
-    -- per_second for a high-resolution request, otherwise per_minute.
-    storage_resolution: StorageResolution
+-- One valid JSON log event submitted to the configured output sink. Its single
+-- timestamp and root target members apply to every metric it contains.
+value EmfDocument {
+    timestamp: Timestamp
+    namespace: String
+    dimensions: List<MetricDimension>
+    measurements: List<Measurement>
 }
 
 ------------------------------------------------------------
 -- Contracts
 ------------------------------------------------------------
 
--- The boundary the publisher fulfils: observe the telemetry stream and turn the
--- metric-bearing events into CloudWatch measurements. These guarantees concern a
--- pure, deterministic classification of each event, so they live as contract
--- invariants rather than entity state.
 contract MetricPublication {
-    -- Classify one observed event into a published measurement, or nothing when
-    -- the event is not a publishable metric.
-    measure: (event: TelemetryEvent) -> Measurement
-    -- Drain a batch of buffered events, publishing the qualifying ones.
-    publish_batch: (events: Set<TelemetryEvent>) -> Set<Measurement>
+    measure: (event: TelemetryEvent) -> Measurement?
+    publish_batch: (events: List<TelemetryEvent>) -> PublicationResult
+    encode: (measurements: List<Measurement>) -> List<EmfDocument>
+    final_drain: () -> PublicationResult
+    health: () -> PublisherHealth
 
-    @invariant MetricSelection
-        -- A measurement is produced for an event if and only if the event names
-        -- a metric and carries either a value or a duration. Every other
-        -- observed event — including a bare name with no measurement — is
-        -- silently dropped: not published and not errored.
+    @invariant MetricRegistryIsAuthoritative
+        -- A metric is publishable only when its name resolves to exactly one
+        -- definition. The definition supplies its type, unit, default resolution
+        -- and dimension vocabulary. Conflicting event metadata is invalid.
 
-    @invariant CounterVersusTimer
-        -- An event carrying a metric value is published as a count of that
-        -- value. An event with no value but a duration is published as that
-        -- duration in milliseconds. The recorded unit follows the same split.
+    @invariant ConsumerRegistryExtension
+        -- A consumer may add application-owned metric definitions using the
+        -- same type, unit, resolution and bounded-dimension schema as Grain.
+        -- Consumer names must be disjoint from Grain's reserved metric names;
+        -- attempting to replace a Grain definition is rejected rather than
+        -- silently changing its lifetime semantics.
 
-    @invariant ResolutionMapping
-        -- A low-resolution request stores the metric at per-minute granularity.
-        -- Every other case — a high-resolution request, an unspecified request
-        -- or an unrecognised one — stores it at per-second granularity. Only the
-        -- low request diverts from the per-second default.
+    @invariant LegacyClassification
+        -- During migration, an unregistered named metric_value is a Count
+        -- counter, while an unregistered named duration with no metric_value is
+        -- a Milliseconds timer. Legacy low resolution maps to standard storage;
+        -- every other legacy request maps to high storage.
 
-    @invariant DrainCompleteness
-        -- A publish flush considers every event in the batch exactly once and
-        -- leaves none behind: a buffered event is either published or dropped on
-        -- the flush that observes it, never carried into a later flush and never
-        -- published twice.
+    @invariant Validation
+        -- Names, values, timestamps, units, resolutions and dimensions meet both
+        -- EMF and MetricDatum constraints. Namespace and metric names contain 1
+        -- through 255 permitted characters. Numeric values are finite and within
+        -- CloudWatch's inclusive range from -2^360 through 2^360. Timers and
+        -- counter increments are non-negative; gauges may be negative. Zero is
+        -- valid for every metric type. Timestamps are no more than two weeks old
+        -- and no more than two hours in the future.
 
-    @invariant Passive
-        -- Publishing is read-only with respect to the telemetry stream: it
-        -- observes events and emits measurements, and never alters the meaning
-        -- or content of the events it reads.
+    @invariant SafeDimensions
+        -- Every dimension is explicitly permitted for that metric and has an
+        -- allowed bounded value. Unknown dimensions and values are rejected.
+        -- Entity, tenant, request and event identifiers; raw URLs; messages;
+        -- payload values; credentials; tokens and personal data are forbidden.
+        -- No metric has more than 30 dimensions. Dimension names contain 1
+        -- through 255 permitted ASCII characters, cannot begin with a colon and
+        -- contain no control characters. Values contain 1 through 1024 permitted
+        -- ASCII characters, include a non-whitespace character and contain no
+        -- control characters.
+
+    @invariant DurationNormalization
+        -- Durations are converted once into the definition's unit. A duration
+        -- is never published as Count or as an implicit nanosecond value.
+
+    @invariant StandardResolutionDefault
+        -- Registered counters and gauges default to standard resolution. High
+        -- resolution is used only when the metric definition permits it.
+
+    @invariant Aggregation
+        -- Measurements aggregate only when name, complete dimension set, unit
+        -- and resolution match. Counters sum; gauges publish the last valid
+        -- value in source order; timer samples retain their individual values.
+        -- The aggregate uses the latest source timestamp represented by it.
+
+    @invariant EmfDocumentShape
+        -- Each sink record is exactly one valid JSON object with no surrounding
+        -- text. It contains _aws.Timestamp as epoch milliseconds and one or more
+        -- CloudWatchMetrics directives. Every directive contains Namespace,
+        -- Dimensions and Metrics. Referenced metric and dimension targets are
+        -- non-nested members of the root object. Metric targets are numbers or
+        -- arrays of no more than 100 numbers; dimension targets are strings.
+
+    @invariant EmfDocumentBounds
+        -- No EMF log event exceeds AWS's 1 MB log-event limit. No directive
+        -- contains more than 100 metric definitions, no numeric target array
+        -- contains more than 100
+        -- values and no dimension set contains more than 30 keys. A batch is
+        -- split into additional documents before any bound would be exceeded.
+
+    @invariant EmfTimestampScope
+        -- One _aws.Timestamp applies to every measurement extracted from an EMF
+        -- document. Measurements with different aggregate timestamps are emitted
+        -- in different documents; per-metric timestamps are never implied.
+
+    @invariant PerEventFailureIsolation
+        -- Invalid input or failure to construct one measurement does not prevent
+        -- other events in the flush from being considered. Every invalid event
+        -- increments invalid accounting exactly once.
+
+    @invariant DeliveryAccounting
+        -- Measurements accepted by the configured output sink are removed and
+        -- counted as published. This means accepted by stdout or another local
+        -- sink, not extracted by CloudWatch. Output failure increments flush-
+        -- failure accounting and retains only measurements not known to be
+        -- accepted. Ambiguous failure can cause re-delivery.
+
+    @invariant CloudWatchDeliverySemantics
+        -- After a valid EMF log reaches CloudWatch Logs, AWS extraction provides
+        -- at-least-once delivery and may create duplicate metric values. The
+        -- publisher neither promises exactly-once extraction nor treats local
+        -- sink acceptance as CloudWatch acknowledgement.
+
+    @invariant RetryBound
+        -- An unacknowledged measurement is retried no more than the configured
+        -- attempt limit. Exhausted measurements are removed and counted dropped.
+
+    @invariant Overflow
+        -- Capacity is bounded. Under default drop-newest, an event arriving at
+        -- capacity is not buffered and increments dropped exactly once. Any
+        -- configured displacement also increments dropped exactly once.
+
+    @invariant BoundedShutdown
+        -- Shutdown stops accepting events and drains until empty or its deadline.
+        -- Events remaining at the deadline are counted dropped, and shutdown
+        -- never waits beyond the configured deadline for publication.
+
+    @invariant IndependentHealth
+        -- Publisher health remains observable while the output sink is failing
+        -- and does not depend upon successful publication through that sink.
+        -- Deployment monitoring also observes AWS/Logs EMFParsingErrors and
+        -- EMFValidationErrors because local success cannot prove extraction.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum MetricType { counter | timer | gauge }
+enum MetricUnit { count | milliseconds | seconds | bytes | percent | none }
+enum StorageResolution { high | standard }
+enum ResolutionRequest { high | standard | low }
+enum OverflowPolicy { drop_newest | drop_oldest }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity Measurement {
+    source: TelemetryEvent
+    definition: MetricDefinition?
+    name: String
+    value: Decimal
+    metric_type: MetricType
+    unit: MetricUnit
+    storage_resolution: StorageResolution
+    dimensions: List<MetricDimension>
+    timestamp: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    namespace: String = "ObneyAI/InfoSystem"
+    buffer_capacity: Integer = 10_000
+    flush_interval: Duration = 0.2.seconds
+    overflow_policy: OverflowPolicy = drop_newest
+    max_delivery_attempts: Integer = 3
+    final_drain_timeout: Duration = 5.seconds
 }
 
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
 
--- When a buffered event is observed on a publish flush, a qualifying event (a
--- named metric with a value or a duration) is published as one measurement; a
--- non-qualifying event is dropped without producing anything. A counter
--- publishes as a count, a timer as milliseconds; a high-resolution request
--- stores per-second, otherwise per-minute. The publisher does not write back to
--- the observed event: consider-once is a property of the batch drain
--- (DrainCompleteness), not a flag set on the event.
-rule ObserveEvent {
+rule ObserveValidMetric {
     when: event: TelemetryEvent.created
-    requires: event.is_metric
+    requires: valid_metric_event(event)
     ensures:
         Measurement.created(
             source: event,
-            unit: if event.metric_value != null: count else: milliseconds,
-            storage_resolution:
-                if event.resolution = low: per_minute else: per_second
+            definition: metric_definition(event),
+            name: normalized_metric_name(event),
+            value: normalized_metric_value(event),
+            metric_type: normalized_metric_type(event),
+            unit: normalized_metric_unit(event),
+            storage_resolution: normalized_resolution(event),
+            dimensions: validated_dimensions(event),
+            timestamp: normalized_timestamp(event)
         )
+
+    @guidance
+        -- Normalization is deterministic and performs no output delivery.
 }
 
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
 
--- A measurement is only ever published from a qualifying event: nothing that
--- lacks a named metric with a value or duration produces a measurement.
-invariant OnlyMetricsMeasured {
-    for m in Measurements:
-        m.source.is_metric
+invariant MeasurementsHaveStableDefinitions {
+    for measurement in Measurements:
+        measurement.definition != null implies
+            measurement.name = measurement.definition.name
+            and measurement.metric_type = measurement.definition.metric_type
+            and measurement.unit = measurement.definition.unit
 }
 
--- A counter sample is recorded as a count and a timer sample as milliseconds:
--- the chosen unit always matches whether the source carried a direct value.
-invariant UnitMatchesSample {
-    for m in Measurements:
-        (m.source.metric_value != null implies m.unit = count)
-        and (m.source.metric_value = null implies m.unit = milliseconds)
-}
-
--- A low-resolution request stores per-minute; every other case (high or
--- unspecified) stores per-second. The mapping is total over the source request.
-invariant ResolutionFollowsRequest {
-    for m in Measurements:
-        (m.source.resolution = low implies m.storage_resolution = per_minute)
-        and (m.source.resolution != low implies m.storage_resolution = per_second)
+invariant MeasurementValuesFollowType {
+    for measurement in Measurements:
+        measurement.metric_type = gauge or measurement.value >= 0
 }
 
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
 
--- The boundary between the telemetry runtime and this publisher. The runtime
--- (the μ/log framework, code rather than a person) feeds observed events by
--- periodically asking the publisher to drain its buffer; the publisher fulfils
--- the measurement contract.
 surface MetricPublishing {
     context event: TelemetryEvent
 
@@ -194,20 +278,29 @@ surface MetricPublishing {
         event.metric_name
         event.metric_value
         event.duration
-        event.is_metric
+        event.metric_type
+        event.unit
+        event.resolution
+        event.timestamp
+        event.dimensions
 
     contracts:
         fulfils MetricPublication
 
-    @guarantee OnlyMetricsArePublished
-        -- A measurement crosses this boundary for an event if and only if the
-        -- event names a metric and carries either a value or a duration. All
-        -- other observed events pass through unpublished.
+    @guarantee BoundedSafePublication
+        -- Only validated, bounded measurements are published; every accepted or
+        -- discarded metric is accounted for; final drain is deadline-bounded.
 }
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred specification "The Grain metric registry defines every metric's stable type, unit, resolution, dimensions, bounded vocabularies and emission point."
 
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
 
-open question "On a publish failure for one event in a batch, should the rest of the batch still be published, or is the whole flush abandoned? The current behaviour drains and emits per event with no batch-level failure handling specified."
-open question "Are duplicate metric names within a single flush expected (the same name appearing on multiple events in one batch), and if so should they aggregate or each publish independently?"
+open question "What acceptance boundary can each supported output sink provide for distinguishing accepted writes from ambiguous local failures? CloudWatch extraction is explicitly outside this boundary."
+open question "Should drop-oldest remain supported, or should drop-newest be the sole overflow policy?"

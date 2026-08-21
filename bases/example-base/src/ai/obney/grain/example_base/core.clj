@@ -13,6 +13,8 @@
    poll, and periodic tick is scoped to `service-schemas/example-tenant-id`."
   (:require [ai.obney.grain.command-request-handler-v2.interface :as crh]
             [ai.obney.grain.query-request-handler.interface :as qrh]
+            [ai.obney.grain.command-processor-v2.interface :as command-processor]
+            [ai.obney.grain.query-processor.interface :as query-processor]
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.event-store-v3.interface :as es]
@@ -89,10 +91,45 @@
         (u/start-publisher! {:type :console-json
                              :pretty? false})
 
+        command-names (keys (command-processor/global-command-registry))
+        query-names (keys (query-processor/global-query-registry))
+        processor-names (keys @tp/processor-registry*)
+        periodic-names (keys @pt/periodic-trigger-registry*)
+        operation-names (concat command-names query-names processor-names periodic-names)
+        dimension-values
+        (merge (into {}
+                     (map (fn [[dimension value]] [dimension #{value}]))
+                     (select-keys (u/global-context) [:app-name :env]))
+               {:service (set (map #(or (namespace %) "unqualified") operation-names))
+                :command (set (map str command-names))
+                :query (set (map str query-names))
+                :processor (set (map str processor-names))
+                :periodic (set (map str periodic-names))
+                :backend #{"in-memory" "sqlite" "postgres"}
+                :operation #{"start" "append" "read" "transaction" "notification" "pool"}
+                :outcome #{"succeeded" "rejected" "anomaly" "failed"
+                           "retrying" "skipped" "triggered" "timed-out"}
+                :anomaly-category #{"incorrect" "not-found" "forbidden"
+                                    "conflict" "fault" "busy" "unavailable"
+                                    "interrupted"}
+                :failure-class #{"incorrect" "not-found" "forbidden"
+                                 "conflict" "fault" "busy" "unavailable"
+                                 "interrupted" "exception"}})
+        ;; Applications extend the framework registry with domain metrics.
+        ;; Values for every dimension remain explicitly bounded.
+        application-metrics
+        {"ExampleOperationCount"
+         {:metric/type :counter
+          :metric/unit :count
+          :metric/resolution :standard
+          :metric/dimensions {:operation #{"example-operation"}
+                              :outcome #{"succeeded" "failed"}}}}
         cloudwatch-emf-pub-stop-fn
-        (u/start-publisher!
-         {:type :custom
-          :fqn-function #'cloudwatch-emf/cloudwatch-emf-publisher})]
+        (cloudwatch-emf/start-cloudwatch-emf-publisher!
+         {:metric-registry
+          (cloudwatch-emf/extend-grain-metric-registry
+           dimension-values
+           application-metrics)})]
     (fn []
       (console-pub-stop-fn)
       (cloudwatch-emf-pub-stop-fn))))

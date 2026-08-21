@@ -4,6 +4,7 @@
             [ai.obney.grain.query-request-handler.core :as core]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [ai.obney.grain.query-processor.interface :as qp]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [cognitect.anomalies :as anom]
             [cognitect.transit :as transit]
             [io.pedestal.http :as http]
@@ -431,6 +432,23 @@
           body (transit-read (:body response))]
       (is (= 403 (:status response)))
       (is (= "Unauthorized" (:message body))))))
+
+(deftest authorization-denial-emits-bounded-query-metric
+  (let [events (atom [])
+        query {:query/name :test/auth-false}
+        response (with-redefs [mulog-core/log*
+                               (fn [_ event-name pairs]
+                                 (swap! events conj (assoc (apply hash-map pairs)
+                                                           :mulog/event-name event-name)))]
+                   (response-for *service* :post "/query"
+                                 :headers {"Content-Type" "application/transit+json"}
+                                 :body (transit-write {:query query})))
+        metric (first (filter #(= "QueryAuthorizationDenied" (:metric/name %)) @events))]
+    (is (= 403 (:status response)))
+    (is (= 1 (:metric/value metric)))
+    (is (= {:service "test" :query ":test/auth-false"
+            :outcome "rejected" :anomaly-category "forbidden"}
+           (:metric/dimensions metric)))))
 
 (deftest test-e2e-authorized-when-predicate-returns-true
   (testing "Query with :authorized? returning true proceeds"
