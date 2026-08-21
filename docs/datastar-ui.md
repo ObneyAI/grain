@@ -635,7 +635,8 @@ Prefer checked `ui/...` forms in new production UI.
 
 `hiccup`
 
-Compiles checked UI source to plain Hiccup with Datastar attributes:
+Compiles checked UI source to plain Hiccup with Datastar attributes. Use it at
+the application boundary when a renderer or Grain query needs ordinary Hiccup:
 
 ```clojure
 (ui/hiccup source)
@@ -644,7 +645,8 @@ Compiles checked UI source to plain Hiccup with Datastar attributes:
 
 `ir`
 
-Compiles checked UI source to Datastar UI IR:
+Compiles checked UI source to Datastar UI IR. Use it when tooling, validation,
+or tests need to inspect intent before Datastar attribute strings are emitted:
 
 ```clojure
 (ui/ir source)
@@ -652,7 +654,8 @@ Compiles checked UI source to Datastar UI IR:
 
 `lower-ir`
 
-Lowers UI IR to plain Hiccup:
+Lowers UI IR to plain Hiccup. Use it when an earlier phase already produced IR
+and only target-specific lowering remains:
 
 ```clojure
 (ui/lower-ir ir-node)
@@ -661,7 +664,9 @@ Lowers UI IR to plain Hiccup:
 
 `static`
 
-Interprets IR as static Hiccup:
+Interprets IR as static Hiccup. Use it for non-reactive rendering, previews, or
+tests that should keep visible content while optionally removing navigation and
+raw browser-event behavior:
 
 ```clojure
 (ui/static ir-node)
@@ -672,7 +677,9 @@ Interprets IR as static Hiccup:
 
 `defcomponent`
 
-Defines a component function that returns `ui/hiccup` output:
+Defines a component function that automatically returns `ui/hiccup` output.
+Use it for reusable public components whose callers should receive compiled
+Hiccup rather than DSL source:
 
 ```clojure
 (ui/defcomponent save-button [document-id]
@@ -686,27 +693,35 @@ Defines a component function that returns `ui/hiccup` output:
 `with-signals`
 
 Declares lexical Datastar signals and attaches declarations to the returned
-subtree root:
+subtree root. Use it to give a component reactive local state while retaining
+checked signal handles throughout its body:
 
 ```clojure
 (ui/with-signals [query {:init ""}
                   open? {:init false}
                   amount {:name "amount-dollars" :init ""}]
-  ...)
+  [:section
+   [:input {:bind/value query}]
+   [:button {:on/click {:effect (ui/set-signal open? true)}} "Open"]
+   [:output {:bind/text amount}]])
 ```
 
 `with-signal-scope`
 
-Advanced. Binds an explicit signal scope:
+Advanced. Binds an explicit signal scope. Use it when repeated component
+instances need stable, collision-free generated signal names:
 
 ```clojure
 (ui/with-signal-scope {:prefix "plan" :key application-id}
-  ...)
+  (ui/with-signals [duration {:init ""}]
+    [:input {:bind/value duration}]))
 ```
 
 `create-signal`
 
-Low-level. Creates a signal handle from a binding symbol and options map:
+Low-level. Creates a signal handle from a binding symbol and options map. Use it
+when macros or tooling need to construct declarations programmatically;
+application components should normally use `with-signals`:
 
 ```clojure
 (ui/create-signal 'query {:init ""})
@@ -714,7 +729,9 @@ Low-level. Creates a signal handle from a binding symbol and options map:
 
 `attach-signals`
 
-Low-level. Attaches signal declarations to a Hiccup element:
+Low-level. Attaches signal declarations to a Hiccup element. Use it when a
+programmatically created handle must be attached to a subtree root;
+`with-signals` performs this automatically:
 
 ```clojure
 (ui/attach-signals [query-signal] [:div])
@@ -722,7 +739,9 @@ Low-level. Attaches signal declarations to a Hiccup element:
 
 `signal-ref`
 
-Low-level. Returns the Datastar JavaScript reference for a signal/name:
+Low-level. Returns the Datastar JavaScript reference for a signal/name. Use it
+only at raw-JavaScript or integration boundaries; checked DSL forms accept the
+signal handle directly:
 
 ```clojure
 (ui/signal-ref "query")
@@ -733,14 +752,16 @@ Low-level. Returns the Datastar JavaScript reference for a signal/name:
 
 `:bind/value`
 
-Lowers to `data-bind` for ordinary signal handles:
+Lowers to `data-bind` for ordinary signal handles. Use it for two-way binding
+between a form control's value and a signal:
 
 ```clojure
 [:input {:bind/value query}]
 ```
 
 For indexed collection references, the compiler emits checked read/write
-behavior that updates only that collection element:
+behavior that updates only that collection element. This avoids replacing or
+manually rewriting the whole collection:
 
 ```clojure
 [:input {:bind/value (ui/indexed custom-amounts idx)}]
@@ -748,7 +769,8 @@ behavior that updates only that collection element:
 
 `:bind/text`
 
-Lowers to `data-text`:
+Lowers to `data-text`. Use it when an element's text content should reactively
+reflect an expression:
 
 ```clojure
 [:p {:bind/text (ui/trimmed query)}]
@@ -756,7 +778,8 @@ Lowers to `data-text`:
 
 `:bind/show`
 
-Lowers to `data-show`:
+Lowers to `data-show`. Use it to show or hide an existing DOM subtree without
+conditionally removing that subtree on the server:
 
 ```clojure
 [:section {:bind/show open?}]
@@ -764,7 +787,7 @@ Lowers to `data-show`:
 
 `:bind/class`
 
-Lowers to `data-class`:
+Lowers to `data-class`. Use it to toggle a class from a checked expression:
 
 ```clojure
 [:div {:bind/class (ui/present? query)}]
@@ -772,7 +795,8 @@ Lowers to `data-class`:
 
 `:bind/attr`
 
-Lowers each entry to `data-attr:*`:
+Lowers each entry to `data-attr:*`. Use it to reactively control HTML attributes
+such as accessibility state or disabled state:
 
 ```clojure
 [:button {:bind/attr {:disabled saving?
@@ -781,7 +805,8 @@ Lowers each entry to `data-attr:*`:
 
 `:bind/prop`
 
-Lowers each entry to a `data-effect` DOM property write:
+Lowers each entry to a `data-effect` DOM property write. Use it when browser
+behavior depends on a live DOM property rather than an HTML attribute:
 
 ```clojure
 [:input {:type "checkbox"
@@ -790,7 +815,8 @@ Lowers each entry to a `data-effect` DOM property write:
 
 `:effect`
 
-Lowers a checked effect to `data-effect`:
+Lowers a checked effect to `data-effect`. Use it for reactive work that should
+run when its referenced signals change, rather than in response to a DOM event:
 
 ```clojure
 [:section {:effect (ui/set-signal page-ready? true)}]
@@ -807,6 +833,13 @@ after render:
 ```
 
 Other `:bind/foo` attrs lower to `data-bind:foo`.
+
+Use this open-ended form when Datastar supports a binding that does not yet
+have a specialized Grain entry:
+
+```clojure
+[:input {:bind/checked selected?}]
+```
 
 ### Event Attributes
 
@@ -828,10 +861,19 @@ Supported checked event names are open-ended. Common names are:
 :on/signal-patch
 ```
 
+Use `:on/<event>` to run checked effects from DOM events while keeping event
+lowering and signal references inside the DSL:
+
+```clojure
+[:form {:on/submit {:effect (ui/dispatch :documents/save {:id document-id})
+                    :modifiers {:prevent true}}}]
+```
+
 `:on/signal-patch`
 
 Datastar signal patch hook. The checked form uses the normal event map but
-lowers to `data-on-signal-patch`:
+lowers to `data-on-signal-patch`. Use it when a server or browser signal patch,
+rather than a DOM event, should trigger follow-up behavior:
 
 ```clojure
 {:on/signal-patch
@@ -846,19 +888,25 @@ and sequenced effects are safe in ordinary `:on/*` handlers and in
 
 `:modifiers`
 
-Generic Datastar event modifier map:
+Generic Datastar event modifier map. Use it to declaratively alter event
+handling—for example, prevent native submission, debounce input, or listen on
+`window`:
 
 ```clojure
-{:prevent true
- :debounce "300ms"
- :window true}
+[:input
+ {:on/input
+  {:effect (ui/refresh :search/results {:q query})
+   :modifiers {:prevent true
+               :debounce "300ms"
+               :window true}}}]
 ```
 
 ### Route And Payload Forms
 
 `dispatch`
 
-Creates a checked command dispatch effect:
+Creates a checked command dispatch effect. Use it when a user interaction should
+submit a registered Grain command with an explicit payload:
 
 ```clojure
 (ui/dispatch :documents/sign {:id document-id})
@@ -875,7 +923,8 @@ Options:
 
 `refresh`
 
-Creates a checked query/stream refresh effect:
+Creates a checked query/stream refresh effect. Use it when changed signals or a
+user action should rerun a registered query through its generated stream route:
 
 ```clojure
 (ui/refresh :documents/signing-page {:id document-id})
@@ -894,7 +943,8 @@ Options:
 
 `href`
 
-Creates a checked page href:
+Creates a checked page href. Use it for ordinary navigation to a registered
+query while letting Grain validate the route and fill path/query parameters:
 
 ```clojure
 (ui/href :documents/signing-page
@@ -906,11 +956,17 @@ Creates a checked page href:
 
 `set-signal`
 
+Assigns an expression to a signal. Use it for local state transitions that do
+not require a server round trip:
+
 ```clojure
 (ui/set-signal saving? true)
 ```
 
 `reset-signal`
+
+Restores a signal to its declared initial value. Use it to clear component state
+without duplicating that initial value at each call site:
 
 ```clojure
 (ui/reset-signal query)
@@ -918,11 +974,17 @@ Creates a checked page href:
 
 `clear-errors`
 
+Clears Grain's conventional Datastar error signals. Use it before retrying an
+operation or after the user has corrected invalid input:
+
 ```clojure
 (ui/clear-errors)
 ```
 
 `blur`
+
+Calls `blur()` on the element handling the current event. Use it to dismiss
+focus-driven UI, such as a mobile keyboard, after an action:
 
 ```clojure
 (ui/blur)
@@ -930,11 +992,17 @@ Creates a checked page href:
 
 `action`
 
+Embeds a raw Datastar action string. Use it only as an escape hatch when the
+checked effect vocabulary cannot express required browser behavior:
+
 ```clojure
 (ui/action "$open = false;")
 ```
 
 `effects`
+
+Sequences multiple effects in order. Use it when one interaction must perform
+several local and/or server actions:
 
 ```clojure
 (ui/effects (ui/set-signal saving? true)
@@ -943,12 +1011,18 @@ Creates a checked page href:
 
 `when-effect`
 
+Runs an effect only when a checked expression is truthy. Use it for guarded
+behavior that has no else branch:
+
 ```clojure
 (ui/when-effect (ui/present? signature)
   (ui/dispatch :documents/sign {:signature signature}))
 ```
 
 `choose-effect`
+
+Chooses one of two effects from a checked condition. Use it when both the true
+and false paths require explicit behavior:
 
 ```clojure
 (ui/choose-effect (ui/present? signature)
@@ -958,6 +1032,9 @@ Creates a checked page href:
 
 `on-keys`
 
+Maps keyboard keys to effects. Use it to keep keyboard workflows declarative
+without writing a raw `evt.key` conditional:
+
 ```clojure
 (ui/on-keys {"Enter" (ui/dispatch :search/submit {:q query})
              "Escape" (ui/reset-signal query)})
@@ -965,7 +1042,9 @@ Creates a checked page href:
 
 `lower-effect`
 
-Low-level. Lowers a checked effect to a Datastar action string:
+Low-level. Lowers a checked effect to a Datastar action string. Use it for
+testing, diagnostics, or integration with an API that specifically requires the
+final action string; attributes lower effects automatically:
 
 ```clojure
 (ui/lower-effect (ui/set-signal query ""))
@@ -975,7 +1054,8 @@ Low-level. Lowers a checked effect to a Datastar action string:
 
 Signal handles
 
-Use a signal handle directly:
+Use a signal handle directly wherever a checked expression is accepted. This is
+the normal way to read reactive state; no explicit dereference form is needed:
 
 ```clojure
 query
@@ -983,15 +1063,35 @@ query
 
 `lit`
 
-Wraps a literal expression value:
+Wraps a value as a safely encoded JavaScript literal. Most checked DSL helpers
+already treat plain values as literals, so `lit` is mainly useful inside
+`ui/js`, where plain strings are raw JavaScript fragments:
 
 ```clojure
 (ui/lit "open")
+
+(ui/js "value === " (ui/lit "open"))
+;; => value === "open"
 ```
+
+Without `lit`, quoting must be written into the raw fragment manually:
+
+```clojure
+(ui/js "value === " "open")
+;; => value === open  (references a JavaScript variable)
+
+(ui/js "value === " "'open'")
+;; => value === 'open'
+```
+
+Prefer `lit` when embedding literal strings or dynamic Clojure values in
+`ui/js`; it handles quoting and escaping for you. Outside `ui/js`, plain values
+are normally sufficient.
 
 `indexed`
 
-References one element inside a collection signal:
+References one element inside a collection signal. Use it for per-row or
+per-input bindings that must read and update a single collection slot:
 
 ```clojure
 (ui/indexed custom-amounts 0)
@@ -1000,7 +1100,8 @@ References one element inside a collection signal:
 
 `trimmed`
 
-Calls `.trim()` on a signal/expression:
+Calls `.trim()` on a signal/expression. Use it to normalize text input in
+conditions or payloads without mutating the displayed signal:
 
 ```clojure
 (ui/trimmed query)
@@ -1008,7 +1109,8 @@ Calls `.trim()` on a signal/expression:
 
 `num`
 
-Wraps `Number(x)`:
+Wraps `Number(x)`. Use it when an HTML input's string value must be sent or
+compared as a JavaScript number:
 
 ```clojure
 (ui/num amount)
@@ -1016,7 +1118,8 @@ Wraps `Number(x)`:
 
 `num-cents`
 
-Converts dollar text to rounded integer cents:
+Converts dollar text to rounded integer cents represented as a string. Use it
+for currency payloads that should avoid floating-point dollar storage:
 
 ```clojure
 (ui/num-cents amount)
@@ -1024,7 +1127,8 @@ Converts dollar text to rounded integer cents:
 
 `present?`
 
-Checks for non-empty/non-null:
+Checks that a value is neither the empty string nor `null`. Use it for concise
+required-value guards while still allowing values such as `0` and `false`:
 
 ```clojure
 (ui/present? signature)
@@ -1032,16 +1136,17 @@ Checks for non-empty/non-null:
 
 `changed?`
 
-Compares an expression to an old value:
+Compares an expression to an old value with JavaScript strict inequality. Use it
+to avoid dispatching or refreshing when an editable value has not changed:
 
 ```clojure
-(ui/changed? draft saved)
 (ui/changed? title "Old")
 ```
 
 `evt`
 
-References a field on Datastar's event object:
+References a field on Datastar's event object. Use it when checked behavior
+depends on event data such as the pressed key:
 
 ```clojure
 (ui/evt :key)
@@ -1049,7 +1154,9 @@ References a field on Datastar's event object:
 
 `js`
 
-Raw JavaScript expression fragments with checked values embedded:
+Joins raw JavaScript expression fragments with checked expressions embedded.
+Use it as the expression escape hatch for browser APIs or operators absent from
+the checked vocabulary; prefer checked helpers when available:
 
 ```clojure
 (ui/js "Math.max(0, " (ui/num amount) ")")
@@ -1057,7 +1164,9 @@ Raw JavaScript expression fragments with checked values embedded:
 
 `lower-expr`
 
-Low-level. Lowers an expression to a Datastar JavaScript string:
+Low-level. Lowers an expression to a Datastar JavaScript string. Use it in tests,
+diagnostics, or external integrations; DSL attributes lower expressions
+automatically:
 
 ```clojure
 (ui/lower-expr (ui/trimmed query))
@@ -1067,19 +1176,36 @@ Low-level. Lowers an expression to a Datastar JavaScript string:
 
 `default-command-post`
 
-Default reserved Datastar action target used by `dispatch`:
+Default reserved Datastar action target used by `dispatch`. Use the constant
+when integration code must refer to the same target without duplicating its
+spelling:
 
 ```clojure
 ui/default-command-post
+;; => "$__grainAction"
 ```
 
 `*signal-scope*`
 
-Dynamic var used by `with-signal-scope`. Framework-level only.
+Dynamic var used by `with-signal-scope`. It exists so macro expansion and
+framework tooling can propagate the active naming scope; application code
+should use `with-signal-scope` instead of binding it directly:
+
+```clojure
+(ui/with-signal-scope {:prefix "invoice" :key invoice-id}
+  (ui/with-signals [amount {:init ""}]
+    [:input {:bind/value amount}]))
+```
 
 `*lower-opts*`
 
-Dynamic var used during lowering. Framework-level only.
+Dynamic var used during lowering. It carries compiler options through recursive
+lowering; application code should pass options to `hiccup`, `lower-ir`, or
+`static` rather than binding it directly:
+
+```clojure
+(ui/hiccup source {:query-registry registry})
+```
 
 ## Code Agent Checklist
 
