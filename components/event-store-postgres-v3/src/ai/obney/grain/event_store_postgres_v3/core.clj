@@ -158,6 +158,33 @@
 ;; Read Queries  ;;
 ;; ------------ ;;
 
+(defn- emit-pool-gauge! [metric-name value]
+  (u/log :metric/metric
+         :metric/name metric-name
+         :metric/value value
+         :metric/resolution :low
+         :metric/dimensions {:backend "postgres"
+                             :operation "pool"
+                             :outcome "sampled"}))
+
+(defn- sample-pool! [pool]
+  (when-let [bean (try (.getHikariPoolMXBean pool) (catch Throwable _ nil))]
+    (let [active (.getActiveConnections bean)
+          idle (.getIdleConnections bean)
+          pending (.getThreadsAwaitingConnection bean)
+          total (.getTotalConnections bean)]
+      (emit-pool-gauge! "PostgresPoolActive" active)
+      (emit-pool-gauge! "PostgresPoolIdle" idle)
+      (emit-pool-gauge! "PostgresPoolPending" pending)
+      (when (and (pos? pending) (>= active total))
+        (u/log :metric/metric
+               :metric/name "PostgresPoolSaturated"
+               :metric/value 1
+               :metric/resolution :low
+               :metric/dimensions {:backend "postgres"
+                                   :operation "pool"
+                                   :outcome "saturated"})))))
+
 (defn- build-single-query-sql
   "Build WHERE clause and params for a single read query.
    Returns {:where-sql \"WHERE ...\" :params [...]}"
@@ -197,30 +224,36 @@
   (reify
     clojure.lang.IReduceInit
     (reduce [_ f init]
-      (jdbc/with-transaction [tx conn {:read-only true}]
-        (jdbc/execute! tx [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
-        (let [plan (jdbc/plan tx (into [sql] params) {:fetch-size 500})]
-          (reduce
-           (fn [acc row]
-             (f acc (transform-row row)))
-           init
-           plan))))
+      (sample-pool! conn)
+      (try
+        (jdbc/with-transaction [tx conn {:read-only true}]
+          (jdbc/execute! tx [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
+          (let [plan (jdbc/plan tx (into [sql] params) {:fetch-size 500})]
+            (reduce
+             (fn [acc row]
+               (f acc (transform-row row)))
+             init
+             plan)))
+        (finally (sample-pool! conn))))
     clojure.lang.IReduce
     (reduce [_ f]
-      (jdbc/with-transaction [tx conn {:read-only true}]
-        (jdbc/execute! tx [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
-        (let [plan (jdbc/plan tx (into [sql] params) {:fetch-size 500})
-              reduced-result
-              (reduce
-               (fn [acc row]
-                 (if (= acc ::none)
-                   (transform-row row)
-                   (f acc (transform-row row))))
-               ::none
-               plan)]
-          (if (= reduced-result ::none)
-            (f)
-            reduced-result))))))
+      (sample-pool! conn)
+      (try
+        (jdbc/with-transaction [tx conn {:read-only true}]
+          (jdbc/execute! tx [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
+          (let [plan (jdbc/plan tx (into [sql] params) {:fetch-size 500})
+                reduced-result
+                (reduce
+                 (fn [acc row]
+                   (if (= acc ::none)
+                     (transform-row row)
+                     (f acc (transform-row row))))
+                 ::none
+                 plan)]
+            (if (= reduced-result ::none)
+              (f)
+              reduced-result)))
+        (finally (sample-pool! conn))))))
 
 (defn- read-single
   [event-store tenant-id query]
@@ -296,8 +329,11 @@
 (defn append
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
-  (jdbc/with-transaction
-    [conn (get-in event-store [:state ::connection-pool])]
+  (let [pool (get-in event-store [:state ::connection-pool])]
+    (sample-pool! pool)
+    (try
+      (jdbc/with-transaction
+       [conn pool]
       ;; Set tenant context for RLS
       (jdbc/execute! conn [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
       ;; Per-tenant advisory lock
@@ -340,7 +376,17 @@
                               ::cas cas}]
                 (u/log ::cas-failed :anomaly anomaly)
                 anomaly)))
-          (persist!)))))
+          (persist!))))
+      (catch Throwable throwable
+        (u/log :metric/metric
+               :metric/name "PostgresTransactionFailed"
+               :metric/value 1
+               :metric/resolution :low
+               :metric/dimensions {:backend "postgres"
+                                   :operation "transaction"
+                                   :outcome "failed"})
+        (throw throwable))
+      (finally (sample-pool! pool)))))
 
 (defn tenants
   [event-store]

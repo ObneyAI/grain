@@ -78,15 +78,15 @@
            (if (= :local (:route/decision decision))
              (do
                (case (:route/reason decision)
-                 :owner       (u/log :metric/metric :metric/name "RoutingLocal" :metric/value 1 :metric/resolution :high)
+                 :owner       (u/log :metric/metric :metric/name "RoutingLocal" :metric/value 1 :metric/resolution :low)
                  (:no-owner
-                  :owner-stale) (u/log :metric/metric :metric/name "RoutingDegradation" :metric/value 1 :metric/resolution :high)
+                  :owner-stale) (u/log :metric/metric :metric/name "RoutingDegradation" :metric/value 1 :metric/resolution :low)
                  nil)
                (assoc pedestal-context
                       ::routing-decision decision
                       ::tenant-id tenant-id))
              (do
-               (u/log :metric/metric :metric/name "RoutingRemote" :metric/value 1 :metric/resolution :high)
+               (u/log :metric/metric :metric/name "RoutingRemote" :metric/value 1 :metric/resolution :low)
                (assoc pedestal-context
                       :response
                       {:status retry-status

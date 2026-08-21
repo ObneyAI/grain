@@ -29,7 +29,8 @@
 --   - UUID v7 generation internals and clock source (time component)
 --   - the pubsub transport (core.async topics) — only that appended events
 --     are published carrying the tenant id
---   - threads, connection pools, logging and metrics
+--   - backend-specific connection-pool internals (common operation metrics are
+--     part of this facade's observable contract)
 --
 -- Conformance properties ES1..ES9 correspond to the in-memory test suite
 -- (in_memory_test.clj). Where each is captured:
@@ -125,6 +126,34 @@ contract EventStream {
     @invariant NoInternalLeakage
         -- ES8: the tenant-scoping marker the store attaches internally is never
         -- present on events returned to a reader.
+}
+
+-- The backend-neutral operational record produced by the facade. Read timing
+-- covers consumption of the returned stream, not merely construction of its
+-- reducible value.
+contract EventStoreTelemetry {
+    record_append: (backend: String, outcome: String, event_count: Integer) -> Any
+    record_read: (backend: String, outcome: String, event_count: Integer) -> Any
+
+    @invariant AppendOutcomeCoverage
+        -- Every append attempt records EventAppendDuration and exactly one of
+        -- EventAppendSucceeded or EventAppendFailed. Successful attempts also
+        -- record EventAppendEventCount; conflicts additionally record
+        -- EventCasConflict.
+
+    @invariant StreamingReadCoverage
+        -- Each consumed read records EventReadDuration and EventReadEventCount
+        -- over the actual reduction. A reduction failure records
+        -- EventReadFailed without forcing the stream into memory.
+
+    @invariant ConnectionFailureIsDiagnostic
+        -- SQLState connection-class failures during start, append, or read
+        -- additionally record EventStoreConnectionFailure.
+
+    @invariant BoundedDimensions
+        -- Common event-store measurements use only the bounded backend,
+        -- operation, and outcome dimensions. Tenant and event identifiers are
+        -- never metric dimensions.
 }
 
 ------------------------------------------------------------

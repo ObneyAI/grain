@@ -2,6 +2,7 @@
   (:require [clojure.test :refer :all]
             [ai.obney.grain.query-processor.interface :as qp]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [cognitect.anomalies :as anom]
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime]))
@@ -41,6 +42,15 @@
 (defn make-registry
   [query-handlers]
   (into {} (map (fn [[k v]] [k {:handler-fn v}]) query-handlers)))
+
+(defn capture-metrics [f]
+  (let [events (atom [])]
+    (with-redefs [mulog-core/log*
+                  (fn [_ event-name pairs]
+                    (swap! events conj (assoc (apply hash-map pairs)
+                                              :mulog/event-name event-name)))]
+      (f))
+    (filterv :metric/name @events)))
 
 ;; Sample Query Handlers
 
@@ -371,3 +381,30 @@
         (is (contains? (qp/global-query-registry) :test/some-query))
         (finally
           (reset! qp/query-registry* initial-registry))))))
+
+(deftest query-success-emits-duration-and-one-outcome
+  (let [query (make-query :test/simple-query)
+        registry (make-registry {:test/simple-query successful-handler})
+        metrics (capture-metrics #(qp/process-query (make-context query registry)))
+        names (mapv :metric/name metrics)]
+    (is (= 1 (count (filter #{"QueryDuration"} names))))
+    (is (= 1 (count (filter #{"QuerySucceeded"} names))))
+    (is (not-any? #{"QueryRejected" "QueryAnomaly"} names))
+    (is (= {:service "test" :query ":test/simple-query" :outcome "succeeded"}
+           (:metric/dimensions (first (filter #(= "QuerySucceeded" (:metric/name %)) metrics)))))))
+
+(deftest unknown-query-does-not-become-a-dimension
+  (let [query (make-query :caller/unbounded-name)
+        metrics (capture-metrics #(qp/process-query (make-context query {})))
+        rejected (first (filter #(= "QueryRejected" (:metric/name %)) metrics))]
+    (is (= "not-found" (get-in rejected [:metric/dimensions :anomaly-category])))
+    (is (not (contains? (:metric/dimensions rejected) :query)))
+    (is (not (contains? (:metric/dimensions rejected) :service)))))
+
+(deftest thrown-query-handler-emits-anomaly-and-diagnostic
+  (let [query (make-query :test/throwing-handler)
+        registry (make-registry {:test/throwing-handler handler-throwing-exception})
+        names (mapv :metric/name
+                    (capture-metrics #(qp/process-query (make-context query registry))))]
+    (is (= 1 (count (filter #{"QueryAnomaly"} names))))
+    (is (= 1 (count (filter #{"QueryHandlerException"} names))))))

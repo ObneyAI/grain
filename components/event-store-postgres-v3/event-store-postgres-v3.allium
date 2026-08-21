@@ -33,7 +33,7 @@
 --     captured only as the Roundtrip guarantee, not the byte layout
 --   - UUID-v7 as the concrete ordered-id scheme; modelled as an abstract
 --     stream position whose total order is independent of append order
---   - logging, tracing and metrics
+--   - notification delivery telemetry (owned by the notifier component)
 --
 -- The conformance points below correspond to the component's test suite
 -- (integration_test.clj). Where each is captured:
@@ -249,6 +249,25 @@ contract WatermarkRegistry {
     @invariant RegistryEnumeratesAllTenants
         -- Every tenant that has ever had events committed appears in the result;
         -- enumerating watermarks crosses no tenant's stream and reads no events.
+}
+
+contract PostgresTelemetry {
+    sample_pool: () -> Any
+    record_transaction_failure: () -> Any
+
+    @invariant CommonMetricParity
+        -- Appends and consumed reads expose the backend-neutral event-store
+        -- duration, outcome, count, conflict, and connection-failure metrics
+        -- with backend = postgres.
+
+    @invariant PoolStateIsSampled
+        -- Operations sample active, idle, and pending Hikari connections.
+        -- Waiting borrowers with every existing connection active additionally
+        -- record PostgresPoolSaturated.
+
+    @invariant TransactionFailureIsAdditive
+        -- A thrown append transaction records PostgresTransactionFailed in
+        -- addition to the common append failure measurement.
 }
 
 ------------------------------------------------------------

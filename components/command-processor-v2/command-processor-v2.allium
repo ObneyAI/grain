@@ -43,7 +43,7 @@
 --     mechanics are the EventAppend contract, owned by event-store-v3
 --   - the registry's storage (a process-global atom), the handler macro, and
 --     how handlers are wired at startup
---   - schema/Malli specifics, anomaly category taxonomy, logging and metrics
+--   - schema/Malli specifics and anomaly category taxonomy
 --   - threads, retries and transport: a command arrives already in hand
 --
 -- The authorization model here is deny-by-default at the outcome level: a
@@ -204,6 +204,32 @@ contract EventAppend {
     @invariant AllOrNothing
         -- An append either stores every event in the batch or none of them;
         -- partial appends are not observable.
+}
+
+-- The operational record emitted for every command attempt. Command and
+-- service labels come only from registered command names; an unknown inbound
+-- name is deliberately omitted so caller-controlled data cannot create an
+-- unbounded metric dimension.
+contract CommandTelemetry {
+    record_duration: (command: Command, outcome: String) -> Any
+    record_outcome: (command: Command, outcome: String, anomaly_category: String) -> Any
+
+    @invariant ExactlyOneOutcome
+        -- Every processing attempt records one CommandDuration and exactly one
+        -- terminal outcome counter: CommandSucceeded, CommandRejected, or
+        -- CommandAnomaly. Expected incorrect, not-found, forbidden and conflict
+        -- outcomes are rejected; technical faults are anomalies.
+
+    @invariant BoundedCommandDimensions
+        -- Service and command dimensions are present only when the name came
+        -- from the bounded command registry. Unknown or malformed caller input
+        -- is never copied into a metric dimension.
+
+    @invariant DiagnosticsAreAdditive
+        -- A thrown handler additionally records CommandHandlerException. An
+        -- event append anomaly additionally records CommandEventAppendFailed,
+        -- and a conflicting append additionally records CommandCasConflict.
+        -- These diagnostics do not replace the one terminal outcome counter.
 }
 
 ------------------------------------------------------------
@@ -441,6 +467,7 @@ surface CommandDispatch {
         demands CommandSchema
         demands CommandHandler
         demands EventAppend
+        demands CommandTelemetry
 
     @guarantee DenyByDefault
         -- A command with no registered handler is rejected as unknown and

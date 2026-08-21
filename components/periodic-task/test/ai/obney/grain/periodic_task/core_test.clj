@@ -1,7 +1,8 @@
 (ns ai.obney.grain.periodic-task.core-test
   (:require [clojure.test :refer :all]
             [ai.obney.grain.periodic-task.core :as core]
-            [ai.obney.grain.periodic-task.interface :as pt])
+            [ai.obney.grain.periodic-task.interface :as pt]
+            [com.brunobonacci.mulog.core :as mulog-core])
   (:import [java.time Instant Duration ZoneId]))
 
 (defn- eventually
@@ -187,5 +188,40 @@
                              [trigger-name :running?])))
           (finally
             (pt/stop-periodic-triggers! triggers))))
+      (finally
+        (reset! core/periodic-trigger-registry* previous)))))
+
+(deftest successful-fire-emits-bounded-health-metrics
+  (let [previous @core/periodic-trigger-registry*
+        trigger-name :test/health-metric
+        tenant-id (random-uuid)
+        events (atom [])]
+    (try
+      (reset! core/periodic-trigger-registry* {})
+      (pt/register-periodic-trigger! trigger-name (fn [_ _] {})
+                                     {:schedule {:every 60 :duration :seconds}})
+      (with-redefs [mulog-core/log*
+                    (fn [_ event-name pairs]
+                      (swap! events conj (assoc (apply hash-map pairs)
+                                                :mulog/event-name event-name)))]
+        (let [triggers (pt/start-periodic-triggers!
+                        {:append-fn (constantly nil)
+                         :tenant-ids-fn (constantly #{tenant-id})})]
+          (try
+            (is (eventually #(some (fn [event]
+                                     (= "PeriodicSucceeded" (:metric/name event)))
+                                   @events)))
+            (let [metrics (filterv :metric/name @events)
+                  names (mapv :metric/name metrics)
+                  succeeded (first (filter #(= "PeriodicSucceeded"
+                                                (:metric/name %)) metrics))]
+              (is (= 1 (count (filter #{"PeriodicTriggered"} names))))
+              (is (= 1 (count (filter #{"PeriodicDuration"} names))))
+              (is (= 1 (count (filter #{"PeriodicTenantCount"} names))))
+              (is (= {:service "test" :periodic ":test/health-metric"
+                      :outcome "succeeded"}
+                     (:metric/dimensions succeeded))))
+            (finally
+              (pt/stop-periodic-triggers! triggers)))))
       (finally
         (reset! core/periodic-trigger-registry* previous)))))

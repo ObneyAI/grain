@@ -5,6 +5,7 @@
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
             [clojure.core.async :as async]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime ZoneOffset]
            [java.util UUID]))
@@ -66,6 +67,15 @@
 
 (defn tx-events [events]
   (filterv #(= :grain/tx (:event/type %)) events))
+
+(defn capture-metrics [f]
+  (let [events (atom [])]
+    (with-redefs [mulog-core/log*
+                  (fn [_ event-name pairs]
+                    (swap! events conj (assoc (apply hash-map pairs)
+                                              :mulog/event-name event-name)))]
+      (f))
+    (filterv :metric/name @events)))
 
 ;; ======================== ;;
 ;; A. Lifecycle (2 tests)   ;;
@@ -748,3 +758,38 @@
       (finally
         (es/stop store)
         (pubsub/stop ps)))))
+(deftest common-append-metrics-identify-backend-and-outcome
+  (let [event (es/->event {:type :test/alpha :tags #{} :body {:n 1}})
+        metrics (capture-metrics
+                 #(es/append *event-store*
+                             {:tenant-id *tenant-id* :events [event]}))
+        by-name (group-by :metric/name metrics)]
+    (is (contains? by-name "EventAppendDuration"))
+    (is (contains? by-name "EventAppendSucceeded"))
+    (is (= 1 (:metric/value (first (by-name "EventAppendEventCount")))))
+    (is (= {:backend "in-memory" :operation "append" :outcome "succeeded"}
+           (:metric/dimensions (first (by-name "EventAppendSucceeded")))))))
+
+(deftest common-read-metrics-cover-stream-consumption
+  (append-event! :test/alpha #{} {:n 1})
+  (let [metrics (capture-metrics
+                 #(into [] (es/read *event-store*
+                                    {:tenant-id *tenant-id*
+                                     :types #{:test/alpha}})))
+        by-name (group-by :metric/name metrics)]
+    (is (contains? by-name "EventReadDuration"))
+    (is (= 1 (:metric/value (first (by-name "EventReadEventCount")))))
+    (is (= {:backend "in-memory" :operation "read" :outcome "succeeded"}
+           (:metric/dimensions (first (by-name "EventReadDuration")))))))
+
+(deftest common-cas-conflict-metric-is-emitted
+  (let [event (es/->event {:type :test/alpha :tags #{} :body {:n 1}})
+        metrics (capture-metrics
+                 #(es/append *event-store*
+                             {:tenant-id *tenant-id*
+                              :events [event]
+                              :cas {:types #{:test/alpha}
+                                    :predicate-fn (constantly false)}}))
+        names (set (map :metric/name metrics))]
+    (is (contains? names "EventAppendFailed"))
+    (is (contains? names "EventCasConflict"))))

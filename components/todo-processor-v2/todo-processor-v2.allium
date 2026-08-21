@@ -54,7 +54,7 @@
 --     interchangeable mechanisms behind the same processing guarantees
 --   - threads, thread pools, poll intervals, batch sizes as tuning knobs,
 --     in-flight dispatch bookkeeping
---   - serialization, wire formats, storage backends, logging and metrics
+--   - serialization, wire formats, storage backends and logging details
 --   - the defprocessor macro (a registration convenience over the registry)
 --
 -- Conformance notes correspond to the todo-processor-v2 test suite. Where each
@@ -289,6 +289,29 @@ contract Delivery {
         -- commits; the rest are rejected with a conflict that is passed through
         -- unchanged. So the events a triggering event yields are recorded at most
         -- once even across nodes.
+}
+
+contract TodoTelemetry {
+    record_duration: (processor: Processor, outcome: String) -> Any
+    record_outcome: (processor: Processor, outcome: String, failure_class: String) -> Any
+
+    @invariant AttemptOutcome
+        -- Every attempted event records TodoDuration and exactly one of
+        -- TodoSucceeded or TodoFailed. A thrown handler also records
+        -- TodoHandlerException.
+
+    @invariant ReplayRetryObserved
+        -- When retry_on_error deliberately leaves a failed event uncheckpointed,
+        -- TodoRetry is recorded. No exhaustion metric is emitted because this
+        -- component currently has no bounded retry policy.
+
+    @invariant OperationalFailuresObserved
+        -- Failed checkpoint appends, lease-fenced skips and polling failures are
+        -- recorded independently of the terminal event outcome.
+
+    @invariant BoundedProcessorDimensions
+        -- Service and processor labels come only from the registered processor
+        -- vocabulary; tenant and event identifiers are never metric dimensions.
 }
 
 ------------------------------------------------------------
@@ -696,6 +719,7 @@ surface DomainProcessing {
         demands HandlerFunction
         fulfils Checkpointing
         fulfils Delivery
+        demands TodoTelemetry
 
     @guarantee TenantIsolation
         -- A handler's output is appended to the same tenant the triggering event

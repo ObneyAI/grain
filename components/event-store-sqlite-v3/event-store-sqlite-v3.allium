@@ -212,6 +212,20 @@ contract EventStorePubsub {
         -- the stream but never fanned out to subscribers.
 }
 
+contract CommonEventStoreTelemetry {
+    record_append: (outcome: String, event_count: Integer) -> Any
+    record_read: (outcome: String, event_count: Integer) -> Any
+
+    @invariant BackendParity
+        -- Alongside SQLite contention diagnostics, appends and consumed reads
+        -- expose the common duration, outcome, count, conflict, and connection
+        -- failure metrics with backend = sqlite.
+
+    @invariant SafeDimensions
+        -- These common measurements use only backend, operation, and outcome;
+        -- tenant and event identifiers remain outside metric dimensions.
+}
+
 ------------------------------------------------------------
 -- Entities and Variants
 ------------------------------------------------------------

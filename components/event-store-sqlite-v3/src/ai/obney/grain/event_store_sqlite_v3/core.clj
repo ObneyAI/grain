@@ -491,12 +491,12 @@
                   (let [queue-wait-ns (- (System/nanoTime) queued-at)]
                     (u/log :metric/metric
                            :metric/name "SQLiteWriteQueueWait"
-                           :metric/value queue-wait-ns
+                           :mulog/duration queue-wait-ns
                            :metric/resolution :high)
                     (u/log :metric/metric
                            :metric/name "SQLiteWriteQueueDepth"
                            :metric/value (.size (.getQueue coordinator))
-                           :metric/resolution :high)
+                           :metric/resolution :low)
                     (u/trace ::append
                       [:metric/name "SQLiteAppend"
                        :metric/resolution :high
@@ -507,7 +507,7 @@
       (u/log :metric/metric
              :metric/name "SQLiteWriteQueueDepth"
              :metric/value (.size (.getQueue coordinator))
-             :metric/resolution :high)
+             :metric/resolution :low)
       (try
         (.get task)
         (catch ExecutionException e

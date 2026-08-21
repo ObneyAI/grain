@@ -5,6 +5,7 @@
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [ai.obney.grain.command-processor-v2.interface :as cp]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [cognitect.anomalies :as anom]
             [cognitect.transit :as transit]
             [io.pedestal.http :as http]
@@ -466,6 +467,23 @@
           body (transit-read (:body response))]
       (is (= 403 (:status response)))
       (is (= "Unauthorized" (:message body))))))
+
+(deftest authorization-denial-emits-bounded-command-metric
+  (let [events (atom [])
+        command {:command/name :test/auth-false}
+        response (with-redefs [mulog-core/log*
+                               (fn [_ event-name pairs]
+                                 (swap! events conj (assoc (apply hash-map pairs)
+                                                           :mulog/event-name event-name)))]
+                   (response-for *service* :post "/command"
+                                 :headers {"Content-Type" "application/transit+json"}
+                                 :body (transit-write {:command command})))
+        metric (first (filter #(= "CommandRejected" (:metric/name %)) @events))]
+    (is (= 403 (:status response)))
+    (is (= 1 (:metric/value metric)))
+    (is (= {:service "test" :command ":test/auth-false"
+            :outcome "rejected" :anomaly-category "forbidden"}
+           (:metric/dimensions metric)))))
 
 (deftest test-e2e-authorized-when-predicate-returns-true
   (testing "Command with :authorized? returning true proceeds"
