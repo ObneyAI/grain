@@ -91,6 +91,11 @@ value EventId {
     value: String
 }
 
+-- Optional inert Malli data describing the shape of the accumulated projection.
+-- Registration validates that it parses; projection execution does not validate
+-- each intermediate or returned state against it.
+value StateSchema {}
+
 -- A description of which of a tenant's events a read model folds: the subscribed
 -- event types, plus an optional scope that narrows the set further (a tag filter
 -- or an explicit set of sub-queries). Two reads whose effective query differs
@@ -282,6 +287,7 @@ entity ReadModel {
     event_types: Set<String>
     -- Bump to invalidate previously cached state.
     version: Integer
+    state_schema: StateSchema?
     -- Present only for partitioned read models: when true the read model shards
     -- its state by a partition key derived from entity state. When false a single
     -- monolithic-or-segmented projection is kept.

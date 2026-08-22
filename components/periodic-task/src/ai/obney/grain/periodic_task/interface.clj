@@ -20,6 +20,18 @@
   [trigger-name handler-fn opts]
   (core/register-periodic-trigger! trigger-name handler-fn opts))
 
+(defn ^:no-doc register-declared! [trigger-name handler-fn opts definition]
+  (swap! periodic-trigger-registry*
+         (fn [registry]
+           (when-let [existing (get registry trigger-name)]
+             (when (and definition (:definition/value existing)
+                        (not= (:definition/value definition) (:definition/value existing)))
+               (throw (ex-info "Conflicting periodic task definition"
+                               {:periodic/name trigger-name :existing existing
+                                :candidate definition}))))
+           (assoc registry trigger-name
+                  (merge {:handler-fn handler-fn} opts definition)))))
+
 (defn start-periodic-triggers!
   [event-store-fns]
   (core/start-periodic-triggers! event-store-fns))
@@ -52,11 +64,19 @@
                                 [(first args) (second args) (drop 2 args)]
                                 [nil (first args) (rest args)])
         trigger-name (keyword (name ns-kw) (name fn-name))
-        var-name (symbol (str (name ns-kw) "-" (name fn-name)))]
+        var-name (symbol (str (name ns-kw) "-" (name fn-name)))
+        definition (when docstring
+                     {:definition/description docstring
+                      :definition/source {:ns (str *ns*) :file *file*
+                                          :line (:line (meta &form))}
+                      :definition/value
+                      {:description docstring
+                       :options (select-keys opts #{:schedule
+                                                    :grain.event-model/produces})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
          ~args
          ~@body)
-       (register-periodic-trigger! ~trigger-name (var ~var-name) ~opts)
+       (register-declared! ~trigger-name (var ~var-name) ~opts ~definition)
        (var ~var-name))))

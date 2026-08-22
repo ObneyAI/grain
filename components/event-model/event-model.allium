@@ -125,6 +125,21 @@ contract KindNaming {
         -- the same area share a name.
 }
 
+-- Common definition-quality behavior for Grain's handler/reducer macros.
+contract DefinitionRegistration {
+    @invariant DocstringOptsIn
+        -- A defcommand, defquery, defreadmodel, defprocessor or defperiodic
+        -- declaration with a docstring records that description, its source
+        -- location and the macro kind's inert declarative options. Existing
+        -- declarations without docstrings retain legacy registration behavior.
+
+    @invariant ReloadsCompareOnlyDeclarations
+        -- Re-registering an equal declarative value is accepted and refreshes
+        -- the executable handler. A different declarative value for the same
+        -- qualified name is rejected. Handler identity and function-valued
+        -- runtime options are excluded from value comparison.
+}
+
 -- The connection grammar. A flow strings building blocks together, and only
 -- certain kind-to-kind connections are meaningful in an event-sourced CQRS
 -- system. This contract states the legal adjacency; FlowStep.is_legal makes the
@@ -173,8 +188,10 @@ contract ConnectionGrammar {
 -- and query — each carry a payload schema (a command's and a query's params, an
 -- event's body), registered live under the block's own :<area>/<name> key. The
 -- model keeps that schema opaque but validates that it is a well-formed malli
--- schema and matches the live registered schema. read-models, todo-processors,
--- periodic-tasks and screens carry no required payload schema.
+-- schema and matches the live registered schema. A read model may separately
+-- carry an optional projected-state schema in its own registry entry; it never
+-- occupies the shared command/query schema key. Todo processors, periodic tasks
+-- and screens carry no schema.
 contract PayloadSchema {
     carries_schema: (block: Block) -> Boolean
     schema_well_formed: (block: Block) -> Boolean
@@ -193,6 +210,8 @@ contract PayloadSchema {
     @invariant CarriedSchemaMatchesRuntime
         -- A command's, event's or query's schema must equal the schema
         -- registered for that :<area>/<name> in the live malli registry.
+        -- When a read model declares a projected-state schema, it must equal the
+        -- optional schema stored with its live defreadmodel registration.
 }
 
 contract BehavioralTrace {
@@ -257,8 +276,9 @@ variant Command : Block {
 variant Event : Block {}
 
 -- A read-side projection: queryable state derived from events. Declares the
--- events it consumes (confirmed against the live runtime). Carries no own schema
--- by convention (its key collides with the same-named query's schema slot).
+-- events it consumes (confirmed against the live runtime). It may carry an
+-- optional projected-state schema stored on its own definition rather than in
+-- the shared schema registry, where its name may collide with a query.
 variant ReadModel : Block {
     consumes: Event with read_model_consumer = this
     version: Integer?
@@ -387,6 +407,7 @@ surface EventModelAuthoring {
 
     contracts:
         fulfils KindNaming
+        fulfils DefinitionRegistration
         fulfils ConnectionGrammar
         fulfils PayloadSchema
         fulfils BehavioralTrace

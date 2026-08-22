@@ -345,17 +345,32 @@
 
 (defn- check-schema-match [model opts]
   (let [reg (schema-registry)
+        read-models (rmp/global-read-model-registry)
         sev (if (= :lenient (:schema-match opts)) :warning :error)]
-    (for [[area area-map] model
-          [field kind] [[:commands :command] [:events :event] [:queries :query]]
-          [block-key block] (get area-map field)
-          :let [spec-schema (:schema block)]
-          :when (and spec-schema (contains? reg block-key))
-          :let [sf (schema-form spec-schema) lf (schema-form (get reg block-key))]
-          :when (and (not= sf ::unparseable) (not= lf ::unparseable) (not= sf lf))]
-      (finding :schema/mismatch sev
-               {:area area :kind kind :block block-key :spec/schema sf :live/schema lf
-                :message (str "Spec schema for " block-key " differs from the live registered schema.")}))))
+    (concat
+     (for [[area area-map] model
+           [field kind] [[:commands :command] [:events :event] [:queries :query]]
+           [block-key block] (get area-map field)
+           :let [spec-schema (:schema block)]
+           :when (and spec-schema (contains? reg block-key))
+           :let [sf (schema-form spec-schema) lf (schema-form (get reg block-key))]
+           :when (and (not= sf ::unparseable) (not= lf ::unparseable) (not= sf lf))]
+       (finding :schema/mismatch sev
+                {:area area :kind kind :block block-key :spec/schema sf :live/schema lf
+                 :message (str "Spec schema for " block-key " differs from the live registered schema.")}))
+     (for [[area area-map] model
+           [block-key block] (:read-models area-map)
+           :when (contains? read-models block-key)
+           :let [spec-schema (:schema block)
+                 live-schema (get-in read-models [block-key :schema])
+                 sf (when spec-schema (schema-form spec-schema))
+                 lf (when live-schema (schema-form live-schema))]
+           :when (and (not= sf ::unparseable) (not= lf ::unparseable) (not= sf lf))]
+       (finding :schema/mismatch sev
+                {:area area :kind :read-model :block block-key
+                 :spec/schema sf :live/schema lf
+                 :message (str "Spec state schema for " block-key
+                               " differs from the live read-model registration.")})))))
 
 (defn- check-wiring [model live]
   (concat

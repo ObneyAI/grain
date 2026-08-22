@@ -4,6 +4,18 @@
 ;; Global query registry atom
 (def query-registry* (atom {}))
 
+(defn ^:no-doc register-declared! [query-name handler-fn opts definition]
+  (swap! query-registry*
+         (fn [registry]
+           (when-let [existing (get registry query-name)]
+             (when (and definition (:definition/value existing)
+                        (not= (:definition/value definition) (:definition/value existing)))
+               (throw (ex-info "Conflicting query definition"
+                               {:query/name query-name :existing existing
+                                :candidate definition}))))
+           (assoc registry query-name
+                  (merge {:handler-fn handler-fn} opts definition)))))
+
 (defn register-query!
   "Registers a query handler in the global registry.
    query-name should be a qualified keyword (e.g., :example/counters)
@@ -60,13 +72,20 @@
                                 [(first args) (second args) (drop 2 args)]
                                 [nil (first args) (rest args)])
         query-name (keyword (name ns-kw) (name fn-name))
-        var-name (symbol (str (name ns-kw) "-" (name fn-name)))]
+        var-name (symbol (str (name ns-kw) "-" (name fn-name)))
+        definition (when docstring
+                     {:definition/description docstring
+                      :definition/source {:ns (str *ns*) :file *file*
+                                          :line (:line (meta &form))}
+                      :definition/value
+                      {:description docstring
+                       :options (select-keys opts #{:grain.event-model/reads})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
          ~args
          ~@body)
-       (register-query! ~query-name (var ~var-name) ~opts)
+       (register-declared! ~query-name (var ~var-name) ~opts ~definition)
        (var ~var-name))))
 
 (defn process-query

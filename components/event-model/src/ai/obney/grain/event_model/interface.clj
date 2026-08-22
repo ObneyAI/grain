@@ -103,7 +103,7 @@
    [:map
     [:description :string]
    [:consumes [:set :event-model/block-name]]                          ; events consumed
-    [:schema {:optional true} :event-model/malli-schema]                ; optional, design-time only
+    [:schema {:optional true} :event-model/malli-schema]                ; optional projected-state schema; reconciled with defreadmodel
     [:version {:optional true} :int]
     [:grain/allium {:optional true} :event-model/allium-references]]
 

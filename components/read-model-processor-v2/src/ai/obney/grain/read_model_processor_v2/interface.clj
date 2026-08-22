@@ -103,7 +103,8 @@
    Context fields `:read-model/name` and `:read-model/cache-tier` are attached
    to every metric event for observability."
   (:require [ai.obney.grain.read-model-processor-v2.core :as core]
-            [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]))
+            [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]
+            [malli.core :as m]))
 
 (defn p
   "Low-level projection function. Reads events from the store, reduces them
@@ -144,7 +145,33 @@
   "Register a read model reducer and its opts under `rm-name` (qualified keyword).
    Called automatically by `defreadmodel`; use directly for programmatic registration."
   [rm-name reducer-fn opts]
+  (when-let [schema (:schema opts)]
+    (try
+      (m/schema schema)
+      (catch Exception cause
+        (throw (ex-info "Read model state schema is malformed"
+                        {:read-model/name rm-name :schema schema}
+                        cause)))))
   (swap! read-model-registry* assoc rm-name (merge {:reducer-fn reducer-fn} opts)))
+
+(defn ^:no-doc register-declared! [rm-name reducer-fn opts definition]
+  (when-let [schema (:schema opts)]
+    (try
+      (m/schema schema)
+      (catch Exception cause
+        (throw (ex-info "Read model state schema is malformed"
+                        {:read-model/name rm-name :schema schema}
+                        cause)))))
+  (swap! read-model-registry*
+         (fn [registry]
+           (when-let [existing (get registry rm-name)]
+             (when (and definition (:definition/value existing)
+                        (not= (:definition/value definition) (:definition/value existing)))
+               (throw (ex-info "Conflicting read model definition"
+                               {:read-model/name rm-name :existing existing
+                                :candidate definition}))))
+           (assoc registry rm-name
+                  (merge {:reducer-fn reducer-fn} opts definition)))))
 
 (defn global-read-model-registry
   "Returns the current snapshot of all registered read models."
@@ -159,6 +186,7 @@
        (defreadmodel :ns-kw name
          {:events  #{:ns/event-a :ns/event-b}  ; event types to subscribe to
           :version 1                            ; bump to invalidate cache
+          :schema [:map [:count :int]]          ; optional projected-state schema
           ;; Optional — for partitioned read models:
           :partition-fn  (fn [entity] ...)      ; entity -> partition key
           :entity-id-fn  (fn [event] ...)       ; event -> entity id
@@ -180,13 +208,21 @@
                                 [(first args) (second args) (drop 2 args)]
                                 [nil (first args) (rest args)])
         rm-name (keyword (name ns-kw) (name fn-name))
-        var-name (symbol (str (name ns-kw) "-" (name fn-name)))]
+        var-name (symbol (str (name ns-kw) "-" (name fn-name)))
+        definition (when docstring
+                     {:definition/description docstring
+                      :definition/source {:ns (str *ns*) :file *file*
+                                          :line (:line (meta &form))}
+                      :definition/value
+                      {:description docstring
+                       :options (select-keys opts #{:events :version :schema
+                                                    :l1-ttl-ms})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
          ~args
          ~@body)
-       (register-read-model! ~rm-name (var ~var-name) ~opts)
+       (register-declared! ~rm-name (var ~var-name) ~opts ~definition)
        (var ~var-name))))
 
 (defn project

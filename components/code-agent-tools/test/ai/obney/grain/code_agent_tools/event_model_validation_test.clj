@@ -5,9 +5,14 @@
    def* macros populate the global registries at load time — so the validator
    runs against the LIVE :example area with no `install!`."
   (:require [ai.obney.grain.code-agent-tools.interface :as tools]
+            [ai.obney.grain.command-processor-v2.interface :as cp]
             [ai.obney.grain.event-model.interface :as em]
             [ai.obney.grain.event-model-validator.interface :as emv]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.periodic-task.interface :as pt]
+            [ai.obney.grain.query-processor.interface :as qp]
+            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.example-base.core]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
@@ -49,6 +54,11 @@
                         :consumes #{:example/counter-created
                                     :example/counter-incremented
                                     :example/counter-decremented}
+                        :schema [:map-of :uuid
+                                 [:map
+                                  [:counter/id :uuid]
+                                  [:counter/name :string]
+                                  [:counter/value {:optional true} :int]]]
                         :version 1}}
     :queries
     {:example/counters {:description "all" :schema [:map] :reads #{:example/counters}}
@@ -73,6 +83,29 @@
 
 (defn- types [v] (set (map :type (:findings v))))
 (defn- errors [v] (filter #(= :error (:severity %)) (:findings v)))
+
+(deftest definition-quality-registration-is-consistent-across-macros
+  (let [name :definition-test/aligned
+        definition {:definition/description "Aligned definition"
+                    :definition/source {:ns "test" :file "test.clj" :line 1}
+                    :definition/value {:description "Aligned definition"
+                                       :options {}}}
+        conflict (assoc-in definition [:definition/value :description] "Different")
+        cases [[cp/register-declared! cp/command-registry*]
+               [qp/register-declared! qp/query-registry*]
+               [rmp/register-declared! rmp/read-model-registry*]
+               [tp/register-declared! tp/processor-registry*]
+               [pt/register-declared! pt/periodic-trigger-registry*]]]
+    (doseq [[register! registry*] cases]
+      (try
+        (register! name identity {} definition)
+        (register! name identity {} definition)
+        (is (= "Aligned definition"
+               (get-in @registry* [name :definition/description])))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (register! name identity {} conflict)))
+        (finally
+          (swap! registry* dissoc name))))))
 
 (def retention-model
   {:retention-validator
@@ -193,6 +226,11 @@
     (is (contains? (types (tools/validate-event-model
                            (assoc-in sample [:example :commands :example/create-counter :schema]
                                      [:map [:name :int]])))
+                   :schema/mismatch)))
+  (testing "read-model state schema differs from its live registration -> :schema/mismatch"
+    (is (contains? (types (tools/validate-event-model
+                           (assoc-in sample [:example :read-models :example/counters :schema]
+                                     [:map [:wrong :string]])))
                    :schema/mismatch)))
   (testing "illegal CQRS flow connection -> :flow/illegal-connection"
     (is (contains? (types (tools/validate-event-model
