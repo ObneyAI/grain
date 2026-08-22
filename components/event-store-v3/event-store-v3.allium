@@ -47,9 +47,9 @@
 -- Value Types
 ------------------------------------------------------------
 
--- A time-ordered event identifier (UUID v7). Identity is global and monotonic:
--- a later-appended event always has a greater id than an earlier one, so the id
--- doubles as the total order over a tenant's stream.
+-- A time-ordered event identifier (UUID v7), minted by the store only after it
+-- has entered the tenant's serialization boundary. A later-appended event has
+-- a greater id than an earlier one, so the id doubles as stream position.
 value EventId {
     -- The embedded creation time that gives the id its ordering. Two ids
     -- compare in the same direction as the times they were minted at.
@@ -101,11 +101,11 @@ contract EventStream {
         -- name the same tenant.
 
     @invariant AscendingByEventId
-        -- ES4/ES5: results are ordered by event id ascending (oldest first),
-        -- which is also chronological order. A reversed read yields the same
-        -- set in descending id order; a limited read caps the count, taking
-        -- from whichever end the order selects (oldest by default, newest when
-        -- reversed).
+        -- ES4/ES5: results are ordered by event id ascending, independently of
+        -- storage insertion or append order. A reversed read yields the same
+        -- set in descending id order. Ordering happens before limiting, so a
+        -- limited read takes from the selected end (lowest ids by default,
+        -- highest ids when reversed).
 
     @invariant SubsetTagAndTypeMatch
         -- ES5: an event matches a query's tags only if it carries all of them
@@ -176,7 +176,10 @@ entity Event {
     -- The domain meaning of the event (a qualified name such as
     -- :order/placed). Always present; the store does not enumerate the set.
     event_type: String
-    -- When the event was minted.
+    -- The store-controlled recorded-at time of the atomic append. Every domain
+    -- event and transaction marker in one batch shares this timestamp. It is
+    -- canonical UTC at microsecond precision so append results equal rereads
+    -- across backends, including PostgreSQL timestamptz.
     timestamp: Timestamp
     -- The entities this event concerns; reads filter on these.
     tags: Set<EventTag>
@@ -241,13 +244,15 @@ rule AppendBatch {
         -- event shape), or the whole batch is rejected before anything commits.
         -- An unrecognised type or a malformed event fails the batch as a whole.
         events.all(e => has_registered_schema(e.event_type) and conforms_to_schema(e))
+        events.all(e => e.id = null and e.timestamp = null)
 
     ensures:
+        let append_time = now -- canonical UTC, truncated to microseconds
         let marker = Event.created(
             tenant: tenant,
             kind: transaction_marker,
             event_type: tx_marker_type(),
-            timestamp: now,
+            timestamp: append_time,
             tags: {},
             batch_event_ids: event_ids(events),
             metadata: metadata
@@ -257,7 +262,7 @@ rule AppendBatch {
                 tenant: tenant,
                 kind: domain,
                 event_type: e.event_type,
-                timestamp: e.timestamp,
+                timestamp: append_time,
                 tags: e.tags
             )
         -- The durable high-watermark advances to the marker that closed this
@@ -278,7 +283,8 @@ rule AppendBatch {
 -- A conditional (compare-and-swap) append. The caller supplies a predicate and
 -- a filter; the store reads the current events matching that filter for the
 -- tenant, and commits the new events only if the predicate accepts them.
--- Unlike a plain append, a CAS commit records no transaction marker.
+-- A successful CAS append uses the same marker and persistence-envelope rules
+-- as an unconditional append; a rejected CAS mints no ids or timestamps.
 rule CasAppendCommits {
     when: CasAppend(tenant, events, filter, predicate)
     let current = matching_events(tenant, filter)
@@ -286,18 +292,27 @@ rule CasAppendCommits {
         -- Same deny-by-default gate as a plain append: malformed or
         -- unrecognised events fail before the predicate is even consulted.
         events.all(e => has_registered_schema(e.event_type) and conforms_to_schema(e))
+        events.all(e => e.id = null and e.timestamp = null)
         accepts(predicate, current)
     ensures:
+        let append_time = now -- canonical UTC, truncated to microseconds
+        let marker = Event.created(
+            tenant: tenant,
+            kind: transaction_marker,
+            event_type: tx_marker_type(),
+            timestamp: append_time,
+            tags: {},
+            batch_event_ids: event_ids(events)
+        )
         for e in events:
             Event.created(
                 tenant: tenant,
                 kind: domain,
                 event_type: e.event_type,
-                timestamp: e.timestamp,
+                timestamp: append_time,
                 tags: e.tags
             )
-        let last_appended = ordered_last(events)
-        tenant.last_event_id = last_appended.id
+        tenant.last_event_id = marker.id
         if config.publish_on_append:
             for e in events:
                 EventCommitted(tenant: tenant, event: e)
@@ -394,8 +409,9 @@ surface EventAppend {
         -- condition cannot be invalidated between the check and the commit.
 
     @guarantee DenyByDefault
-        -- Events whose type has no registered schema, and malformed arguments,
-        -- are rejected before anything is committed.
+        -- Events whose type has no registered schema, malformed arguments, and
+        -- caller-supplied ids or timestamps are rejected before anything is
+        -- committed.
 }
 
 -- The read boundary: how a caller streams a tenant's events back.
@@ -419,8 +435,9 @@ surface EventRead {
         -- including across the queries of a batch read.
 
     @guarantee OrderedByEventId
-        -- ES4: events stream in event-id order — chronological, oldest first,
-        -- or newest first when the read is reversed.
+        -- ES4: events stream in event-id order, regardless of append position:
+        -- ascending by default or descending when the read is reversed. A
+        -- limit is applied only after that ordering is established.
 }
 
 -- The administrative boundary: an operator-side caller enumerating every tenant

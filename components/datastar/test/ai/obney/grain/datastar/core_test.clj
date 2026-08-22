@@ -34,6 +34,7 @@
    :test/tagged-counters [:map]
    :test/filterable-counters [:map [:filter {:optional true} :string]]
    :test/typed-query [:map
+                      [:entity-id :uuid]
                       [:page :int]
                       [:include-archived? :boolean]
                       [:tab [:enum :active :archived]]]
@@ -499,12 +500,16 @@
     (is (some? (:query/timestamp decoded))))
 
   (testing "decodes common Datastar string values to canonical query types"
-    (let [raw {:query/name :test/typed-query
+    (let [id (random-uuid)
+          raw {:query/name :test/typed-query
+               :entity-id (str id)
                :page "3"
                :include-archived? "false"
                :tab "archived"}
           decoded (#'ds/decode-json-query raw)]
       (is (= :test/typed-query (:query/name decoded)))
+      (is (uuid? (:entity-id decoded)))
+      (is (= id (:entity-id decoded)))
       (is (= 3 (:page decoded)))
       (is (= false (:include-archived? decoded)))
       (is (= :archived (:tab decoded))))))

@@ -213,7 +213,7 @@
                  :else            {:types (:events entry)})]
      (p context (cond-> {:f       (:reducer-fn entry)
                          :query   query
-                         :name    (name rm-name)
+                         :name    rm-name
                          :version (:version entry 1)
                          :scope   scope}
                   (:partition-fn entry)  (assoc :partition-fn (:partition-fn entry))

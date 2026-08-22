@@ -75,7 +75,7 @@ value Event {}
 
 -- A fixed-interval schedule: fire every `count` units of the given granularity
 -- (e.g. every 30 seconds, every 5 minutes, every 2 hours). The first fire is
--- one interval after the schedule starts; subsequent fires are evenly spaced.
+-- immediate when the schedule starts; subsequent fires are evenly spaced.
 value Interval {
     count: Integer
     granularity: IntervalGranularity
@@ -203,9 +203,9 @@ entity PeriodicTrigger {
     interval: Interval?
     cron: Cron?
 
-    -- The schedule's next fire instant. Reaching it is what fires the trigger;
-    -- after a fire it advances to the schedule's following instant. Absent until
-    -- the trigger is started.
+    -- The node-local schedule's currently armed fire instant. Reaching it fires
+    -- the trigger. It is absent before start, while a fire is executing, and
+    -- after stop; once execution completes, the following instant is armed.
     next_fire_at: Timestamp?
 
     -- The fires this trigger has produced.
@@ -272,7 +272,9 @@ rule TenantEntersFanOut {
 
 -- A trigger is registered with a schedule and a handler before it can run. It
 -- starts not yet running; starting it (see the lifecycle surface) is what begins
--- the schedule.
+-- the schedule. The runtime starts a snapshot of the triggers registered at
+-- startup; registrations added afterward remain unstarted until another runtime
+-- startup.
 rule TriggerRegistered {
     when: RegisterTrigger(name, schedule)
     ensures: PeriodicTrigger.created(
@@ -300,7 +302,7 @@ rule TriggerStarted {
     requires: not trigger.running
     ensures:
         trigger.running = true
-        trigger.next_fire_at = Schedule.next_instant(trigger, now)
+        trigger.next_fire_at = Schedule.fire_times(trigger, now).first
 }
 
 -- Stopping a running trigger halts its schedule: it produces no further fires
@@ -325,10 +327,9 @@ rule TriggerFires {
     let domain_tenants = EventAppend.domain_tenants()
 
     ensures:
-        -- Advance to the schedule's following instant so this fire instant is
-        -- not re-triggered; the strictly-increasing schedule guarantees forward
-        -- progress.
-        trigger.next_fire_at = Schedule.next_instant(trigger, now)
+        -- No future instant is armed while this fire is executing. The following
+        -- instant is armed once handler execution completes.
+        trigger.next_fire_at = null
         let fire = ScheduledFire.created(trigger: trigger, fire_time: now)
         for tenant in domain_tenants:
             let result = TriggerHandler.handle(tenant, now)
@@ -340,6 +341,7 @@ rule TriggerFires {
                     cas: result.cas
                 )
                 EventAppend.append(tenant: tenant, events: recorded.events, cas: recorded.cas)
+        trigger.next_fire_at = Schedule.next_instant(trigger, now)
 
     @guidance
         -- The schedule guarantees a strictly-increasing fire sequence
@@ -409,6 +411,7 @@ surface TriggerLifecycle {
     exposes:
         trigger.name
         trigger.running
+        trigger.next_fire_at
 
     provides:
         StartTrigger(runtime, trigger) when not trigger.running

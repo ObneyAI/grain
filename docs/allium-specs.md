@@ -47,9 +47,9 @@ Captures the single reusable behaviour-tree leaf node (`dspy`) that bridges a tr
 
 ### [`code-agent-tools`](../components/code-agent-tools/code-agent-tools.allium)
 
-A developer-tooling boundary: a code agent installs a live Grain runtime once, then drives it over a REPL via read-only tools (catalog, schemas, validate, events, projections, diagnostics) and write tools (invoke command/query). The spec captures how the toolkit gates (dev-only install, requires installation), scopes (tenant deny-by-default), sanitizes (no raw runtime objects leak) and forwards to the demanded host runtime contracts — not the command/query/event-store/control-plane behaviour itself.
+A developer-tooling boundary: a code agent installs a live Grain runtime once, then drives it over a REPL via read-only tools (catalog, schemas, validate, events, projections, diagnostics) and write tools (invoke command/query). The spec captures how the toolkit gates, scopes, sanitizes and forwards calls, plus its dev/CI composition gate for resolving Event Model links to checked Allium declarations.
 
-<sub>entities 1 · rules 7 · contracts 3 · invariants 2 · surfaces 3</sub>
+<sub>entities 1 · rules 7 · contracts 4 · invariants 2 · surfaces 3 · actors 1</sub>
 
 ### [`command-processor`](../components/command-processor/command-processor.allium)
 
@@ -83,9 +83,9 @@ The datastar component is the server-driven reactive-UI boundary for grain's CQR
 
 ### [`event-model`](../components/event-model/event-model.allium)
 
-The spec captures event-model as the design-time vocabulary and well-formedness grammar for describing a grain CQRS application: six classified building-block kinds (command, event, view, todo-processor, screen, periodic-task), names unique per kind, the canonical connection grammar wiring blocks into flows, payload-schema obligations on data-carrying kinds, and Given/When/Then acceptance examples on commands. It models behavioural guarantees as contracts, variants and invariants rather than runtime mechanics.
+The spec captures event-model as the topology vocabulary and well-formedness grammar for describing a Grain CQRS application **service-area-first**: a model is a map of service areas, each owning seven classified building-block kinds keyed `:<area>/<name>`, the canonical connection grammar wiring blocks into flows, kind-typed dependency edges, payload-schema obligations matched against the live registry, and explicit links from commands/screens to behavioural rules/surfaces in companion Allium specs. Runtime validation reconciles topology against a live Grain catalog; dev/CI composition validation resolves the Allium links (see [docs/event-model.md](event-model.md)).
 
-<sub>entities 4 · rules 0 · contracts 3 · invariants 5 · surfaces 2</sub>
+<sub>entities 4 · variants 7 · contracts 4 · invariants 3 · surfaces 2 · actors 2</sub>
 
 ### [`event-notifier-postgres`](../components/event-notifier-postgres/event-notifier-postgres.allium)
 
@@ -107,7 +107,7 @@ A library spec for grain's durable, Postgres-backed, tenant-scoped append-only e
 
 ### [`event-store-sqlite-v3`](../components/event-store-sqlite-v3/event-store-sqlite-v3.allium)
 
-A library/framework spec for the durable single-file SQLite backend behind grain's event-store-v3 boundary: a per-tenant, append-only, time-ordered event log with atomic batch commits, a synthesized transaction marker per append, compare-and-swap (fenced) conditional appends, filtered/reversed/limited and batch reads, a durable per-tenant watermark, and faithful body/tag/timestamp round-trip. The behavioural guarantees (time-ordering, atomicity, writer serialization, durability, indexed newest-event lookup, tenant isolation, codec round-trip, pubsub tenant-scoping) are modelled as module-level contracts with @invariant guarantees, plus entities, expression-bearing invariants and code-facing surfaces.
+A library/framework spec for the durable single-file SQLite backend behind grain's event-store-v3 boundary: a per-tenant, append-only, time-ordered event log with atomic batch commits, a synthesized transaction marker per append, compare-and-swap (fenced) conditional appends, filtered/reversed/limited and batch reads, a durable per-tenant watermark, and faithful body/tag/timestamp round-trip. The behavioural guarantees (time-ordering, atomicity, writer serialization, durability, indexed newest-event lookup, tag-scoped reads costing the tag's own stream rather than the store, tenant isolation, codec round-trip, pubsub tenant-scoping) are modelled as module-level contracts with @invariant guarantees, plus entities, expression-bearing invariants and code-facing surfaces.
 
 <sub>entities 3 · rules 5 · contracts 3 · invariants 7 · surfaces 3</sub>
 
@@ -246,4 +246,3 @@ The time component is the system clock: a single source of the current instant p
 A thin HTTP-server lifecycle wrapper: a host starts a single server over a caller-supplied route set on a configured port (port 0 binds an OS-chosen ephemeral port readable back from the instance) and later stops it. All request semantics — routing, authorization, tenant scoping, command/query dispatch — belong to the route-providing components, not here.
 
 <sub>entities 0 · rules 0 · contracts 1 · invariants 4 · surfaces 1</sub>
-

@@ -32,7 +32,7 @@
 --   - the body serialization format (Fressian) and the tag/type wire encoding;
 --     captured only as the Roundtrip guarantee, not the byte layout
 --   - UUID-v7 as the concrete ordered-id scheme; modelled as an abstract
---     stream position that is monotonic in append order
+--     stream position whose total order is independent of append order
 --   - logging, tracing and metrics
 --
 -- The conformance points below correspond to the component's test suite
@@ -71,13 +71,13 @@ external entity Tenant {
 -- Value Types
 ------------------------------------------------------------
 
--- A position within a tenant's stream. Positions are totally ordered and
--- strictly increasing in append order, so "later in the stream" is "greater
+-- A position within a tenant's stream. Positions are totally ordered by event
+-- identity independently of append order, so "later in a read" is "greater
 -- position". Used as event identity, as the read window bounds (after / as_of)
 -- and as the durable per-tenant watermark. The concrete scheme (a time-ordered
--- UUID) is an implementation detail; what matters is the total order.
+-- UUID) is an implementation detail; what matters is the identity-defined order.
 value Position {
-    -- The ordinal of this position in append order. Strictly increasing.
+    -- The ordinal of this position in the identity-defined stream order.
     ordinal: Integer
 }
 
@@ -128,8 +128,8 @@ value CasGuard {
 ------------------------------------------------------------
 
 -- Faithful round-tripping of an event across a durable write and read. The store
--- DEMANDS that whatever it persists, it returns unchanged: identity, type, tags,
--- timestamp and an arbitrary structured body survive a write/read cycle intact.
+-- DEMANDS that whatever it persists, it returns unchanged: store-assigned
+-- identity and timestamp plus type, tags and arbitrary body survive a read cycle.
 -- This is the serialization guarantee, stated behaviourally and independently of
 -- the encoding used.
 contract EventCodec {
@@ -181,6 +181,12 @@ contract AppendWriter {
         -- Concurrent appends to one tenant are serialized so each observes a
         -- settled stream and none is lost; appends to different tenants proceed
         -- independently.
+
+    @invariant StoreOwnsPersistenceEnvelope
+        -- Submitted domain events carry neither position nor timestamp. After a
+        -- guard accepts, the store assigns ordered UUID-v7 positions and one
+        -- shared recorded-at timestamp to the complete atomic unit. Supplying
+        -- either field is rejected rather than preserved or overwritten.
 }
 
 -- Ordered, filtered, streaming reads of a tenant's committed events. The store
@@ -200,14 +206,16 @@ contract StreamReader {
         -- A read returns exactly the tenant's events satisfying the filter — by
         -- tag membership, by type, and by an open position window (strictly
         -- after a lower bound, at-or-before an upper bound) — in ascending
-        -- position order. An empty match yields an empty stream. Two reads with
-        -- the same filter return the same events.
+        -- position order, even when append order differs from position order.
+        -- An empty match yields an empty stream. Two reads with the same filter
+        -- return the same events.
 
     @invariant ReverseAndLimitSeekNewest
         -- A reversed read returns matches in descending position order; combined
         -- with a limit it yields the newest matching events (e.g. reverse with
         -- limit one yields the single newest match). A limit without reverse
-        -- yields the oldest matches. Direction and limit apply to single reads.
+        -- yields the oldest matches. Ordering precedes limiting. Direction and
+        -- limit apply to single reads.
 
     @invariant BatchMergesAndDeduplicates
         -- A batch read returns the union of its filters' matches, with each
@@ -272,8 +280,8 @@ entity Event {
     kind: DomainEvent | TransactionMarker
 }
 
--- A caller-supplied fact: an application event with a type and an arbitrary
--- structured body. These are the events domain logic appends and reads back.
+-- A caller-supplied fact: an application event with a type and arbitrary body.
+-- Position and timestamp are absent at submission and assigned by the store.
 variant DomainEvent : Event {
     -- The event's type, used both to interpret its body and to filter reads.
     event_type: String
@@ -319,8 +327,12 @@ rule AppendEvents {
     when: AppendRequested(tenant, events, metadata?)
 
     ensures:
+        let append_time = now
+        for event in events:
+            event.timestamp = append_time
         let marker = TransactionMarker.created(
             tenant: tenant,
+            timestamp: append_time,
             committed: events.position,
             metadata: metadata
         )
@@ -482,9 +494,8 @@ surface EventRead {
 
     @guarantee StreamOrdered
         -- Events are read in stream order: ascending position by default,
-        -- descending when reversed. Within a tenant this order matches the order
-        -- in which the events were appended, so replaying the stream reconstructs
-        -- state deterministically.
+        -- descending when reversed, regardless of storage insertion or append
+        -- order. Limits are applied after that ordering is established.
 
     @guarantee ReadIsTenantScoped
         -- A read returns only the events of its own tenant. One tenant's events

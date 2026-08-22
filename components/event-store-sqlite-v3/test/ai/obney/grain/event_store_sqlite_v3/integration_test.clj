@@ -12,7 +12,8 @@
             [clojure.string]
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime ZoneOffset Instant]
-           [java.io File]))
+           [java.io File]
+           [java.util UUID]))
 
 ;; -------------------- ;;
 ;; Schema Registration  ;;
@@ -71,13 +72,11 @@
   ([type tags body]
    (let [event (es/->event (cond-> {:type type :tags tags}
                              body (assoc :body body)))]
-     (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
-     event)))
+     (first (es/append *event-store* {:tenant-id *tenant-id* :events [event]})))))
 
 (defn append-events! [events-data]
   (let [events (mapv es/->event events-data)]
-    (es/append *event-store* {:tenant-id *tenant-id* :events events})
-    events))
+    (es/append *event-store* {:tenant-id *tenant-id* :events events})))
 
 (defn read-events [args]
   (into [] (es/read *event-store* (if (vector? args)
@@ -89,6 +88,18 @@
 
 (defn tx-events [events]
   (filterv #(= :grain/tx (:event/type %)) events))
+
+(defn- with-configured-store [config f]
+  (let [tmp (File/createTempFile "grain-sqlite-policy-" ".sqlite")
+        _ (.delete tmp)
+        path (.getAbsolutePath tmp)
+        store (es/start {:conn (merge {:type :sqlite :database-file path} config)})]
+    (try
+      (f store)
+      (finally
+        (es/stop store)
+        (.delete (File. path))
+        (delete-sidecar-files path)))))
 
 ;; ======================== ;;
 ;; A. Lifecycle             ;;
@@ -248,9 +259,9 @@
 
 (deftest events-with-empty-body
   (let [event (es/->event {:type :test/alpha :tags #{}})
-        _ (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
+        [persisted] (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
         read (first (non-tx-events (read-events {})))]
-    (is (= (:event/id event) (:event/id read)))
+    (is (= (:event/id persisted) (:event/id read)))
     (is (= :test/alpha (:event/type read)))))
 
 ;; ============================ ;;
@@ -410,6 +421,25 @@
                              (uuid/= a b) 0
                              :else 1))
                      ids)))))
+
+(deftest commit-order-is-established-before-reversing-or-limiting-sqlite
+  (let [tag-id (uuid/v4)
+        first-event (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 2}})
+        second-event (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 1}})]
+    (let [[persisted-first] (es/append *event-store* {:tenant-id *tenant-id* :events [first-event]})
+          [persisted-second] (es/append *event-store* {:tenant-id *tenant-id* :events [second-event]})
+          expected [(:event/id persisted-first) (:event/id persisted-second)]
+          ids #(mapv :event/id (read-events %))]
+      (is (= expected (ids {:types #{:test/alpha}})))
+      (is (= expected
+             (ids [{:types #{:test/alpha}}
+                   {:tags #{[:order tag-id]}}])))
+      (is (= (vec (reverse expected))
+             (ids {:types #{:test/alpha} :reverse? true})))
+      (is (= [(:event/id persisted-first)]
+             (ids {:types #{:test/alpha} :limit 1})))
+      (is (= [(:event/id persisted-second)]
+             (ids {:types #{:test/alpha} :reverse? true :limit 1}))))))
 
 (deftest batch-empty-result
   (let [events (non-tx-events
@@ -634,13 +664,19 @@
 
 (deftest timestamp-preserved-as-offsetdatetime
   (let [before (OffsetDateTime/now)
-        _ (append-event! :test/alpha #{} {:n 1})
+        submitted [(es/->event {:type :test/alpha :tags #{} :body {:n 1}})
+                   (es/->event {:type :test/beta :tags #{} :body {:n 2}})]
+        returned (es/append *event-store* {:tenant-id *tenant-id* :events submitted})
         after (OffsetDateTime/now)
-        read (first (non-tx-events (read-events {})))
-        ts (:event/timestamp read)]
+        stored (read-events {})
+        timestamps (mapv :event/timestamp stored)
+        ts (first timestamps)]
     (is (instance? OffsetDateTime ts))
     (is (not (.isBefore ts before)))
-    (is (not (.isAfter ts after)))))
+    (is (not (.isAfter ts after)))
+    (is (apply = timestamps))
+    (is (= (mapv :event/timestamp returned)
+           (mapv :event/timestamp (non-tx-events stored))))))
 
 ;; ======================================== ;;
 ;; J. Tenant Isolation                      ;;
@@ -869,6 +905,85 @@
     (is (= 1 (count (non-tx-events (into [] (es/read store {:tenant-id tenant-id
                                                             :types #{:test/alpha}}))))))))
 
+(deftest transient-external-writer-contention-is-retried
+  (with-configured-store
+    {:busy-timeout-ms 20 :busy-max-retries 10
+     :busy-retry-backoff-ms 5 :busy-retry-max-backoff-ms 20}
+    (fn [store]
+      (let [pool (get-in store [:state ::sqlite-core/connection-pool])
+            tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :body {:n 1}})]
+        (with-open [lock-conn (jdbc/get-connection pool)]
+          (jdbc/execute! lock-conn ["BEGIN IMMEDIATE"])
+          (let [result (future (es/append store {:tenant-id tenant-id :events [event]}))]
+            (Thread/sleep 100)
+            (jdbc/execute! lock-conn ["ROLLBACK"])
+            (is (= 1 (count (deref result 5000 ::timeout))))))
+        (is (= 1 (count (non-tx-events
+                         (into [] (es/read store {:tenant-id tenant-id}))))))))))
+
+(deftest exhausted-external-writer-contention-is-bounded
+  (with-configured-store
+    {:busy-timeout-ms 10 :busy-max-retries 1
+     :busy-retry-backoff-ms 1 :busy-retry-max-backoff-ms 1}
+    (fn [store]
+      (let [pool (get-in store [:state ::sqlite-core/connection-pool])
+            tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :body {:n 1}})]
+        (with-open [lock-conn (jdbc/get-connection pool)]
+          (jdbc/execute! lock-conn ["BEGIN IMMEDIATE"])
+          (let [started (System/nanoTime)
+                result (es/append store {:tenant-id tenant-id :events [event]})
+                elapsed-ms (/ (- (System/nanoTime) started) 1e6)]
+            (is (= ::anom/busy (::anom/category result)))
+            (is (= 2 (::sqlite-core/busy-attempts result)))
+            (is (< elapsed-ms 1000))
+            (jdbc/execute! lock-conn ["ROLLBACK"])))
+        (is (empty? (into [] (es/read store {:tenant-id tenant-id}))))))))
+
+(deftest wal-read-continues-while-writer-lock-is-held
+  (with-configured-store
+    {:busy-timeout-ms 20}
+    (fn [store]
+      (let [pool (get-in store [:state ::sqlite-core/connection-pool])
+            tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :body {:n 1}})]
+        (es/append store {:tenant-id tenant-id :events [event]})
+        (with-open [lock-conn (jdbc/get-connection pool)]
+          (jdbc/execute! lock-conn ["BEGIN IMMEDIATE"])
+          (try
+            (let [read-result (future (into [] (es/read store {:tenant-id tenant-id})))]
+              (is (= 1 (count (non-tx-events
+                               (deref read-result 1000 ::timeout))))))
+            (finally
+              (jdbc/execute! lock-conn ["ROLLBACK"]))))))))
+
+(deftest saturated-write-queue-rejects-deterministically
+  (with-configured-store
+    {:write-queue-capacity 1}
+    (fn [store]
+      (let [tenant-id (uuid/v4)
+            entered (promise)
+            release (promise)
+            blocking-cas {:predicate-fn (fn [_] (deliver entered true) @release true)}
+            event #(es/->event {:type :test/alpha :body {:n %}})
+            active (future (es/append store {:tenant-id tenant-id :events [(event 1)]
+                                             :cas blocking-cas}))]
+        (is (= true (deref entered 5000 ::timeout)))
+        (let [queued (future (es/append store {:tenant-id tenant-id :events [(event 2)]}))
+              coordinator (get-in store [:state ::sqlite-core/write-coordinator])]
+          (loop [remaining 100]
+            (when (and (zero? (.size (.getQueue coordinator))) (pos? remaining))
+              (Thread/sleep 5)
+              (recur (dec remaining))))
+          (let [rejected (es/append store {:tenant-id tenant-id :events [(event 3)]})]
+            (is (= ::anom/busy (::anom/category rejected))))
+          (deliver release true)
+          (is (= 1 (count (deref active 5000 ::timeout))))
+          (is (= 1 (count (deref queued 5000 ::timeout))))
+          (is (= 2 (count (non-tx-events
+                           (into [] (es/read store {:tenant-id tenant-id})))))))))))
+
 ;; ===================================================== ;;
 ;; Reverse / Limit single-read primitive + EXPLAIN       ;;
 ;; ===================================================== ;;
@@ -929,3 +1044,30 @@
             "plan uses an index SEARCH/seek")
         (is (not (some #(re-find #"(?i)SCAN .*\bevents\b" %) details))
             "plan does NOT full-scan the events table")))))
+
+(deftest tag-read-drives-from-tag-index
+  ;; A tag-scoped read must drive the join from the event_tags PK so its cost
+  ;; tracks the tag's match set, never the tenant's whole stream. On a fresh
+  ;; database with no statistics the planner would otherwise drive from events
+  ;; (SEARCH on tenant_id alone = full tenant scan); CROSS JOIN pins the order.
+  (let [eid (uuid/v4)]
+    (dotimes [n 20] (append-event! :test/alpha #{[:entity eid]} {:n n}))
+    (let [{:keys [sql params]} (#'sqlite-core/build-single-query
+                                {:tenant-id *tenant-id*
+                                 :tags #{[:entity eid]}})
+          plan-rows (jdbc/execute! (pool)
+                                   (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                   {:builder-fn rs/as-unqualified-maps})
+          details (mapv :detail plan-rows)
+          joined (clojure.string/join " | " details)]
+      (testing (str "query plan: " joined)
+        ;; The outermost (first) access path must be the tag table, seeked on
+        ;; tenant AND tag — not the events table.
+        (is (re-find #"(?i)SEARCH t\b" (first details))
+            "plan drives from event_tags")
+        (is (re-find #"(?i)tag" (first details))
+            "event_tags access seeks on the tag column")
+        ;; events must be probed per tag row on both PK columns, never walked
+        ;; on tenant_id alone (which would visit the whole tenant stream).
+        (is (some #(re-find #"(?i)SEARCH e\b.*\(tenant_id=\? AND id=\?\)" %) details)
+            "events is probed by full (tenant_id, id) key")))))

@@ -4,10 +4,8 @@
             [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [start-event-store]]
             [ai.obney.grain.anomalies.interface :refer [anomaly?]]
             [ai.obney.grain.pubsub.interface :as pubsub]
-            [ai.obney.grain.time.interface :as time]
             [malli.core :as mc]
             [cognitect.anomalies :as anom]
-            [clj-uuid :as uuid]
             [com.brunobonacci.mulog :as u])
   (:import [clojure.lang ExceptionInfo]))
 
@@ -40,7 +38,7 @@
 
          ;; Schema validation issues
          (try (->> events
-                   (mapv #(mc/explain [:and ::schemas/event (:event/type %)] %))
+                   (mapv #(mc/explain [:and ::schemas/appendable-event (:event/type %)] %))
                    (filterv (complement nil?)))
               (catch ExceptionInfo _
                 {::anom/category ::anom/fault
@@ -61,9 +59,12 @@
       (let [result (p/append event-store args)]
         (if (anomaly? result)
           result
-          (let [{:keys [tenant-id]} args]
+          (let [{:keys [tenant-id]} args
+                persisted-events (if (sequential? result) result events)]
             (when event-pubsub
-              (run! #(pubsub/pub event-pubsub {:message (assoc % :grain/tenant-id tenant-id)}) events))))))))
+              (run! #(pubsub/pub event-pubsub {:message (assoc % :grain/tenant-id tenant-id)})
+                    persisted-events))
+            result))))))
 
 (defn tenants
   [event-store]
@@ -84,8 +85,6 @@
      ::anom/message "Invalid arguments"
      :explain/data validation-error}
     (merge
-     {:event/id (uuid/v7)
-      :event/timestamp (time/now)
-      :event/type type
+     {:event/type type
       :event/tags tags}
      body)))

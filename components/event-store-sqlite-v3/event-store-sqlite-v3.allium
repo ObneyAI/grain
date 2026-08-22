@@ -32,7 +32,8 @@
 --     (the tenant-id propagation guarantee is recorded as a contract obligation,
 --     but the bus itself is owned elsewhere)
 --   - the datasource extension point (pluggable :file / custom datasources),
---     logging, tracing and metrics, threads and pools
+--     logging transport, threads and pools; queueing, contention bounds and
+--     their observable measurements are behavioural and are included below
 --   - how UUID v7 ids are generated (an event arrives already identified); this
 --     backend relies only on their time-ordering, not on minting them
 --
@@ -50,6 +51,7 @@
 --   filter by tags (all), types (any), id range  -> rule ReadStream (@guidance filter language)
 --   batch read unions + dedups by id             -> rule BatchReadStream (@guidance dedup by id)
 --   reverse + limit = newest, cost ~ limit        -> contract EventLog.NewestRetrievedDirectly
+--   tag read cost ~ tag's stream, not the store  -> contract EventLog.TagReadsBoundedByTagStream
 --   per-tenant durable last-event-id watermark   -> entity Tenant.last_event_id
 --   tenant registered lazily on first append     -> rule AppendTransaction ensures
 --   persistence across restart, idempotent init  -> contract EventLog.Durable
@@ -92,10 +94,9 @@ value ReadQuery {
 -- Contracts
 ------------------------------------------------------------
 
--- The faithful round-trip obligation. An event carries an identity, a type, a
--- timestamp, a set of tags and an arbitrary structured body; all of it must come
--- back out byte-faithful to what went in. This is a property of the encode/decode
--- pair, not of stored entity state, so it lives as a contract invariant.
+-- The faithful round-trip obligation begins after the store assigns the event's
+-- persistence envelope. Identity, recorded-at timestamp, type, tags and body
+-- must then come back out byte-faithful to what was committed.
 contract EventCodec {
     -- Persist an event's body, tags and metadata for later reconstruction.
     encode: (event: Event) -> ByteArray
@@ -128,10 +129,10 @@ contract EventLog {
     read_stream: (tenant: Tenant, filter: ReadQuery) -> Sequence<Event>
 
     @invariant TimeOrdered
-        -- Events are positioned by a time-ordered identity (UUID v7), so the
-        -- order in which they were appended is the order in which they read
-        -- back. A read streams ascending by id by default; a reverse read
-        -- streams descending. Ordering is per tenant.
+        -- Events are positioned by a time-ordered identity (UUID v7). A read
+        -- streams ascending by id by default even when append order differs;
+        -- a reverse read streams descending. Ordering is per tenant and is
+        -- established before any limit is applied.
 
     @invariant AppendOnly
         -- Committed events are immutable facts. The store only ever appends; it
@@ -151,12 +152,42 @@ contract EventLog {
         -- This is what makes a compare-and-swap append a sound concurrency
         -- fence — two writers racing on the same pre-state cannot both succeed.
 
+    @invariant BoundedContention
+        -- Appends admitted within the configured queue and contention bounds
+        -- absorb transient writer-lock contention. If the queue is already full
+        -- or the configured busy attempts are exhausted, the caller receives a
+        -- stable busy outcome rather than a raw database-lock exception. Every
+        -- retry repeats the entire atomic transaction; no partial attempt is
+        -- observable.
+
+    @invariant ReadsRemainConcurrent
+        -- Read operations are never placed behind the single-writer admission
+        -- boundary. Where the underlying store supports concurrent readers and
+        -- a writer, a queued or active append does not prevent those reads.
+
+    @invariant ContentionIsObservable
+        -- Queue depth and saturation, append and transaction latency, busy
+        -- retries, and exhausted contention are emitted as operational
+        -- measurements so load and overload can be distinguished.
+
     @invariant NewestRetrievedDirectly
         -- The newest matching event(s) for a tenant — a reverse read with a
         -- small limit, optionally narrowed by type and tag — are retrieved
-        -- directly, in time proportional to the limit, without examining the
-        -- whole match set. This is the read shape a processor's checkpoint
-        -- lookup relies on, and it stays cheap as a tenant's stream grows.
+        -- directly, never by walking the tenant's whole stream. Narrowed by
+        -- type or id bounds alone, the cost is proportional to the limit;
+        -- narrowed by tag, it is bounded by the events bearing the tag
+        -- (see TagReadsBoundedByTagStream). This is the read shape a
+        -- processor's checkpoint lookup relies on, and it stays cheap as a
+        -- tenant's stream grows.
+
+    @invariant TagReadsBoundedByTagStream
+        -- A tag-narrowed read — forward or reverse, with or without a limit —
+        -- costs in proportion to the events bearing the requested tags (one
+        -- entity's stream, small by design), never to the size of the
+        -- tenant's whole stream, and this holds from the store's very first
+        -- start on a fresh database. Automation handlers that consult an
+        -- entity's tagged history on every step rely on this staying flat as
+        -- the store grows.
 
     @invariant Durable
         -- Committed events survive process restart: a store reopened on the same
@@ -208,9 +239,9 @@ entity Tenant {
     domain_events: events where is_transaction_marker = false
 }
 
--- A single immutable fact in one tenant's stream. Its id is a time-ordered
--- identity assigned before it reaches the store; that identity fixes both the
--- event's uniqueness within its tenant and its position in the ordered stream.
+-- A single immutable fact in one tenant's stream. The store assigns its id and
+-- timestamp inside the tenant-serialized append; the id fixes uniqueness and
+-- position in the ordered stream.
 -- An event carries zero or more tags (entity references it concerns) and an
 -- arbitrary body, both opaque to the store.
 entity Event {
@@ -218,8 +249,8 @@ entity Event {
     id: String
     -- Owning tenant. Reads and appends are confined to a single tenant.
     tenant: Tenant
-    -- When the fact occurred, as recorded by its producer. Preserved exactly,
-    -- including a non-UTC offset.
+    -- When the store recorded the atomic append. Every domain event and marker
+    -- in one append shares this value.
     timestamp: Timestamp
     -- The event's kind. May be a simple or qualified name; round-trips exactly.
     event_type: String
@@ -255,6 +286,21 @@ entity Transaction {
 }
 
 ------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Millisecond values are represented as integers because contention policy
+    -- is configured directly at the storage-driver boundary.
+    busy_timeout_ms: Integer = 1000
+    busy_max_retries: Integer = 3
+    busy_retry_backoff_ms: Integer = 10
+    busy_retry_max_backoff_ms: Integer = 250
+    write_queue_capacity: Integer = 1024
+    write_shutdown_timeout_ms: Integer = 5000
+}
+
+------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
 
@@ -266,13 +312,16 @@ rule AppendTransaction {
     when: AppendEvents(tenant, events, tx_metadata?)
 
     ensures:
+        let append_time = now
         let marker = Event.created(
             tenant: tenant,
             event_type: "grain/tx",
+            timestamp: append_time,
             is_transaction_marker: true
         )
         for event in events:
             event.tenant = tenant
+            event.timestamp = append_time
         Transaction.created(
             tenant: tenant,
             marker: marker,
@@ -386,11 +435,10 @@ invariant EventsBelongToOneTenant {
 -- The store's authoritative order within a tenant is event id order. The store
 -- reads events back in id order and treats that as the stream's total order (see
 -- EventLog.TimeOrdered). It relies on ids being UUID v7 (time-ordered) so that id
--- order approximates chronological order, but it does not itself mint ids or
--- timestamps and does not enforce any relationship between an event's id and its
--- producer-supplied timestamp; under cross-node clock skew a larger id may carry
--- an earlier timestamp (see open questions). The guarantee the store makes is the
--- id ordering itself, captured as EventLog.TimeOrdered, not a timestamp coupling.
+-- order approximates chronological order. The store mints ids and one timestamp
+-- per append after tenant serialization. Cross-node wall-clock skew can still
+-- make timestamps non-monotonic across appends, so id ordering remains the sole
+-- authoritative stream order captured by EventLog.TimeOrdered.
 
 -- A transaction marker's committed-id set never includes the marker itself: the
 -- marker records the domain events of its append, not its own id.
@@ -475,6 +523,11 @@ surface EventAppend {
         -- A batch commits whole or not at all, and a checked append is a sound
         -- concurrency fence: serialized writers mean a compare-and-swap that
         -- passes truly observed the latest committed state for its tenant.
+
+    @guarantee BoundedAndObservableContention
+        -- Transient writer contention is handled within the configured bounds.
+        -- Saturation and exhausted contention return a stable busy result, and
+        -- queueing, latency, retry and saturation measurements are emitted.
 }
 
 -- The read boundary: how a client streams a tenant's events back, filtered and
@@ -496,16 +549,25 @@ surface EventRead {
         demands EventCodec
 
     @guarantee OrderedAndTenantScoped
-        -- A read returns this tenant's matching events in time order (ascending
-        -- by default, descending on a reverse read), reconstructed faithfully
-        -- from storage, and never includes any other tenant's events. A batch
-        -- read merges its filters and deduplicates by id.
+        -- A read returns this tenant's matching events in id order regardless of
+        -- append position (ascending by default, descending on a reverse read),
+        -- reconstructed faithfully from storage, and never includes any other
+        -- tenant's events. Ordering precedes limiting. A batch read merges its
+        -- filters and deduplicates by id.
 
     @guarantee NewestRetrievedDirectly
         -- Fetching the newest matching event(s) — a reverse read with a small
-        -- limit — costs in proportion to the limit, not to the size of the
-        -- match set. This is the read shape a processor checkpoint lookup
+        -- limit — costs in proportion to the limit (or, when narrowed by tag,
+        -- to the tag's own stream), never to the size of the tenant's whole
+        -- stream. This is the read shape a processor checkpoint lookup
         -- depends on, and it stays cheap as the stream grows.
+
+    @guarantee TagReadsStayFlat
+        -- A tag-scoped read costs in proportion to the events bearing the
+        -- requested tags, never to the tenant's whole stream — including on a
+        -- freshly created store. A client consulting one entity's tagged
+        -- history on every step can rely on that read not degrading as the
+        -- rest of the store grows.
 }
 
 -- The administrative boundary: the per-tenant durable watermark, readable

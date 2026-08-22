@@ -29,6 +29,8 @@
 --     filled in when absent before being forwarded
 --   - graceful degradation: diagnostics report a present/absent control plane
 --     rather than failing when none is installed
+--   - spec composition: a dev/CI-only validator resolves Event Model links to
+--     declarations in checked Allium specifications
 --
 -- Excludes (implementation, governed by the demanded runtime contracts):
 --   - command validation/authorization and event emission (command processor)
@@ -92,6 +94,25 @@ contract SchemaValidation {
         -- envelope for that kind (command, query or event) conjoined with the
         -- named schema, so envelope-shape violations are caught alongside
         -- payload violations.
+}
+
+-- The composition boundary between Grain topology and Allium behaviour. It is
+-- deliberately separate from the production boot validator.
+contract SpecificationComposition {
+    validate_composition: (model: Any, project_root: String) -> Any
+
+    @invariant TotalVerdict
+        -- Missing tooling, unsafe or missing paths, invalid Allium syntax, and
+        -- unresolved declarations become typed findings rather than exceptions.
+
+    @invariant BehaviouralBoundaryCoverage
+        -- Every Event Model command links to an Allium rule and every screen to
+        -- an Allium surface. Every optional link supplied elsewhere also resolves
+        -- to a declaration of its stated kind.
+
+    @invariant DevelopmentOnly
+        -- Resolution shells out to the Allium CLI in development and CI. The
+        -- production boot guard never requires Allium source files or tooling.
 }
 
 -- The execution guarantee the toolkit DEMANDS of the host: a normalized,
@@ -317,6 +338,7 @@ surface RuntimeInspection {
     contracts:
         fulfils Introspection
         fulfils SchemaValidation
+        fulfils SpecificationComposition
 
     @guarantee InstallationIndependent
         -- Introspection and validation read the host's process-wide registries

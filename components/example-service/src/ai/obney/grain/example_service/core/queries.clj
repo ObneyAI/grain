@@ -17,7 +17,8 @@
             [cognitect.anomalies :as anom]))
 
 (defquery :example counters
-  {:authorized? (constantly true)}
+  {:authorized? (constantly true)
+   :grain.event-model/reads #{:example/counters}}
   "Returns all counters."
   [context]
   (let [counters (->> (read-models/root context)
@@ -25,7 +26,8 @@
     {:query/result counters}))
 
 (defquery :example counter
-  {:authorized? (constantly true)}
+  {:authorized? (constantly true)
+   :grain.event-model/reads #{:example/counters}}
   "Returns a single counter by id."
   [{{:keys [counter-id]} :query :as context}]
   (let [counter (-> (read-models/root context)

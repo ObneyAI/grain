@@ -14,7 +14,8 @@
             [com.brunobonacci.mulog :as u]))
 
 (defperiodic :example example-periodic-task
-  {:schedule {:every 30 :duration :seconds}}
+  {:schedule {:every 30 :duration :seconds}
+   :grain.event-model/produces #{}}
   "Example periodic task. Runs every 30s per tenant; no-op heartbeat."
   [tenant-id _time]
   (u/log ::example :tenant-id tenant-id)

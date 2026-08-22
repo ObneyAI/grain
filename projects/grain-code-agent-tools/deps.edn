@@ -1,6 +1,8 @@
 {:paths []
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         cat/code-agent-tools {:local/root "../../components/code-agent-tools"}
+        cat/event-model {:local/root "../../components/event-model"}
+        cat/event-model-validator {:local/root "../../components/event-model-validator"}
         cat/anomalies {:local/root "../../components/anomalies"}
         cat/command-processor-v2 {:local/root "../../components/command-processor-v2"}
         cat/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}

@@ -1,0 +1,18 @@
+{
+  "name": "grain",
+  "version": "0.1.0",
+  "description": "Compose Allium behavioural specifications with Grain Event Model topology.",
+  "author": {"name": "ObneyAI"},
+  "repository": "https://github.com/ObneyAI/grain",
+  "license": "EPL-2.0",
+  "skills": [
+    "./skills/grain",
+    "./skills/event-model",
+    "./skills/event-model-elicit",
+    "./skills/event-model-distill",
+    "./skills/event-model-tend",
+    "./skills/event-model-propagate",
+    "./skills/event-model-weed",
+    "./skills/grain-genome"
+  ]
+}

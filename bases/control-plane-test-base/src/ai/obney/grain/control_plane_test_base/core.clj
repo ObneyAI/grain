@@ -320,6 +320,13 @@
 ;; (for use from REPL) ;;
 ;; ------------------- ;;
 
+(defn all-events
+  "Show all non-tx events for a tenant."
+  [system tenant-id]
+  (into []
+    (remove #(= :grain/tx (:event/type %)))
+    (es/read (:event-store system) {:tenant-id tenant-id})))
+
 (defn create-tenant!
   "Create a tenant by appending an initial event."
   [system tenant-id]
@@ -333,6 +340,35 @@
   (es/append (:event-store system)
     {:tenant-id tenant-id
      :events [(es/->event {:type :test/counter-incremented :body {}})]}))
+
+(defn append-checkpoint-gap!
+  "Construct A before B without persistence metadata, commit and process B,
+   then append A. Returns the store-assigned IDs and timestamps. Against the
+   former constructor-owned metadata contract this reproduces the checkpoint
+   ordering gap deterministically."
+  [system tenant-id timeout-ms]
+  (let [event-a (es/->event {:type :test/counter-incremented :body {:label :a}})
+        event-b (es/->event {:type :test/counter-incremented :body {:label :b}})
+        [persisted-b] (es/append (:event-store system)
+                                {:tenant-id tenant-id :events [event-b]})
+        deadline (+ (System/currentTimeMillis) timeout-ms)
+        checkpointed? (fn []
+                        (some #(and (= :grain/todo-processor-checkpoint (:event/type %))
+                                    (= (:event/id persisted-b) (:triggered-by %)))
+                              (all-events system tenant-id)))]
+    (loop []
+      (cond
+        (checkpointed?) nil
+        (>= (System/currentTimeMillis) deadline)
+        (throw (ex-info "Timed out waiting for B checkpoint"
+                        {:tenant-id tenant-id :event-id (:event/id persisted-b)}))
+        :else (do (Thread/sleep 50) (recur))))
+    (let [[persisted-a] (es/append (:event-store system)
+                                  {:tenant-id tenant-id :events [event-a]})]
+      {:final-a-id (:event/id persisted-a)
+       :final-a-timestamp (:event/timestamp persisted-a)
+       :final-b-id (:event/id persisted-b)
+       :final-b-timestamp (:event/timestamp persisted-b)})))
 
 (defn submit-slow-work!
   "Append a slow-work event to a tenant."
@@ -391,13 +427,6 @@
   "Reset the slow-work effect execution counter. Call before each test scenario."
   []
   (reset! slow-work-effect-executions {}))
-
-(defn all-events
-  "Show all non-tx events for a tenant."
-  [system tenant-id]
-  (into []
-    (remove #(= :grain/tx (:event/type %)))
-    (es/read (:event-store system) {:tenant-id tenant-id})))
 
 (defn scheduled-trigger-summary
   "Summary of scheduled triggers and their processing for a tenant."

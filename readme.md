@@ -43,13 +43,29 @@ Add to your `deps.edn`:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "6817ba3ab82b7fc916150ab4c783d5a1b36d2919" ;; update to latest commit sha
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea" ;; update to latest commit sha
  :deps/root "projects/grain-core-v2"}
 ```
 
 See `bases/example-base` and `components/example-service` for a complete example application. Run `development/src/example_app_demo.clj` to start and interact with the example system.
 
 For multi-instance deployments, add the [control plane](docs/distributed-coordination.md) package.
+
+### Specifications and agent workflow
+
+Grain projects keep two complementary specifications: [Allium](https://github.com/juxt/allium)
+for observable behaviour and Grain [Event Models](docs/event-model.md) for CQRS
+service topology. Install Allium separately, then install this repository's
+`grain` plugin or its portable skills:
+
+```sh
+npx skills add juxt/allium
+npx skills add ObneyAI/grain
+```
+
+Claude Code and Codex plugin manifests are included at the repository root. Use
+`/grain` as the composed entry point; it delegates behavioural phases to Allium
+and adds topology, runtime, and trace-link verification.
 
 ## Example App: Grain Todo List
 
@@ -77,6 +93,7 @@ Grain Sessions walks through the app as a teaching series:
 | **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
 | **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE, including distributed live updates |
 | **grain-code-agent-tools** | Dev-only nREPL tools for coding agents working against live Grain apps |
+| **grain-event-model** | Service-area Event Model registration and production boot validation |
 | **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
 | **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
@@ -111,7 +128,7 @@ Grain is MIT licensed. We use it in production, but it's actively evolving. The 
 
 ## More Information
 
-- **Docs**: [Core Concepts](docs/core-concepts.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
+- **Docs**: [Core Concepts](docs/core-concepts.md) | [Event Model](docs/event-model.md) | [Allium Specs](docs/allium-specs.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
 - **Examples**: [`grain-todo-list`](https://github.com/ObneyAI/grain-todo-list), `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
 - **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians
