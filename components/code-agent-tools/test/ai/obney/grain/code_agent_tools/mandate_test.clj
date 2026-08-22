@@ -6,6 +6,8 @@
    register the handlers and whose event-model ns registers the :example model."
   (:require [ai.obney.grain.event-model-validator.interface :as emv]
             [ai.obney.grain.event-model.interface :as em]
+            [ai.obney.grain.event-retention.interface :as retention]
+            [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.example-base.core]
             [clojure.test :refer [deftest is testing]]))
 
@@ -27,6 +29,26 @@
     (is (= :event-model/invalid (:type (ex-data ex))))
     (is (false? (get-in (ex-data ex) [:verdict :valid?])))
     (is (contains? (types (:verdict (ex-data ex))) :block/uncovered))))
+
+(deftest strict-boot-reconciles-durable-retention-activation
+  (let [store (es/start {:conn {:type :in-memory}})
+        admin (retention/administration store)]
+    (try
+      (retention/activate! admin :grain/todo-processor-checkpoint)
+      (is (true? (:valid? (emv/verify-event-model! {:event-store store}))))
+      (let [original es/event-definition
+            verdict (with-redefs [es/event-definition
+                                  (fn [event-type]
+                                    (cond-> (original event-type)
+                                      (= event-type :grain/todo-processor-checkpoint)
+                                      (assoc :history/normalized
+                                             {:retain-at-least {:seconds 7200 :nanos 0}
+                                              :keep-latest-per {:tags #{:processor}}})))]
+                      (emv/verify-event-model! {:event-store store}))]
+        (is (false? (:valid? verdict)))
+        (is (contains? (types verdict) :history/active-policy-mismatch)))
+      (finally
+        (es/stop store)))))
 
 (deftest strict-mandates-full-coverage
   (testing "dropping a live command from the model -> :block/uncovered -> fatal"

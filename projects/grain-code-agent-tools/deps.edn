@@ -12,6 +12,7 @@
         cat/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
         cat/periodic-task {:local/root "../../components/periodic-task"}
         cat/event-store-v3 {:local/root "../../components/event-store-v3"}
+        cat/event-retention {:local/root "../../components/event-retention"}
         cat/fressian-util {:local/root "../../components/fressian-util"}
         cat/kv-store {:local/root "../../components/kv-store"}
         cat/pubsub {:local/root "../../components/pubsub"}

@@ -1,5 +1,6 @@
 (ns ai.obney.grain.event-store-v3.interface.schemas
-  (:require [ai.obney.grain.schema-util.interface :refer [register!]]
+  (:require [ai.obney.grain.event-model.interface :as event-model]
+            [ai.obney.grain.schema-util.interface :refer [register!]]
             [ai.obney.grain.event-store-v3.interface.event-definition :as definitions]
             [clj-uuid :as uuid]))
 
@@ -122,3 +123,25 @@
             [:processor/name :keyword]
             [:triggered-by ::id]
             [:error/message :string]]})
+
+(event-model/defeventmodel :grain
+  {:description "Grain event-store infrastructure."
+   :events
+   {:grain/tx
+    {:description "The reified transaction containing committed event IDs."
+     :schema [:map
+              [:event-ids [:set ::id]]
+              [:metadata {:optional true} [:map]]]}
+    :grain/todo-processor-checkpoint
+    {:description "A todo processor durably recorded stream progress."
+     :schema [:map
+              [:processor/name :keyword]
+              [:triggered-by ::id]
+              [:checkpoint/kind {:optional true} :keyword]
+              [:checkpoint/from {:optional true} ::id]]}
+    :grain/todo-processor-effect-failure
+    {:description "A todo processor effect failed."
+     :schema [:map
+              [:processor/name :keyword]
+              [:triggered-by ::id]
+              [:error/message :string]]}}})

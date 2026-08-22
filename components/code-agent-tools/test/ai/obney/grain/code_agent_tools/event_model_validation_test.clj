@@ -7,6 +7,7 @@
   (:require [ai.obney.grain.code-agent-tools.interface :as tools]
             [ai.obney.grain.event-model.interface :as em]
             [ai.obney.grain.event-model-validator.interface :as emv]
+            [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.example-base.core]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
@@ -14,6 +15,11 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
+
+(es/defevent :retention-validator/ephemeral
+  "Validator fixture with bounded history."
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "PT1H"}})
 
 (def sample
   "A correct event model for the live :example area. Deliberately exercises both
@@ -67,6 +73,35 @@
 
 (defn- types [v] (set (map :type (:findings v))))
 (defn- errors [v] (filter #(= :error (:severity %)) (:findings v)))
+
+(def retention-model
+  {:retention-validator
+   {:events
+    {:retention-validator/ephemeral
+     {:description "fixture" :schema [:map [:value :int]]}}
+    :read-models
+    {:retention-validator/current
+     {:description "current value"
+      :consumes #{:retention-validator/ephemeral}}}}})
+
+(deftest bounded-history-requires-factual-structural-safety
+  (testing "the modeled and registered schemas must agree"
+    (is (contains? (types (tools/validate-event-model
+                           (assoc-in retention-model
+                                     [:retention-validator :events
+                                      :retention-validator/ephemeral :schema]
+                                     [:map [:value :string]])))
+                   :history/schema-mismatch)))
+  (testing "bounded trigger subscriptions remain unsupported until checkpoint safety exists"
+    (let [with-processor (-> retention-model
+                             (update-in [:retention-validator :read-models] dissoc
+                                        :retention-validator/current)
+                             (assoc-in [:retention-validator :todo-processors
+                                        :retention-validator/react]
+                                       {:description "react"
+                                        :subscribes #{:retention-validator/ephemeral}}))]
+      (is (contains? (types (tools/validate-event-model with-processor))
+                     :history/todo-processor-unsupported)))))
 
 (def ^:private example-allium-declarations
   [[:rule "CreateCounter"]

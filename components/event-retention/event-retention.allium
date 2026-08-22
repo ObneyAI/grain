@@ -1,7 +1,7 @@
 -- allium: 3
 -- event-retention.allium
 --
--- This is a spec-first design; no event-retention implementation is claimed yet.
+-- This specification governs the implemented event-retention component.
 -- This specification is the normative source of truth for event-definition and
 -- retention behaviour.
 --
@@ -160,7 +160,9 @@ contract RetentionValidation {
         -- validate always returns inert findings. For every bounded definition,
         -- it checks the event is represented in the event model, schemas agree,
         -- the policy and retention-key tag names are structurally well formed,
-        -- and declared in-Grain consumers acknowledge bounded history.
+        -- and todo processors do not subscribe to bounded event types until
+        -- checkpoint-safety validation exists. It makes no unverified claim
+        -- about read-model replay correctness.
         -- Cardinality of constructed tags is checked against stored events by
         -- activation preflight and again fail-closed by compaction; it cannot be
         -- inferred from the payload schema. Validation never deletes or
@@ -207,13 +209,9 @@ contract RetentionAdministration {
     @invariant StoredDataPreflight
         -- Before first activation or a changed activation, assessment checks
         -- existing events can satisfy the schema and retention-key obligations
-        -- and checks declared processors, projections and snapshots for bounded-
-        -- history compatibility. A todo processor blocks activation for a
-        -- tenant when its durable checkpoint is not newer than the proposed
-        -- cutoff; a snapshot-backed projection blocks unless its verified
-        -- snapshot is at or after the truncation boundary. Unsafe or incomplete
-        -- evidence prevents activation. External undeclared consumers remain an
-        -- explicit operational responsibility.
+        -- for bounded-history compatibility. Unsafe or incomplete evidence
+        -- prevents activation. External undeclared consumers remain an explicit
+        -- operational responsibility.
 
     @invariant IdempotentByValue
         -- Activating an already-active equal normalized value is idempotent.

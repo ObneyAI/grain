@@ -102,7 +102,7 @@
    :event-model/read-model
    [:map
     [:description :string]
-    [:consumes [:set :event-model/block-name]]                          ; events consumed
+   [:consumes [:set :event-model/block-name]]                          ; events consumed
     [:schema {:optional true} :event-model/malli-schema]                ; optional, design-time only
     [:version {:optional true} :int]
     [:grain/allium {:optional true} :event-model/allium-references]]

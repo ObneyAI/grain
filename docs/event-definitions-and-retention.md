@@ -346,12 +346,9 @@ IDs/timestamps, last compaction, and whether history has been truncated. APIs
 that promise complete historical replay must call it before replaying a retained
 type.
 
-Read models consuming retained types must declare one of:
-
-* `:history/require-complete` (default): retention enablement is rejected;
-* `:history/window-safe`: reducer correctness depends only on retained events;
-* `:history/snapshot-backed`: a verified snapshot at or after the truncation
-  boundary is required.
+Grain does not accept a declarative claim that a read model is safe to rebuild
+from retained history: the validator cannot prove that claim. Read-model replay
+correctness remains a test obligation for the application.
 
 For initial rollout, the boot guard checks the loaded Grain-owned consumers.
 That check cannot prove the safety of an unknown external service or a consumer
@@ -360,10 +357,9 @@ availability contract: external consumers must be designed for the declared
 window. General application opt-in should wait until deployments can account for
 all consumers that require complete replay.
 
-Todo processors subscribing to an expiring trigger type must either guarantee
-their durable checkpoint is newer than the proposed cutoff or block compaction.
-This check is per tenant and processor. Being offline beyond the retention window
-must never silently discard unprocessed work.
+Todo processors subscribing to an expiring trigger type are rejected. Grain does
+not yet have an implemented checkpoint-safety proof that could authorize this
+case, and an operational recovery promise is insufficient evidence for deletion.
 
 ### Validator and boot guard
 
@@ -371,13 +367,11 @@ The existing event-model validator is the application-quality boundary. For each
 `defevent` with bounded history it requires that:
 
 * the event exists in the event model and its schemas agree;
-* every consuming read model declares `:history/window-safe` or
-  `:history/snapshot-backed`;
-* every consuming todo processor declares a compatible recovery window;
+* no todo processor subscribes to the bounded event;
 * retention-key tag names and policy structure are valid.
 
-Stored-event cardinality, processor checkpoints, and snapshot sufficiency are
-checked by the separate activation preflight, not by every application boot.
+Stored-event schema and retention-key cardinality are checked by the separate
+activation preflight, not by every application boot.
 
 Adding or changing `:history` is reported as a breaking data-contract change,
 not ordinary metadata drift. Any unresolved obligation makes the registered
