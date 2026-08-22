@@ -1,10 +1,13 @@
 (ns ai.obney.grain.event-store-postgres-v3.core
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
+            [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
             [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
+            [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.event-store-postgres-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [next.jdbc :as jdbc]
+            [next.jdbc.result-set :as rs]
             [com.brunobonacci.mulog :as u]
             [integrant.core :as ig]
             [hikari-cp.core :as hikari]
@@ -132,6 +135,9 @@
   (if (qualified-keyword? k)
     (str (namespace k) "/" (name k))
     (str (name k))))
+
+(defn- placeholders [n]
+  (string/join "," (repeat n "?")))
 
 (defn- ->offset-date-time
   "Convert a java.sql.Timestamp to java.time.OffsetDateTime (UTC)."
@@ -351,6 +357,72 @@
                  [id {:tenant/last-event-id last_event_id}]))
           rows)))
 
+(defn- set-tenant! [conn tenant-id]
+  (jdbc/execute! conn [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")]))
+
+(defn- load-tenant-events [conn tenant-id]
+  (set-tenant! conn tenant-id)
+  (mapv transform-row
+        (jdbc/execute! conn
+                       ["SELECT id, time, type, tags, data FROM grain.events WHERE tenant_id = ? ORDER BY id"
+                        tenant-id]
+                       {:builder-fn rs/as-unqualified-lower-maps})))
+
+(defn- postgres-compaction-context [conn {:keys [activation tenant-id limit evaluated-at]}]
+  (let [{:keys [event/type policy]} activation
+        lifecycle (load-tenant-events conn compaction/system-tenant-id)]
+    (when (and (pos-int? limit)
+               (not (contains? compaction/protected-event-types type))
+               (compaction/activation-matches? lifecycle activation))
+      (let [cutoff (compaction/cutoff (or evaluated-at (time/now))
+                                      (:retain-at-least policy))]
+        {:cutoff cutoff
+         :eligible (compaction/eligible-events
+                    (load-tenant-events conn tenant-id) type policy cutoff limit)}))))
+
+(defn estimate-compaction [event-store request]
+  (jdbc/with-transaction [conn (get-in event-store [:state ::connection-pool])]
+    (if-let [{:keys [cutoff eligible]} (postgres-compaction-context conn request)]
+      {:eligible-count (count eligible)
+       :eligible-event-ids (mapv :event/id eligible)
+       :cutoff cutoff}
+      {:eligible-count 0 :authorized? false})))
+
+(defn compact-events! [event-store {:keys [activation tenant-id] :as request}]
+  (jdbc/with-transaction [conn (get-in event-store [:state ::connection-pool])]
+    (jdbc/execute! conn ["SET LOCAL lock_timeout = '5000ms'"])
+    (doseq [lock-key (sort [(tenant-lock-key compaction/system-tenant-id)
+                            (tenant-lock-key tenant-id)])]
+      (jdbc/execute! conn ["SELECT pg_advisory_xact_lock(?)" lock-key]))
+    (if-let [{:keys [cutoff eligible]} (postgres-compaction-context conn request)]
+      (when (seq eligible)
+        (let [deleted-ids (set (map :event/id eligible))
+              _ (set-tenant! conn tenant-id)
+              last-id (committed-last-event-id conn tenant-id)
+              receipt {:event/type compaction/compaction-receipt-type
+                       :event/tags #{(compaction/policy-tag (:event/type activation))}
+                       :retention/activation-id (:activation/id activation)
+                       :retention/event-type (:event/type activation)
+                       :retention/policy (:policy activation)
+                       :retention/tenant-id tenant-id
+                       :retention/cutoff cutoff
+                       :retention/deleted-event-ids deleted-ids}
+              {:keys [events events-with-tx last-event-id]}
+              (prepare-append last-id [receipt]
+                              {:grain/operation :retention-compaction})]
+          (jdbc/execute! conn
+                         (into [(str "DELETE FROM grain.events WHERE tenant_id = ? AND id IN ("
+                                     (placeholders (count deleted-ids)) ")")
+                                tenant-id]
+                               deleted-ids))
+          (jdbc/execute! conn ["INSERT INTO grain.tenants (id, last_event_id) VALUES (?, ?)
+                                ON CONFLICT (id) DO UPDATE SET last_event_id = ?"
+                               tenant-id last-event-id last-event-id])
+          (insert-events conn tenant-id events-with-tx)
+          (first events)))
+      (throw (ex-info "Retention compaction is not authorized by the active policy"
+                      {:request request})))))
+
 ;; ----------------- ;;
 ;; Record Definition ;;
 ;; ----------------- ;;
@@ -372,7 +444,11 @@
     (append this args))
 
   (read [this args]
-    (read this args)))
+    (read this args))
+
+  compaction/EventCompaction
+  (estimate [this request] (estimate-compaction this request))
+  (compact! [this request] (compact-events! this request)))
 
 (defmethod start-event-store :postgres
   [config]

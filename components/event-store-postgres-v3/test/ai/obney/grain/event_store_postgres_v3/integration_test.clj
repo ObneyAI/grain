@@ -2,12 +2,15 @@
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.event-store-postgres-v3.core :as pg-core]
+            [ai.obney.grain.event-retention.interface :as retention]
+            [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
+            [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [clj-uuid :as uuid])
-  (:import [java.time OffsetDateTime]
+  (:import [java.time OffsetDateTime ZoneOffset]
            [java.util UUID]))
 
 ;; -------------------- ;;
@@ -19,6 +22,11 @@
    :test/beta  [:map]
    :test/gamma [:map]
    :hello/world [:map]})
+
+(es/defevent :postgres-test/ephemeral
+  "Postgres retention integration event"
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "P1D"}})
 
 ;; -------------------- ;;
 ;; Config & Dynamic Var ;;
@@ -86,6 +94,20 @@
 
 (defn tx-events [events]
   (filterv #(= :grain/tx (:event/type %)) events))
+
+(deftest privileged-retention-compaction-is-durable
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        deleted (with-redefs [time/now (constantly old)]
+                  (append-event! :postgres-test/ephemeral #{} {:value 1}))
+        retained (append-event! :postgres-test/ephemeral #{} {:value 2})]
+    (retention/activate! admin :postgres-test/ephemeral)
+    (let [receipt (retention/compact! admin :postgres-test/ephemeral *tenant-id* 100)]
+      (is (= #{(:event/id deleted)} (:retention/deleted-event-ids receipt)))
+      (is (= [(:event/id retained)]
+             (mapv :event/id
+                   (read-events {:types #{:postgres-test/ephemeral}}))))
+      (is (= 1 (count (read-events {:types #{compaction/compaction-receipt-type}})))))))
 
 ;; ======================== ;;
 ;; A. Lifecycle (3 tests)   ;;

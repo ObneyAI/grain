@@ -1,5 +1,6 @@
 (ns ai.obney.grain.event-store-v3.interface.schemas
   (:require [ai.obney.grain.schema-util.interface :refer [register!]]
+            [ai.obney.grain.event-store-v3.interface.event-definition :as definitions]
             [clj-uuid :as uuid]))
 
 (defn- as-of-or-after [x] (not (and (:as-of x) (:after x))))
@@ -97,22 +98,27 @@
     [:map
      [:type ::type]
      [:tags {:optional true} ::tags]
-     [:body {:optional true} [:map]]]]
+     [:body {:optional true} [:map]]]]})
 
-   :grain/tx
-   [:map
-    [:event-ids [:set ::id]]
-    [:metadata {:optional true} [:map]]]
+(definitions/defevent :grain/tx
+  "The reified transaction containing the exact event IDs committed atomically."
+  {:schema [:map
+            [:event-ids [:set ::id]]
+            [:metadata {:optional true} [:map]]]})
 
-   :grain/todo-processor-checkpoint
-   [:map
-    [:processor/name :keyword]
-    [:triggered-by ::id]
-    [:checkpoint/kind {:optional true} :keyword]
-    [:checkpoint/from {:optional true} ::id]]
+(definitions/defevent :grain/todo-processor-checkpoint
+  "A todo processor durably recorded progress through a tenant event stream."
+  {:schema [:map
+            [:processor/name :keyword]
+            [:triggered-by ::id]
+            [:checkpoint/kind {:optional true} :keyword]
+            [:checkpoint/from {:optional true} ::id]]
+   :history {:retain-at-least "PT1H"
+             :keep-latest-per {:tags #{:processor}}}})
 
-   :grain/todo-processor-effect-failure
-   [:map
-    [:processor/name :keyword]
-    [:triggered-by ::id]
-    [:error/message :string]]})
+(definitions/defevent :grain/todo-processor-effect-failure
+  "A todo processor effect failed while handling a triggering event."
+  {:schema [:map
+            [:processor/name :keyword]
+            [:triggered-by ::id]
+            [:error/message :string]]})

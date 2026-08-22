@@ -1,0 +1,5 @@
+{:paths ["src"]
+ :deps {cat/event-store-v3 {:local/root "../event-store-v3"}
+        metosin/malli {:mvn/version "0.16.4"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {}}}}

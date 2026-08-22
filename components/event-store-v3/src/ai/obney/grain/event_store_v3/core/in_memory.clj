@@ -1,7 +1,9 @@
 (ns ai.obney.grain.event-store-v3.core.in-memory
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p]
+            [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
             [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
+            [ai.obney.grain.time.interface :as time]
             [cognitect.anomalies :as anom]
             [clojure.set :as set]
             [com.brunobonacci.mulog :as u]
@@ -141,6 +143,66 @@
   [event-store]
   (-> event-store :state deref :tenants))
 
+(defn- tenant-events [state tenant-id]
+  (filter #(matches-tenant? tenant-id %) (:events state)))
+
+(defn- compaction-context
+  [state {:keys [activation tenant-id limit evaluated-at]}]
+  (let [system-events (tenant-events state compaction/system-tenant-id)
+        {:keys [event/type policy]} activation]
+    (when (and (pos-int? limit)
+               (not (contains? compaction/protected-event-types type))
+               (compaction/activation-matches? system-events activation))
+      (let [cutoff-time (compaction/cutoff (or evaluated-at (time/now))
+                                           (:retain-at-least policy))
+            eligible (compaction/eligible-events
+                      (tenant-events state tenant-id) type policy cutoff-time limit)]
+        {:cutoff cutoff-time :eligible eligible}))))
+
+(defn estimate-compaction
+  [event-store request]
+  (if-let [{:keys [cutoff eligible]} (compaction-context @(:state event-store) request)]
+    {:eligible-count (count eligible)
+     :eligible-event-ids (mapv :event/id eligible)
+     :cutoff cutoff}
+    {:eligible-count 0 :authorized? false}))
+
+(defn compact!
+  [event-store {:keys [activation tenant-id] :as request}]
+  (dosync
+   (let [state @(:state event-store)]
+     (if-let [{:keys [cutoff eligible]} (compaction-context state request)]
+       (if (empty? eligible)
+         nil
+         (let [deleted-ids (set (map :event/id eligible))
+               last-id (get-in state [:tenants tenant-id :tenant/last-event-id])
+               receipt {:event/type compaction/compaction-receipt-type
+                        :event/tags #{(compaction/policy-tag (:event/type activation))}
+                        :retention/activation-id (:activation/id activation)
+                        :retention/event-type (:event/type activation)
+                        :retention/policy (:policy activation)
+                        :retention/tenant-id tenant-id
+                        :retention/cutoff cutoff
+                        :retention/deleted-event-ids deleted-ids}
+               {:keys [events events-with-tx last-event-id]}
+               (prepare-append last-id [receipt]
+                               {:grain/operation :retention-compaction})]
+           (alter (:state event-store)
+                  (fn [s]
+                    (-> s
+                        (update :events
+                                (fn [all-events]
+                                  (into [] (remove #(and (= tenant-id (:grain/tenant-id %))
+                                                        (contains? deleted-ids (:event/id %)))
+                                                   all-events))))
+                        (update :events into
+                                (tag-events-with-tenant tenant-id events-with-tx))
+                        (assoc-in [:tenants tenant-id :tenant/last-event-id]
+                                  last-event-id))))
+           (first events)))
+       (throw (ex-info "Retention compaction is not authorized by the active policy"
+                       {:request request}))))))
+
 (defrecord InMemoryEventStore [config]
   p/EventStore
 
@@ -158,7 +220,15 @@
     (append this args))
 
   (read [this args]
-    (read this args)))
+    (read this args))
+
+  compaction/EventCompaction
+
+  (estimate [this request]
+    (estimate-compaction this request))
+
+  (compact! [this request]
+    (compact! this request)))
 
 (defmethod p/start-event-store :in-memory
   [config]

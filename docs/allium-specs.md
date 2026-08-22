@@ -1,13 +1,14 @@
 # Allium Specifications
 
-Distilled behavioural specifications for every grain component on `main`. Each spec
-captures *what* a component does and *why* it matters — not *how* it is implemented —
-and lives beside its component as `components/<name>/<name>.allium` (Allium language v3).
+Behavioural specifications for Grain components and accepted component designs.
+Each spec captures *what* a component does and *why* it matters — not *how* it is
+implemented — and lives at `components/<name>/<name>.allium` (Allium language v3).
 
-**37 components** — 2 domain, 26 library, 9 infrastructure. All pass `allium check` and `allium analyse` with no errors and no findings.
+**38 components** — 2 domain, 27 library, 9 infrastructure. All pass `allium check` and `allium analyse` with no errors and no findings.
 
-Each was distilled and then adversarially audited and repaired against its own source
-and tests. Two specs (`pubsub`, `command-request-handler`) carry an expected
+Implemented-component specs were distilled and then adversarially audited against
+their source and tests. Spec-first designs are identified explicitly and do not
+claim implementation alignment. Two specs (`pubsub`, `command-request-handler`) carry an expected
 `externalEntity.missingSourceHint` reminder — a caller-supplied/cross-component type
 with no governing spec to import — which is correct, not a defect.
 
@@ -93,6 +94,12 @@ A cross-instance event-notification bridge: when one node appends events for a t
 
 <sub>entities 1 · rules 2 · contracts 2 · invariants 1 · surfaces 2</sub>
 
+### [`event-retention`](../components/event-retention/event-retention.allium)
+
+**Spec-first design; not yet implemented.** An opt-in event-history compaction boundary: event definitions require a name, description and payload schema, retain complete history by default, and may declare an inert bounded-history policy using a fixed ISO 8601 duration and optional composite tag key. Durable activation is explicit and value-matched; structural boot validation and stored-data preflight fail closed; only a restricted event-store capability may atomically delete conservative bounded batches while recording exact durable receipts. Activation workflow remains application policy rather than framework behaviour.
+
+<sub>entities 3 · rules 6 · contracts 4 · invariants 2 · surfaces 3 · actors 3</sub>
+
 ### [`event-store-postgres-v2`](../components/event-store-postgres-v2/event-store-postgres-v2.allium)
 
 A durable, append-only relational event store: the persistence boundary of the event-sourced system. The spec is a library/framework spec modelling the construct/append/read boundaries as module-level contracts with @invariant guarantees, an Event placeholder entity, and writer/reader surfaces. It captures the real proven guarantees: time-ordered total ordering, atomic and globally-serialised batch append, a self-describing transaction marker per append, optimistic compare-and-swap (stored vs conflict), conjunctive read filtering, deduplicated batch reads, streaming/early-terminable reads, faithful round-trip, and idempotent initialisation.
@@ -119,7 +126,7 @@ The event-store-v2 facade: the validating, publishing boundary above a pluggable
 
 ### [`event-store-v3`](../components/event-store-v3/event-store-v3.allium)
 
-Captures the append-only, tenant-scoped event store at the heart of grain's event-sourced CQRS model: event identity/time-ordering, atomic batch append with a transaction marker and per-tenant high-watermark, filtered/reversed/limited streaming reads, batch union+dedup, conditional CAS append, deny-by-default schema validation, tenant isolation, serialization round-trip, and tenant-tagged publication. Modelled as a library spec with EventCodec/EventStream contracts plus Tenant/Event entities, CAS rules, cross-entity invariants and append/read surfaces.
+Captures the normally append-only application boundary of the tenant-scoped event store at the heart of grain's event-sourced CQRS model: event identity/time-ordering, atomic batch append with a transaction marker and per-tenant high-watermark, filtered/reversed/limited streaming reads, batch union+dedup, conditional CAS append, deny-by-default schema validation, tenant isolation, serialization round-trip, and tenant-tagged publication. The ordinary surfaces expose no deletion; privileged history compaction is a separate capability governed by `event-retention`. Modelled as a library spec with EventCodec/EventStream contracts plus Tenant/Event entities, CAS rules, cross-entity invariants and append/read surfaces.
 
 <sub>entities 2 · rules 3 · contracts 2 · invariants 4 · surfaces 2</sub>
 

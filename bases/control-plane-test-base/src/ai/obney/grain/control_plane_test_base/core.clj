@@ -4,6 +4,7 @@
    and processes events. The test processor records which node handled
    each event for observability."
   (:require [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.event-retention.interface :as retention]
             [ai.obney.grain.event-store-postgres-v3.interface]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.event-tailer.interface :as event-tailer]
@@ -340,6 +341,48 @@
   (es/append (:event-store system)
     {:tenant-id tenant-id
      :events [(es/->event {:type :test/counter-incremented :body {}})]}))
+
+(defn exercise-retention!
+  "Activate and exercise the real bookkeeping policies against the live store.
+   Only retention's evaluation clock is advanced; stored event timestamps and
+   the registered policy values are unchanged. Returns compact summaries rather
+   than the potentially large exact-ID receipts."
+  [system tenant-id]
+  (let [store (:event-store system)
+        admin (retention/administration
+               store {:clock #(.plusHours (java.time.OffsetDateTime/now
+                                            java.time.ZoneOffset/UTC)
+                                           2)})
+        control-tenant ai.obney.grain.control-plane.events/control-plane-tenant-id
+        cases [{:event-type :grain.control/node-heartbeat
+                :tenant-id control-tenant
+                :key-tag :node}
+               {:event-type :grain/todo-processor-checkpoint
+                :tenant-id tenant-id
+                :key-tag :processor}]
+        summarize (fn [{:keys [event-type tenant-id key-tag]}]
+                    (let [events (into [] (es/read store {:tenant-id tenant-id
+                                                          :types #{event-type}}))]
+                      {:count (count events)
+                       :keys (->> events
+                                  (mapcat :event/tags)
+                                  (filter #(= key-tag (first %)))
+                                  (map second)
+                                  set)}))]
+    (into {}
+          (for [{:keys [event-type tenant-id] :as retention-case} cases]
+            (do
+              (retention/activate! admin event-type)
+              (let [before (summarize retention-case)
+                    estimate (retention/estimate admin event-type tenant-id 100000)
+                    receipt (retention/compact! admin event-type tenant-id 100000)
+                    after (summarize retention-case)]
+                [event-type
+                 {:before before
+                  :estimated (:eligible-count estimate)
+                  :deleted (count (:retention/deleted-event-ids receipt))
+                  :after after
+                  :receipt? (boolean receipt)}]))))))
 
 (defn append-checkpoint-gap!
   "Construct A before B without persistence metadata, commit and process B,

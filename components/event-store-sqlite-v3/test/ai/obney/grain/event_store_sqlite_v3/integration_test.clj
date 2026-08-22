@@ -3,6 +3,9 @@
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.event-store-sqlite-v3.core :as sqlite-core]
             [ai.obney.grain.event-store-sqlite-v3.interface]
+            [ai.obney.grain.event-retention.interface :as retention]
+            [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
+            [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
@@ -24,6 +27,11 @@
    :test/beta   [:map]
    :test/gamma  [:map]
    :hello/world [:map]})
+
+(es/defevent :sqlite-test/ephemeral
+  "SQLite retention integration event"
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "P1D"}})
 
 ;; -------------------- ;;
 ;; Config & Dynamic Var ;;
@@ -88,6 +96,20 @@
 
 (defn tx-events [events]
   (filterv #(= :grain/tx (:event/type %)) events))
+
+(deftest privileged-retention-compaction-is-durable
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        deleted (with-redefs [time/now (constantly old)]
+                  (append-event! :sqlite-test/ephemeral #{} {:value 1}))
+        retained (append-event! :sqlite-test/ephemeral #{} {:value 2})]
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (let [receipt (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 100)]
+      (is (= #{(:event/id deleted)} (:retention/deleted-event-ids receipt)))
+      (is (= [(:event/id retained)]
+             (mapv :event/id
+                   (read-events {:types #{:sqlite-test/ephemeral}}))))
+      (is (= 1 (count (read-events {:types #{compaction/compaction-receipt-type}})))))))
 
 (defn- with-configured-store [config f]
   (let [tmp (File/createTempFile "grain-sqlite-policy-" ".sqlite")
