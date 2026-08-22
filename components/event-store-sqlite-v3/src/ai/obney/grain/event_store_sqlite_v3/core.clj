@@ -1,7 +1,7 @@
 (ns ai.obney.grain.event-store-sqlite-v3.core
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
-            [ai.obney.grain.event-store-v3.interface :refer [->event]]
+            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
             [ai.obney.grain.event-store-sqlite-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [next.jdbc :as jdbc]
@@ -9,10 +9,14 @@
             [integrant.core :as ig]
             [hikari-cp.core :as hikari]
             [cognitect.anomalies :as anom]
-            [clojure.string :as string])
+            [clojure.string :as string]
+            [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime]
            [java.util UUID]
-           [java.sql Connection]))
+           [java.sql Connection SQLException]
+           [java.util.concurrent ArrayBlockingQueue Callable CancellationException
+            ExecutionException FutureTask RejectedExecutionException ThreadFactory
+            ThreadPoolExecutor ThreadPoolExecutor$AbortPolicy TimeUnit]))
 
 ;; -------------------------- ;;
 ;; Event Store Initialization ;;
@@ -59,11 +63,24 @@
      (jdbc/execute! conn ["PRAGMA foreign_keys = ON"]))
    (jdbc/with-transaction [conn connection-pool]
      (doseq [statement schema-statements]
-       (jdbc/execute! conn [statement])))))
+       (jdbc/execute! conn [statement])))
+   ;; Refresh planner statistics on an existing database so every query gets
+   ;; real cardinality estimates. analysis_limit bounds the row sample per
+   ;; index, keeping ANALYZE cheap enough to run at every start. Plain ANALYZE
+   ;; rather than PRAGMA optimize: optimize only covers tables the current
+   ;; connection has already queried (until SQLite 3.46's 0x10002 mask), so on
+   ;; a fresh connection at start it can no-op. On an empty database this
+   ;; writes no stats — the tag query does not depend on them because CROSS
+   ;; JOIN pins its plan.
+   (with-open [conn (jdbc/get-connection connection-pool)]
+     (jdbc/execute! conn ["PRAGMA analysis_limit = 400"])
+     (jdbc/execute! conn ["ANALYZE"]))))
 
 ;; --------------------------- ;;
 ;; Integrant / Lifecycle Setup ;;
 ;; --------------------------- ;;
+
+(declare make-write-coordinator)
 
 (defn start
   [config]
@@ -74,14 +91,21 @@
                  {::config config
                   ::connection-pool {::config (ig/ref ::config)}})]
      (init-idempotently system)
-     system)))
+     (assoc system ::write-coordinator (make-write-coordinator config)))))
 
 (defn stop
   [event-store]
   (u/trace
    ::stopping-event-store
    []
-   (ig/halt! event-store)))
+   (when-let [^ThreadPoolExecutor coordinator (::write-coordinator event-store)]
+     (.shutdown coordinator)
+     (when-not (.awaitTermination
+                coordinator
+                (long (or (get-in event-store [::config :write-shutdown-timeout-ms]) 5000))
+                TimeUnit/MILLISECONDS)
+       (run! #(.cancel ^FutureTask % true) (.shutdownNow coordinator))))
+   (ig/halt! (dissoc event-store ::write-coordinator))))
 
 (defmethod ig/init-key ::config [_ config]
   config)
@@ -95,6 +119,29 @@
 
 (defmethod ig/halt-key! ::connection-pool [_ connection-pool]
   (hikari/close-datasource connection-pool))
+
+(defn- make-write-coordinator
+  [config]
+  (let [capacity (long (or (:write-queue-capacity config) 1024))
+        thread-number (atom 0)]
+    (when-not (pos? capacity)
+      (throw (IllegalArgumentException. ":write-queue-capacity must be positive")))
+    (doseq [[key default] [[:busy-timeout-ms 1000]
+                           [:busy-max-retries 3]
+                           [:busy-retry-backoff-ms 10]
+                           [:busy-retry-max-backoff-ms 250]
+                           [:write-shutdown-timeout-ms 5000]]]
+      (when (neg? (long (get config key default)))
+        (throw (IllegalArgumentException. (str key " must not be negative")))))
+    (ThreadPoolExecutor.
+     1 1 0 TimeUnit/MILLISECONDS
+     (ArrayBlockingQueue. capacity true)
+     (reify ThreadFactory
+       (newThread [_ runnable]
+         (doto (Thread. runnable
+                        (str "grain-sqlite-writer-" (swap! thread-number inc)))
+           (.setDaemon true))))
+     (ThreadPoolExecutor$AbortPolicy.))))
 
 ;; -------------- ;;
 ;; Encoding       ;;
@@ -153,8 +200,9 @@
                   ORDER BY e.id
 
    Returns {:sql \"...\" :params [...]}."
-  [{:keys [tenant-id tags types after as-of]}]
-  (let [tenant-str (str tenant-id)]
+  [{:keys [tenant-id tags types after as-of reverse? limit]}]
+  (let [tenant-str (str tenant-id)
+        order-dir  (if reverse? " DESC" "")]
     (if (seq tags)
       (let [tag-strs (mapv tag->str tags)
             type-strs (when types (mapv #(str ":" (key-fn %)) types))
@@ -163,18 +211,26 @@
                           types  (conj (str "e.type IN (" (placeholders (count type-strs)) ")"))
                           after  (conj "e.id > ?")
                           as-of  (conj "e.id <= ?"))
+            ;; :limit must be the LAST positional param — after the HAVING count.
             params (cond-> (into [tenant-str] tag-strs)
                      types  (into type-strs)
                      after  (conj (str after))
                      as-of  (conj (str as-of))
-                     true   (conj (count tag-strs)))
+                     true   (conj (count tag-strs))
+                     limit  (conj limit))
+            ;; CROSS JOIN is a SQLite planner directive: it pins the join order
+            ;; so the query drives from the event_tags PK (tenant_id, tag,
+            ;; event_id) and probes events per matching tag row. A plain JOIN
+            ;; lets the planner drive from events on a database with no
+            ;; statistics, which scans the tenant's entire stream per read.
             sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
-                     "FROM events e "
-                     "JOIN event_tags t ON t.tenant_id = e.tenant_id AND t.event_id = e.id "
+                     "FROM event_tags t CROSS JOIN events e "
+                     "ON e.tenant_id = t.tenant_id AND e.id = t.event_id "
                      "WHERE " (string/join " AND " where-parts) " "
                      "GROUP BY e.id "
                      "HAVING COUNT(DISTINCT t.tag) = ? "
-                     "ORDER BY e.id")]
+                     "ORDER BY e.id" order-dir
+                     (when limit " LIMIT ?"))]
         {:sql sql :params params})
       (let [type-strs (when types (mapv #(str ":" (key-fn %)) types))
             where-parts (cond-> ["tenant_id = ?"]
@@ -184,10 +240,12 @@
             params (cond-> [tenant-str]
                      types (into type-strs)
                      after (conj (str after))
-                     as-of (conj (str as-of)))
+                     as-of (conj (str as-of))
+                     limit (conj limit))
             sql (str "SELECT id, time, type, data FROM events "
                      "WHERE " (string/join " AND " where-parts) " "
-                     "ORDER BY id")]
+                     "ORDER BY id" order-dir
+                     (when limit " LIMIT ?"))]
         {:sql sql :params params}))))
 
 (defn- make-reducible
@@ -281,6 +339,14 @@
                    ON CONFLICT(id) DO UPDATE SET last_event_id = excluded.last_event_id"
                   (str tenant-id) (str last-event-id)]))
 
+(defn- committed-last-event-id
+  [conn tenant-id]
+  (some-> (jdbc/execute-one! conn
+                             ["SELECT last_event_id FROM tenants WHERE id = ?"
+                              (str tenant-id)])
+          :tenants/last_event_id
+          UUID/fromString))
+
 (defn- with-immediate-tx
   "Run body-fn inside a BEGIN IMMEDIATE transaction on a fresh connection.
    body-fn receives the connection and returns its result.
@@ -288,9 +354,10 @@
 
    We must keep auto-commit = true so that JDBC does not issue an implicit
    DEFERRED BEGIN before our explicit BEGIN IMMEDIATE statement runs."
-  [pool body-fn]
+  [pool busy-timeout-ms body-fn]
   (with-open [conn (jdbc/get-connection pool)]
     (.setAutoCommit ^Connection conn true)
+    (jdbc/execute! conn [(str "PRAGMA busy_timeout = " busy-timeout-ms)])
     (jdbc/execute! conn ["BEGIN IMMEDIATE"])
     (let [completed? (volatile! false)]
       (try
@@ -327,35 +394,134 @@
                     (jdbc/plan conn (into [sql] params)))]
         (if (= result ::none) (f) result)))))
 
-(defn append
+(defn- sqlite-contention?
+  [throwable]
+  (loop [cause throwable]
+    (cond
+      (nil? cause) false
+      (and (instance? SQLException cause)
+           (contains? #{5 6} (.getErrorCode ^SQLException cause))) true
+      :else (recur (.getCause ^Throwable cause)))))
+
+(defn- retry-backoff-ms
+  [config retry-number]
+  (let [initial (long (or (:busy-retry-backoff-ms config) 10))
+        maximum (long (or (:busy-retry-max-backoff-ms config) 250))]
+    (loop [remaining (dec retry-number)
+           delay (min initial maximum)]
+      (if (or (zero? remaining) (= delay maximum))
+        delay
+        (recur (dec remaining)
+               (if (> delay (quot maximum 2)) maximum (* 2 delay)))))))
+
+(defn- append-direct
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
-  (let [events* (conj
-                 events
-                 (->event
-                  {:type :grain/tx
-                   :body (cond-> {:event-ids (set (mapv :event/id events))}
-                           tx-metadata (assoc :metadata tx-metadata))}))
-        max-event-id (:event/id (last events*))
-        pool (get-in event-store [:state ::connection-pool])]
+  (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
+      (long (or (get-in event-store [:config :busy-timeout-ms]) 1000))
       (fn [conn]
-        (if cas
-          (let [{:keys [sql params]} (build-single-query (assoc cas :tenant-id tenant-id))
-                cas-events (conn-reducible conn sql params)]
-            (if (predicate-fn cas-events)
+        (let [last-id (committed-last-event-id conn tenant-id)
+              persist! (fn []
+                         (let [{:keys [events events-with-tx last-event-id]}
+                               (prepare-append last-id events tx-metadata)]
+                           (upsert-tenant! conn tenant-id last-event-id)
+                           (insert-events! conn tenant-id events-with-tx)
+                           events))]
+          (if cas
+            (let [{:keys [sql params]} (build-single-query (assoc cas :tenant-id tenant-id))
+                  cas-events (conn-reducible conn sql params)]
+              (if (predicate-fn cas-events)
+                (persist!)
+                (let [anomaly {::anom/category ::anom/conflict
+                               ::anom/message "CAS failed"
+                               ::cas cas}]
+                  (u/log ::cas-failed :anomaly anomaly)
+                  anomaly)))
+            (persist!)))))))
+
+(defn- append-with-busy-retry
+  [event-store args]
+  (let [config (:config event-store)
+        max-retries (long (or (:busy-max-retries config) 3))]
+    (loop [attempt 0]
+      (let [[status value]
+            (try
+              [:ok (u/trace ::write-transaction
+                     [:metric/name "SQLiteWriteTransaction"
+                      :metric/resolution :high
+                      :attempt (inc attempt)]
+                     (append-direct event-store args))]
+              (catch Throwable t [:error t]))]
+        (if (= :ok status)
+          value
+          (if (and (sqlite-contention? value) (< attempt max-retries))
+            (let [retry-number (inc attempt)
+                  backoff-ms (retry-backoff-ms config retry-number)]
+              (u/log :metric/metric
+                     :metric/name "SQLiteBusyRetry"
+                     :metric/value 1
+                     :metric/resolution :high
+                     :retry retry-number
+                     :backoff-ms backoff-ms)
+              (Thread/sleep backoff-ms)
+              (recur retry-number))
+            (if (sqlite-contention? value)
               (do
-                (upsert-tenant! conn tenant-id max-event-id)
-                (insert-events! conn tenant-id events*))
-              (let [anomaly {::anom/category ::anom/conflict
-                             ::anom/message "CAS failed"
-                             ::cas cas}]
-                (u/log ::cas-failed :anomaly anomaly)
-                anomaly)))
-          (do
-            (upsert-tenant! conn tenant-id max-event-id)
-            (insert-events! conn tenant-id events*)))))))
+                (u/log :metric/metric
+                       :metric/name "SQLiteBusyExhausted"
+                       :metric/value 1
+                       :metric/resolution :high
+                       :attempts (inc attempt))
+                {::anom/category ::anom/busy
+                 ::anom/message "SQLite event-store contention limit exhausted"
+                 ::busy-attempts (inc attempt)})
+              (throw value))))))))
+
+(defn append
+  [event-store args]
+  (let [^ThreadPoolExecutor coordinator
+        (get-in event-store [:state ::write-coordinator])
+        queued-at (System/nanoTime)
+        task (FutureTask.
+              ^Callable
+              (reify Callable
+                (call [_]
+                  (let [queue-wait-ns (- (System/nanoTime) queued-at)]
+                    (u/log :metric/metric
+                           :metric/name "SQLiteWriteQueueWait"
+                           :metric/value queue-wait-ns
+                           :metric/resolution :high)
+                    (u/log :metric/metric
+                           :metric/name "SQLiteWriteQueueDepth"
+                           :metric/value (.size (.getQueue coordinator))
+                           :metric/resolution :high)
+                    (u/trace ::append
+                      [:metric/name "SQLiteAppend"
+                       :metric/resolution :high
+                       :queue-wait-ns queue-wait-ns]
+                      (append-with-busy-retry event-store args))))))]
+    (try
+      (.execute coordinator task)
+      (u/log :metric/metric
+             :metric/name "SQLiteWriteQueueDepth"
+             :metric/value (.size (.getQueue coordinator))
+             :metric/resolution :high)
+      (try
+        (.get task)
+        (catch ExecutionException e
+          (throw (.getCause e)))
+        (catch CancellationException e
+          (throw (IllegalStateException. "SQLite event-store writer stopped" e))))
+      (catch RejectedExecutionException _
+        (u/log :metric/metric
+               :metric/name "SQLiteWriteQueueSaturated"
+               :metric/value 1
+               :metric/resolution :high
+               :queue-capacity (or (get-in event-store [:config :write-queue-capacity]) 1024))
+        {::anom/category ::anom/busy
+         ::anom/message "SQLite event-store write queue is full"}))))
 
 ;; ----------- ;;
 ;; Tenants     ;;

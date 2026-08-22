@@ -7,7 +7,7 @@ Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 proc
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -18,7 +18,7 @@ Distributed coordination for multi-instance deployments. Coordinator election, t
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -31,7 +31,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -57,7 +57,7 @@ Dev-only nREPL-facing tools for coding agents working against a live Grain app. 
 ```clojure
 obneyai/grain-code-agent-tools
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea"
  :deps/root "projects/grain-code-agent-tools"}
 ```
 
@@ -73,7 +73,26 @@ Install it after the app's Grain system starts:
 
 Use it from nREPL to inspect the live catalog, validate command/query payloads
 against the schema registry, read events, inspect projections, and run runtime
-diagnostics. See [Code Agent Tools](code-agent-tools.md) for the full guide.
+diagnostics. It also provides Event Model runtime and Allium composition
+validation. See [Code Agent Tools](code-agent-tools.md) for the full guide.
+
+## grain-event-model
+
+Service-area Event Model registration plus the shippable structural validator
+and strict production boot guard. This package provides `defeventmodel`, runtime
+topology reconciliation, coverage checks, and `verify-or-throw!`. Production
+validation does not require Allium source files or the Allium CLI:
+
+```clojure
+obneyai/grain-event-model
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea"
+ :deps/root "projects/grain-event-model"}
+```
+
+Use the separate `grain-code-agent-tools` package for the development/CI
+composition gate that resolves Event Model `:grain/allium` links. See
+[Event Model](event-model.md) for setup and the composed specification workflow.
 
 ## grain-event-store-postgres-v3
 
@@ -82,20 +101,36 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
 ## grain-event-store-sqlite-v3
 
-Embedded SQLite backend implementing the v3 event store protocol for single-process deployments where running Postgres is overkill. WAL mode with `BEGIN IMMEDIATE` per append, a tenant-scoped events table plus a normalized `event_tags` join table for indexed superset tag filtering, and Fressian binary serialization. Same tenant-scoped API as the Postgres backend — swap the `:conn` type to move between them:
+Embedded SQLite backend implementing the v3 event store protocol for single-process deployments where running Postgres is overkill. WAL mode with a bounded single-writer queue and `BEGIN IMMEDIATE` per append, a tenant-scoped events table plus a normalized `event_tags` join table for indexed superset tag filtering, and Fressian binary serialization. Reads continue to use the connection pool concurrently; increasing the pool size improves available read concurrency but cannot increase SQLite's single-writer throughput. Same tenant-scoped API as the Postgres backend — swap the `:conn` type to move between them:
 
 ```clojure
 obneyai/grain-event-store-sqlite-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea"
  :deps/root "projects/grain-event-store-sqlite-v3"}
 ```
+
+SQLite contention policy is configured inside `:conn`:
+
+```clojure
+{:type :sqlite
+ :database-file "grain.sqlite"
+ :maximum-pool-size 4
+ :write-queue-capacity 1024
+ :busy-timeout-ms 1000
+ :busy-max-retries 3
+ :busy-retry-backoff-ms 10
+ :busy-retry-max-backoff-ms 250
+ :write-shutdown-timeout-ms 5000}
+```
+
+The queue admits one active write plus `:write-queue-capacity` waiting writes. A full queue returns a `cognitect.anomalies/busy` result immediately. SQLite busy/locked results retry the complete transaction with capped exponential backoff; exhaustion also returns a busy anomaly rather than exposing a raw `SQLITE_BUSY` exception. Keep at least two pooled connections when reads must proceed alongside a writer; the default is four. A larger pool can serve more simultaneous reads, but still cannot create a second SQLite writer. Grain emits μ/log metrics named `SQLiteWriteQueueDepth`, `SQLiteWriteQueueWait`, `SQLiteAppend`, `SQLiteWriteTransaction`, `SQLiteBusyRetry`, `SQLiteBusyExhausted`, and `SQLiteWriteQueueSaturated`.
 
 ## grain-mulog-aws-cloudwatch-emf-publisher
 
@@ -104,7 +139,7 @@ obneyai/grain-event-store-sqlite-v3
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "24720f69fb41ca1979f2a4ab61ac2dedbffefb21"
+ :git/sha "fe6ddf5369423776de84c6fc1b2fc990ad0befea"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 

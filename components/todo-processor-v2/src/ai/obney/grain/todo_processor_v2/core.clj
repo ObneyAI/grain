@@ -71,8 +71,14 @@
          result (event-store/append event-store
                   {:tenant-id tenant-id
                    :events all-events
+                   ;; CAS reads only the newest checkpoint (:reverse? + :limit 1):
+                   ;; by the monotonicity invariant the max :triggered-by lives in
+                   ;; the latest checkpoint, so testing it alone is equivalent to
+                   ;; scanning the whole history. O(1) instead of O(N) per write.
                    :cas {:types #{:grain/todo-processor-checkpoint}
                          :tags  #{[:processor proc-uuid]}
+                         :reverse? true
+                         :limit 1
                          :predicate-fn
                          (fn [evts]
                            (not (reduce
@@ -117,19 +123,21 @@
              :triggered-by triggering-event-id
              :error/message error-message}})))
 
+(declare get-last-processed-id)
+
 (defn- already-checkpointed?
-  "Returns true if a checkpoint already exists for this processor+event pair."
+  "Returns true if this event has already been checkpointed by this processor+tenant.
+
+   O(1) w.r.t. checkpoint count: compares the event against the processor's
+   high-watermark (newest checkpoint's :triggered-by) rather than scanning the
+   whole checkpoint history. Sound because checkpoints advance monotonically and
+   gap-free, so any triggering-id at or below the watermark is already covered.
+   On the effect path `flush-batch` runs first, so on first processing the
+   watermark sits just below this event's id (not skipped) and at/above it on
+   replay (skipped) — preserving at-least-once replay-guard semantics."
   [event-store tenant-id processor-name triggering-id]
-  (let [proc-uuid (processor-name->uuid processor-name)]
-    (reduce (fn [_ evt]
-              (if (= triggering-id (:triggered-by evt))
-                (reduced true)
-                false))
-            false
-            (event-store/read event-store
-              {:tenant-id tenant-id
-               :types #{:grain/todo-processor-checkpoint}
-               :tags #{[:processor proc-uuid]}}))))
+  (when-let [last-id (get-last-processed-id event-store tenant-id processor-name)]
+    (not (uuid/< last-id triggering-id))))
 
 (defn- process-effect-after
   "At-least-once: run effect first, then append events + checkpoint.
@@ -231,13 +239,20 @@
 ;; ------------------- ;;
 
 (defn- get-last-processed-id
-  "Queries the event store for the most recent checkpoint for this processor+tenant."
+  "Queries the event store for the most recent checkpoint for this processor+tenant.
+
+   O(1) w.r.t. checkpoint count: reads only the single newest checkpoint via an
+   indexed reverse seek (`:reverse? true :limit 1`). Relies on the monotonicity
+   invariant — checkpoints for a processor+tenant advance gap-free in ascending
+   event-id, so the highest-id checkpoint carries the highest :triggered-by."
   [event-store tenant-id processor-name]
   (let [proc-uuid (processor-name->uuid processor-name)]
     (->> (event-store/read event-store
            {:tenant-id tenant-id
             :types #{:grain/todo-processor-checkpoint}
-            :tags #{[:processor proc-uuid]}})
+            :tags #{[:processor proc-uuid]}
+            :reverse? true
+            :limit 1})
          (reduce (fn [_ event] (:triggered-by event)) nil))))
 
 (defn- catch-up-tenant

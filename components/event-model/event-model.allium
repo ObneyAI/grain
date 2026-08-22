@@ -1,0 +1,440 @@
+-- allium: 3
+-- event-model.allium
+--
+-- Distilled from components/event-model (grain).
+--
+-- Scope: The vocabulary and well-formedness rules for *describing* a grain
+--        application as a SERVICE-AREA-FIRST event model. An event model is a
+--        map of service areas; each service area owns the building blocks of an
+--        event-sourced CQRS system — commands, events, read-models, queries,
+--        todo-processors, periodic-tasks and screens — together with named flows
+--        that wire those blocks into the canonical data-flow shape. This
+--        component defines what a valid description looks like so that tooling
+--        (the grain code-agent-tools `validate-event-model`) can structurally
+--        check it against a live grain runtime over the REPL.
+--
+-- Includes: the service area as the top-level owning container; the kinds of
+--           building block, 1:1 with grain's def* macros; the keying discipline
+--           (:<area>/<name>, kind from structural position); the grammar of legal
+--           connections between blocks within a flow; the kind-typed dependency
+--           edges a block may declare; and explicit links from behavioural
+--           boundaries to declarations in companion Allium specifications.
+--
+-- Excludes (implementation or governed elsewhere):
+--   - the runtime behaviour of any building block: command validation, event
+--     persistence, read-model reduction, query handling, todo-processor delivery
+--     and checkpointing, periodic-task scheduling, screen rendering. Each is a
+--     separate grain component with its own behavioural guarantees.
+--   - the concrete field structure of a command/event/query payload schema: it is
+--     opaque to this model, which only obliges it to be a well-formed malli schema
+--     (see PayloadSchema).
+--   - serialization, the schema registry mechanism, tenancy and authorization.
+--
+-- An event model is a design-time artefact. The actor on its boundary is the
+-- application author (and the tooling acting on their behalf) who declares the
+-- areas, blocks and flows; the obligations below are what that author must honour
+-- for the description to be well-formed. A second boundary — StructuralValidation
+-- — is the code-agent-tools surface that reconciles a declared model against the
+-- live runtime.
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The kinds of building block an event model recognises, 1:1 with grain's def*
+-- macros (read_model was previously "view"; query is new). This is the closed
+-- vocabulary and the sum-type discriminator for Block.
+enum BlockKind {
+    command
+    event
+    read_model
+    query
+    todo_processor
+    periodic_task
+    screen
+}
+
+enum AlliumDeclarationKind {
+    actor
+    contract
+    entity
+    enum
+    invariant
+    rule
+    surface
+    value
+    variant
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A periodic-task schedule, as grain's defperiodic expects: either a cron
+-- expression or an every/duration pair. Not a bare string.
+value Schedule {
+    cron: String?
+    every: Integer?
+    duration: String?
+}
+
+-- A directed flow endpoint. Because a block's kind is NOT recoverable from its
+-- :<area>/<name> alone (a single name may be several kinds — e.g. a read-model
+-- and a query share a name), a flow endpoint is kind-qualified: it pairs the
+-- kind with the block name. An absent endpoint marks a flow entry point or
+-- terminus.
+value Endpoint {
+    kind: BlockKind
+    block: Block
+}
+
+-- A one-way reference from topology to an existing Allium declaration. The
+-- specification path is repository-relative; resolution is a dev/CI concern.
+value AlliumReference {
+    spec: String
+    kind: AlliumDeclarationKind
+    name: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The classification and keying rule. An event model is keyed at two levels: a
+-- service area (a simple keyword), and within it a block (a qualified keyword
+-- whose namespace is the area and whose name is the block's local name). A
+-- block's KIND is not encoded in the keyword — it comes from structural position
+-- (which catalogue map the block sits in). Identity is therefore the pair
+-- (kind, name), and a single name may legitimately denote blocks of different
+-- kinds.
+contract KindNaming {
+    -- The kind a given block occupies, by its structural position.
+    kind_of: (block: Block) -> BlockKind
+    -- The service area a given block belongs to.
+    area_of: (block: Block) -> ServiceArea
+
+    @invariant BlockNamespaceMatchesArea
+        -- A block's name is a qualified keyword whose namespace equals the name
+        -- of the service area that owns it. A block declared under area :billing
+        -- must be named :billing/<something>.
+
+    @invariant IdentityIsKindPlusName
+        -- A block is identified by the pair (kind, name). Two blocks may share a
+        -- name when they are of different kinds (a read-model and a query named
+        -- :area/counters are distinct blocks); no two blocks of the SAME kind in
+        -- the same area share a name.
+}
+
+-- The connection grammar. A flow strings building blocks together, and only
+-- certain kind-to-kind connections are meaningful in an event-sourced CQRS
+-- system. This contract states the legal adjacency; FlowStep.is_legal makes the
+-- same rule machine-checkable per step.
+contract ConnectionGrammar {
+    -- Whether a directed connection from one kind of block to another is legal.
+    connects: (from: BlockKind, to: BlockKind) -> Boolean
+    -- Whether a connection can be confirmed against the live runtime (only
+    -- subscription edges are; production edges live inside handler bodies).
+    confirmable: (from: BlockKind, to: BlockKind) -> Boolean
+
+    @invariant CanonicalDataFlow
+        -- The legal connections, reconciled to grain's actual def* contracts:
+        --   command        -> event              (a command emits events)
+        --   event          -> read_model         (a read-model consumes events)
+        --   read_model     -> command            (a command reads a projection for validation)
+        --   read_model     -> query              (a query reads a projection)
+        --   query          -> screen             (a screen displays a query)
+        --   query          -> todo_processor     (an automation reads its TODO-list query)
+        --   screen         -> command            (a user action issues a command)
+        --   todo_processor -> command            (a reactor issues a command)
+        --   periodic_task  -> command            (a schedule issues a command)
+        --   periodic_task  -> event              (a schedule emits events directly)
+        -- Read-models are INTERNAL projections: they feed only commands and
+        -- queries, never a screen, todo_processor or periodic_task directly.
+        -- Everything user/automation-facing reads through a query. A
+        -- todo_processor's INPUT edge is therefore a query (the "TODO list"), NOT
+        -- a raw event or a read_model: event -> todo_processor and read_model ->
+        -- todo_processor are both rejected. (The processor still SUBSCRIBES to
+        -- event topics at runtime; that is trigger wiring, :subscribes, not a flow edge.)
+
+    @invariant OnlySubscriptionEdgesAreConfirmableFromWiring
+        -- Only event -> read_model (a read-model declares the events it consumes)
+        -- and a processor's event subscription (it declares the topics it
+        -- subscribes to) can be confirmed from observed live wiring. Every other edge is a
+        -- production edge that lives inside handler code and is invisible to
+        -- runtime introspection; by default the validator checks such edges for
+        -- endpoint existence and grammar only. A service MAY opt in to confirming
+        -- production/read edges by declaring them at the def site
+        -- (grain.event-model/produces, grain.event-model/reads); the validator
+        -- reconciles those declarations against the spec. This confirms
+        -- spec-vs-code-declaration agreement, not that a handler actually emits.
+}
+
+-- The payload-schema obligation. The three data-carrying kinds — command, event
+-- and query — each carry a payload schema (a command's and a query's params, an
+-- event's body), registered live under the block's own :<area>/<name> key. The
+-- model keeps that schema opaque but validates that it is a well-formed malli
+-- schema and matches the live registered schema. read-models, todo-processors,
+-- periodic-tasks and screens carry no required payload schema.
+contract PayloadSchema {
+    carries_schema: (block: Block) -> Boolean
+    schema_well_formed: (block: Block) -> Boolean
+    matches_runtime: (block: Block) -> Boolean
+
+    @invariant DataBlocksCarrySchema
+        -- Every command, event and query carries a payload schema. read-models
+        -- may carry one (design-time only); todo-processors, periodic-tasks and
+        -- screens carry none.
+
+    @invariant CarriedSchemaIsWellFormed
+        -- A carried payload schema must parse as a malli schema; one that does
+        -- not is reported malformed (or, if it references an unregistered name,
+        -- as an unresolved reference).
+
+    @invariant CarriedSchemaMatchesRuntime
+        -- A command's, event's or query's schema must equal the schema
+        -- registered for that :<area>/<name> in the live malli registry.
+}
+
+contract BehavioralTrace {
+    resolves: (reference: AlliumReference) -> Boolean
+
+    @invariant CommandsTraceRules
+        -- Every command links to at least one rule in a companion Allium spec.
+
+    @invariant ScreensTraceSurfaces
+        -- Every screen links to at least one surface in a companion Allium spec.
+
+    @invariant SuppliedReferencesResolve
+        -- Every supplied reference names an existing declaration of the stated
+        -- kind in a safe repository-relative .allium file.
+
+    @guidance
+        -- Trace resolution is performed in development and CI with the Allium
+        -- CLI. Production boot validates runtime topology without source files.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The top-level owning container — the central construct grain otherwise lacks.
+-- A service area is identified by a simple keyword (its area key) and owns the
+-- blocks and flows declared within it.
+entity ServiceArea {
+    -- The area key (a simple keyword such as :example); the namespace of every
+    -- block the area owns.
+    area: String
+    description: String?
+
+    blocks: Block with area = this
+    flows: Flow with area = this
+}
+
+-- A building block named and catalogued within a service area. The seven kinds
+-- are placeholders: each block's runtime behaviour is governed by its own grain
+-- component. An event model only asserts that a block exists, its kind, a human
+-- description, and its declared dependency edges.
+entity Block {
+    area: ServiceArea
+    -- A qualified keyword :<area>/<name> (see KindNaming).
+    name: String
+    description: String
+    kind: Command | Event | ReadModel | Query | TodoProcessor | PeriodicTask | Screen
+    allium_references: List<AlliumReference>
+}
+
+-- A request to change the system; validates business rules and, on success,
+-- emits events. Carries a params schema and may compose read-models. Observable
+-- behavioural rules and test obligations live in Allium.
+variant Command : Block {
+    -- read-models this command composes (e.g. to enforce a uniqueness rule).
+    reads: ReadModel with command_reader = this
+    -- events this command emits.
+    produces: Event with command_producer = this
+}
+
+-- An immutable fact recorded in the event store. Carries a body schema.
+variant Event : Block {}
+
+-- A read-side projection: queryable state derived from events. Declares the
+-- events it consumes (confirmed against the live runtime). Carries no own schema
+-- by convention (its key collides with the same-named query's schema slot).
+variant ReadModel : Block {
+    consumes: Event with read_model_consumer = this
+    version: Integer?
+}
+
+-- A read against projected state. Carries a params schema and composes
+-- read-models.
+variant Query : Block {
+    reads: ReadModel with query_reader = this
+}
+
+-- An asynchronous reactor that subscribes to event topics (confirmed against the
+-- live runtime) and issues commands.
+variant TodoProcessor : Block {
+    -- The event topics it subscribes to at runtime (the trigger; confirmed
+    -- against the live :topics). This is trigger wiring, not the flow input edge.
+    subscribes: Event with processor_subscriber = this
+    -- The queries it works from — the "TODO list", and its modeled INPUT edge.
+    reads: Query with processor_reader = this
+    produces: Command with processor_producer = this
+}
+
+-- A scheduled reactor that emits events (and/or issues commands) on a recurring
+-- schedule.
+variant PeriodicTask : Block {
+    schedule: Schedule
+    produces: Block with periodic_producer = this
+}
+
+-- A user-facing surface. Design-time only: grain has no defscreen, so a screen's
+-- existence is not runtime-verifiable, but its declared dependencies are. A
+-- screen declares the queries it depends on and the commands it issues.
+-- A screen is most often 1:1 with a single query — the query that backs what it
+-- renders — but this is a convention, not a requirement; a screen may compose
+-- several queries or none (hence `queries` is a collection).
+variant Screen : Block {
+    -- queries the screen depends on.
+    queries: Query with screen_viewer = this
+    -- commands the screen issues on user action.
+    commands: Command with screen_actor = this
+}
+
+-- A named, ordered description of how a chain of building blocks collaborates to
+-- deliver one slice of behaviour. A flow is the readable unit of design; it
+-- carries no behaviour, only intended wiring constrained to legal connections.
+entity Flow {
+    area: ServiceArea
+    name: String
+    description: String
+    steps: FlowStep with flow = this
+}
+
+-- A single directed connection within a flow. Endpoints are kind-qualified; an
+-- absent source marks an entry point and an absent target a terminus.
+entity FlowStep {
+    flow: Flow
+    source: Endpoint?
+    target: Endpoint?
+
+    -- A step is legal when it is an endpoint marker (missing source or target)
+    -- or its source/target kinds form a connection the grammar permits.
+    is_legal:
+        source = null
+        or target = null
+        or connects(source.kind, target.kind)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A block's namespace must match its owning area (the machine-checkable
+-- counterpart of KindNaming.BlockNamespaceMatchesArea).
+invariant BlockNamespaceMatchesArea {
+    for area in ServiceAreas:
+        for block in area.blocks:
+            namespace(block.name) = area.area
+}
+
+-- No two blocks of the same kind in the same area share a name.
+invariant BlockNamesUniquePerAreaAndKind {
+    for a in Blocks:
+        for b in Blocks:
+            a != b and a.area = b.area and kind_of(a) = kind_of(b)
+                implies a.name != b.name
+}
+
+-- Every step in every flow must be a legal connection.
+invariant AllFlowStepsLegal {
+    for step in FlowSteps:
+        step.is_legal
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The author declares the catalogue of areas, blocks and flows.
+actor Author {
+    identified_by: ServiceArea where description != null
+}
+
+-- A coding harness that validates a declared model against the live grain
+-- runtime over the REPL (the code-agent-tools client).
+actor Harness {
+    identified_by: ServiceArea
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The design-time boundary: what an author declares and what well-formedness the
+-- model guarantees in return.
+surface EventModelAuthoring {
+    facing author: Author
+    context area: ServiceArea
+
+    exposes:
+        area.area
+        area.description
+        area.blocks
+        area.flows
+        for block in area.blocks:
+            block.allium_references
+
+    contracts:
+        fulfils KindNaming
+        fulfils ConnectionGrammar
+        fulfils PayloadSchema
+        fulfils BehavioralTrace
+
+    @guarantee WellFormedByKindAndConnection
+        -- A declared model is well-formed when every block's namespace matches
+        -- its area, names are unique within (area, kind), every data-carrying
+        -- block carries a well-formed payload schema, every declared dependency
+        -- edge resolves to a block of the expected kind, and every flow step is a
+        -- connection the canonical CQRS data flow permits.
+}
+
+-- The structural-validation boundary: a harness submits a declared model and the
+-- tooling reconciles it against the live runtime, returning a total verdict of
+-- typed findings. This is the REPL-authoritative half that the prior model
+-- lacked.
+surface StructuralValidation {
+    facing harness: Harness
+    context area: ServiceArea
+
+    exposes:
+        area.blocks
+        area.flows
+
+    contracts:
+        demands KindNaming
+        demands ConnectionGrammar
+        demands PayloadSchema
+
+    @guarantee FindingsReconcileSpecAgainstRuntime
+        -- For each area the model declares, validation reports: blocks declared
+        -- but absent from the live registries; live blocks of that area missing
+        -- from the spec; schemas that are missing, malformed, or differ from the
+        -- live registry; illegal or dangling flow connections; dependency edges
+        -- that dangle or name the wrong kind; subscription edges that diverge
+        -- from live wiring; and missing authorization. Screens and flows have no
+        -- runtime counterpart and are checked structurally only.
+
+    @guidance
+        -- Runtime validation is structural only: it never invokes a command. It
+        -- needs no running system to be installed
+        -- — it reads the process-wide registries — and degrades to spec-internal
+        -- checks when no registries are loaded.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Production/read edges are confirmable when a service opts in via def-site declarations (grain.event-model/produces and grain.event-model/reads). Allium specifies and tests the observable behaviour; should a future validator also derive these topology edges from implementation traces?"
+open question "Event coverage is best-effort (events have no handler registry; existence is inferred from the schema registry and consumption sets). Should events gain an authoritative live registry so coverage can be exact?"

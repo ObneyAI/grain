@@ -59,9 +59,36 @@
 ;; --------------------------------- ;;
 
 (def periodic-trigger-registry*
-  "Global registry of periodic triggers. Maps trigger-name keyword to
-   {:schedule config, :handler-fn fn}."
+  "Global registry of periodic triggers. Maps trigger-name keyword to its
+   declaration config and, while started, node-local runtime state."
   (atom {}))
+
+(defn- update-trigger-runtime!
+  [trigger-name runtime-state]
+  (swap! periodic-trigger-registry*
+         (fn [registry]
+           (if (contains? registry trigger-name)
+             (update registry trigger-name merge runtime-state)
+             registry))))
+
+(defn- running-trigger?
+  [trigger-name]
+  (true? (get-in @periodic-trigger-registry* [trigger-name :running?])))
+
+(defn next-fire-at
+  "Return the node-local Instant currently armed for a running trigger.
+   Returns nil when the trigger is unknown, unstarted, stopped, or firing."
+  [trigger-name]
+  (let [{:keys [running? next-fire-at]} (get @periodic-trigger-registry* trigger-name)]
+    (when running? next-fire-at)))
+
+(defn- tracked-schedule
+  [trigger-name times]
+  (map (fn [time]
+         (when (running-trigger? trigger-name)
+           (update-trigger-runtime! trigger-name {:next-fire-at time}))
+         time)
+       times))
 
 (defn register-periodic-trigger!
   "Register a periodic trigger."
@@ -85,26 +112,33 @@
     (into {}
       (for [[trigger-name config] registry]
         (let [sseq (schedule-seq (:schedule config))
-              handler-fn (:handler-fn config)
-              task (chime/chime-at sseq
-                     (fn [time]
-                       (try
-                         (let [domain-tenants (disj (tenant-ids-fn) control-plane-tid)]
-                           (doseq [tid domain-tenants]
-                             (let [result (handler-fn tid time)]
-                               (when-let [events (:result/events result)]
-                                 (append-fn
-                                   (cond-> {:tenant-id tid :events events}
-                                     (:result/cas result) (assoc :cas (:result/cas result))))))))
-                         (catch Throwable t
-                           (u/log ::periodic-trigger-error :trigger trigger-name :exception t)))))]
-          [trigger-name task])))))
+              handler-fn (:handler-fn config)]
+          (update-trigger-runtime! trigger-name {:running? true :next-fire-at nil})
+          (try
+            (let [task (chime/chime-at (tracked-schedule trigger-name sseq)
+                         (fn [time]
+                           (update-trigger-runtime! trigger-name {:next-fire-at nil})
+                           (try
+                             (let [domain-tenants (disj (tenant-ids-fn) control-plane-tid)]
+                               (doseq [tid domain-tenants]
+                                 (let [result (handler-fn tid time)]
+                                   (when-let [events (:result/events result)]
+                                     (append-fn
+                                       (cond-> {:tenant-id tid :events events}
+                                         (:result/cas result) (assoc :cas (:result/cas result))))))))
+                             (catch Throwable t
+                               (u/log ::periodic-trigger-error :trigger trigger-name :exception t)))))]
+              [trigger-name task])
+            (catch Throwable t
+              (update-trigger-runtime! trigger-name {:running? false :next-fire-at nil})
+              (throw t))))))))
 
 (defn stop-periodic-triggers!
   "Stop all running periodic triggers."
   [triggers]
   (doseq [[trigger-name task] triggers]
     (u/log ::stopping-periodic-trigger :trigger trigger-name)
+    (update-trigger-runtime! trigger-name {:running? false :next-fire-at nil})
     (.close task)))
 
 

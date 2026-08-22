@@ -11,6 +11,18 @@
         (is (= "org.sqlite.JDBC" (:driver-class-name @captured)))
         (is (= "PRAGMA foreign_keys = ON" (:connection-init-sql @captured)))))))
 
+(deftest file-config-propagates-explicit-busy-timeout
+  (let [captured (atom nil)]
+    (with-redefs [hikari-cp.core/make-datasource (fn [config] (reset! captured config) :mock-ds)]
+      (datasource/make-datasource {:database-file "/tmp/foo.sqlite"
+                                   :busy-timeout-ms 73
+                                   :busy-max-retries 2
+                                   :write-queue-capacity 8})
+      (is (= "PRAGMA foreign_keys = ON" (:connection-init-sql @captured)))
+      (is (not (contains? @captured :busy-timeout-ms)))
+      (is (not (contains? @captured :busy-max-retries)))
+      (is (not (contains? @captured :write-queue-capacity))))))
+
 (deftest memory-config-builds-jdbc-url
   (let [captured (atom nil)]
     (with-redefs [hikari-cp.core/make-datasource (fn [config] (reset! captured config) :mock-ds)]

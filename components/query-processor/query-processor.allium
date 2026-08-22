@@ -1,0 +1,290 @@
+-- allium: 3
+-- query-processor.allium
+--
+-- Distilled from components/query-processor (grain).
+--
+-- Scope: The read side of CQRS. A query names a question; the processor looks
+--        up a registered handler for that name, validates the query against a
+--        schema, runs the handler, and returns the handler's result. Queries
+--        are PURE READS: a handler reads from projections / read-models and
+--        returns data. It never emits events and never changes state. This is
+--        the read-side mirror of the command-processor, with no storage step.
+--
+-- Includes: handler registration and lookup, two-registry resolution (a
+--           per-call registry shadowing a process-wide fallback), query schema
+--           validation (both the query-specific schema and the base shape that
+--           requires a name, id and timestamp), handler outcome classification
+--           (result / anomaly / nil / thrown), and pass-through preservation of
+--           a handler's own anomaly category and context.
+--
+-- Excludes (implementation / governed elsewhere):
+--   - projections and read-models the handler reads from: those are governed by
+--     the read-model and event-store components, not here. A query never
+--     touches the event log.
+--   - what any individual domain query means (the question and its answer live
+--     in the domain specs that register handlers, not here)
+--   - the registry's storage form (a global atom vs. a per-call map) and the
+--     macro that generates handler functions — framework mechanics
+--   - logging, tracing and metrics
+--   - the write side (commands, events, event storage)
+--   - the on-the-wire shape of a query and the keyword/anomaly value types
+--
+-- Authorization note: the registration mechanism carries an `:authorized?` /
+--   opts map alongside each handler, but THIS component does not evaluate it;
+--   the processor dispatches on name and schema alone, then runs the handler.
+--   Deny-by-default authorization is enforced by the request handler that sits
+--   in front of the processor (and a handler may itself return a forbidden
+--   anomaly, which the processor preserves). Recorded as an open question.
+--
+-- Tenancy note: a query is processed against one tenant's read side via the
+--   context handed to the handler. Tenant scoping is the read-model / event
+--   store's concern, not a field here; the processor passes the context through
+--   unchanged and reads nothing tenant-specific itself.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The reply to processing a query. A handler yields one of three outcomes, and
+-- the processor maps a thrown handler and an unknown name onto the rest.
+-- Modelled as a value because a query result has no identity or lifecycle — it
+-- is the return of a single processing attempt.
+value QueryResult {
+    outcome: ProcessingOutcome
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The pure read a registered handler performs. Handlers do not touch the event
+-- log and do not mutate anything; they read context (projections / read-models
+-- plus the query parameters) and return an answer. The processor DEMANDS that a
+-- handler behaves like this so the read side stays free of side effects.
+contract QueryHandler {
+    -- Answer a validated query against the supplied read context.
+    handle: (query: Query) -> QueryResult
+
+    @invariant ReadsNotWrites
+        -- A handler never emits events and never changes state. The only thing
+        -- it produces is a result returned to the caller; queries are the
+        -- read-only half of CQRS.
+
+    @invariant NonNullResult
+        -- A handler must return an answer. Returning nothing is treated by the
+        -- processor as a fault, never as success — even an "empty" answer is an
+        -- explicit (non-null) result.
+
+    @invariant AnomalyByDecline
+        -- A handler declines a query by returning an anomaly (e.g. not-found
+        -- when a requested resource is absent, or forbidden) rather than by
+        -- throwing or returning nothing. The category and any extra context
+        -- fields the handler attaches are the handler's own; the processor
+        -- treats this anomaly as a legitimate, fully-formed result. (That the
+        -- processor surfaces it unchanged is the processor's guarantee, stated
+        -- as OutcomePreserved on the QuerySubmission surface.)
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How a single processing attempt ended. `succeeded` covers any non-null result
+-- the handler returned, including an empty one; the failure values mirror the
+-- anomaly categories the processor returns. `rejected` carries the handler's own
+-- declining anomaly (not-found, forbidden, conflict, ...) unchanged.
+enum ProcessingOutcome {
+    succeeded
+    unknown_query
+    invalid_query
+    rejected
+    fault
+}
+
+-- The two resolution scopes a registration can live in. A query resolves
+-- against exactly one of them (see RegistryResolution); the per-call scope, when
+-- present, shadows the process-wide one. This is a behavioural distinction the
+-- caller controls (pass a registry or don't), not a storage detail.
+enum RegistryScope {
+    per_call
+    process_wide
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A registered query name bound to a handler. Registration makes a name
+-- answerable; without it a query for that name is unknown. The handler is
+-- modelled by the QueryHandler contract; `authorized` records that an
+-- authorization predicate / opts map is carried alongside the registration even
+-- though this component does not evaluate it.
+entity HandlerRegistration {
+    -- The qualified query name this registration answers to. Resolved against
+    -- the active registry (see RegistryResolution); unique within a registry.
+    name: String
+    -- Which resolution scope this registration lives in. The same name may be
+    -- registered in both scopes; only the active one applies to a given query.
+    registry: RegistryScope
+    -- Whether authorization metadata (an `:authorized?` opt) was supplied at
+    -- registration time. Carried as metadata; not enforced by the processor.
+    authorized: Boolean
+}
+
+-- A request to read state: a question named by a qualified query name, carrying
+-- a unique id and the moment it was issued, plus any query-specific parameters.
+-- A query is well-formed only when name, id and timestamp are present and
+-- correctly typed AND the query-specific schema for its name is satisfied.
+entity Query {
+    -- The qualified query name; selects which handler runs.
+    name: String
+    -- A unique identifier for this query instance.
+    id: String
+    -- When the query was issued.
+    issued_at: Timestamp
+
+    -- The single registry this query is resolved against. A per-call registry,
+    -- when the caller supplies one, is the active scope and shadows the
+    -- process-wide registry entirely; otherwise the process-wide registry is the
+    -- fallback (see RegistryResolution).
+    resolved_in: RegistryScope
+
+    -- The registration this query's name resolves to in the active registry, if
+    -- any. Scoped to resolved_in, so a name registered in both scopes never
+    -- resolves to two handlers — lookup stays unambiguous.
+    registration: HandlerRegistration with name = this.name and registry = this.resolved_in
+
+    -- The result of running the registered handler for this query. Present once
+    -- the handler has been invoked; absent until then. Typed by the value the
+    -- QueryHandler contract produces.
+    handler_result: QueryResult?
+
+    -- Well-formed iff the base shape is satisfied (name, id and timestamp
+    -- present and correctly typed). The query-specific schema is checked too;
+    -- both must pass for the handler to run.
+    is_well_formed: id != null and issued_at != null
+
+    -- Recognised iff some handler is registered for the name in the active
+    -- registry. Name lookup precedes schema validation.
+    is_recognised: registration != null
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A query for an unregistered name is rejected as unknown before any schema
+-- validation or handler runs. Lookup precedes validation, so a query whose name
+-- is missing or mistyped also lands here.
+rule UnknownQuery {
+    when: ProcessQuery(query)
+    requires: not query.is_recognised
+    ensures: QueryRejected(query: query, outcome: unknown_query)
+}
+
+-- A recognised query that fails schema validation (a missing or mistyped id or
+-- timestamp, or a query-specific required parameter absent) is rejected as
+-- invalid; the handler does not run. The caller receives a human-readable
+-- explanation of what was wrong.
+rule InvalidQuery {
+    when: ProcessQuery(query)
+    requires:
+        query.is_recognised
+        not query.is_well_formed
+    ensures: QueryRejected(query: query, outcome: invalid_query)
+}
+
+-- A recognised, well-formed query runs its handler. The handler's outcome is
+-- passed back unchanged; in particular a handler that declines (returns an
+-- anomaly) is surfaced with its own category preserved, a handler that returns
+-- nothing is a fault, and a handler that throws is caught and reported as a
+-- fault. No events are recorded and no state changes — a query is a pure read.
+rule ExecuteQuery {
+    when: ProcessQuery(query)
+    requires:
+        query.is_recognised
+        query.is_well_formed
+    ensures: QueryAnswered(query: query, result: query.handler_result)
+
+    @guidance
+        -- The handler is given a context (the query plus ambient read
+        -- dependencies) and returns one of: a non-null result (succeeded,
+        -- including an empty result), an anomaly (rejected, preserving the
+        -- anomaly's category and any extra context fields), nothing (fault,
+        -- "handler returned nil"), or it throws (fault, the exception is caught
+        -- and wrapped). The processor classifies the return; it does not
+        -- interpret the handler's read logic. `handler_result` denotes the
+        -- outcome the QueryHandler contract produces for this query.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Within a single registry a query name binds to at most one handler, so lookup
+-- is unambiguous and which handler runs is deterministic. Uniqueness is
+-- per-registry, NOT global: the same name may be registered in both the
+-- process-wide registry and a per-call registry. Those never compete, because a
+-- query is resolved against exactly one registry (see RegistryResolution), and
+-- the per-call registry shadows the process-wide one entirely.
+invariant UniqueRegistration {
+    for a in HandlerRegistrations:
+        for b in HandlerRegistrations:
+            a != b and a.registry = b.registry implies a.name != b.name
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The read boundary: a caller submits a query and receives a classified
+-- outcome. The processor fulfils dispatch + validation + handler execution; it
+-- demands a well-behaved, side-effect-free handler. The boundary faces the
+-- query itself — the caller's identity is not checked here (see the
+-- authorization open question), so any submitted query is a party.
+surface QuerySubmission {
+    facing query: Query
+
+    exposes:
+        query.name
+        query.is_recognised
+        query.is_well_formed
+
+    provides:
+        ProcessQuery(query)
+
+    contracts:
+        demands QueryHandler
+
+    @guarantee NoSideEffects
+        -- Processing a query never changes system state: no events are
+        -- appended and no entities are mutated. A query reads and returns; the
+        -- only observable result is the answer handed back to the caller.
+
+    @guarantee OutcomePreserved
+        -- Every attempt yields exactly one classified outcome: succeeded (any
+        -- non-null result, including empty), unknown_query, invalid_query,
+        -- rejected (the handler's own anomaly, category and context preserved)
+        -- or fault (handler returned nothing or threw).
+
+    @guarantee RegistryResolution
+        -- A per-call registry, when supplied, is the active registry and
+        -- shadows the process-wide registry entirely; otherwise the process-wide
+        -- registry is the fallback. The name is resolved in exactly one
+        -- registry, so two registrations of the same name in different
+        -- registries never both apply to one query.
+
+    @guidance
+        -- Lookup precedes validation: an unknown name short-circuits to
+        -- unknown_query before the schema is checked, which is why a query with
+        -- a missing or mistyped name reports unknown rather than invalid. A
+        -- recognised name then has both its base shape (name, id, timestamp) and
+        -- its query-specific schema validated before the handler runs.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The registry carries an :authorized? predicate / opts per handler, but the processor never evaluates it; it dispatches on name and schema alone. Should deny-by-default authorization be a guarantee of this component, or is it correctly delegated to the request handler in front of it (with a handler free to return a forbidden anomaly, which the processor preserves)?"
+open question "A nil handler return is classified as a fault ('handler returned nil'), distinct from a handler that deliberately returns an empty result (succeeded). Is forbidding a nil return the intended contract for handler authors, or should nil be a legitimate 'no answer' outcome?"

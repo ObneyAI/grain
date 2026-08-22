@@ -1,0 +1,377 @@
+-- allium: 3
+-- read-model-processor.allium
+--
+-- Distilled from components/read-model-processor (grain).
+--
+-- NOTE: this component is the DEPRECATED v1 read-model processor
+-- (superseded by read-model-processor-v2). The spec captures the behaviour
+-- the v1 code and its test suite actually prove, so the guarantees can be
+-- compared against the successor.
+--
+-- Scope: The read side of CQRS. A projection names a read model: a pure
+--        reducer (state, event) -> state. The processor reads the events the
+--        read model cares about from the tenant's event store and folds them
+--        through the reducer to produce the read model's current state. To
+--        avoid re-reading the whole stream every time, it transparently keeps
+--        an incremental snapshot keyed by the read model's identity (name,
+--        version and scope), records how far it has folded (a watermark), and
+--        on a later call resumes from that watermark over only the new events.
+--
+-- Includes: read-model registration and lookup, projection by folding events
+--           through a reducer, incremental snapshot caching keyed by identity,
+--           watermark-based resumption, the cache-update threshold, snapshot
+--           serialization roundtrip, scope-based event filtering and per-scope
+--           cache isolation, and the transparency of caching to the result.
+--
+-- Excludes (implementation / governed elsewhere):
+--   - the event store itself: append durability, total ordering of events,
+--     the meaning of an event id, and tenant scoping are the event-store
+--     component's guarantees (modelled here as the EventLog contract demanded)
+--   - the snapshot cache's storage form and durability (an embedded key/value
+--     store) — modelled as the SnapshotCache contract demanded
+--   - the concrete serialization format of a snapshot (fressian) — modelled as
+--     the Codec contract's roundtrip guarantee
+--   - what any individual read model computes (domain logic lives in the
+--     reducers that domain specs register, not here)
+--   - the registry's storage form (a global atom) and the macro that generates
+--     and registers reducer functions — framework mechanics
+--   - logging, tracing and metrics
+--   - the write side (commands, handlers, event submission)
+--
+-- Conformance properties RM1..RM9 correspond to the test suite
+-- (interface_test.clj). Where each is captured:
+--   RM1 cache-miss folds all events  -> rule ProjectOnCacheMiss
+--   RM2 cache-hit resumes from watermark over new events only
+--                                     -> rule ProjectOnCacheHit
+--   RM3 snapshot updated only at/above the threshold
+--                                     -> rules SnapshotAtThreshold / SnapshotBelowThreshold
+--   RM4 result is independent of cache state (caching is transparent)
+--                                     -> surface ReadModelProjection @guarantee CachingIsTransparent
+--   RM5 state accumulates correctly across incremental calls
+--                                     -> contract Reducer.Determinism + RM1/RM2
+--   RM6 separate cache per name/version/scope
+--                                     -> invariant OneSnapshotPerIdentity + @guarantee ScopeIsolation
+--   RM7 scope filters which events the projection sees
+--                                     -> rules read the read model's scoped event set
+--   RM8 snapshot survives serialization roundtrip
+--                                     -> contract Codec.Roundtrip
+--   RM9 reducer receives whole events and is pure
+--                                     -> contract Reducer.Purity
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- An immutable fact read from the tenant's event store, identified by a
+-- total-order id. The processor neither creates nor orders events; it only
+-- reads them (via the EventLog contract) and the read model's reducer folds
+-- over them. Modelled as a value because this component owns no event lifecycle
+-- — an event is an opaque, already-ordered unit it receives, folds and forgets.
+-- Shape beyond the id (type, tags, body) is the event store's concern.
+value Event {
+    -- The store-assigned identifier. Events are totally ordered by id, so a
+    -- watermark naming an id partitions the stream into "already folded" and
+    -- "not yet folded".
+    id: String
+}
+
+-- A scope narrows a projection to a subset of the stream (e.g. one
+-- organisation's events) and is folded into the read model's cache identity so
+-- differently-scoped projections never share a snapshot. Absent scope means
+-- the projection sees the whole stream for its event types.
+value Scope {
+    -- An opaque discriminator for the subset. Two projections with equal scope
+    -- share a snapshot; with differing scope they are isolated.
+    key: String
+}
+
+-- The incremental snapshot the processor keeps for a read model. It pairs the
+-- folded state with the watermark recording how far the fold has reached, so a
+-- later call can resume rather than re-read the whole stream.
+value Snapshot {
+    -- The projected read-model state as of the watermark.
+    state: Any
+    -- The id of the last event folded into `state`. A later projection reads
+    -- only events after this id.
+    watermark: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The append-only event log the processor reads from. The processor DEMANDS a
+-- totally-ordered, tenant-scoped read so that watermark resumption is sound.
+contract EventLog {
+    -- Read the events matching a read model's query, optionally only those
+    -- after a watermark, in id order.
+    read_after: (watermark: String) -> Sequence<Event>
+
+    @invariant TotalOrder
+        -- Events are returned in a stable total order by id. Resuming "after a
+        -- watermark" therefore yields exactly the events not yet folded, with
+        -- no gaps and no repeats, so an incremental fold equals a full fold.
+
+    @invariant TenantScoped
+        -- A projection reads only the store of the tenant it was issued for. The
+        -- processor never chooses or crosses tenants; it reads the store it was
+        -- handed. Read models for different tenants never see each other's
+        -- events.
+}
+
+-- The durable snapshot store the processor keeps incremental state in. The
+-- processor DEMANDS a roundtrip-faithful key/value store so a snapshot read
+-- back equals the snapshot written.
+contract SnapshotCache {
+    -- Fetch the snapshot stored under a read model's identity key, if any.
+    lookup: (key: String) -> Snapshot
+    -- Store (or replace) the snapshot under a read model's identity key.
+    store: (key: String, snapshot: Snapshot) -> Any
+
+    @invariant IdentityKeyed
+        -- A snapshot is addressed solely by the read model's identity (name,
+        -- version and scope). Distinct identities never collide; the same
+        -- identity always resolves to the same slot.
+}
+
+-- The serialization the snapshot store uses. The processor DEMANDS a faithful
+-- roundtrip so that caching cannot change the projected result.
+contract Codec {
+    serialize: (snapshot: Snapshot) -> ByteArray
+    deserialize: (bytes: ByteArray) -> Snapshot
+
+    @invariant Roundtrip
+        -- deserialize(serialize(s)) reproduces the snapshot's state and
+        -- watermark exactly. RM8: a snapshot survives a storage roundtrip
+        -- unchanged.
+}
+
+-- The pure fold a registered read model is. The processor DEMANDS purity and
+-- determinism so that the incremental snapshot is a sound optimisation of the
+-- full fold.
+contract Reducer {
+    -- Fold one event onto the accumulated state.
+    step: (state: Any, event: Event) -> Any
+
+    @invariant Purity
+        -- RM9: the reducer is pure. It reads only its accumulated state and the
+        -- whole event it is given; no I/O, no clock, no state outside its
+        -- arguments. Whether an event arrives in a cache-miss full fold or a
+        -- cache-hit incremental fold is invisible to it.
+
+    @invariant Determinism
+        -- RM5: folding the same events in the same order from the same starting
+        -- state yields the same result. Read-model state therefore depends only
+        -- on the events seen, never on the cache's contents.
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A registered read model: a named, versioned reducer over a chosen set of
+-- event types. Registration makes the name projectable; without it the name is
+-- unknown. The reducer itself is modelled by the Reducer contract.
+entity ReadModel {
+    -- The qualified read-model name (e.g. crm/contacts). A name addresses at
+    -- most one registered reducer; re-registering a name replaces it (see
+    -- UniqueRegistration).
+    name: String
+    -- The reducer version. Version is not a registry key — a name holds a single
+    -- registered reducer carrying its version — but it is folded into the
+    -- projection's snapshot identity, so bumping it starts a fresh identity that
+    -- folds from empty rather than reusing the older version's snapshot.
+    version: Integer
+}
+
+-- A single projection of a read model, optionally scoped. Its identity (read
+-- model name, version and scope) is exactly the snapshot's cache key, so two
+-- projections with the same identity share an incremental snapshot and two with
+-- differing identity are isolated. A projection reads only the events its read
+-- model and scope select; absent scope selects the read model's whole stream.
+entity Projection {
+    read_model: ReadModel
+    -- The scope narrowing this projection, absent when the whole stream is
+    -- projected.
+    scope: Scope?
+
+    -- The snapshot kept for this identity, if one exists yet. Held by the
+    -- snapshot store under this projection's identity key; absent before the
+    -- first projection.
+    snapshot: Snapshot?
+
+    -- The events this projection folds, in id order: the read model's event
+    -- types, narrowed by the scope, as read from the event log. An ordered list,
+    -- so `.last` names the highest-id event and a watermark cleanly partitions
+    -- it.
+    selected_events: List<Event>
+
+    -- A snapshot exists for this identity (a prior projection populated it).
+    is_cached: snapshot != null
+
+    -- Events not yet folded into the snapshot: those after the snapshot's
+    -- watermark. On a cache miss this is the whole selected stream.
+    pending_events: selected_events where id > snapshot.watermark
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The smallest incremental batch that justifies rewriting the snapshot on a
+    -- cache hit. When fewer than this many new events are folded, the snapshot
+    -- is left as-is and those events are folded again next time; the projected
+    -- result is identical either way (the cache is a pure optimisation).
+    snapshot_update_threshold: Integer = 10
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- First projection of an identity (no snapshot yet): fold every selected event
+-- from empty state, then record a fresh snapshot at the last event folded so
+-- subsequent projections can resume. The first snapshot is always written — the
+-- update threshold gates only later cache-hit rewrites, never this initial
+-- write. RM1.
+rule ProjectOnCacheMiss {
+    when: ProjectReadModel(projection)
+    requires: not projection.is_cached
+    let folded = fold(projection.selected_events)
+    ensures:
+        projection.snapshot = Snapshot{
+            state: folded,
+            watermark: projection.selected_events.last.id
+        }
+        ReadModelProjected(projection: projection, state: folded)
+}
+
+-- A later projection of an identity that already has a snapshot resumes from
+-- the watermark, folding only the events after it onto the cached state. The
+-- result is the same as a full fold would give (the snapshot equals the fold of
+-- everything up to the watermark). RM2.
+rule ProjectOnCacheHit {
+    when: ProjectReadModel(projection)
+    requires: projection.is_cached
+    let folded = continue_fold(projection.snapshot.state, projection.pending_events)
+    ensures: ReadModelProjected(projection: projection, state: folded)
+}
+
+-- After a cache-hit fold, the snapshot is advanced only when the incremental
+-- batch was at least the threshold, amortising snapshot writes. The advanced
+-- snapshot carries the freshly folded state and the new watermark. RM3.
+rule SnapshotAtThreshold {
+    when: ReadModelProjected(projection, state)
+    requires:
+        projection.is_cached
+        projection.pending_events.count >= config.snapshot_update_threshold
+    ensures:
+        projection.snapshot = Snapshot{
+            state: state,
+            watermark: projection.selected_events.last.id
+        }
+}
+
+-- Below the threshold the snapshot is deliberately left untouched: the same
+-- pending events are folded again on the next projection. This is safe because
+-- the result depends only on the events folded, not on whether the snapshot
+-- moved (see the Reducer contract). RM3 / RM4.
+rule SnapshotBelowThreshold {
+    when: ReadModelProjected(projection, state)
+    requires:
+        projection.is_cached
+        projection.pending_events.count > 0
+        projection.pending_events.count < config.snapshot_update_threshold
+    ensures: SnapshotUnchanged(projection: projection)
+
+    @guidance
+        -- "Left untouched" is an explicit non-effect: the watermark does not
+        -- advance, so the same below-threshold events are re-folded next time
+        -- and the projected result is unchanged. The threshold only governs how
+        -- often the snapshot is rewritten, never what the projection returns.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- RM6: a read model's identity (name, version and scope) addresses at most one
+-- snapshot. Distinct identities are isolated; the same identity always resolves
+-- to the same snapshot, which is why differently-scoped or differently-
+-- versioned projections never contaminate one another.
+invariant OneSnapshotPerIdentity {
+    for a in Projections:
+        for b in Projections:
+            (a != b
+             and a.read_model = b.read_model
+             and a.scope = b.scope)
+            implies a.snapshot = b.snapshot
+}
+
+-- A read-model name resolves to exactly one registered reducer: the registry is
+-- keyed by name alone, so no two distinct registered read models share a name
+-- (re-registering a name replaces the prior entry). A projection is therefore
+-- unambiguous about which reducer it folds. Version is not part of the registry
+-- key; its isolating role is the snapshot identity (see OneSnapshotPerIdentity).
+invariant UniqueRegistration {
+    for a in ReadModels:
+        for b in ReadModels:
+            a != b implies a.name != b.name
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The read boundary: a caller asks for a read model's current state (optionally
+-- scoped) and receives the fold of the selected events. The processor fulfils
+-- the projection-with-incremental-snapshot mechanism; it demands an ordered
+-- tenant-scoped event log, a roundtrip-faithful snapshot store and a pure
+-- reducer. The boundary faces the projection itself; this component does not
+-- check caller identity (authorization is enforced by the query request
+-- handler in front of it).
+surface ReadModelProjection {
+    facing projection: Projection
+
+    exposes:
+        projection.read_model.name
+        projection.read_model.version
+        projection.is_cached
+
+    provides:
+        ProjectReadModel(projection)
+
+    contracts:
+        demands EventLog
+        demands SnapshotCache
+        demands Codec
+        demands Reducer
+
+    @guarantee CachingIsTransparent
+        -- RM4: the state returned for a read model depends only on the events
+        -- selected for it, never on whether a snapshot existed, was below the
+        -- threshold or was just written. The snapshot is an optimisation; it
+        -- can be discarded at any time without changing any result.
+
+    @guarantee ScopeIsolation
+        -- RM6 / RM7: a scoped projection sees only the events its scope selects
+        -- and keeps its snapshot under a scope-specific identity. An unscoped
+        -- projection sees the whole stream. Scopes never share folded state.
+
+    @guidance
+        -- A projection is identified by (name, version, scope). A first call
+        -- folds the whole selected stream and writes a snapshot; later calls
+        -- resume from the snapshot's watermark over only the new events, and
+        -- rewrite the snapshot only once an incremental batch reaches the
+        -- threshold. Bumping a read model's version starts a fresh identity that
+        -- folds from empty, the intended way to roll out a reducer change.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "This is the deprecated v1 read-model processor. Should this spec be retired in favour of a read-model-processor-v2 spec, or kept as the documented baseline the successor must not regress against?"
+open question "The cache-update threshold trades snapshot-write frequency against re-fold work below the threshold. Is 10 a tuned value or an arbitrary default, and should it be configurable per read model rather than globally?"
+open question "A reducer change without a version bump would fold new logic onto a snapshot produced by the old logic, silently corrupting state. Should the component detect reducer drift (e.g. hash the reducer into the identity), or is disciplined version bumping the contract?"

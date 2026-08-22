@@ -1,0 +1,117 @@
+-- allium: 3
+-- schema-util.allium
+--
+-- Distilled from components/schema-util (grain).
+--
+-- Scope: A shared schema registry. One process-wide namespace of named data
+--        schemas that every grain component contributes to, so that any
+--        component can name and validate the same shapes (commands, events,
+--        views, etc.) and reference each other's schemas by name without
+--        importing them.
+--
+-- Classification: INFRASTRUCTURE / thin plumbing. There is no domain here and
+--        almost no state machine — the whole component is a registration
+--        boundary over a validation library. The only behaviour worth pinning
+--        down is the registry contract: names are unique, registration is
+--        last-writer-wins and idempotent, registered names resolve globally,
+--        and a registered schema either accepts or rejects a value.
+--
+-- Includes: the act of contributing named schemas, the global resolvability of
+--           a registered name, last-writer-wins / idempotent registration
+--           semantics, and validation of a value against a registered schema.
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the underlying validation library (Malli) and its schema grammar
+--   - the mutable registry cell, merge mechanics and default-registry wiring
+--   - the macro that both registers and binds a local symbol (a convenience
+--     over the same register operation)
+--   - the bundled library schemas (time schemas, library defaults) and the
+--     async-channel predicate, which are seed entries, not behaviour
+--   - serialization, storage and the Clojure/ClojureScript split
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A schema named so other components can refer to it by name. The definition is
+-- opaque at this altitude: it is a predicate over values supplied by the
+-- contributing component. Identity is the name; two registrations with the same
+-- name describe the same registry slot.
+value Schema {
+    name: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The registry boundary. Components contribute named schemas into one shared
+-- namespace and then resolve and validate against any contributed name. These
+-- are guarantees about a process-wide table of pure predicates, so they live as
+-- contract invariants rather than entity state.
+contract SchemaRegistry {
+    -- Contribute one or more named schemas to the shared registry.
+    register: (schemas: Set<Schema>) -> Any
+    -- Resolve a previously registered schema by name. Null if no schema has been
+    -- registered under that name.
+    resolve: (name: String) -> Schema?
+    -- Test a value against a registered schema; true when the value conforms.
+    validate: (name: String, value: Any) -> Boolean
+
+    @invariant UniqueNames
+        -- A name resolves to exactly one schema at a time. There is never more
+        -- than one definition live for a given name.
+
+    @invariant LastWriterWins
+        -- Registering a name that already exists replaces the prior definition
+        -- rather than erroring or duplicating. Registration accumulates: names
+        -- not present in the contribution are left untouched, so a later
+        -- contributor never clears an earlier one's schemas — only a colliding
+        -- name is overwritten. This is what lets independently loading
+        -- components each populate the shared namespace without coordination.
+
+    @invariant IdempotentRegistration
+        -- Registering the same name with the same definition any number of
+        -- times leaves the registry in the same state as registering it once.
+        -- Components may load in any order and re-load freely.
+
+    @invariant GlobalResolvability
+        -- Once a name is registered, it resolves from anywhere in the process,
+        -- with no per-call wiring. This is what lets one component's schema name
+        -- another component's schema by name alone, without importing it.
+
+    @invariant ValidationDecides
+        -- validate(name, value) is a pure predicate: for a registered name it
+        -- returns true exactly when the value conforms to that name's current
+        -- definition, and is stable for the same name and value while the
+        -- definition is unchanged.
+
+    @guidance
+        -- Registration is the only mutation. Resolution and validation are
+        -- read-only. The convenience of binding a local handle to the same
+        -- schemas at the point of registration is sugar over register and has
+        -- no separate semantics.
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary every schema-defining component drives. A component fulfils the
+-- registry by populating it; all components share the one namespace.
+surface SchemaContribution {
+    contracts:
+        fulfils SchemaRegistry
+
+    @guarantee SharedNamespace
+        -- Every component registers into and resolves from the same registry.
+        -- Names are global and last-writer-wins, so contributors must keep
+        -- names distinct across components; a collision silently replaces the
+        -- earlier definition rather than failing.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Name collisions across components are resolved silently by last-writer-wins. Should the registry detect and reject a re-registration that changes an existing definition, to catch accidental clashes?"

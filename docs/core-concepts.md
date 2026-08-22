@@ -141,6 +141,18 @@ Schedule options:
 {:schedule {:every 5 :duration :minutes}}
 ```
 
+`defperiodic` registrations are snapshotted when periodic triggers start. The
+current node's next armed fire time can be queried by trigger name:
+
+```clojure
+(pt/next-fire-at :billing/daily-membership-check) ; => java.time.Instant or nil
+```
+
+The result is `nil` before startup, while the trigger is firing, after it is
+stopped, or when the name is unknown. Interval schedules fire immediately at
+startup and then at the configured interval. In a cluster this timestamp is
+node-local because each node runs its own scheduler.
+
 ## Read Models / Projections
 
 Read models are pure reducer functions `(state, event) -> state` that project event streams into queryable state. The processor handles caching, incremental updates, and multi-tenant isolation automatically.

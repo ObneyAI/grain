@@ -1,7 +1,7 @@
 (ns ai.obney.grain.event-store-v3.core.in-memory
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p]
-            [ai.obney.grain.event-store-v3.core :refer [->event]]
+            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
             [cognitect.anomalies :as anom]
             [clojure.set :as set]
             [com.brunobonacci.mulog :as u]
@@ -21,23 +21,31 @@
 (defn- strip-tenant-id [event]
   (dissoc event :grain/tenant-id))
 
+(defn- compare-event-ids [a b]
+  (cond (uuid/< a b) -1
+        (uuid/= a b) 0
+        :else 1))
+
 (defn- read-single
-  [event-store {:keys [tenant-id tags types as-of after] :as args}]
-  (let [filtered-events (->> (-> event-store :state deref :events)
-                              (filter
-                               (fn [event]
-                                 (and
-                                  (matches-tenant? tenant-id event)
-                                  (or (not tags)
-                                      (set/subset? tags (:event/tags event)))
-                                  (or (not types)
-                                      (contains? types (:event/type event)))
-                                  (cond
-                                    as-of (or (uuid/< (:event/id event) as-of)
-                                              (uuid/= (:event/id event) as-of))
-                                    after (uuid/> (:event/id event) after)
-                                    :else true))))
-                              (map strip-tenant-id))]
+  [event-store {:keys [tenant-id tags types as-of after reverse? limit] :as args}]
+  (let [filtered-events (cond->> (->> (-> event-store :state deref :events)
+                                      (filter
+                                       (fn [event]
+                                         (and
+                                          (matches-tenant? tenant-id event)
+                                          (or (not tags)
+                                              (set/subset? tags (:event/tags event)))
+                                          (or (not types)
+                                              (contains? types (:event/type event)))
+                                          (cond
+                                            as-of (or (uuid/< (:event/id event) as-of)
+                                                      (uuid/= (:event/id event) as-of))
+                                            after (uuid/> (:event/id event) after)
+                                            :else true))))
+                                      (map strip-tenant-id)
+                                      (sort-by :event/id compare-event-ids))
+                          reverse? reverse
+                          limit    (take limit))]
      (reify
        clojure.lang.IReduceInit
        (reduce [_ f init]
@@ -68,10 +76,7 @@
                                     (update ::events conj event))))
                             {::seen #{} ::events []})
                     ::events
-                    (sort-by :event/id (fn [a b]
-                                         (cond (uuid/< a b) -1
-                                               (uuid/= a b) 0
-                                               :else 1))))]
+                    (sort-by :event/id compare-event-ids))]
     (reify
       clojure.lang.IReduceInit
       (reduce [_ f init]
@@ -106,32 +111,31 @@
    ::append
    [:grain/event-ids (map :event/id events)
     :metric/name "GrainAppendEvents"]
-   (let [tx (->event
-             {:type :grain/tx
-              :body {:event-ids (set (mapv :event/id events))
-                     :metadata tx-metadata}})]
-     (dosync
+   (dosync
+    (let [last-id (get-in @(:state event-store)
+                          [:tenants tenant-id :tenant/last-event-id])
+          persist! (fn []
+                     (let [{:keys [events events-with-tx last-event-id]}
+                           (prepare-append last-id events tx-metadata)]
+                       (alter (:state event-store)
+                              (fn [s]
+                                (-> s
+                                    (update :events into
+                                            (tag-events-with-tenant tenant-id events-with-tx))
+                                    (assoc-in [:tenants tenant-id :tenant/last-event-id]
+                                              last-event-id))))
+                       events))]
       (if cas
         (let [events* (read event-store (assoc cas :tenant-id tenant-id))
               pred-result (predicate-fn events*)]
           (if pred-result
-            (alter (:state event-store)
-                   (fn [s]
-                     (-> s
-                         (update :events into (tag-events-with-tenant tenant-id events))
-                         (assoc-in [:tenants tenant-id :tenant/last-event-id]
-                                   (:event/id (last events))))))
+            (persist!)
             (let [anomaly {::anom/category ::anom/conflict
                            ::anom/message "CAS failed"
                            :cas cas}]
               (u/log :grain/cas-failed :anomaly anomaly)
               anomaly)))
-        (alter (:state event-store)
-               (fn [s]
-                 (-> s
-                     (update :events into (tag-events-with-tenant tenant-id (conj events tx)))
-                     (assoc-in [:tenants tenant-id :tenant/last-event-id]
-                               (:event/id tx))))))))))
+        (persist!))))))
 
 (defn tenants
   [event-store]

@@ -1,0 +1,472 @@
+-- allium: 3
+-- command-processor-v2.allium
+--
+-- Distilled from components/command-processor-v2 (grain).
+--
+-- Scope: The dispatch boundary that turns an inbound COMMAND into stored
+--        EVENTS. A command names an intent; this component finds the handler
+--        registered for that name, validates the command against its schema,
+--        runs the handler inside a tenant-scoped context, and durably appends
+--        whatever events the handler emits to the tenant's event stream.
+--
+-- This is a LIBRARY / FRAMEWORK component: a reusable mechanism with
+-- behavioural guarantees, not a domain. It is modelled as module-level
+-- contracts (the registry, the handler, the event-append boundary), a
+-- Command placeholder for the intent it carries, and a surface describing the
+-- dispatch boundary. The domain meaning of any given command lives in the
+-- consuming service, not here.
+--
+-- A "tenant scope" is treated here as an opaque key the dispatch threads from
+-- the command through to the event append. Tenants as entities (their
+-- creation, lifecycle and stream) are governed by the event store; this
+-- component only guarantees it never crosses scopes.
+--
+-- Includes (the guarantees the code and tests actually prove):
+--   - command-name -> handler registry lookup, with deny-by-default for
+--     unknown commands and a context registry that overrides the global one
+--   - command schema validation before any handler runs, with the
+--     name/lookup failure distinguished from the shape/validation failure
+--   - handler outcome discipline: a successful result, a passed-through
+--     rejection (authorization / conflict / etc.), nil -> fault, thrown -> fault
+--   - event persistence: emitted events are appended to the command's tenant
+--     scope; a command that emits none leaves the stream untouched
+--   - optional compare-and-swap (CAS) append, whose failure surfaces as a
+--     conflict rather than a generic fault
+--   - skip-storage composition: a caller (a composing parent handler) may
+--     dispatch a child command with storage suppressed, collect its events,
+--     and have them stored exactly once (by the parent). Suppression is a
+--     dispatch input the caller supplies, not a value the child handler returns
+--   - tenant isolation: every append is scoped to the command's tenant scope
+--
+-- Excludes (implementation / governed elsewhere):
+--   - the event store itself: durability, ordering, serialization and the CAS
+--     mechanics are the EventAppend contract, owned by event-store-v3
+--   - the registry's storage (a process-global atom), the handler macro, and
+--     how handlers are wired at startup
+--   - schema/Malli specifics, anomaly category taxonomy, logging and metrics
+--   - threads, retries and transport: a command arrives already in hand
+--
+-- The authorization model here is deny-by-default at the outcome level: a
+-- handler that refuses returns a forbidden rejection, which dispatch passes
+-- through unchanged. No events are stored for a refused command.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- An inbound intent to be processed. Every command carries an identity, a
+-- name selecting its handler and schema, the tenant scope it acts within, and
+-- a payload validated against that name's schema. Commands are constructed
+-- upstream (by the request handlers); this component reacts to a command's
+-- arrival and dispatches it. Its lifecycle is governed upstream, not here.
+external entity Command {
+    -- The command's own identity (used upstream for tracing / dedup).
+    id: String
+    -- Selects which handler and which schema apply. A command whose name is
+    -- absent or malformed cannot be looked up at all.
+    name: String?
+    -- Opaque key naming the tenant this command acts within; all resulting
+    -- events are appended under this scope and never another.
+    tenant_scope: String
+    -- When the command was issued.
+    issued_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- What a handler returns. A handler either produced a result (success,
+-- possibly carrying events to store and a caller-facing payload) or it
+-- refused. Dispatch reads these fields to decide the outcome; it never
+-- inspects the events' contents.
+value HandlerOutput {
+    -- True when the handler completed with a success result; false when its
+    -- return was a categorised rejection instead. A handler that returns
+    -- nothing or raises produces no output at all (handled as a fault, see
+    -- rules) — distinct from returning a rejection, which is still an output.
+    produced_result: Boolean
+    -- True when the handler's return was a categorised rejection of its own
+    -- (any category it chose — unauthorized, conflict, not-found, etc.) rather
+    -- than a success. Such a rejection is data the handler returns, never a
+    -- thrown exception, and dispatch relays it untouched.
+    refused: Boolean
+    -- The events the handler computed. Dispatch appends them unless the
+    -- invoking caller marked this dispatch skip-storage (see CommandRun).
+    events: Set<EmittedEvent>
+    -- When present, a compare-and-swap precondition the append must satisfy.
+    guard: AppendGuard?
+}
+
+-- One event a handler computed, awaiting persistence. Its body and ordering
+-- are the event store's concern; here it carries only the scope it belongs to.
+value EmittedEvent {
+    tenant_scope: String
+}
+
+-- A compare-and-swap precondition attached to an append: the events are
+-- stored only if this guard holds against the current stream at commit time.
+value AppendGuard {}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The set of commands this dispatch knows how to handle, keyed by name. Two
+-- registries are consulted: a per-call registry supplied with the command's
+-- context, and a process-wide global registry. The per-call registry, when
+-- present, wins; otherwise the global one is used.
+contract CommandRegistry {
+    -- The handler bound to a command name, if any is registered.
+    handler_for: (name: String) -> CommandHandler
+    -- The schema a command of this name must satisfy, if registered.
+    schema_for: (name: String) -> CommandSchema
+
+    @invariant DenyUnknownByDefault
+        -- A name with no registered handler resolves to nothing. Dispatch
+        -- treats this as not-found and runs no handler: an unregistered
+        -- command can never produce events. This is the deny-by-default
+        -- posture at the registry layer.
+
+    @invariant ContextOverridesGlobal
+        -- When both a per-call registry and the global registry bind the same
+        -- name, the per-call binding is used. The global registry is the
+        -- fallback consulted only when no per-call registry is supplied. This
+        -- lets a caller substitute handlers (e.g. in tests or composition)
+        -- without mutating global state.
+}
+
+-- The schema a command of a given name must satisfy. Opaque here; its only
+-- role is to accept or reject a command's shape before the handler runs.
+contract CommandSchema {
+    -- Whether a command satisfies this schema.
+    accepts: (command: Command) -> Boolean
+
+    @invariant ValidatedBeforeHandler
+        -- The schema is checked before the handler is invoked. A command that
+        -- fails carries a human-readable explanation upstream and reaches no
+        -- handler.
+}
+
+-- The domain logic bound to one command name. A handler is pure with respect
+-- to the event store: it computes events and a result from the command and
+-- its context but does not itself persist anything — dispatch persists what
+-- the handler returns. A handler signals refusal by returning a rejection
+-- rather than throwing.
+contract CommandHandler {
+    -- Run the handler for a validated command within its tenant scope.
+    handle: (command: Command) -> HandlerOutput
+
+    @invariant RefusalIsData
+        -- A handler that declines returns that rejection as its output instead
+        -- of throwing. Dispatch passes the rejection through verbatim — its
+        -- exact category (whatever the handler chose), its message and any extra
+        -- context fields it attached all reach the caller unchanged — and stores
+        -- no events. Dispatch never reclassifies or collapses a returned
+        -- rejection into a single category: a handler's forbidden, conflict,
+        -- not-found, incorrect or self-declared fault each surface as themselves.
+
+    @invariant ResultIsReturned
+        -- A handler that succeeds returns a caller-facing result alongside any
+        -- events. Dispatch returns that result to the caller unchanged; it
+        -- inspects the output only to decide persistence, never to rewrite the
+        -- handler's result payload.
+
+    @invariant NilIsFault
+        -- A handler that returns nothing is a programming error, surfaced as a
+        -- fault. Absence of an outcome is never silently treated as success.
+
+    @invariant ThrowIsContainedAsFault
+        -- A handler that raises is contained: dispatch reports a fault rather
+        -- than letting the failure escape. One handler's crash does not take
+        -- down the dispatcher.
+}
+
+-- The event-store boundary dispatch writes through. Owned by event-store-v3;
+-- demanded here so that appending a handler's events is durable, atomic and
+-- tenant-scoped.
+contract EventAppend {
+    -- Append a batch of events under a tenant scope, optionally guarded by a
+    -- compare-and-swap precondition.
+    append: (tenant_scope: String, events: Set<EmittedEvent>, guard: AppendGuard) -> Any
+
+    @invariant TenantScopedAppend
+        -- Events are appended only under the tenant scope carried by the
+        -- command. A command for one tenant can never write into another's
+        -- stream.
+
+    @invariant CasGuardIsAtomic
+        -- When an append carries a CAS guard, the events are stored only if
+        -- the guard predicate holds against the current stream at commit time.
+        -- If it does not, nothing is stored and the append reports a conflict.
+        -- The check and the write are atomic with respect to other appends.
+
+    @invariant AllOrNothing
+        -- An append either stores every event in the batch or none of them;
+        -- partial appends are not observable.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Why a command did not complete. These are the categories observable at the
+-- dispatch boundary; each maps to a distinct caller reaction.
+enum RejectionReason {
+    -- No handler is registered for the command's name (or the name is
+    -- absent / malformed, so lookup cannot proceed).
+    unknown_command
+    -- The command's payload failed schema validation; carries a
+    -- human-readable explanation upstream.
+    invalid_command
+    -- A CAS guard's precondition did not hold: the events were not stored
+    -- because the stream had changed.
+    conflict
+    -- The handler refused for a domain reason it categorised itself
+    -- (authorization, not-found, conflict, incorrect, or its own fault). This
+    -- enum value marks the outcome class; the handler's specific category and
+    -- message are passed through to the caller unchanged, not flattened to one
+    -- generic reason.
+    handler_rejected
+    -- The handler returned nothing or raised; an internal error.
+    fault
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A durable fact stored under a tenant scope. This component creates events
+-- by appending a handler's output to the event store; their structure,
+-- ordering and durability are the event store's concern, captured by the
+-- EventAppend contract.
+entity Event {
+    tenant_scope: String
+    -- The dispatch run that produced and stored this event.
+    run: CommandRun
+}
+
+-- The record of dispatching one command: every accepted or rejected command
+-- yields exactly one run, which ends either completed or rejected. A run
+-- captures the handler's output (once it has run) and, on rejection, why the
+-- command did not complete. This makes each command's outcome a single
+-- observable thing rather than a scatter of trigger emissions.
+entity CommandRun {
+    command: Command
+    status: dispatching | completed | rejected
+
+    -- Whether this dispatch was asked to withhold storage and hand the
+    -- handler's events back to a composing parent instead of appending them.
+    -- This is an input to the dispatch supplied by the caller (the composing
+    -- parent), not something the handler returns: the handler always computes
+    -- its events the same way, and the invoking context decides whether this
+    -- run persists them. A top-level dispatch never skips.
+    skip_storage: Boolean
+
+    -- The handler's output, present once the handler has run (it is absent for
+    -- runs rejected before dispatch — unknown command or invalid command).
+    output: HandlerOutput?
+    -- Why the command did not complete; present only on rejection.
+    reason: RejectionReason when status = rejected
+
+    transitions status {
+        dispatching -> completed
+        dispatching -> rejected
+        terminal: completed, rejected
+    }
+
+    -- The events this run stored, if any.
+    stored_events: Event with run = this
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A command whose name resolves to no registered handler is rejected as
+-- unknown before any handler runs. This covers both an absent/malformed name
+-- (lookup cannot even be attempted) and a well-formed but unregistered name.
+-- No handler runs and no events are produced.
+rule UnknownCommandRejected {
+    when: command: Command.created
+    let handler = handler_for(command.name)
+    requires: not exists handler
+    ensures: CommandRun.created(command: command, status: rejected, reason: unknown_command)
+}
+
+-- A command with a registered handler is validated against that name's schema
+-- before the handler runs. A command that fails validation is rejected as
+-- invalid, with no handler executed and no events stored. Validation happens
+-- after a successful lookup, so a missing name is reported as unknown rather
+-- than invalid.
+rule InvalidCommandRejected {
+    when: command: Command.created
+    let handler = handler_for(command.name)
+    let schema = schema_for(command.name)
+    requires: exists handler
+    requires: not schema.accepts(command)
+    ensures: CommandRun.created(command: command, status: rejected, reason: invalid_command)
+}
+
+-- A valid command with a registered handler is dispatched: the handler runs
+-- within the command's tenant scope, and whatever it returns determines the
+-- outcome. This rule opens the single dispatch path; the result (completion or
+-- rejection) is resolved by the handler's output and the append below.
+rule CommandDispatched {
+    when: command: Command.created
+    let handler = handler_for(command.name)
+    let schema = schema_for(command.name)
+    requires: exists handler
+    requires: schema.accepts(command)
+
+    let result = handler.handle(command)
+
+    -- skip_storage is read from the dispatch context the caller supplied, not
+    -- from the handler. A composing parent dispatches the child with this set;
+    -- a top-level dispatch leaves it false. dispatch_skips resolves the
+    -- suppression flag carried by this dispatch's context, the same way
+    -- handler_for / schema_for resolve the ambient registry.
+    let skip = dispatch_skips(command)
+    ensures: CommandRun.created(command: command, status: dispatching, output: result, skip_storage: skip)
+
+    @guidance
+        -- The handler runs exactly once per accepted command. Its output is
+        -- one of: a success carrying events and/or a caller result; a refusal
+        -- (a categorised rejection it chose to return); nothing (a fault); or
+        -- a raised exception (contained as a fault). ResolveDispatch (below)
+        -- turns that output into the run's completed or rejected outcome.
+}
+
+-- Once the handler has run, the run is resolved to its single outcome based on
+-- the handler's output. This is one decision, not a race: the cases below are
+-- mutually exclusive, so exactly one applies to any given run. The cases are:
+--
+--   - the handler refused: passed through as a handler_rejected outcome;
+--   - the handler returned nothing / raised: a fault;
+--   - the handler succeeded with no events: completes, store untouched;
+--   - the handler succeeded with events but this dispatch was asked to skip
+--     storage: completes without storing (the composing parent will store
+--     them once);
+--   - the handler succeeded with events and a CAS guard that no longer holds:
+--     a conflict, nothing stored;
+--   - the handler succeeded with events and the append held: the events are
+--     stored under the command's tenant scope and the run completes.
+--
+-- No events are stored on any rejection path; the tenant's stream is touched
+-- only on the final, successful branch.
+rule ResolveDispatch {
+    when: run: CommandRun.created
+    requires: run.status = dispatching
+
+    ensures:
+        if not run.output.produced_result:
+            run.status = rejected
+            if run.output.refused:
+                run.reason = handler_rejected
+            else:
+                run.reason = fault
+        else if run.output.events.count = 0:
+            run.status = completed
+        else if run.skip_storage:
+            run.status = completed
+        else if not append_succeeds(run.command.tenant_scope, run.output.events, run.output.guard):
+            run.status = rejected
+            run.reason = conflict
+        else:
+            for emitted in run.output.events:
+                Event.created(tenant_scope: emitted.tenant_scope, run: run)
+            run.status = completed
+
+    @guidance
+        -- The handler runs exactly once per accepted command (in
+        -- CommandDispatched); this rule turns its output into the run's
+        -- terminal state.
+        --
+        -- A handler may attach a CAS guard to its output; the append stores
+        -- the events only if the guard holds at commit time (append_succeeds
+        -- is that predicate, evaluated by the event store). The Event.created
+        -- assertions describe the post-append state of the tenant's stream;
+        -- durability, ordering and atomicity are the EventAppend contract.
+        --
+        -- skip-storage is the composition primitive, and it is a property of
+        -- the dispatch invocation, not of the handler's output: a parent
+        -- handler dispatches a child with skip-storage set, collects the
+        -- child's events into its own output, and the parent's (non-skipping)
+        -- dispatch stores them once. The child handler is unaware it is being
+        -- composed; the parent's choice to skip is what defers persistence.
+        -- This is how commands compose without double-writing.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Tenant isolation as a point-in-time property: every stored event belongs to
+-- the scope of the command that produced it. Modelled here as: a stored event
+-- always carries a tenant scope (it is never scope-less). Cross-scope leakage
+-- is prevented structurally because the append is keyed by command.tenant_scope
+-- (see EventAppend.TenantScopedAppend).
+invariant EveryEventIsScoped {
+    for e in Events:
+        e.tenant_scope != null
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The party that drives dispatch is upstream code — a request handler, or a
+-- parent command composing children — rather than an end user. It is modelled
+-- as a submitter that holds a command to dispatch.
+actor Submitter {
+    identified_by: Command where name != null
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The dispatch boundary: a submitter hands in a command and receives an
+-- outcome (completion or a categorised rejection). The submitter is upstream
+-- code, not an end user.
+surface CommandDispatch {
+    facing submitter: Submitter
+
+    exposes:
+        submitter.name
+        submitter.tenant_scope
+
+    contracts:
+        demands CommandRegistry
+        demands CommandSchema
+        demands CommandHandler
+        demands EventAppend
+
+    @guarantee DenyByDefault
+        -- A command with no registered handler is rejected as unknown and
+        -- runs nothing. A handler may further refuse for its own reasons; that
+        -- refusal is passed through with its category intact. In neither case
+        -- are events stored.
+
+    @guarantee ValidatedBeforeEffect
+        -- A command is validated against its schema before its handler runs.
+        -- An invalid command produces no handler execution and no events.
+
+    @guarantee EventsStoredExactlyOncePerTenant
+        -- The events a successful command produces are appended once, under
+        -- the command's tenant scope only. A dispatch the caller marked
+        -- skip-storage stores nothing itself, deferring persistence to the
+        -- composing parent that dispatched it. A CAS guard that fails stores
+        -- nothing and is reported as a conflict.
+
+    @guarantee FailuresAreContained
+        -- A handler returning nothing or raising becomes a fault; the
+        -- dispatcher survives and other commands are unaffected.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Command.id is carried but dispatch does not deduplicate on it here. Is idempotency (at-most-once processing of a given command id) a guarantee of this component, or is it provided upstream by the request handler / event-store CAS?"
+open question "On a contained handler fault, are partially-produced events ever observable, or is the no-events guarantee absolute? The code stores only what a successful result returns, so a fault stores nothing — confirm no handler can both fault and have emitted events through a side channel."

@@ -1,0 +1,311 @@
+-- allium: 3
+-- event-notifier-postgres.allium
+--
+-- Distilled from components/event-notifier-postgres (grain).
+--
+-- Scope: Cross-instance event notification. When one application instance
+--        appends events for a tenant, every instance learns of it and
+--        delivers those events to its own local subscribers, so a node that
+--        did not perform the write still reacts to it. This is the fan-out
+--        that turns a shared, durable event store into a live, multi-node
+--        event bus without each node polling every tenant.
+--
+-- Includes: a per-tenant notification signal fired when events are appended;
+--           a bridge that, on each signal, catches a tenant up from where it
+--           last left off and republishes the new events to the local bus
+--           with their tenant attached; per-tenant progress tracking that
+--           makes redelivery within a running bridge gap-free and
+--           duplicate-free; ordering preservation per tenant; suppression of
+--           internal bookkeeping events; and containment of per-notification
+--           failures so one bad notification cannot stop the stream.
+--
+-- Excludes (implementation / plumbing, governed elsewhere):
+--   - the database LISTEN/NOTIFY transport, the dedicated connection, polling
+--     intervals, the background thread and its daemon/lifecycle mechanics
+--   - the local pub/sub fan-out mechanism itself (topic routing, channels);
+--     this component DEMANDS its delivery from the LocalBus contract and owns
+--     none of it
+--   - the event store's persistence, ordering and read internals; this
+--     component DEMANDS them as the EventSource contract and owns none of it
+--   - the wire encoding of the notification payload and of events
+--   - logging, tracing and metrics (notify/read/publish counters, trace log)
+--   - thread pools and the async execution model
+--
+-- The conformance points below correspond to the component's test suite
+-- (integration_test.clj). Where each is captured:
+--   NOTIFY fires on append                      -> rule EventsAppended + surface AppendNotification
+--   payload is the tenant-id                    -> contract EventSource.NotificationCarriesTenant
+--   distinct tenants -> distinct notifications  -> rule EventsAppended (per-tenant) + TenantIsolation
+--   bridge reads new events and republishes     -> rule CatchUpTenant
+--   republished event carries its tenant        -> rule CatchUpTenant ensures + DeliveriesAreTenantScoped
+--   incremental read from last watermark        -> rule CatchUpTenant (read_after cursor) + GapFreeWithinBridge
+--   internal tx markers are not delivered       -> rule CatchUpTenant (domain_events filter) + InternalEventsNotDelivered
+--   a handler error does not stop the listener  -> surface LocalDelivery @guarantee ResilientStream
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A domain tenant. Every event, notification, read and delivery is scoped to
+-- exactly one tenant. Tenants are created and governed by the event store, not
+-- by this component; here a tenant is only the key that a notification carries
+-- (the notification payload is the tenant's identifier) and that a catch-up
+-- reads and delivers under.
+external entity Tenant {
+    -- Stable identifier. A notification carries this so the bridge can resolve
+    -- which tenant's stream to catch up.
+    id: String
+}
+
+-- A single immutable fact in a tenant's event stream. Events are produced,
+-- ordered and positioned by the event store; this component never creates them,
+-- it only reads and republishes them. The one property this component relies on
+-- beyond the owning tenant — a tenant-stream-relative ordering position — is a
+-- guarantee of the EventSource contract, not state this component governs. A
+-- tenant's stream mixes ordinary domain events with store-internal bookkeeping
+-- records (a transaction marker written on every append); this component
+-- distinguishes them itself and republishes only the domain events. The event
+-- the bridge last delivered for a tenant acts as the cursor for the next
+-- incremental read.
+external entity Event {
+    -- The tenant whose stream this event belongs to.
+    tenant: Tenant
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The durable, shared event store this component bridges from. It both signals
+-- that new events exist and answers incremental reads. The signal and the read
+-- are the only things this component depends on; how events are stored, ordered
+-- or transported is the store's concern.
+contract EventSource {
+    -- Read a tenant's events appended strictly after a given cursor event, in
+    -- stream (append) order. With no cursor, reads the whole stream from the
+    -- start. The store returns the raw stream as appended — domain events and
+    -- store-internal bookkeeping records alike; it does not filter the latter,
+    -- so the bridge must.
+    read_after: (tenant: Tenant, after: Event) -> Sequence<Event>
+
+    @invariant NotificationCarriesTenant
+        -- Every notification identifies exactly the tenant whose stream grew.
+        -- The signal carries the tenant key and nothing more; the bridge uses
+        -- it to decide which stream to catch up.
+
+    @invariant NotifiesOnAppend
+        -- Appending one or more events for a tenant causes a notification for
+        -- that tenant to be observed by every running listener. The signal is
+        -- tied to the durable append, not to any single node, so a node that
+        -- did not perform the write still learns of it.
+
+    @invariant ReadIsOrderedAndComplete
+        -- read_after returns every event positioned strictly after the cursor,
+        -- in stream order, with no gaps and no duplicates. Two catch-ups from the
+        -- same cursor see the same events in the same order. The stream includes
+        -- store-internal bookkeeping records; excluding those is the bridge's
+        -- job, not the store's.
+}
+
+-- The instance-local event bus this component republishes onto. Subscribers on
+-- the same node receive events delivered here. This component DEMANDS delivery
+-- and failure containment from the bus; it owns no routing of its own.
+contract LocalBus {
+    -- Deliver one event, carrying its tenant, to local subscribers.
+    deliver: (event: Event, tenant: Tenant) -> Any
+
+    @invariant DeliveredEventCarriesTenant
+        -- Each delivered event carries the tenant whose stream it came from, so
+        -- a local subscriber can tell which tenant a cross-instance event
+        -- belongs to even though it did not perform the originating write.
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A running bridge's record of how far it has caught a tenant up: the last
+-- domain event it read for that tenant on the most recent catch-up. It advances
+-- to the last event of each non-empty read BEFORE that batch is delivered, and
+-- bounds the next catch-up — the bridge reads strictly after this event — so on
+-- the happy path each domain event is republished to the local bus once and in
+-- order within one running bridge. A watermark exists per tenant the bridge has
+-- seen; absence means "never caught up, read from the start". The watermark is
+-- in-memory progress, not durable state: a fresh bridge starts with none and
+-- re-reads each tenant from the beginning.
+entity TenantWatermark {
+    tenant: Tenant
+    -- The last domain event this bridge read for the tenant; the cursor for the
+    -- next incremental read. Advanced ahead of delivery, so it does not track
+    -- successful delivery.
+    last_delivered: Event
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- An event is appended to a tenant's stream. The append signals that tenant —
+-- one notification scoped to the tenant whose stream grew — and every running
+-- listener observes it, regardless of which node performed the append. The
+-- notification carries only the tenant's identifier; the bridge resolves it.
+-- Appends to different tenants signal distinct, independently-scoped
+-- notifications.
+rule EventsAppended {
+    when: event: Event.created
+    ensures: TenantStreamNotified(tenant_id: event.tenant.id)
+}
+
+-- On notification, the bridge resolves the carried identifier to a tenant and
+-- catches that tenant up: it reads the tenant's stream appended since it last
+-- left off, drops the store-internal bookkeeping records, republishes each
+-- remaining domain event onto the local bus with its tenant attached, and
+-- advances the watermark to the last domain event delivered. A notification that
+-- resolves to a known tenant whose new appends are all bookkeeping records (or
+-- none) leaves the watermark untouched and delivers nothing.
+rule CatchUpTenant {
+    when: TenantStreamNotified(tenant_id)
+
+    let tenant = Tenant{id: tenant_id}
+    let watermark = TenantWatermark{tenant: tenant}
+    let cursor = watermark?.last_delivered
+    let new_events = read_after(tenant, cursor)
+    -- domain_only drops the store-internal bookkeeping records (the transaction
+    -- marker appended on every write), keeping only ordinary domain events. This
+    -- filtering is performed by the bridge, not the store.
+    let domain_events = domain_only(new_events)
+
+    requires: exists tenant
+    requires: domain_events.count > 0
+
+    ensures:
+        for event in domain_events:
+            deliver(event, tenant)
+        let last = domain_events.last
+        if exists watermark:
+            watermark.last_delivered = last
+        else:
+            TenantWatermark.created(tenant: tenant, last_delivered: last)
+
+    @guidance
+        -- The notification payload is just the tenant's identifier; the bridge
+        -- resolves it to the tenant whose stream to read. The cursor is that
+        -- tenant's last read domain event, or absent on the first notification
+        -- for the tenant (read from the start). Reading strictly after the cursor
+        -- and advancing it to the last domain event read is what makes catch-up
+        -- gap-free and duplicate-free within a running bridge on the happy path:
+        -- each domain event is read once, in stream order, and republished once.
+        --
+        -- The watermark advances to the last domain event read BEFORE that batch
+        -- is delivered, not after each delivery. Republishing the batch is
+        -- therefore not gated on the watermark advance: if delivery throws part
+        -- way through a batch, the cursor has already moved past the whole batch,
+        -- so the undelivered remainder is not re-read on the next notification —
+        -- a gap, not a redelivery. Within-bridge "delivered once" holds when
+        -- delivery succeeds; it is not a delivery-failure recovery guarantee.
+        --
+        -- The store returns the raw stream including its own bookkeeping records
+        -- (a transaction marker is appended on every write). This component
+        -- filters those out before delivering, so store-internal records never
+        -- reach a subscriber; the republished event carries its tenant so local
+        -- subscribers can attribute a cross-instance event to the right tenant.
+        --
+        -- The watermark is in-process progress, not durable. A bridge that
+        -- restarts has no watermarks and re-reads each tenant from the
+        -- beginning, so cross-bridge-restart delivery is at-least-once, not
+        -- exactly-once. Subscribers that must dedupe should key on the event's
+        -- stream position within its tenant.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A running bridge tracks at most one progress cursor per tenant; catch-up
+-- advances the existing watermark rather than forking a second one. This is
+-- what lets a tenant's deliveries stay gap-free and duplicate-free.
+invariant OneWatermarkPerTenant {
+    for a in TenantWatermarks:
+        for b in TenantWatermarks:
+            a != b implies a.tenant != b.tenant
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary where the durable store signals an append for a tenant and the
+-- bridge reads that tenant's stream. This component drives the read and reacts
+-- to the signal; it DEMANDS the signalling and ordered, complete reads from the
+-- store. One surface instance exists per tenant whose stream the bridge tracks.
+surface AppendNotification {
+    facing tenant: Tenant
+
+    exposes:
+        tenant.id
+
+    contracts:
+        demands EventSource
+
+    @guarantee NotifiedPerTenant
+        -- An append to a tenant's stream signals that tenant, and only that
+        -- tenant, carrying just the tenant's identifier. The signal reaches
+        -- every running listener, so a node that did not perform the write still
+        -- catches the tenant up.
+
+    @guarantee TenantIsolation
+        -- A notification, the catch-up read it triggers, and every delivery it
+        -- produces are scoped to a single tenant. One tenant's events are never
+        -- read under, or delivered as, another tenant's.
+}
+
+-- The boundary where the bridge republishes a tenant's caught-up events onto
+-- the local bus for in-process subscribers. This component DEMANDS delivery from
+-- the bus; it owns failure containment itself. One surface instance exists per
+-- tenant.
+surface LocalDelivery {
+    facing tenant: Tenant
+
+    exposes:
+        tenant.id
+
+    contracts:
+        demands LocalBus
+
+    @guarantee DeliveriesAreTenantScoped
+        -- Every event delivered to the local bus carries the tenant whose
+        -- stream it came from, and is delivered in that tenant's append order.
+
+    @guarantee InternalEventsNotDelivered
+        -- Store-internal bookkeeping records are never delivered to
+        -- subscribers; only domain events cross this boundary.
+
+    @guarantee GapFreeWithinBridge
+        -- Within a single running bridge, when delivery succeeds, each domain
+        -- event is delivered to the local bus once and in order: catch-up reads
+        -- strictly after the cursor and advances it past each batch. The cursor
+        -- advances before the batch is delivered, so it bounds redelivery but
+        -- does not track delivery: a delivery that throws part way through a batch
+        -- leaves the remainder of that batch undelivered and not re-read. Across a
+        -- bridge restart, delivery is at-least-once, since in-process progress is
+        -- not retained.
+
+    @guarantee ResilientStream
+        -- A failure handling one notification — a malformed payload, a failed
+        -- read, a subscriber that throws — is contained by this component to that
+        -- notification. It does not stop the listener or drop later
+        -- notifications; the stream keeps flowing and later notifications are
+        -- still caught up. Containment is to the listener, not to a tenant's
+        -- delivery completeness: a read that throws before the cursor advances
+        -- leaves that tenant's progress intact (the batch is re-read next time),
+        -- but a delivery that throws after the cursor has advanced skips the
+        -- undelivered remainder of that batch (see GapFreeWithinBridge).
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Per-tenant progress is in-memory, so a bridge restart re-reads each tenant from the start and redelivers. Is at-least-once cross-restart delivery the intended contract, or should progress be durable (or seeded from a checkpoint) to make it exactly-once?"
+open question "A notification triggers a full catch-up read for its tenant rather than carrying the appended events. Under a burst of appends this coalesces naturally, but should the contract bound how far behind a catch-up may fall, or guarantee liveness (every appended event is eventually delivered)?"
+open question "Delivery ordering is guaranteed per tenant. Is any cross-tenant ordering expected by subscribers, or is per-tenant ordering the whole contract?"

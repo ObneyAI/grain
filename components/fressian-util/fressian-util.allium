@@ -1,0 +1,100 @@
+-- allium: 3
+-- fressian-util.allium
+--
+-- Distilled from components/fressian-util (grain).
+--
+-- Scope: A binary codec for grain's domain values. It encodes a value to a
+--        compact byte representation and decodes it back, extending the base
+--        serialization with grain's timestamp types so that events and
+--        projections round-trip without loss.
+--
+-- Classification: INFRASTRUCTURE / thin plumbing. This component is a single
+--        serialization mechanism with one real behavioural guarantee — a
+--        faithful round-trip. There is no domain model, no lifecycle and no
+--        workflow here, so the spec is deliberately brief: a single Codec
+--        contract carrying the Roundtrip guarantee proved by the tests.
+--
+-- Includes: the encode/decode boundary and the equivalence guarantee between a
+--           value and its round-tripped form, across grain's supported value
+--           shapes (scalars, keywords/symbols, ordered and unordered
+--           collections, maps, nested structures, and the two timestamp types).
+--
+-- Excludes (implementation, governed elsewhere):
+--   - the wire format itself (Fressian) and its byte layout
+--   - the specific read/write handler registration mechanism
+--   - the post-decode normalisation that restores native collection kinds
+--     (an internal step in service of the Roundtrip guarantee, not observable
+--     behaviour in its own right)
+--   - which callers (event store, projections) use the codec, and why
+--
+-- The Roundtrip guarantee corresponds to the component's test suite
+-- (interface_test.clj): OffsetDateTime, Instant, nested structures, stock
+-- Clojure types, and legacy timestamp-free payloads all decode to a value
+-- equivalent to the original.
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The serialization boundary. encode turns a value into bytes; decode turns
+-- those bytes back into a value. The pair is the whole point of the component.
+contract Codec {
+    -- Encode a supported value to its byte representation.
+    encode: (value: Any) -> ByteArray
+    -- Decode bytes produced by encode back into a value.
+    decode: (bytes: ByteArray) -> Any
+
+    @invariant Roundtrip
+        -- decode(encode(value)) produces a value equivalent to the original
+        -- for every supported value shape: scalars, keywords and symbols,
+        -- maps, ordered collections, unordered collections and arbitrary
+        -- nesting of these. Collection kind is preserved — an unordered
+        -- collection decodes as unordered and an ordered one as ordered, at
+        -- every level of nesting, not only the top.
+
+    @invariant TimestampFidelity
+        -- The two timestamp types grain relies on round-trip exactly. A
+        -- zone-qualified timestamp keeps its original offset: a value carrying a
+        -- specific offset decodes with that same offset, not a normalised or
+        -- UTC-shifted one. An absolute instant keeps its exact point in time.
+        -- This extends the base codec, which does not natively carry these types.
+
+    @invariant BackwardCompatibility
+        -- A payload that contains no timestamp values — one that predates the
+        -- timestamp extension — decodes unchanged. Adding the timestamp
+        -- handlers does not alter how previously encodable values round-trip.
+
+    @guidance
+        -- encode and decode are inverse, pure and deterministic for supported
+        -- inputs. They form a closed pair: bytes are only expected to decode
+        -- when produced by this same encode. The contract says nothing about
+        -- decoding foreign or corrupt bytes; that is out of scope.
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The party that drives the codec: any grain component that calls encode/decode.
+-- A bare counterpart for the Serialization surface to face. The codec is
+-- agnostic to which component this is, so it carries no fields and no lifecycle
+-- of its own.
+entity Component {}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The codec boundary grain components depend on. A caller hands a value to be
+-- encoded and later recovers an equivalent value by decoding the bytes.
+surface Serialization {
+    facing caller: Component
+
+    contracts:
+        fulfils Codec
+
+    @guarantee LosslessRoundtrip
+        -- A value handed to encode is recoverable, equivalent to the original,
+        -- by decoding the bytes that encode produced — preserving collection
+        -- kind, nesting and timestamp offsets.
+}

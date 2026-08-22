@@ -1,0 +1,397 @@
+-- allium: 3
+-- query-request-handler.allium
+--
+-- Distilled from components/query-request-handler (grain).
+--
+-- Scope: The boundary where an external caller submits a QUERY. The handler
+--        decodes and stamps the query, validates its shape, enforces
+--        deny-by-default authorization, dispatches it to the query processor,
+--        and maps the outcome onto a stable, transport-agnostic result
+--        classification. It isolates handler faults so a misbehaving query
+--        cannot crash the boundary. A query is a PURE READ: nothing is appended
+--        to the event log and no state is changed. This is the read-side mirror
+--        of command-request-handler, without any event-persistence step.
+--
+-- Classification: LIBRARY / FRAMEWORK. This component is a reusable request
+--        boundary with behavioural guarantees, not a domain. The guarantees are
+--        modelled as a module-level contract plus a surface; the query, the
+--        query processor and the read side it reads from are external
+--        placeholders the consuming system supplies.
+--
+-- Includes:
+--   - query admission: identity/timestamp stamping, shape validation
+--   - deny-by-default authorization (no predicate, or predicate not exactly
+--     true => deny)
+--   - propagation of the caller's full context to the authorization check and
+--     the handler (ambient grain context + upstream-interceptor context +
+--     decoded query + the active registry)
+--   - two-registry resolution: a per-call registry shadows a process-wide
+--     fallback registry
+--   - dispatch to the query processor and pass-through of the handler's outcome
+--   - outcome classification into a fixed category set (ok / incorrect /
+--     not-found / forbidden / conflict / fault)
+--   - fault isolation: an exception thrown by a handler becomes a fault outcome
+--
+-- Excludes (implementation, governed elsewhere):
+--   - HTTP transport, routing, status codes and the transit wire format
+--   - the query processor's internal dispatch/validation/handler execution (the
+--     QueryProcessing contract records only the guarantees this boundary relies
+--     on; they are owned by the query-processor component)
+--   - the query registry's storage form (a per-call map vs. a process-wide
+--     atom) and the schema language
+--   - logging, tracing and metrics
+--   - threads, async channels and connection pools
+--
+-- Conformance properties below correspond to the component's test suite
+-- (interface_test.clj). Where each is captured:
+--   envelope validation rejected as incorrect    -> rule AdmitQuery (incorrect outcome)
+--   missing query name => incorrect               -> rule AdmitQuery
+--   missing authorizer => forbidden               -> rule AuthorizeQuery + invariant DenyByDefault
+--   authorizer not exactly true => forbidden      -> rule AuthorizeQuery
+--   authorizer true => proceeds                   -> rule DispatchQuery
+--   authorizer receives full context              -> surface QuerySubmission @guarantee FullContextToAuthorizer
+--   handler outcome category mapping              -> enum OutcomeCategory + contract QueryProcessing.OutcomeClassified
+--   handler exception => fault                     -> contract QueryProcessing.FaultContained + @guarantee FaultIsolation
+--   per-call registry shadows process-wide one    -> @guarantee RegistryResolution
+--   query is a pure read (no events / no writes)  -> contract QueryProcessing.ReadsNotWrites + @guarantee NoSideEffects
+--   id/timestamp stamped on admission             -> rule ReceiveQuery
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A query submitted by a caller: a named question, carried with its
+-- caller-supplied fields. The query's name selects a handler and an
+-- authorization predicate from the active registry. Stamped with a fresh
+-- identity and an admission timestamp the moment it is admitted. The shape of
+-- each named query is governed by the consuming system's schemas, not here. The
+-- boundary refers to a query by its stamped id (a join lookup), not by
+-- embedding it, because each request tracks one already-admitted query.
+external entity Query {
+    id: String
+    name: String
+    admitted_at: Timestamp?
+}
+
+-- The decided handler and authorizer for a query name, in the active registry.
+-- Registered by the consuming system; this boundary only looks them up. A
+-- registration may carry no authorizer at all, which this boundary treats as
+-- "deny".
+external entity QueryRegistration {
+    query_name: String
+    has_authorizer: Boolean
+}
+
+-- The caller's request context: the ambient grain context (active registry and
+-- read dependencies) merged with any context contributed by upstream
+-- interceptors, plus the decoded query. Both the authorization predicate and the
+-- handler see this whole context. Modelled as an opaque placeholder keyed by a
+-- handle; its internal shape is the consuming system's concern.
+external entity RequestContext {
+    handle: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The processing runtime this boundary dispatches to once a query is admitted
+-- and authorized. The boundary DEMANDS these guarantees; it does not implement
+-- them. The processor runs the registered handler and returns a classified
+-- outcome, reading from the read side without changing any state.
+contract QueryProcessing {
+    -- Process an admitted, authorized query in its context, returning a
+    -- classified outcome.
+    process: (query: Query, context: RequestContext) -> OutcomeCategory
+
+    @invariant ReadsNotWrites
+        -- Processing a query never appends an event and never changes state.
+        -- The only thing it produces is the classified outcome returned to the
+        -- boundary; queries are the read-only half of CQRS.
+
+    @invariant OutcomeClassified
+        -- Every processing result resolves to exactly one OutcomeCategory.
+        -- A result that carries no anomaly is ok; an anomalous result carries a
+        -- category that maps to incorrect, not_found, forbidden, conflict, or —
+        -- for any unrecognised anomaly — fault. A query whose fields do not match
+        -- the schema for that name is incorrect; a query that targets a resource
+        -- that does not exist is not_found. (The boundary validates only the base
+        -- query envelope; per-name schema resolution happens here, in the
+        -- processor.) Note: an unregistered query name does NOT reach this
+        -- contract as not_found — it is screened out earlier by deny-by-default
+        -- authorization (no registration means no authorizer means forbidden, see
+        -- rule AuthorizeQuery), so the processor's own unknown-name path is only
+        -- entered for a registration that authorizes but supplies no handler.
+
+    @invariant FaultContained
+        -- A query handler that fails unexpectedly, including by throwing, is
+        -- contained by the processor: the failure never propagates out as a
+        -- crash. It resolves to a fault outcome. This is the processor's
+        -- obligation; the boundary that demands this contract relays the fault
+        -- outcome rather than classifying handler failures itself.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The fixed, transport-agnostic classification of a query's outcome. This is
+-- the boundary's stable vocabulary; the mapping onto transport-level codes (e.g.
+-- HTTP status) lives in the implementation and is out of scope.
+--   ok        - the query succeeded (with or without a result payload)
+--   incorrect - the query was malformed or failed validation
+--   not_found - the query targeted something that does not exist
+--   forbidden - the caller is not permitted to run this query
+--   conflict  - the query conflicts with current state
+--   fault     - an unexpected failure, including an uncaught handler exception
+enum OutcomeCategory { ok | incorrect | not_found | forbidden | conflict | fault }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- One pass of a query through the boundary. Tracks the query (by its stamped id
+-- and name) and its caller context (by handle) from arrival through admission,
+-- the authorization decision, and the final classified outcome. Each request is
+-- independent; nothing is shared or retained between requests beyond the
+-- registry the boundary reads.
+entity QueryRequest {
+    -- The stamped id of the query this request tracks; resolves the full Query
+    -- via lookup when the boundary needs it.
+    query_id: String
+    -- The submitted query name; selects the registration to authorize against.
+    query_name: String
+    -- The handle of the caller's context; resolves the full RequestContext via
+    -- lookup when authorization or dispatch needs the whole view.
+    context_handle: String
+
+    -- Lifecycle of a single request through the boundary.
+    status: received | admitted | authorized | rejected | completed
+
+    -- The classified outcome, set once the request reaches a terminal state.
+    outcome: OutcomeCategory when status = rejected | completed
+
+    transitions status {
+        received -> admitted        -- shape is valid; query stamped
+        received -> rejected        -- shape is invalid (incorrect outcome)
+        admitted -> authorized      -- authorizer present and returned true
+        admitted -> rejected        -- denied (no authorizer, or not exactly true)
+        authorized -> completed     -- dispatched; processor returned an outcome
+        terminal: rejected, completed
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A query arrives. It is stamped with a fresh identity and an admission
+-- timestamp, and a request is opened to track its passage through the boundary.
+-- The caller's context travels with the query so that authorization and the
+-- handler both see the same view the caller submitted under.
+rule ReceiveQuery {
+    when: QuerySubmitted(context, query)
+    ensures:
+        query.admitted_at = now
+        QueryRequest.created(
+            query_id: query.id,
+            query_name: query.name,
+            context_handle: context.handle,
+            status: received
+        )
+
+    @guidance
+        -- Identity and timestamp are assigned on arrival regardless of validity,
+        -- so even a query that is about to be rejected is uniquely identifiable.
+        -- The id is a fresh opaque value stamped at admission; query.id denotes
+        -- that stamped value.
+}
+
+-- A received query is checked for a well-formed envelope. A well-formed query
+-- is admitted; a malformed one is rejected immediately as incorrect and never
+-- reaches authorization or dispatch. A query missing its name is malformed and
+-- so is rejected here too.
+rule AdmitQuery {
+    when: request: QueryRequest.status becomes received
+    requires: request.status = received
+    let query = Query{id: request.query_id}
+    ensures:
+        if valid_shape(query):
+            request.status = admitted
+        else:
+            request.status = rejected
+            request.outcome = incorrect
+
+    @guidance
+        -- This is envelope validation only: the query is well-formed when it
+        -- carries a name and the stamped id and admission timestamp, all
+        -- correctly typed. Whether the query's fields match the schema for its
+        -- name is decided downstream by the query processor (a field mismatch
+        -- resolves to incorrect, per QueryProcessing.OutcomeClassified), not here.
+        -- Whether the name is registered at all is decided at the NEXT step,
+        -- authorization: an unregistered name has no authorizer and so is denied
+        -- as forbidden (rule AuthorizeQuery), never reaching the processor. A
+        -- missing query name fails envelope validation here and is rejected as
+        -- incorrect. valid_shape() is opaque to this spec.
+}
+
+-- An admitted query is authorized deny-by-default: it proceeds ONLY when its
+-- registration carries an authorizer AND that authorizer, given the full
+-- request context, returns exactly true. A missing authorizer or any non-true
+-- result is a denial, reported as forbidden. The authorizer sees the whole
+-- context, including the decoded query, so it can make a query-specific
+-- decision.
+rule AuthorizeQuery {
+    when: request: QueryRequest.status transitions_to admitted
+    requires: request.status = admitted
+    let query = Query{id: request.query_id}
+    let context = RequestContext{handle: request.context_handle}
+    let registration = QueryRegistration{query_name: request.query_name}
+    ensures:
+        if exists registration and registration.has_authorizer and authorizer_grants(query, context):
+            request.status = authorized
+        else:
+            request.status = rejected
+            request.outcome = forbidden
+
+    @guidance
+        -- Deny-by-default: absence of an authorizer is a denial, not an
+        -- allowance, and is indistinguishable at the boundary from an authorizer
+        -- that returned false. authorizer_grants() evaluates the registered
+        -- predicate against the full context and is true only when the predicate
+        -- returns exactly true (any other value, including a truthy non-true
+        -- value, is a denial).
+}
+
+-- An authorized query is dispatched to the query processor. The processor's
+-- classified outcome becomes the request's outcome verbatim and the request
+-- completes. The boundary does not re-classify or second-guess the outcome. No
+-- events are recorded and no state changes — a query is a pure read.
+rule DispatchQuery {
+    when: request: QueryRequest.status transitions_to authorized
+    requires: request.status = authorized
+    let query = Query{id: request.query_id}
+    let context = RequestContext{handle: request.context_handle}
+    let result = process(query, context)
+    ensures:
+        request.status = completed
+        request.outcome = result
+
+    @guidance
+        -- The outcome is whatever category the processor reports (ok on success,
+        -- or the anomaly's category otherwise — incorrect, not_found, conflict or
+        -- fault). A handler that fails unexpectedly, including by throwing, is
+        -- contained by the processor and reported as fault
+        -- (QueryProcessing.FaultContained); the boundary relays that fault but
+        -- does not itself classify handler exceptions. This boundary touches no
+        -- read-model or event store directly; the handler, run by the processor,
+        -- performs the read.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Deny-by-default: a request can only reach the authorized state when its
+-- query's registration actually carries an authorizer. No authorizer means no
+-- authorized request — the request must have been rejected instead. This is the
+-- structural statement of the deny-by-default guarantee.
+invariant DenyByDefault {
+    for r in QueryRequests:
+        let registration = QueryRegistration{query_name: r.query_name}
+        r.status = authorized implies
+            (exists registration and registration.has_authorizer)
+}
+
+-- A terminal request always carries a classified outcome, and a non-terminal one
+-- never does. The boundary never completes a request without a verdict.
+invariant TerminalRequestsAreClassified {
+    for r in QueryRequests:
+        r.status in {rejected, completed} implies r.outcome != null
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The party on the far side of the boundary is a caller submitting queries. It
+-- is code rather than a person, so it carries a minimal identity.
+actor Caller {
+    identified_by: RequestContext where true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The query-submission boundary. A caller submits a named query in a context;
+-- the boundary admits, authorizes, dispatches and returns a classified outcome.
+-- The processing guarantees the boundary relies on are demanded from the query
+-- processor.
+surface QuerySubmission {
+    facing caller: Caller
+    context request: QueryRequest
+    let query = Query{id: request.query_id}
+
+    exposes:
+        request.status
+        request.outcome
+
+    provides:
+        QuerySubmitted(caller, query)
+
+    contracts:
+        demands QueryProcessing
+
+    @guarantee DenyByDefaultAuthorization
+        -- A query runs only when its registration supplies an authorizer that
+        -- returns exactly true for this caller's context. A missing authorizer
+        -- or any non-true result is denied as forbidden — the same observable
+        -- outcome either way, so an unprotected query is never reachable by
+        -- accident.
+
+    @guarantee FullContextToAuthorizer
+        -- The authorization predicate and the handler both receive the caller's
+        -- entire context — the ambient grain context, any context contributed by
+        -- upstream interceptors, and the decoded query — so authorization can be
+        -- query-specific and the handler need not re-fetch ambient state.
+
+    @guarantee RegistryResolution
+        -- A per-call registry, when supplied in the context, is the active
+        -- registry and shadows the process-wide fallback registry entirely;
+        -- otherwise the process-wide registry is used. A query's name and
+        -- authorizer are resolved in exactly one registry.
+
+    @guarantee StableOutcomeClassification
+        -- Every submitted query resolves to exactly one OutcomeCategory.
+        -- A malformed envelope is incorrect and a denied query is forbidden
+        -- before dispatch; every other outcome — including a further incorrect,
+        -- not_found, conflict or fault from the processor itself — is the
+        -- processor's classified result relayed verbatim. The caller can rely on
+        -- this fixed vocabulary independent of transport.
+
+    @guarantee NoSideEffects
+        -- Processing a query never changes system state: no events are appended
+        -- and no entities are mutated. A query reads and returns; the only
+        -- observable result is the classified outcome handed back to the caller.
+
+    @guarantee FaultIsolation
+        -- A handler that fails unexpectedly, including by throwing, never crashes
+        -- the caller's request: the processor contains the failure and the
+        -- boundary relays it as a fault outcome (QueryProcessing.FaultContained).
+        -- One query's failure never affects the boundary's ability to serve the
+        -- next.
+
+    @guarantee RequestIndependence
+        -- Each submission is handled in isolation: identity and admission
+        -- timestamp are stamped per request, and no caller state leaks between
+        -- requests beyond the shared query registry the boundary reads.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Deny-by-default treats a missing authorizer and an authorizer returning false (or any non-true value) as the same observable outcome (forbidden). Is the caller ever entitled to distinguish 'no authorizer configured' (an operator misconfiguration) from 'access denied' (a legitimate rejection)?"
+open question "An uncaught handler exception is classified as fault and the failure detail is surfaced to the caller in the message. Is exposing handler failure detail to the caller intended, or should faults be opaque at the boundary?"
+open question "Authorization is enforced here at the request boundary, while the query processor behind it dispatches on name and schema alone and does not re-check. Is single-point authorization at this boundary the intended division of responsibility?"

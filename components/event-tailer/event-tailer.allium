@@ -1,0 +1,416 @@
+-- allium: 3
+-- event-tailer.allium
+--
+-- Distilled from components/event-tailer (grain).
+--
+-- Scope: Subscription-driven, polling live delivery of new events. A consumer
+--        registers interest in a tenant and a set of event types; from that
+--        moment on, every newly appended event of those types for that tenant
+--        is republished onto the local event bus with its tenant attached. This
+--        is the "tail from now" counterpart to the notifier: instead of a
+--        durable signal per append, a single background poll catches up every
+--        actively-subscribed tenant on a fixed interval.
+--
+-- Includes: reference-counted, per-tenant per-type subscription interest
+--           (subscribe raises interest, unsubscribe lowers it, a type stops
+--           being tailed when its interest reaches zero, a tenant stops being
+--           tailed when it has no live interest); a "from now" cursor captured
+--           at first subscription so pre-existing events are never replayed;
+--           per-tenant incremental polling that reads only the subscribed
+--           types strictly after the cursor, in append order, capped per tick,
+--           republishes each event with its tenant attached, and advances the
+--           cursor to the last published event; delivery of each event once per
+--           tenant regardless of how many subscribers hold interest;
+--           containment of per-tenant poll failures so a failing tenant neither
+--           advances its cursor nor stops the tailer; and a stop that halts all
+--           further publishing.
+--
+-- Excludes (implementation / plumbing, governed elsewhere):
+--   - the background poll thread, its daemon/interrupt/join lifecycle, and the
+--     fixed sleep between ticks
+--   - the event store's persistence, ordering, type-filtering and read
+--     internals; this component DEMANDS them as the EventSource contract and
+--     owns none of it
+--   - the instance-local pub/sub fan-out itself (topic routing, channels);
+--     this component DEMANDS delivery from the LocalBus contract and owns none
+--     of it
+--   - the wire encoding of events and of the tenant key on a republished event
+--   - logging, tracing and metrics (tick errors, start/stop log lines)
+--   - the in-memory maps holding subscriber counts and watermarks
+--
+-- The conformance points below correspond to the component's test suite
+-- (interface_test.clj). Where each is captured:
+--   pre-existing events do not replay        -> rule TenantFirstSubscribed (anchor at latest_position) + guarantee CursorStartsFromNow
+--   only subscribed types are read/delivered -> rule TailSubscribedTenant (read of active_types) + guarantee OnlySubscribedTypesDelivered
+--   no active subscriptions -> no reads      -> rule TailSubscribedTenant fires only while active_types.count > 0
+--   batch caps each tick, then continues     -> contract EventSource.ReadIsOrderedAndComplete + config.max_events_per_tick
+--   read errors do not advance the cursor    -> rule TailSubscribedTenant (cursor advances only on delivered events) + guarantee FailuresDoNotAdvanceCursor
+--   overlapping subscriptions dedupe         -> rule RaiseTypeInterest + invariant OneSubscriptionPerTenantType + guarantee DeliveredOncePerTenant
+--   unsubscribe decrements / removes interest-> rule ConsumerUnsubscribes + invariant InterestCountPositive
+--   stop prevents further publishes          -> surface guarantee PublishingStopsOnStop
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A domain tenant. Every subscription, read and delivery is scoped to exactly
+-- one tenant. Tenants are created and governed by the event store, not by this
+-- component; here a tenant is identified by its stable id — the key callers
+-- subscribe under and that all per-tenant state is filed against — and the
+-- store reports each tenant's current latest stream position. The store itself
+-- stays implicit: its persistence, ordering and read transport are captured
+-- only as the EventSource and LocalBus contracts, not as an entity.
+external entity Tenant {
+    -- Stable tenant identity. Callers name a tenant by this id, and the
+    -- component resolves the tenant record from it.
+    id: String
+    -- The store's current last-appended position for this tenant's stream, used
+    -- at subscription time to anchor the tail "from now". Absent when the tenant
+    -- is not yet known to the store or its stream is empty, in which case the
+    -- tail reads from the start.
+    latest_position: Event?
+}
+
+-- A single immutable fact in a tenant's event stream. Events are produced,
+-- ordered and positioned by the event store; this component never creates them,
+-- it only reads and republishes them. The properties this component relies on
+-- beyond the owning tenant — a tenant-stream-relative ordering position used as
+-- the poll cursor, and a type used to match subscribed interest — are
+-- guarantees of the EventSource contract, not state this component governs.
+external entity Event {
+    -- The tenant whose stream this event belongs to.
+    tenant: Tenant
+    -- The kind of event, matched against a tenant's subscribed types.
+    event_type: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The durable, shared event store this component tails. It answers incremental,
+-- type-filtered reads in append order, and reports each tenant's current latest
+-- position so a fresh subscription can start "from now". How events are stored,
+-- ordered or transported is the store's concern.
+contract EventSource {
+    -- Read up to `limit` of a tenant's events of the given types appended
+    -- strictly after a given cursor event, in stream (append) order. With no
+    -- cursor, reads from the start of the stream. Only the named types are
+    -- returned, and at most `limit` of them, so one catch-up is bounded.
+    read_after: (tenant: Tenant, types: Set<String>, after: Event?, limit: Integer) -> Sequence<Event>
+
+    @invariant ReportsLatestPosition
+        -- The store reports each tenant's current latest stream position
+        -- (Tenant.latest_position), read at subscription time to anchor a fresh
+        -- tail "from now". It is absent when the tenant is not yet known to the
+        -- store or its stream is empty, in which case the tail reads from the
+        -- start.
+
+    @invariant ReadIsOrderedAndComplete
+        -- read_after returns the requested types positioned strictly after the
+        -- cursor, in stream order, with no gaps and no duplicates, taking at most
+        -- `limit` events. The next read from the advanced cursor returns the next
+        -- contiguous run, so the cap bounds work per tick without losing or
+        -- reordering events.
+
+    @invariant ReadFiltersToRequestedTypes
+        -- read_after returns only events whose type is in the requested set.
+        -- Events of other types in the same tenant stream are skipped over by
+        -- the store and never returned; a subsequent read after the advanced
+        -- cursor still yields the next subscribed event, so interleaved
+        -- unsubscribed events neither block nor reorder delivery.
+
+    @invariant TenantStreamsAreIndependent
+        -- Reads and latest-position are scoped to a single tenant. One tenant's
+        -- events are never returned under another tenant's read.
+}
+
+-- The instance-local event bus this component republishes onto. Subscribers on
+-- the same node receive events delivered here. This component DEMANDS local
+-- delivery from the bus; it owns no routing of its own, and it contains delivery
+-- failures itself rather than relying on the bus to swallow them.
+contract LocalBus {
+    -- Deliver one event, carrying its tenant, to local subscribers.
+    deliver: (event: Event, tenant: Tenant) -> Any
+
+    @invariant DeliveredEventCarriesTenant
+        -- deliver receives the event together with the tenant whose stream it
+        -- came from, so a local subscriber can attribute a tailed event to the
+        -- right tenant.
+
+    @invariant DeliveryIsBestEffortAndLocal
+        -- deliver hands an event to subscribers on this node only; it offers no
+        -- durability, acknowledgement or cross-node fan-out. A delivery that
+        -- fails (e.g. a subscriber that throws) surfaces back to the caller
+        -- rather than being swallowed by the bus, which is why this component
+        -- wraps each tenant's poll in its own failure containment (see surface
+        -- LiveTailing @guarantee FailuresDoNotAdvanceCursor).
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How often the tailer catches every actively-subscribed tenant up. The
+    -- live cadence is sub-second (the implementation default is a quarter of a
+    -- second); expressed here at the coarsest faithful resolution, since the
+    -- exact interval is a tuning knob, not a behavioural guarantee.
+    poll_interval: Duration = 1.seconds
+    -- The most events republished for one tenant in a single catch-up. A tenant
+    -- with more pending events is caught up over successive ticks; the cursor
+    -- advances each tick so no event is read twice or skipped.
+    max_events_per_tick: Integer = 100
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A tenant's live interest in a single event type, as a reference count. The
+-- count rises when a consumer subscribes to the type and falls when one
+-- unsubscribes; while it is positive the type is actively tailed for the
+-- tenant. Reference counting is what lets overlapping subscriptions to the same
+-- type share one read-and-publish path, so an event is delivered once per
+-- tenant no matter how many consumers hold interest. When the count would reach
+-- zero the interest ceases to exist and the type is no longer tailed.
+entity TypeInterest {
+    tenant: Tenant
+    event_type: String
+    -- How many consumers currently hold interest in this type for this tenant;
+    -- always positive while the interest exists.
+    count: Integer
+}
+
+-- A tailed tenant's cursor: the last event republished for it, marking how far
+-- the poll has caught it up. It is captured at the tenant's first subscription
+-- as the stream's then-latest event, so events already present are never
+-- replayed ("tail from now"), and it advances as the poll republishes events,
+-- bounding the next incremental read. Absent latest at capture means "stream
+-- was empty, read from the start". The cursor is in-memory progress, not
+-- durable state; a fresh tailer re-anchors each tenant at subscription time.
+entity TenantCursor {
+    tenant: Tenant
+    -- The last event republished for this tenant, or the stream's latest event
+    -- at subscription time; the anchor for the next incremental read. Absent
+    -- when the stream was empty when the tenant was first subscribed.
+    position: Event?
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A consumer registers interest in a tenant (named by id) and a set of event
+-- types. The very first interest in a tenant anchors its cursor at the stream's
+-- current latest position, so anything already present is not replayed — only
+-- events appended after this point will be delivered. The tenant is identified
+-- by its id alone; the component does not validate that the tenant already
+-- exists in the store. A subscription to a tenant with no events yet anchors at
+-- an absent position and so tails from the start of whatever first appears.
+rule TenantFirstSubscribed {
+    when: SubscribeRequested(tenant_id, types)
+    let tenant = Tenant{id: tenant_id}
+    requires: not exists TenantCursor{tenant: tenant}
+    ensures:
+        TenantCursor.created(tenant: tenant, position: tenant.latest_position)
+        for event_type in types:
+            RaiseInterest(tenant: tenant, event_type: event_type)
+}
+
+-- A consumer subscribes to a tenant that is already being tailed. The cursor is
+-- left where it is — a later subscriber joins the live tail, it does not rewind
+-- it — and interest is raised for each requested type.
+rule LaterConsumerSubscribes {
+    when: SubscribeRequested(tenant_id, types)
+    let tenant = Tenant{id: tenant_id}
+    requires: exists TenantCursor{tenant: tenant}
+    ensures:
+        for event_type in types:
+            RaiseInterest(tenant: tenant, event_type: event_type)
+}
+
+-- Raising interest in a type: if the type is already tailed for the tenant its
+-- reference count rises by one (overlapping subscribers share one tail);
+-- otherwise the interest is created at one.
+rule RaiseTypeInterest {
+    when: RaiseInterest(tenant, event_type)
+    let interest = TypeInterest{tenant: tenant, event_type: event_type}
+    ensures:
+        if exists interest:
+            interest.count = interest.count + 1
+        else:
+            TypeInterest.created(tenant: tenant, event_type: event_type, count: 1)
+}
+
+-- A consumer withdraws interest in a tenant and a set of event types, lowering
+-- the reference count of each. A type whose count would drop to zero is no
+-- longer tailed for that tenant.
+rule ConsumerUnsubscribes {
+    when: UnsubscribeRequested(tenant_id, types)
+    let tenant = Tenant{id: tenant_id}
+    ensures:
+        for event_type in types:
+            let interest = TypeInterest{tenant: tenant, event_type: event_type}
+            if exists interest:
+                if interest.count > 1:
+                    interest.count = interest.count - 1
+                else:
+                    not exists interest
+}
+
+-- A new event appears in a subscribed tenant's stream. While that tenant has
+-- live interest in the event's type, the tailer catches the tenant up: it reads
+-- the tenant's events of its currently-subscribed types appended since the
+-- cursor, in append order, republishes each onto the local bus with its tenant
+-- attached, and advances the cursor to the last event published. A tenant with
+-- no live interest is never tailed; an event of an unsubscribed type is not
+-- read or delivered, and the cursor only ever advances to the last delivered
+-- event, never onto an unsubscribed one.
+rule TailSubscribedTenant {
+    when: event: Event.created
+
+    let cursor = TenantCursor{tenant: event.tenant}
+    let active_types = TypeInterests where tenant = event.tenant -> event_type
+    let new_events = read_after(event.tenant, active_types, cursor.position, config.max_events_per_tick)
+
+    requires: exists cursor
+    requires: active_types.count > 0
+    requires: new_events.count > 0
+
+    ensures:
+        for new_event in new_events:
+            deliver(new_event, event.tenant)
+        cursor.position = new_events.last
+
+    @guidance
+        -- The "new event appears" trigger is a behavioural abstraction: the
+        -- mechanism is a single background loop that catches every
+        -- actively-subscribed tenant up on a fixed interval
+        -- (config.poll_interval), not a per-event push. Reading strictly after
+        -- the cursor (or from the start when the anchor was absent) and advancing
+        -- it to the last published event is what makes delivery gap-free and
+        -- duplicate-free within a running tailer: each subscribed event is
+        -- delivered once per tenant, in stream order, regardless of how many
+        -- consumers subscribed to it.
+        --
+        -- Each catch-up reads at most config.max_events_per_tick events; a tenant
+        -- behind by more is caught up over successive ticks, the cursor advancing
+        -- each time so no subscribed event is read twice or skipped. read_after
+        -- returns only the subscribed types: events of other types are filtered
+        -- out by the store and never delivered, and the cursor advances only to
+        -- the last delivered event.
+        --
+        -- A read or delivery failure for one tenant is contained by this
+        -- component: the cursor is not advanced and the tenant is retried on the
+        -- next tick (see surface LiveTailing @guarantee FailuresDoNotAdvanceCursor).
+        -- The cursor is in-process progress, not durable;
+        -- a restarted tailer re-anchors each tenant at subscription time and
+        -- tails from then on, so it never replays history but also does not
+        -- recover events appended while no tailer was running.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A tenant holds at most one interest record per event type; overlapping
+-- subscriptions raise the shared count rather than forking a second record.
+-- This is what collapses concurrent subscribers onto one tail and gives
+-- delivered-once-per-tenant semantics.
+invariant OneSubscriptionPerTenantType {
+    for a in TypeInterests:
+        for b in TypeInterests:
+            a != b implies (a.tenant != b.tenant or a.event_type != b.event_type)
+}
+
+-- Every live interest is held by at least one consumer; an interest that drops
+-- to zero references is removed, never retained at zero.
+invariant InterestCountPositive {
+    for i in TypeInterests:
+        i.count >= 1
+}
+
+-- A tailed tenant has exactly one cursor; the poll advances the existing cursor
+-- rather than forking a second, which is what keeps a tenant's deliveries
+-- gap-free and in order.
+invariant OneCursorPerTenant {
+    for a in TenantCursors:
+        for b in TenantCursors:
+            a != b implies a.tenant != b.tenant
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The boundary where a consumer registers or withdraws live interest in a
+-- tenant's events. Subscribing for the first time anchors the tail "from now";
+-- unsubscribing lowers interest and, at zero, stops the tail for that type. The
+-- surface is scoped per tenant; the consumer is an in-process caller whose own
+-- identity this component does not track (interest is reference-counted, not
+-- attributed).
+surface SubscriptionControl {
+    facing tenant: Tenant
+
+    provides:
+        SubscribeRequested(tenant.id, types)
+        UnsubscribeRequested(tenant.id, types)
+
+    @guarantee CursorStartsFromNow
+        -- The first subscription to a tenant anchors its cursor at the stream's
+        -- current latest event, so events already present are never replayed; a
+        -- later subscriber joins the live tail without rewinding it.
+
+    @guarantee DeliveredOncePerTenant
+        -- Overlapping subscriptions to the same type share one tail: an event is
+        -- delivered to the local bus once per tenant, however many consumers
+        -- subscribed to it. Interest is reference-counted, so a type keeps being
+        -- tailed until the last consumer withdraws.
+
+    @guarantee OnlySubscribedTypesDelivered
+        -- Only events of types a tenant currently has interest in are read and
+        -- delivered; a tenant with no live interest is not polled at all.
+}
+
+-- The boundary where the tailer reads a tenant's stream and republishes new
+-- events onto the local bus. This component drives the read and the publish; it
+-- DEMANDS ordered, complete, type-filtered reads from the store and local
+-- delivery from the bus, and contains per-tenant read/delivery failures itself.
+surface LiveTailing {
+    facing tenant: Tenant
+
+    contracts:
+        demands EventSource
+        demands LocalBus
+
+    @guarantee TailedFromCursorInOrder
+        -- Within a running tailer, each subscribed event is delivered once per
+        -- tenant and in that tenant's append order: each poll reads strictly
+        -- after the cursor and advances it to the last published event. Across a
+        -- tailer restart the cursor re-anchors at subscription time, so history
+        -- is not replayed and events appended while no tailer ran are not
+        -- recovered.
+
+    @guarantee FailuresDoNotAdvanceCursor
+        -- A failed read or delivery for one tenant does not advance its cursor
+        -- and does not stop the tailer; that tenant is retried from the
+        -- unadvanced cursor on the next tick, and other tenants are unaffected.
+
+    @guarantee PublishingStopsOnStop
+        -- Once the tailer is stopped no further events are published for any
+        -- tenant, even if new events are subsequently appended.
+
+    @guarantee TenantIsolation
+        -- Every read and every delivery is scoped to a single tenant; one
+        -- tenant's events are never read under, or delivered as, another
+        -- tenant's.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The cursor is in-memory and anchored 'from now' at subscription, so a tailer restart (or a subscription gap) silently skips events appended while no tail was active. Is tail-from-now-only the intended contract, or should a consumer be able to request catch-up from a known position?"
+open question "Delivery ordering is guaranteed per tenant. Is any cross-tenant ordering expected by subscribers, or is per-tenant append order the whole contract?"
+open question "A poll failure for a tenant is contained and retried indefinitely on the next tick without surfacing to the subscriber. Should there be a bound or an alert after repeated failures, or is silent retry the intended contract?"

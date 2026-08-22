@@ -1,0 +1,227 @@
+(ns ai.obney.grain.code-agent-tools.guides
+  "Authored concept/workflow guides for the code-agent-tools guide layer.
+
+   Requiring this namespace registers the guides into `core/guide-registry*`;
+   `core/guides` and `core/guide` then serve them. Block- and tool-level guides
+   are assembled live from the runtime and need no authored content here.
+
+   These are the part an agent cannot reconstruct from docstrings alone: the
+   end-to-end workflow, the event-model spec format, the flow grammar, and how to
+   resolve each validation finding.
+
+   The flow grammar is rendered FROM the validator's connection-grammar (the
+   single source of truth) so the guide cannot drift from what is enforced."
+  (:require [ai.obney.grain.code-agent-tools.core :as core]
+            [ai.obney.grain.event-model-validator.interface :as emv]
+            [clojure.string :as str]))
+
+(def ^:private kind-order
+  [:command :event :read-model :query :screen :todo-processor :periodic-task])
+
+(defn- render-adjacency
+  "Render the validator's connection-grammar as an aligned `from -> a | b` table,
+   so the guide is generated from the enforcer and can never disagree with it."
+  [grammar]
+  (let [present (filter #(seq (get grammar %)) kind-order)
+        w (apply max 0 (map (comp count name) present))
+        ord (fn [k] (.indexOf kind-order k))]
+    (str/join "\n"
+              (for [k present]
+                (str "  " (format (str "%-" w "s") (name k)) " -> "
+                     (str/join " | " (map name (sort-by ord (get grammar k)))))))))
+
+(core/register-guide!
+ {:id :getting-started
+  :title "Getting started — validate your work against the live grain system"
+  :summary "Connect over nREPL, introspect the live system, author/validate an event model, fix findings."
+  :applies-to :concept
+  :body
+  "The grain code-agent-tools expose a running grain app to a coding agent over
+nREPL. Everything returns plain EDN. The authoritative loop:
+
+1. `(catalog)` — see every live building block (commands, queries, read-models,
+   processors, periodic-triggers) and registered schema. Each block entry carries
+   an `:instructions {:guide <name>}` pointer.
+2. `(guide <id>)` — fetch authoritative usage for any concept, live block, or tool.
+   Start with `(guides)` for the index.
+3. `(validate-event-model <model>)` — structurally check a service-area-first
+   event model (EDN) against the live registries. Returns a total verdict
+   `{:valid? :findings :summary}`; never throws.
+4. Fix findings until `:valid?` is true. See `(guide :findings)`.
+
+`validate-event-model` needs no `install!` (it reads process-wide registries).
+`invoke-command!`/`invoke-query`/`events`/`projection` DO need `(install! ...)`
+with a running Integrant system + context; those execute against real state."})
+
+(core/register-guide!
+ {:id :event-model
+  :title "The service-area-first event model (spec format)"
+  :summary "How to write an EDN event model that joins 1:1 with the live runtime."
+  :applies-to :concept
+  :body
+  "An event model is EDN: a map of service AREAS, keyed by a simple keyword
+(`:example`). Each area OWNS its building blocks and flows:
+
+  {:example
+   {:description \"...\"
+    :commands        {:example/create-counter {:description \"...\" :schema [:map [:name :string]]
+                                               :produces #{:example/counter-created}}}
+    :events          {:example/counter-created {:description \"...\" :schema [:map [:counter-id :uuid]]}}
+    :read-models     {:example/counters {:description \"...\" :consumes #{:example/counter-created}}}
+    :queries         {:example/counters {:description \"...\" :schema [:map] :reads #{:example/counters}}}
+    :todo-processors {:example/avg {:description \"...\" :subscribes #{:example/counter-created}}}
+    :periodic-tasks  {:example/tick {:description \"...\" :schedule {:every 30 :duration :seconds}}}
+    :screens         {:example/dash {:description \"...\" :queries #{:example/counters}
+                                     :commands #{:example/create-counter}}}
+    :flows           {:example/lifecycle {:description \"...\" :steps [...]}}}}
+
+Keying & identity:
+- Blocks are keyed by the RUNTIME convention :<area>/<name>. The keyword
+  NAMESPACE is the area; the KIND comes from structural position (which map it is
+  in). So a single :<area>/<name> is NOT unique across kinds — e.g.
+  :example/counters is both a read-model and a query. Identity is (kind, name).
+
+Kinds are 1:1 with grain's def* macros: command, event, read-model (NOT 'view'),
+query (read side of CQRS), todo-processor, periodic-task, screen.
+
+Dependency graph as kind-typed intent edges (optional, design-time): command
+`:reads` read-models + `:produces` events; query `:reads` read-models; read-model
+`:consumes` events; todo-processor `:subscribes` events (the runtime trigger) +
+`:reads` a query (its TODO list — the modeled input) + `:produces` commands;
+periodic-task `:produces` events/commands; screen `:queries` queries + `:commands`
+commands. The validator checks each target exists AND is the expected kind.
+(Read-models feed only commands and queries; screens and todo-processors read
+through a query — see `(guide :flows)`.)
+
+`:schedule` is a MAP: {:every N :duration :seconds} or {:cron \"...\"}.
+Observable behaviour and test obligations belong in Allium, not Event Model.
+Commands link to Allium rules and screens link to Allium surfaces through
+`:grain/allium`. See `(guide :flows)` and `(guide :findings)`."})
+
+(core/register-guide!
+ {:id :flows
+  :title "Flows and the CQRS connection grammar"
+  :summary "How to wire blocks into flows and which connections are legal."
+  :applies-to :concept
+  :body
+  (str
+   "A flow is a named, ordered chain of steps under an area's :flows
+(keyed :<area>/<flow>). Each step is {:from <endpoint> :to <endpoint>}. An
+endpoint is KIND-QUALIFIED — [kind :<area>/<name>] — or nil for an entry
+point / terminus marker:
+
+  {:example/lifecycle
+   {:description \"...\"
+    :steps [{:from nil :to [:command :example/increment-counter]}
+            {:from [:command :example/increment-counter] :to [:event :example/counter-incremented]}
+            {:from [:event :example/counter-incremented]  :to [:read-model :example/counters]}]}}
+
+Legal CQRS adjacency (rendered from the validator's connection-grammar — the
+single source of truth, so this never drifts from what is enforced):
+
+" (render-adjacency emv/connection-grammar) "
+
+Read-models are INTERNAL projections: they feed only commands (validation reads)
+and queries (the read API) — never a screen, todo-processor, or periodic-task
+directly. Everything user/automation-facing reads through a QUERY. So the
+automation pattern is:
+
+  command -> event -> read-model -> query -> todo-processor -> command
+
+A todo-processor's INPUT edge is a query (its \"TODO list\"); its event :subscribes
+is the runtime TRIGGER (recorded as wiring, confirmed against the live :topics),
+NOT a flow edge — event -> todo-processor and read-model -> todo-processor are
+both rejected. Screens are fed by a query (query -> screen), never a read-model
+directly.
+
+Only event -> read-model (read-model :consumes) and a processor's event
+:subscribes (vs live :topics) are confirmable against live wiring. Production
+edges (command -> event, todo-processor -> command, periodic -> event) are
+checked for endpoint existence + grammar only — the runtime cannot confirm a
+producer actually produces. A flow should be a connected chain: a step's :from
+must be a prior step's :to (or nil to mark an entry).")})
+
+(core/register-guide!
+ {:id :findings
+  :title "Validation findings — what each means and how to resolve it"
+  :summary "Field guide to validate-event-model output."
+  :applies-to :concept
+  :body
+  "validate-event-model returns {:valid? :summary :findings}. :valid? is true when
+there are no :error-severity findings. Each finding has :type, :severity and a
+:message. Types:
+
+  :model/malformed       (error)   spec does not conform to the :event-model schema.
+                                   See :explain/humanized. Fix the shape first.
+  :block/misnamespaced   (error)   a block key's namespace != its area. Re-key it.
+  :block/undeclared      (error)   spec block has no live runtime counterpart.
+                                   Implement the def*, or remove it from the spec.
+  :block/uncovered       (warning) live block missing from the spec. Document it
+                                   (legitimate if intentionally not yet specified).
+  :schema/malformed      (error)   a block :schema does not parse. Fix the schema.
+  :schema/unresolved-ref (warning) a :schema references an unregistered name.
+  :schema/unregistered   (warning) a live command/query/consumed-event lacks a schema.
+  :schema/mismatch       (error)   spec :schema differs from the live registered
+                                   schema. See :spec/schema vs :live/schema.
+  :flow/illegal-connection (error) a flow step violates the CQRS grammar.
+  :flow/dangling-reference (error) a flow endpoint names a non-existent block.
+  :ref/dangling          (error)   an intent edge names a non-existent block.
+  :ref/wrong-kind        (error)   an intent edge names a block of the wrong kind.
+  :wiring/mismatch       (warning) spec :consumes/:subscribes/:schedule != live wiring.
+  :produces/mismatch     (warning) spec :produces != the runtime-declared production edge
+                                   (fires only when the def site declares :grain.event-model/produces).
+  :reads/mismatch        (warning) spec :reads != the runtime-declared read-model dependency
+                                   (fires only when the def site declares :grain.event-model/reads).
+  :flow/discontinuous    (warning) a step's :from has no producing prior step.
+  :auth/missing          (warning) a live command/query has no :authorized? predicate.
+  :runtime/design-only / :runtime/absent (info) notices, not failures.
+
+STRICT MODE (validate-event-model with {:strict true}; used by the boot-guard
+event-model-validator/verify-or-throw!): :block/uncovered, :wiring/mismatch,
+:produces/mismatch and :reads/mismatch become FATAL, and these are added:
+  :produces/undeclared   (error) a live command/processor/periodic does not declare
+                                 :grain.event-model/produces (full declaration required).
+  :reads/undeclared      (error) a live command/query does not declare :grain.event-model/reads.
+A system using verify-or-throw! at boot refuses to start while any fatal finding remains."})
+
+(core/register-guide!
+ {:id :authoring-blocks
+  :title "Authoring blocks — what each kind records"
+  :summary "Per-kind reference for the def* macros and the spec fields."
+  :applies-to :concept
+  :body
+  "command  (defcommand)  — validates rules, emits events. Spec: :description,
+            :schema (params), :reads (read-models), :produces (events), optional
+            :grain/allium links. Live: command registry + param schema + :authorized?.
+  event    (->event)      — immutable fact. Spec: :description, :schema (body).
+            Live: schema registry (no handler registry for events).
+  read-model (defreadmodel) — pure (state,event)->state projection. Spec:
+            :description, :consumes (events), optional :schema/:version. Live:
+            read-model registry + :events.
+  query    (defquery)     — reads projections. Spec: :description, :schema (params),
+            :reads (read-models). Live: query registry + param schema + :authorized?.
+  todo-processor (defprocessor) — async reactor. Spec: :description, :subscribes
+            (event topics — the runtime trigger), :reads (the query TODO list — its
+            modeled input edge), :produces (commands). Live: processor registry + :topics.
+  periodic-task (defperiodic) — scheduled reactor. Spec: :description, :schedule
+            (map), :produces. Live: periodic-trigger registry + :schedule.
+  screen   (design-only — no grain macro) — Spec: :description, :queries, :commands.
+            No runtime counterpart; only its dependency targets are checkable.
+
+  CONFIRMING PRODUCTION/READ EDGES (opt-in): production edges (command->event,
+  todo-processor->command, periodic->event) and read edges (command/query->
+  read-model) live inside handler bodies and are NOT recorded at registration, so
+  by default the validator only type-checks their endpoints. To have them
+  CONFIRMED, annotate the def site with the same edges (matching grain's
+  :grain.control/* keyword convention):
+
+    (defcommand :example create-counter
+      {:authorized? (constantly true)
+       :grain.event-model/produces #{:example/counter-created}
+       :grain.event-model/reads    #{:example/counters}}
+      ...)
+
+  These optional opts pass through to the catalog (no macro/runtime change);
+  validate-event-model then compares them to the spec and reports
+  :produces/mismatch / :reads/mismatch on drift. This confirms topology<->code
+  agreement; Allium rules and generated tests specify and verify behaviour."})

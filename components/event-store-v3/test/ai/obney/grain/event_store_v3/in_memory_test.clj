@@ -6,7 +6,8 @@
             [cognitect.anomalies :as anom]
             [clojure.core.async :as async]
             [clj-uuid :as uuid])
-  (:import [java.time OffsetDateTime]))
+  (:import [java.time OffsetDateTime ZoneOffset]
+           [java.util UUID]))
 
 ;; -------------------- ;;
 ;; Schema Registration  ;;
@@ -49,13 +50,11 @@
   ([type tags body]
    (let [event (es/->event (cond-> {:type type :tags tags}
                              body (assoc :body body)))]
-     (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
-     event)))
+     (first (es/append *event-store* {:tenant-id *tenant-id* :events [event]})))))
 
 (defn append-events! [events-data]
   (let [events (mapv es/->event events-data)]
-    (es/append *event-store* {:tenant-id *tenant-id* :events events})
-    events))
+    (es/append *event-store* {:tenant-id *tenant-id* :events events})))
 
 (defn read-events [args]
   (into [] (es/read *event-store* (if (vector? args)
@@ -89,6 +88,20 @@
         (is (pos? (count events))))
       (finally
         (es/stop store)))))
+
+(deftest event-construction-does-not-assign-persistence-metadata
+  (let [event (es/->event {:type :test/alpha :tags #{} :body {:val 1}})]
+    (is (not (contains? event :event/id)))
+    (is (not (contains? event :event/timestamp)))))
+
+(deftest append-rejects-caller-supplied-persistence-metadata
+  (doseq [metadata [{:event/id (uuid/v7)}
+                    {:event/timestamp (OffsetDateTime/now)}]]
+    (let [event (merge (es/->event {:type :test/alpha :tags #{} :body {:val 1}})
+                       metadata)
+          result (es/append *event-store* {:tenant-id *tenant-id* :events [event]})]
+      (is (= ::anom/incorrect (::anom/category result)))))
+  (is (empty? (read-events {}))))
 
 ;; ================================ ;;
 ;; B. Basic Append & Read (8 tests) ;;
@@ -167,9 +180,9 @@
 
 (deftest events-with-empty-body
   (let [event (es/->event {:type :test/alpha :tags #{}})
-        _ (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
+        [persisted] (es/append *event-store* {:tenant-id *tenant-id* :events [event]})
         read (first (non-tx-events (read-events {})))]
-    (is (= (:event/id event) (:event/id read)))
+    (is (= (:event/id persisted) (:event/id read)))
     (is (= :test/alpha (:event/type read)))))
 
 ;; ============================ ;;
@@ -330,11 +343,81 @@
                              :else 1))
                      ids)))))
 
+(deftest commit-order-is-established-before-reversing-or-limiting
+  (let [tag-id (uuid/v4)
+        first-event (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 2}})
+        second-event (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 1}})]
+    (let [[persisted-first] (es/append *event-store* {:tenant-id *tenant-id* :events [first-event]})
+          [persisted-second] (es/append *event-store* {:tenant-id *tenant-id* :events [second-event]})
+          expected [(:event/id persisted-first) (:event/id persisted-second)]
+          ids #(mapv :event/id (read-events %))]
+      (is (= expected (ids {:types #{:test/alpha}})))
+      (is (= expected
+             (ids [{:types #{:test/alpha}}
+                   {:tags #{[:order tag-id]}}])))
+      (is (= (vec (reverse expected))
+             (ids {:types #{:test/alpha} :reverse? true})))
+      (is (= [(:event/id persisted-first)]
+             (ids {:types #{:test/alpha} :limit 1})))
+      (is (= [(:event/id persisted-second)]
+             (ids {:types #{:test/alpha} :reverse? true :limit 1}))))))
+
 (deftest batch-empty-result
   (let [events (non-tx-events
                 (read-events [{:types #{:test/nonexistent}}
                               {:tags #{[:nope (uuid/v4)]}}]))]
     (is (empty? events))))
+
+;; ===================================================== ;;
+;; D2. Reverse / Limit single-read primitive (7 tests)   ;;
+;; ===================================================== ;;
+
+(deftest reverse-returns-descending-by-id
+  (let [evt1 (append-event! :test/alpha #{} {:n 1})
+        evt2 (append-event! :test/alpha #{} {:n 2})
+        evt3 (append-event! :test/alpha #{} {:n 3})
+        events (non-tx-events (read-events {:types #{:test/alpha} :reverse? true}))]
+    (is (= [(:event/id evt3) (:event/id evt2) (:event/id evt1)]
+           (mapv :event/id events)))))
+
+(deftest limit-caps-result-count
+  (dotimes [n 5] (append-event! :test/alpha #{} {:n n}))
+  (let [events (read-events {:types #{:test/alpha} :limit 2})]
+    (is (= 2 (count events)))))
+
+(deftest reverse-limit-1-returns-single-newest
+  (let [_evt1 (append-event! :test/alpha #{} {:n 1})
+        _evt2 (append-event! :test/alpha #{} {:n 2})
+        evt3 (append-event! :test/alpha #{} {:n 3})
+        events (read-events {:types #{:test/alpha} :reverse? true :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id evt3) (:event/id (first events))))))
+
+(deftest limit-without-reverse-returns-oldest
+  (let [evt1 (append-event! :test/alpha #{} {:n 1})
+        _evt2 (append-event! :test/alpha #{} {:n 2})
+        events (read-events {:types #{:test/alpha} :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id evt1) (:event/id (first events))))))
+
+(deftest reverse-limit-with-tags
+  (let [id (uuid/v4)
+        _evt1 (append-event! :test/alpha #{[:proc id]} {:n 1})
+        evt2 (append-event! :test/alpha #{[:proc id]} {:n 2})
+        events (read-events {:tags #{[:proc id]} :reverse? true :limit 1})]
+    (is (= 1 (count events)))
+    (is (= (:event/id evt2) (:event/id (first events))))))
+
+(deftest reverse-limit-empty-store
+  (let [events (read-events {:types #{:test/alpha} :reverse? true :limit 1})]
+    (is (empty? events))))
+
+(deftest plain-read-unchanged-by-new-keys
+  ;; A read with neither key is byte-identical to before: ascending, unbounded.
+  (let [evt1 (append-event! :test/alpha #{} {:n 1})
+        evt2 (append-event! :test/alpha #{} {:n 2})
+        events (non-tx-events (read-events {:types #{:test/alpha}}))]
+    (is (= [(:event/id evt1) (:event/id evt2)] (mapv :event/id events)))))
 
 ;; ===================================== ;;
 ;; E. CAS — Compare and Swap (5 tests)   ;;
@@ -349,7 +432,7 @@
                         :predicate-fn (constantly true)}})]
     (is (not (::anom/category result)))
     (is (= 1 (count (non-tx-events (read-events {:types #{:test/alpha}})))))
-    (is (empty? (tx-events (read-events {}))))))
+    (is (= 1 (count (tx-events (read-events {})))))))
 
 (deftest cas-predicate-false-returns-conflict-anomaly
   (let [event (es/->event {:type :test/alpha :tags #{} :body {:n 1}})
@@ -554,13 +637,22 @@
 
 (deftest timestamp-preserved-as-offsetdatetime
   (let [before (OffsetDateTime/now)
-        _ (append-event! :test/alpha #{} {:n 1})
+        submitted [(es/->event {:type :test/alpha :tags #{} :body {:n 1}})
+                   (es/->event {:type :test/beta :tags #{} :body {:n 2}})]
+        returned (es/append *event-store* {:tenant-id *tenant-id* :events submitted})
         after (OffsetDateTime/now)
-        read (first (non-tx-events (read-events {})))
-        ts (:event/timestamp read)]
+        stored (read-events {})
+        timestamps (mapv :event/timestamp stored)
+        ts (first timestamps)]
     (is (instance? OffsetDateTime ts))
     (is (not (.isBefore ts before)))
-    (is (not (.isAfter ts after)))))
+    (is (not (.isAfter ts after)))
+    (is (= ZoneOffset/UTC (.getOffset ts)) "store timestamps are canonical UTC")
+    (is (zero? (mod (.getNano ts) 1000))
+        "store timestamps use portable microsecond precision")
+    (is (apply = timestamps) "domain events and transaction marker share one timestamp")
+    (is (= (mapv :event/timestamp returned)
+           (mapv :event/timestamp (non-tx-events stored))))))
 
 ;; ======================================== ;;
 ;; J. Tenant Isolation (4 tests)            ;;

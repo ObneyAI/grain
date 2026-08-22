@@ -1,0 +1,184 @@
+-- allium: 3
+-- example-service.allium
+--
+-- Distilled from components/example-service (grain).
+--
+-- Scope: A minimal, self-contained domain service used as the reference
+--        example for a grain CQRS / event-sourced component. It manages named
+--        Counters that can be incremented and decremented, and records an
+--        average across all counters with a value whenever any counter changes.
+--
+-- Includes: counter creation with a uniqueness rule on the name, counting up
+--           and down, and an average that is recomputed and recorded whenever
+--           any counter changes. Counters and their values are readable; the
+--           recorded average is a write-only fact with no read boundary here.
+--
+-- Excludes (mechanism, governed by the framework components, not here):
+--   - the event store, read-model projection, caching and incremental update
+--     machinery (read-model-processor / event-store)
+--   - command and query dispatch, request handling and HTTP transport
+--     (command-processor / query-processor / *-request-handler)
+--   - the at-least-once polling, checkpointing and effect handling that drives
+--     the automatic average recomputation (todo-processor); only the observable
+--     outcome "a fresh average is recorded when a counter changes, or on explicit
+--     request" is captured here
+--   - the periodic scheduler's cron/CAS dedup machinery (periodic-task); the
+--     example's only periodic task is a no-op heartbeat with no domain effect
+--     and is therefore deliberately omitted
+--   - tenant scoping and serialization. This service is single-tenant; every
+--     operation is implicitly scoped to one fixed tenant. Authorization is a
+--     deny-by-default boundary property captured on the surface, not per-rule.
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A named tally. Each counter has a stable identity assigned on creation and a
+-- human-chosen name that must be unique across all counters. Its value is the
+-- running total of increments minus decrements. A freshly-created counter has
+-- not yet changed, so its value is absent until the first increment or
+-- decrement; an absent value reads as zero for the purpose of changes.
+entity Counter {
+    -- Unique, caller-supplied label. Two counters never share a name.
+    name: String
+    -- Running tally. Absent until the counter is first incremented or
+    -- decremented, at which point it starts from zero and moves by one.
+    value: Integer?
+}
+
+-- A recorded average: the mean value across every counter that has a value at
+-- the moment the average is computed. Each time any counter changes, a fresh
+-- CounterAverage is recorded from scratch over the current counter values, so a
+-- recorded average reflects the counters as they stood when it was computed.
+-- Counters that have never changed (no value yet) are excluded from the mean.
+-- Averages are recorded facts, not a maintained singleton: each computation
+-- records a new one and prior ones are kept, so the service holds a history of
+-- averages rather than one replaced-in-place value.
+entity CounterAverage {
+    value: Decimal
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Create a new counter under a caller-supplied name. The name must not already
+-- be taken; if it is, creation is rejected. A new counter starts with no value
+-- (it has not changed yet).
+rule CreateCounter {
+    when: CreateCounter(name)
+    requires: not exists Counter{name: name}
+    ensures: Counter.created(name: name)
+}
+
+-- Increment an existing counter by one. The counter must exist. The first
+-- change initialises the value from zero; subsequent changes move it by one.
+rule IncrementCounter {
+    when: IncrementCounter(counter)
+    requires: exists counter
+    ensures: counter.value = (counter.value ?? 0) + 1
+}
+
+-- Decrement an existing counter by one, with the same first-change semantics as
+-- incrementing.
+rule DecrementCounter {
+    when: DecrementCounter(counter)
+    requires: exists counter
+    ensures: counter.value = (counter.value ?? 0) - 1
+}
+
+-- Whenever any counter changes (an increment or a decrement), the service
+-- records a fresh average. Counter creation alone does not trigger this; only a
+-- change to a counter's value does. The signal that an average is wanted is
+-- emitted here and consumed by RecordAverage, which performs the recording.
+rule CounterChanged {
+    when: _: Counter.value
+    ensures: AverageWanted()
+}
+
+-- A caller may also ask for a fresh average to be recorded directly, without
+-- changing any counter. This produces the same recording as an automatic change.
+rule CalculateAverage {
+    when: CalculateAverage()
+    ensures: AverageWanted()
+}
+
+-- Record a fresh average across all counters that currently have a value. The
+-- average is recomputed from scratch over the current counter values rather than
+-- adjusted incrementally, so it cannot drift. This recording happens both
+-- automatically (whenever a counter changes, via CounterChanged) and on explicit
+-- caller request (via the CalculateAverage operation on the surface) — the same
+-- effect from two producers.
+rule RecordAverage {
+    when: AverageWanted()
+    let changed_counters = Counters where value != null
+    ensures: CounterAverage.created(value: mean(changed_counters))
+
+    @guidance
+        -- In the implementation the automatic path is asynchronous: an
+        -- at-least-once event processor subscribed to counter-changed facts
+        -- re-derives the mean and records a new average. Because at-least-once,
+        -- the same change may record the average more than once; because the
+        -- value is a pure function of current counter state, every such recording
+        -- for a given change carries the same value. Recordings are not
+        -- deduplicated or replaced: each is appended, so duplicates and the full
+        -- history are retained rather than collapsed to one value. The explicit
+        -- path is the same recording invoked directly by a caller rather than off
+        -- a change. mean() is the arithmetic mean over the changed counters'
+        -- values; with no changed counters the implementation divides by zero, so
+        -- no meaningful average exists (see open question).
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A counter's name uniquely identifies it: no two counters share a name. The
+-- CreateCounter rule enforces this on creation; names never change afterwards.
+invariant UniqueCounterName {
+    for a in Counters:
+        for b in Counters:
+            a != b implies a.name != b.name
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The operational boundary: the commands a caller can issue and the counter
+-- state they can read back. The facing party is any caller the service admits;
+-- callers carry no domain state of their own here, so the Counter context is
+-- the unit each surface instance scopes to.
+surface CounterManagement {
+    facing counter: Counter
+
+    exposes:
+        counter.name
+        counter.value
+
+    provides:
+        CreateCounter(name)
+        IncrementCounter(counter)
+        DecrementCounter(counter)
+        CalculateAverage()
+
+    @guarantee DenyByDefaultAuthorization
+        -- Every operation is reachable only when it declares an authorization
+        -- predicate; an operation with no predicate is not exposed at the
+        -- boundary at all, so access is denied by default. This reference
+        -- service declares predicates that admit every caller, but the boundary
+        -- property is that an operation runs only for callers its predicate
+        -- admits.
+
+    @guarantee NameUniqueness
+        -- Creating a counter with a name already in use is rejected; the caller
+        -- is informed of the conflict rather than producing a duplicate.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "With no counter yet changed there are no values to average. The implementation divides by zero (producing a non-finite average); should the service instead report no average, or a defined zero, when no counter has changed?"
+open question "Counters can only be created, incremented and decremented — never renamed or removed. Is deletion intentionally out of scope, or simply not yet modelled? Removal would affect both name uniqueness and the average."
+open question "A fresh average is recorded on every counter change and on explicit request, but nothing reads it back — there is no projection or query that exposes the latest (or any) recorded average. Is the average meant to be observable, and if so should the service maintain and expose a single current value rather than accumulating a history of recorded averages?"

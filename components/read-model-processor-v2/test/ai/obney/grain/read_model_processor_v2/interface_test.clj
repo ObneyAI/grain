@@ -229,6 +229,40 @@
     (is (= {:count 5} result-b))
     (is (= {:count 5} result-v2))))
 
+(deftest qualified-read-model-names-isolate-registered-projections
+  (let [prev-registry @rmp/read-model-registry*]
+    (try
+      (rmp/register-read-model! :alpha/shared
+                                counter-reducer
+                                {:events #{:test/counter-incremented}
+                                 :version 1
+                                 :l1-ttl-ms 0})
+      (rmp/register-read-model! :beta/shared
+                                (fn [state _event]
+                                  (update state :total (fnil + 0) 10))
+                                {:events #{:test/counter-incremented}
+                                 :version 1
+                                 :l1-ttl-ms 0})
+      (append-test-events! 3)
+
+      (is (= {:count 3} (rmp/project (make-context) :alpha/shared)))
+      (is (= {:total 30} (rmp/project (make-context) :beta/shared)))
+
+      ;; Force both projections through the persistent tier as well as L1.
+      (rmp/l1-clear!)
+      (is (= {:total 30} (rmp/project (make-context) :beta/shared)))
+      (is (= {:count 3} (rmp/project (make-context) :alpha/shared)))
+
+      (let [alpha-key (core/format-scoped-key :alpha/shared 1 test-tenant-id)
+            beta-key  (core/format-scoped-key :beta/shared 1 test-tenant-id)]
+        (is (not= (seq alpha-key) (seq beta-key)))
+        (is (= {:count 3}
+               (:data (fressian-util/decode (kv/get! *cache* {:k alpha-key})))))
+        (is (= {:total 30}
+               (:data (fressian-util/decode (kv/get! *cache* {:k beta-key}))))))
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
 (deftest query-filters-events-correctly
   (append-test-events! 5 :test/counter-incremented)
   (append-test-events! 3 :test/other-event)
@@ -794,6 +828,49 @@
         (is (= 60 (count idx)))
         (is (every? #(contains? #{"x" "y" "z"} (val %)) idx))))))
 
+(deftest qualified-read-model-names-isolate-partitioned-cache-structures
+  (let [prev-registry @rmp/read-model-registry*
+        beta-reducer (fn [state event]
+                       (let [state (item-reducer state event)]
+                         (update-vals state #(assoc % :owner :beta))))]
+    (try
+      (doseq [[rm-name reducer] [[:alpha/items item-reducer]
+                                 [:beta/items beta-reducer]]]
+        (rmp/register-read-model! rm-name reducer
+                                  {:events #{:test/item-created :test/item-updated :test/item-moved}
+                                   :version 1
+                                   :partition-fn item-partition-fn
+                                   :entity-id-fn item-entity-id-fn
+                                   :l1-ttl-ms 0}))
+      (append-item-events! 3 "x")
+
+      (let [alpha-state (rmp/project (make-context) :alpha/items)
+            beta-state  (rmp/project (make-context) :beta/items)]
+        (is (= 3 (count alpha-state)))
+        (is (every? #(nil? (:owner %)) (vals alpha-state)))
+        (is (= 3 (count beta-state)))
+        (is (every? #(= :beta (:owner %)) (vals beta-state))))
+
+      (rmp/l1-clear!)
+      (is (every? #(= :beta (:owner %))
+                  (vals (rmp/project (make-context) :beta/items {:partition-key "x"}))))
+      (is (every? #(nil? (:owner %))
+                  (vals (rmp/project (make-context) :alpha/items {:partition-key "x"}))))
+
+      (let [alpha-key (core/format-scoped-key :alpha/items 1 test-tenant-id)
+            beta-key  (core/format-scoped-key :beta/items 1 test-tenant-id)
+            alpha-manifest (fressian-util/decode (kv/get! *cache* {:k alpha-key}))
+            beta-manifest  (fressian-util/decode (kv/get! *cache* {:k beta-key}))]
+        (is (not= (seq alpha-key) (seq beta-key)))
+        (is (= #{"x"} (:partition-keys alpha-manifest)))
+        (is (= #{"x"} (:partition-keys beta-manifest)))
+        (doseq [base-key [alpha-key beta-key]]
+          (is (some? (kv/get! *cache* {:k (core/partition-cache-key base-key "x")})))
+          (is (= 3 (count (fressian-util/decode
+                           (kv/get! *cache* {:k (core/suffix-key base-key ":eidx")})))))))
+      (finally
+        (reset! rmp/read-model-registry* prev-registry)))))
+
 ;; I4
 (deftest partitioned-incremental-single-partition
   (testing "adding events to one partition doesn't affect others"
@@ -949,7 +1026,7 @@
           (is (every? #(= "b" (:bucket %)) (vals result-b))))
 
         ;; Verify manifest exists at the correct cache key
-        (let [base-key (core/format-scoped-key "partitioned-items" 1 test-tenant-id)
+        (let [base-key (core/format-scoped-key :test/partitioned-items 1 test-tenant-id)
               manifest (fressian-util/decode (kv/get! *cache* {:k base-key}))]
           (is (true? (:partitioned manifest)))
           (is (= #{"a" "b"} (:partition-keys manifest))))

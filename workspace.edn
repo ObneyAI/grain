@@ -33,6 +33,8 @@
             "grain-tui" {:alias "tui"}
             "grain-code-agent-tools" {:alias "cat"
                                       :necessary ["code-agent-tools"]}
+            "grain-event-model" {:alias "gem"
+                                 :necessary ["event-model" "event-model-validator"]}
             "grain-control-plane" {:alias "cp"
                                    :necessary ["control-plane"]}
             "grain-event-store-postgres-v3" {:alias "es-pg-v3"

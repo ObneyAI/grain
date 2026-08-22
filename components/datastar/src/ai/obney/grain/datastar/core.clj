@@ -78,6 +78,34 @@
   "Default command action endpoint emitted as the reserved __grainAction signal."
   "/actions")
 
+;; --------------------------- ;;
+;; Stream Protocol Tokens      ;;
+;; --------------------------- ;;
+
+(def ^:private ds-nonce-param
+  "Query-param (and signal) name carrying the per-page-load stream nonce that
+   keys `active-stream-contexts`, so multiple tabs get independent streams."
+  "dsNonce")
+
+(def ^:private grain-connect-param
+  "Bare URL-param marker identifying a persistent-stream (re)connect. Baked into
+   the shim's data-init URL and replayed verbatim on every SSE auto-reconnect
+   (the same replay that carries dsNonce); never registered as a Datastar signal,
+   so signal-update refreshes never carry it. Its presence routes a request to
+   rebind a fresh stream instead of reusing a prior (possibly silently-dead) one."
+  "__grainConnect")
+
+(defn- request-param
+  "Reads a query/URL param that may arrive keyword- or string-keyed."
+  [raw-query param-name]
+  (or (get raw-query (keyword param-name)) (get raw-query param-name)))
+
+(defn- strip-params
+  "Removes the given protocol params (both keyword and string form) from a raw
+   query map before it is decoded into the domain query."
+  [raw-query & param-names]
+  (reduce (fn [m p] (dissoc m (keyword p) p)) raw-query param-names))
+
 ;; --------------- ;;
 ;; HTML Rendering  ;;
 ;; --------------- ;;
@@ -315,14 +343,20 @@
   [query-context prev-result]
   (let [query-registry (or (:query-registry query-context) @qp/query-registry*)
         query-name (get-in query-context [:query :query/name])
-        authorized? (get-in query-registry [query-name :authorized?])]
+        authorized? (get-in query-registry [query-name :authorized?])
+        ;; Opt-in: a query declaring :datastar/emit-signals? may push a one-shot
+        ;; :datastar/signals patch alongside its hiccup (mirrors the command path).
+        emit-signals? (get-in query-registry [query-name :datastar/emit-signals?])]
     (if (and authorized? (true? (authorized? query-context)))
       (let [result (qp/process-query query-context)]
         (when-not (anomaly? result)
           (when-let [hiccup (:datastar/hiccup result)]
             (when (not= hiccup prev-result)
-              {:event (patch-elements (render-html hiccup) {})
-               :result hiccup}))))
+              (cond-> {:event (patch-elements (render-html hiccup) {})
+                       :result hiccup}
+                (and emit-signals? (:datastar/signals result))
+                (assoc :signals-event
+                       (patch-signals (:datastar/signals result) {})))))))
       (do
         (when-not authorized?
           (u/log ::missing-authorized-predicate :query-name query-name))
@@ -356,7 +390,9 @@
         ;; One-shot mode: render once and close
         (let [poll-result (poll-and-render query-context nil)]
           (when poll-result
-            (async/>!! event-ch (:event poll-result))))
+            (async/>!! event-ch (:event poll-result))
+            (when-let [se (:signals-event poll-result)]
+              (async/>!! event-ch se))))
         ;; Polling mode: loop until channel closes or client disconnects
         (loop [prev-result nil]
           (let [start-time (System/currentTimeMillis)
@@ -370,6 +406,8 @@
                             [[event-ch (:event poll-result)]] true
                             :default false)]
                 (when sent?
+                  (when-let [se (:signals-event poll-result)]
+                    (async/>!! event-ch se))
                   (let [elapsed (- (System/currentTimeMillis) start-time)
                         sleep-ms (max 0 (- interval-ms elapsed))]
                     (when (pos? sleep-ms) (Thread/sleep sleep-ms))
@@ -496,8 +534,9 @@
   [event-ch sse-ctx context query-name event-pubsub event-types debounce-ms additional-context event-tags]
   (let [request (:request sse-ctx)
         raw-query (extract-query-from-request request query-name)
-        nonce (or (:dsNonce raw-query) (get raw-query "dsNonce"))
-        decoded-query (decode-json-query (dissoc raw-query :dsNonce "dsNonce"))
+        nonce (request-param raw-query ds-nonce-param)
+        decoded-query (decode-json-query
+                       (strip-params raw-query ds-nonce-param grain-connect-param))
         initial-context (merge context additional-context {:query decoded-query})
         context-atom (atom initial-context)
         signal-ch (async/chan (async/sliding-buffer 1))
@@ -515,7 +554,9 @@
       ;; Initial render
       (let [initial (poll-and-render @context-atom nil)]
         (when initial
-          (async/>!! event-ch (:event initial)))
+          (async/>!! event-ch (:event initial))
+          (when-let [se (:signals-event initial)]
+            (async/>!! event-ch se)))
         (when (:stop? initial)
           (throw (ex-info "stop" {:stop true})))
         ;; Event loop — listens to domain events AND signal updates
@@ -555,7 +596,10 @@
                                   [[event-ch (:event poll-result)]] true
                                   :default false)]
                       (if sent?
-                        (recur (:result poll-result))
+                        (do
+                          (when-let [se (:signals-event poll-result)]
+                            (async/>!! event-ch se))
+                          (recur (:result poll-result)))
                         nil))
 
                     :else
@@ -566,7 +610,15 @@
       (finally
         (when (and event-tailer tenant-id)
           (event-tailer/unsubscribe! event-tailer tenant-id event-types))
-        (swap! active-stream-contexts dissoc session-key)
+        ;; Compare-and-remove: only drop the registry entry if it still points to
+        ;; THIS loop's event-ch. A reconnect (or POST restart) may have already
+        ;; replaced this key with a newer, healthy stream — an unconditional
+        ;; dissoc here would clobber it and break subsequent reuse for that tab.
+        (swap! active-stream-contexts
+               (fn [m]
+                 (if (identical? (:event-ch (get m session-key)) event-ch)
+                   (dissoc m session-key)
+                   m)))
         (async/close! signal-ch)
         (async/close! sub-chan)
         (async/close! event-ch)))))
@@ -583,25 +635,38 @@
       heartbeat-delay)))
 
 (defn- update-or-start-stream-events
-  "If an active event-driven SSE exists for this user+query+nonce, update its
-   context atom with new signals and trigger a re-render via signal-ch, then
-   return an empty SSE that closes immediately. Otherwise start a new SSE.
-   Works for both GET and POST — enables signal updates without reconnecting.
-   For GET requests, session reuse requires a nonce (dsNonce) to avoid
-   accidental collisions; POST always attempts reuse for backward compatibility."
+  "Routes a request to the event-driven stream by INTENT, not HTTP method:
+
+   - A **(re)connect** of the persistent stream carries the `__grainConnect`
+     marker (baked into the shim's data-init URL, replayed verbatim on every SSE
+     auto-reconnect). It always binds a FRESH stream to this socket, evicting any
+     prior entry under the same key — self-healing whether the old connection
+     died loudly or silently. Works identically for GET and POST persistent
+     streams.
+
+   - An unmarked **signal update** reuses the live SSE for this user+query+nonce:
+     it updates the context atom with new signals, pokes signal-ch to re-render,
+     and returns an empty SSE that closes immediately. GET reuse requires a nonce
+     to avoid accidental collisions; POST always attempts reuse (backward compat).
+
+   Reuse is never attempted for a marked request, so a silently-dead persistent
+   stream can never swallow its own reconnect."
   [context query-name event-pubsub event-types debounce-ms heartbeat-delay event-tags pedestal-context]
   (let [additional-context (:grain/additional-context pedestal-context)
         request (:request pedestal-context)
         raw-query (extract-query-from-request request query-name)
-        nonce (or (:dsNonce raw-query) (get raw-query "dsNonce"))
+        nonce (request-param raw-query ds-nonce-param)
+        ;; Marked (re)connect of the persistent stream — bare URL param, never a
+        ;; Datastar signal, so signal-update refreshes never carry it.
+        connect? (boolean (request-param raw-query grain-connect-param))
         is-post? (= :post (:request-method request))
         user-id (get-in additional-context [:auth-claims :user-id])
         session-key [user-id query-name nonce]
-        ;; For GET, only attempt reuse when a nonce is present — nonce is the
-        ;; explicit opt-in for session reuse (generated by shim-page per page load).
-        ;; Without nonce, GET always starts fresh to avoid accidental collisions.
-        ;; POST always attempts reuse for backward compatibility.
-        existing (when (or is-post? nonce)
+        ;; Reuse (signal-update) is attempted only for UNMARKED requests: POST
+        ;; always (backward compat), GET only with a nonce (explicit opt-in,
+        ;; generated by shim-page per page load). A __grainConnect request skips
+        ;; reuse entirely and falls through to rebind.
+        existing (when (and (not connect?) (or is-post? nonce))
                    (get @active-stream-contexts session-key))
         ;; Only use existing if both signal-ch and event-ch are still open.
         ;; event-ch closes when the browser disconnects (page navigation);
@@ -612,17 +677,22 @@
                    existing)]
     (if existing
       ;; Update existing SSE's context with new signals (from :query-params, already parsed by interceptor)
-      (let [new-decoded (decode-json-query (dissoc raw-query :dsNonce "dsNonce"))
+      (let [new-decoded (decode-json-query
+                         (strip-params raw-query ds-nonce-param grain-connect-param))
             {:keys [context-atom signal-ch]} existing]
         (swap! context-atom assoc :query new-decoded)
         (async/put! signal-ch :signal-update)
         ;; Return empty SSE — close immediately. The real re-render happens
         ;; on the existing SSE via signal-ch.
         (sse/start-stream (fn [ch _] (async/close! ch)) pedestal-context heartbeat-delay))
-      ;; No existing SSE (or stale) — clean up stale entry and start fresh.
-      ;; Close old signal-ch so the orphaned event loop exits cleanly.
+      ;; No reusable SSE — either a marked (re)connect, or an unmarked request
+      ;; whose prior stream is stale/absent. Evict any entry under this key
+      ;; (closing its signal-ch so the orphaned/zombie loop exits) and start
+      ;; fresh. For a __grainConnect this is the rebind that heals a silently-
+      ;; dead persistent stream; the compare-and-remove in the loop's finally
+      ;; keeps the old loop's cleanup from clobbering the entry we register next.
       (do
-        (when (or is-post? nonce)
+        (when (or connect? is-post? nonce)
           (when-let [stale (get @active-stream-contexts session-key)]
             (async/close! (:signal-ch stale))))
         (stream-view-enter-events context query-name event-pubsub event-types
@@ -640,7 +710,7 @@
    - One-shot: when :fps is 0 or nil, renders once and closes."
   [context query-name opts]
   (let [{:keys [fps heartbeat-delay event-types debounce-ms event-tags]
-         :or {fps 30 heartbeat-delay 10 debounce-ms 50}} opts
+         :or {fps 0 heartbeat-delay 10 debounce-ms 50}} opts
         event-pubsub (:event-pubsub context)]
     (if (and (seq event-types) event-pubsub)
       ;; Event-driven mode — both GET and POST check for existing SSE first
@@ -686,9 +756,17 @@
                                              (str resolved-stream-path "?" query-string)
                                              resolved-stream-path)
                                       separator (if (string/includes? base "?") "&" "?")]
-                                  (str base separator "dsNonce=" nonce)))
+                                  ;; __grainConnect marks THIS as the persistent stream's
+                                  ;; (re)connect. It is a bare URL param, never a Datastar
+                                  ;; signal, so it is replayed verbatim on every SSE
+                                  ;; auto-reconnect (the same replay that carries dsNonce)
+                                  ;; but is absent from signal-update refreshes. The stream
+                                  ;; handler treats a marked request as a rebind, not a reuse.
+                                  (str base separator
+                                       ds-nonce-param "=" nonce
+                                       "&" grain-connect-param "=1")))
         reserved-signals (cond-> {"__grainAction" action-path}
-                           effective-stream-path (assoc "dsNonce" nonce))
+                           effective-stream-path (assoc ds-nonce-param nonce))
         page-html (str "<!DOCTYPE html>"
                        (h/html
                          [:html (or html-attrs {})
@@ -824,24 +902,31 @@
 
 (defn gate-interceptor
   "Interceptor factory. Calls check-fn with the grain context merged with
-   per-request auth claims. Redirects with 302 on falsy result.
+   per-request auth claims and the request query-params. Redirects with 302 on
+   falsy result.
 
    context  — grain system context (event store, cache, etc.)
    gate-opts:
-     :check    — (fn [context] boolean), receives grain context + auth claims
-     :redirect — path to redirect to on failure"
+     :check    — (fn [gate-ctx] boolean), receives grain context + auth claims +
+                 request params under :query-params
+     :redirect — redirect target on failure. Either a path string, or a fn
+                 (fn [gate-ctx] path) that computes the path per-request (e.g. to
+                 carry a ?id= from the request)."
   [context {:keys [check redirect]}]
   {:name ::gate
    :enter
    (fn [ctx]
      (let [additional (get ctx :grain/additional-context)
-           gate-ctx (merge context additional)
+           gate-ctx (assoc (merge context additional)
+                           :query-params (get-in ctx [:request :query-params]))
            result (check gate-ctx)]
        (if result
          ctx
          (assoc ctx :response
                 {:status 302
-                 :headers {"Location" redirect}}))))})
+                 :headers {"Location" (if (fn? redirect)
+                                        (redirect gate-ctx)
+                                        redirect)}}))))})
 
 ;; ---------------------- ;;
 ;; Auto-Route Generation  ;;
@@ -861,7 +946,7 @@
   (when-let [path (:datastar/path entry)]
     (let [stream-path (if (= path "/") "/__stream" (str path "/__stream"))
           title (or (:datastar/title entry) "Grain App")
-          fps (:datastar/fps entry 30)
+          fps (:datastar/fps entry 0)
           explicit-interceptors (or (:datastar/interceptors entry) [])
           ;; Auto-generate auth-redirect interceptor when configured in defaults
           ;; and the query's :authorized? predicate rejects empty context (non-public).
@@ -894,10 +979,17 @@
           event-types (when (seq read-models) (resolve-events read-models))
           debounce-ms (:datastar/debounce-ms entry 50)
           event-tags (:datastar/event-tags entry)
+          ;; Per-query :datastar/heartbeat-delay wins; else a global default from
+          ;; the defaults map; else nil, leaving stream-view's own default (10s).
+          ;; Only assoc'd when set so the absent case falls through to that
+          ;; default rather than passing nil to sse/start-stream.
+          heartbeat-delay (or (:datastar/heartbeat-delay entry)
+                              (:datastar/heartbeat-delay defaults))
           stream-opts (cond-> {:fps fps}
                         (seq event-types) (assoc :event-types event-types
                                                  :debounce-ms debounce-ms)
-                        event-tags (assoc :event-tags event-tags))]
+                        event-tags (assoc :event-tags event-tags)
+                        heartbeat-delay (assoc :heartbeat-delay heartbeat-delay))]
       (let [with-signals (fn [extra]
                           (into [parse-datastar-signals] (concat interceptors extra)))]
         [;; Shim page route (GET)
@@ -920,7 +1012,11 @@
    Optional overrides map: {query-name {:datastar/fps 2 :datastar/interceptors [...]}}
    Optional defaults map: {:datastar/shim-opts {:head fn :html-attrs {} :datastar-url str}}
      Defaults are applied to all routes; per-query shim-opts override them.
-     :datastar/action-path sets the command endpoint emitted as __grainAction."
+     :datastar/action-path sets the command endpoint emitted as __grainAction.
+     :datastar/heartbeat-delay sets the SSE heartbeat interval in seconds for all
+       generated streams (default 10); a per-query :datastar/heartbeat-delay
+       overrides it. Lower it to cap live-update latency on iOS Safari behind an
+       HTTP/2 edge — see datastar.allium's config heartbeat_interval note."
   ([context] (routes context {} {}))
   ([context overrides] (routes context overrides {}))
   ([context overrides defaults]

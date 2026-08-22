@@ -7,7 +7,8 @@
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [clj-uuid :as uuid])
-  (:import [java.sql Timestamp]))
+  (:import [java.sql Timestamp]
+           [java.util UUID]))
 
 ;; -------------------- ;;
 ;; Schema Registration  ;;
@@ -359,6 +360,22 @@
                              (uuid/= a b) 0
                              :else 1))
                      ids)))))
+
+(deftest single-and-batch-reads-order-by-id-not-append-position
+  (let [tag-id (uuid/v4)
+        low (assoc (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 1}})
+                   :event/id (UUID/fromString "01900000-0000-7000-8000-000000000001"))
+        high (assoc (es/->event {:type :test/alpha :tags #{[:order tag-id]} :body {:n 2}})
+                    :event/id (UUID/fromString "01900000-0000-7000-8000-000000000002"))]
+    (es/append *event-store* {:events [high]})
+    (es/append *event-store* {:events [low]})
+    (let [single (non-tx-events (read-events {:types #{:test/alpha}}))
+          batch (non-tx-events
+                 (read-events [{:types #{:test/alpha}}
+                               {:tags #{[:order tag-id]}}]))
+          expected [(:event/id low) (:event/id high)]]
+      (is (= expected (mapv :event/id single)))
+      (is (= expected (mapv :event/id batch))))))
 
 (deftest batch-empty-result
   (let [events (non-tx-events
