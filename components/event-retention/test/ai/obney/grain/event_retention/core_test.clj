@@ -64,9 +64,9 @@
         deleted (append-at! old :retention-test/ephemeral #{} 1)
         retained (append-at! recent :retention-test/ephemeral #{} 2)]
     (retention/activate! *admin* :retention-test/ephemeral)
-    (is (= 1 (:eligible-count
-              (retention/estimate *admin* :retention-test/ephemeral *tenant* 10))))
-    (let [receipt (retention/compact! *admin* :retention-test/ephemeral *tenant* 10)]
+    (let [estimate (retention/estimate *admin* :retention-test/ephemeral *tenant* 10)
+          receipt (retention/compact! *admin* :retention-test/ephemeral *tenant* 10)]
+      (is (= [(:event/id deleted)] (:eligible-event-ids estimate)))
       (is (= #{(:event/id deleted)} (:retention/deleted-event-ids receipt)))
       (is (= [(:event/id retained)] (mapv :event/id
                                          (events-of :retention-test/ephemeral))))

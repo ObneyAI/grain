@@ -3,7 +3,6 @@
 
    This namespace is intentionally separate from EventStore: ordinary
    application code can append and read, but cannot compact history."
-  (:require [clojure.set :as set])
   (:import [java.nio.charset StandardCharsets]
            [java.time Duration]
            [java.util UUID]))
@@ -99,7 +98,12 @@
 
 (defprotocol EventCompaction
   (estimate [this request]
-    "Advisory eligibility estimate; never authorizes or deletes history.")
+    "Advisory bounded eligibility selection; never authorizes or deletes history.
+     Given identical activation, tenant state, evaluated-at and limit, returns
+     the same ordered event IDs compact! would select. Implementations must not
+     materialize unrelated event payloads to answer it.")
   (compact! [this request]
     "Atomically recheck activation, delete one bounded batch, and append its
-     permanent receipt and transaction marker."))
+     permanent receipt and transaction marker. The request limit bounds selected
+     IDs; keyed policies may inspect target-type metadata needed to preserve each
+     retention group, but not unrelated payload history."))

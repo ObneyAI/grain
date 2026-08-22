@@ -46,8 +46,14 @@
    {:grain.control/active-nodes
      {:description "Current live control-plane nodes."
      :consumes #{:grain.control/node-heartbeat :grain.control/node-departed}
+     :schema [:map-of :uuid
+              [:map
+               [:last-heartbeat-at :int]
+               [:last-heartbeat-id :uuid]
+               [:metadata [:maybe [:map]]]]]
      :version 1}
     :grain.control/lease-ownership
     {:description "Current tenant lease ownership."
      :consumes #{:grain.control/lease-acquired :grain.control/lease-released}
+     :schema [:map-of :uuid :uuid]
      :version 2}}})

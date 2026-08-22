@@ -303,6 +303,7 @@
         {:events #{:test/counter-incremented}
          :version 2
          :schema [:map [:count :int]]}
+        "Counts increment events in the macro registration test."
         [state event]
         (counter-reducer-multi state event))
 
@@ -344,7 +345,8 @@
     (try
       (rmp/defreadmodel :test documented-rm
         {:events #{:test/counter-incremented}
-         :version 1}
+         :version 1
+         :schema [:map [:count :int]]}
         "A documented read model."
         [state event]
         (update state :count (fnil inc 0)))

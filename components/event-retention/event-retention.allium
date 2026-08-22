@@ -255,6 +255,12 @@ contract EventCompaction {
         -- exact only while relevant store state and the backend clock remain
         -- unchanged; compact performs a fresh authoritative selection.
 
+    @invariant SelectionIsEquivalentAtOneEvaluation
+        -- Estimate and compact apply one eligibility definition. Given the same
+        -- activation, tenant state, fixed evaluation time and batch limit, they
+        -- select exactly the same ordered event ids. Separate calls may differ
+        -- after the clock, activation or relevant tenant state changes.
+
     @invariant EvaluationClockDoesNotAlterPolicy
         -- Retention evaluation receives one fixed current time for each
         -- estimate or compaction attempt. Tests may provide a controlled clock

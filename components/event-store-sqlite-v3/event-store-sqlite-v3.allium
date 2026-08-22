@@ -52,6 +52,7 @@
 --   batch read unions + dedups by id             -> rule BatchReadStream (@guidance dedup by id)
 --   reverse + limit = newest, cost ~ limit        -> contract EventLog.NewestRetrievedDirectly
 --   tag read cost ~ tag's stream, not the store  -> contract EventLog.TagReadsBoundedByTagStream
+--   compaction ignores unrelated payloads         -> contract EventLog.TargetedCompactionMaterialization
 --   per-tenant durable last-event-id watermark   -> entity Tenant.last_event_id
 --   tenant registered lazily on first append     -> rule AppendTransaction ensures
 --   persistence across restart, idempotent init  -> contract EventLog.Durable
@@ -135,9 +136,10 @@ contract EventLog {
         -- established before any limit is applied.
 
     @invariant AppendOnly
-        -- Committed events are immutable facts. The store only ever appends; it
-        -- never updates or deletes an event once committed. A tenant's stream
-        -- therefore grows monotonically.
+        -- Ordinary event-store access only appends immutable facts and never
+        -- updates or deletes them. Deletion exists solely through the separate,
+        -- privileged retention capability and is governed by its activation,
+        -- eligibility and durable-receipt contract.
 
     @invariant AtomicAppend
         -- A whole append — every event in the batch plus the synthesized
@@ -188,6 +190,23 @@ contract EventLog {
         -- start on a fresh database. Automation handlers that consult an
         -- entity's tagged history on every step rely on this staying flat as
         -- the store grows.
+
+    @invariant TargetedCompactionMaterialization
+        -- Retention eligibility reads only policy lifecycle records and
+        -- relational metadata for the requested tenant and event type. Payloads
+        -- from unrelated event types or unrelated system-tenant lifecycle are
+        -- never decoded or materialized. An unkeyed batch materializes at most
+        -- its requested limit. A keyed batch may inspect metadata for all events
+        -- of the requested type to preserve the newest member of every complete
+        -- composite key, but heap materialization is bounded by the requested
+        -- result and the policy's grouping requirements rather than by encoded
+        -- tenant payload history.
+
+    @invariant CompactionSelectionParity
+        -- Estimate and destructive compaction use the same ordered metadata
+        -- selector. With equal activation, tenant state, cutoff and limit they
+        -- return the same ids; destructive compaction repeats authorization and
+        -- selection inside its atomic writer transaction before deletion.
 
     @invariant Durable
         -- Committed events survive process restart: a store reopened on the same

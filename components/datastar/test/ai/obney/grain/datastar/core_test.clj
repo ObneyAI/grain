@@ -56,6 +56,7 @@
 
 (defquery :test counters
   {:authorized? (constantly true)}
+  "Renders the counters test page."
   [context]
   (let [state @(:test-state context)
         counters (:counters state)]
@@ -71,6 +72,7 @@
    :datastar/path "/auto-counters"
    :datastar/title "Auto Counters"
    :datastar/fps 10}
+  "Renders the automatically refreshed counters test page."
   [context]
   (let [state @(:test-state context)
         counters (:counters state)]
@@ -83,6 +85,7 @@
 
 (defcommand :test increment
   {:authorized? (constantly true)}
+  "Increments a counter in the Datastar test state."
   [context]
   (let [id (get-in context [:command :counter-id])
         state (:test-state context)]
@@ -103,7 +106,9 @@
 #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
 (rmp/defreadmodel :test event-counters-rm
   {:events #{:test/counter-incremented}
-   :version 1}
+   :version 1
+   :schema [:map [:count {:optional true} :int]]}
+  "Counts counter-incremented events for event-driven page tests."
   [state event]
   (case (:event/type event)
     :test/counter-incremented (update state :count (fnil inc 0))
@@ -115,6 +120,7 @@
    :datastar/path "/event-counters"
    :datastar/title "Event Counters"
    :datastar/debounce-ms 50}
+  "Renders counters refreshed from an event-driven read model."
   [context]
   (let [state @(:test-state context)
         counters (:counters state)]
@@ -132,7 +138,9 @@
 #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
 (rmp/defreadmodel :test tagged-counters-rm
   {:events #{:test/counter-incremented}
-   :version 1}
+   :version 1
+   :schema [:map [:count {:optional true} :int]]}
+  "Counts tagged counter events for scoped subscription tests."
   [state event]
   (update state :count (fnil inc 0)))
 
@@ -143,6 +151,7 @@
    :datastar/title "Tagged Counters"
    :datastar/debounce-ms 50
    :datastar/event-tags {:counter :counter-id}}
+  "Renders counters refreshed only by matching tagged events."
   [context]
   (let [state @(:test-state context)
         counters (:counters state)]
@@ -160,7 +169,9 @@
 #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
 (rmp/defreadmodel :test filterable-counters-rm
   {:events #{:test/counter-incremented}
-   :version 1}
+   :version 1
+   :schema [:map [:count {:optional true} :int]]}
+  "Counts events used by filterable event-driven query tests."
   [state event]
   (update state :count (fnil inc 0)))
 
@@ -170,6 +181,7 @@
    :datastar/path "/filterable-counters"
    :datastar/title "Filterable Counters"
    :datastar/debounce-ms 50}
+  "Renders an event-driven counter page with a query filter."
   [context]
   (let [state @(:test-state context)
         counters (:counters state)
@@ -191,6 +203,7 @@
    :datastar/path "/owner-only"
    :datastar/title "Owner Only"
    :datastar/fps 0}
+  "Renders a page restricted to owners."
   [context]
   {:query/result {:page :owner-only}
    :datastar/hiccup [:div#app "owner content"]})
@@ -200,6 +213,7 @@
    :datastar/path "/public-page"
    :datastar/title "Public"
    :datastar/fps 0}
+  "Renders a publicly authorized page."
   [context]
   {:query/result {:page :public}
    :datastar/hiccup [:div#app "public content"]})
@@ -213,6 +227,7 @@
    :datastar/path "/signals-emitting"
    :datastar/emit-signals? true
    :datastar/fps 0}
+  "Renders a page whose Datastar signals are emitted."
   [_context]
   {:query/result {:page :signals}
    :datastar/hiccup [:div#app "signals content"]
@@ -222,6 +237,7 @@
   {:authorized? (constantly true)
    :datastar/path "/signals-ignored"
    :datastar/fps 0}
+  "Renders a page whose returned Datastar signals are ignored."
   [_context]
   {:query/result {:page :ignored}
    :datastar/hiccup [:div#app "ignored content"]

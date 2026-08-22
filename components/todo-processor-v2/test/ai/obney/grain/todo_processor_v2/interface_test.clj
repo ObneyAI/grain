@@ -1168,7 +1168,8 @@
     (let [prev @core/processor-registry*]
       (try
         (tp/defprocessor :test dp1-handler
-          {:topics #{:test/event-1}}
+          {:topics #{:test/event-1}
+           :grain.event-model/produces #{:test/event-processed}}
           "Test processor for DP1."
           [context]
           {:result/events
@@ -1193,6 +1194,7 @@
       (try
         (tp/defprocessor :test dp2-handler
           {:topics #{:test/event-1}}
+          "Collects processed event IDs for the coalesced-poller test."
           [context]
           (swap! processed conj (:event/id (:event context)))
           {})
@@ -1220,7 +1222,8 @@
     (let [prev-trig @pt-core/periodic-trigger-registry*]
       (try
         (pt/defperiodic :test periodic-billing
-          {:schedule {:every 1 :duration :seconds}}
+          {:schedule {:every 1 :duration :seconds}
+           :grain.event-model/produces #{:test/periodic-trigger}}
           "Test periodic billing trigger."
           [tenant-id time]
           (let [period (.toString (.toLocalDate time))]
@@ -1250,7 +1253,9 @@
       (try
         ;; Register a trigger via the macro
         (pt/defperiodic :test dp-p2-billing
-          {:schedule {:every 1 :duration :seconds}}
+          {:schedule {:every 1 :duration :seconds}
+           :grain.event-model/produces #{:test/periodic-trigger}}
+          "Emits a fixed-period event for periodic-runner integration testing."
           [tid time]
           {:result/events
            [(es/->event {:type :test/periodic-trigger

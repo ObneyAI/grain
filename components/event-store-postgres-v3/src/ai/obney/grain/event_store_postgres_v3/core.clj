@@ -12,8 +12,7 @@
             [integrant.core :as ig]
             [hikari-cp.core :as hikari]
             [cognitect.anomalies :as anom]
-            [clojure.string :as string]
-            [clj-uuid :as uuid]))
+            [clojure.string :as string]))
 
 ;; --------------------- ;;
 ;; Advisory Lock Mapping  ;;
@@ -52,6 +51,8 @@
                          );"
 
                         "CREATE INDEX IF NOT EXISTS idx_events_tenant_type ON grain.events(tenant_id, type);"
+
+                        "CREATE INDEX IF NOT EXISTS idx_events_tenant_type_time_id ON grain.events(tenant_id, type, time, id);"
 
                         "CREATE INDEX IF NOT EXISTS idx_events_tenant_tags_gin ON grain.events USING GIN (tags);"
 
@@ -360,25 +361,85 @@
 (defn- set-tenant! [conn tenant-id]
   (jdbc/execute! conn [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")]))
 
-(defn- load-tenant-events [conn tenant-id]
-  (set-tenant! conn tenant-id)
+(defn- load-policy-lifecycle-events [conn event-type]
+  (set-tenant! conn compaction/system-tenant-id)
   (mapv transform-row
-        (jdbc/execute! conn
-                       ["SELECT id, time, type, tags, data FROM grain.events WHERE tenant_id = ? ORDER BY id"
-                        tenant-id]
-                       {:builder-fn rs/as-unqualified-lower-maps})))
+        (jdbc/execute!
+         conn
+         ["SELECT id, time, type, tags, data FROM grain.events
+           WHERE tenant_id = ? AND type = ANY(?) AND tags @> ?::text[]
+           ORDER BY id"
+          compaction/system-tenant-id
+          (into-array String (map str [compaction/policy-activated-type
+                                       compaction/policy-deactivated-type]))
+          (into-array String [(str (key-fn (first (compaction/policy-tag event-type)))
+                                   ":" (second (compaction/policy-tag event-type)))])]
+         {:builder-fn rs/as-unqualified-lower-maps})))
+
+(defn- metadata->event [{:keys [id time]}]
+  {:event/id id
+   :event/timestamp (->offset-date-time time)})
+
+(defn- unkeyed-eligible-metadata
+  [conn tenant-id event-type cutoff-time limit]
+  (set-tenant! conn tenant-id)
+  (mapv metadata->event
+        (jdbc/execute!
+         conn
+         ["SELECT id, time FROM grain.events
+           WHERE tenant_id = ? AND type = ? AND time < ?
+           ORDER BY id LIMIT ?"
+          tenant-id (str event-type) cutoff-time limit]
+         {:builder-fn rs/as-unqualified-lower-maps})))
+
+(defn- keyed-eligible-metadata
+  [conn tenant-id event-type cutoff-time limit tag-names]
+  (set-tenant! conn tenant-id)
+  (let [tag-names (mapv key-fn (sort-by key-fn tag-names))
+        exact-counts (mapv (fn [_]
+                             "(SELECT COUNT(*) FROM unnest(e.tags) tag
+                               WHERE split_part(tag, ':', 1) = ?) = 1")
+                           tag-names)
+        sql (str "WITH keyed AS ("
+                 "SELECT e.id, e.time, "
+                 "ROW_NUMBER() OVER (PARTITION BY "
+                 "ARRAY(SELECT tag FROM unnest(e.tags) tag "
+                 "WHERE split_part(tag, ':', 1) = ANY(?::text[]) ORDER BY tag) "
+                 "ORDER BY e.id DESC) AS retention_rank "
+                 "FROM grain.events e "
+                 "WHERE e.tenant_id = ? AND e.type = ? AND "
+                 (string/join " AND " exact-counts)
+                 ") SELECT id, time FROM keyed "
+                 "WHERE time < ? AND retention_rank > 1 "
+                 "ORDER BY id LIMIT ?")
+        params (into [sql
+                      (into-array String tag-names)
+                      tenant-id
+                      (str event-type)]
+                     (concat tag-names [cutoff-time limit]))]
+    (mapv metadata->event
+          (jdbc/execute! conn params
+                         {:builder-fn rs/as-unqualified-lower-maps}))))
+
+(defn- eligible-event-metadata
+  [conn tenant-id event-type policy cutoff-time limit]
+  (if-let [tag-names (seq (get-in policy [:keep-latest-per :tags]))]
+    (keyed-eligible-metadata conn tenant-id event-type cutoff-time limit tag-names)
+    (unkeyed-eligible-metadata conn tenant-id event-type cutoff-time limit)))
 
 (defn- postgres-compaction-context [conn {:keys [activation tenant-id limit evaluated-at]}]
   (let [{:keys [event/type policy]} activation
-        lifecycle (load-tenant-events conn compaction/system-tenant-id)]
+        lifecycle (when (and (pos-int? limit)
+                             (not (contains? compaction/protected-event-types type)))
+                    (load-policy-lifecycle-events conn type))]
     (when (and (pos-int? limit)
                (not (contains? compaction/protected-event-types type))
                (compaction/activation-matches? lifecycle activation))
       (let [cutoff (compaction/cutoff (or evaluated-at (time/now))
                                       (:retain-at-least policy))]
         {:cutoff cutoff
-         :eligible (compaction/eligible-events
-                    (load-tenant-events conn tenant-id) type policy cutoff limit)}))))
+         :eligible (eligible-event-metadata
+                    conn tenant-id type policy cutoff limit)}))))
 
 (defn estimate-compaction [event-store request]
   (jdbc/with-transaction [conn (get-in event-store [:state ::connection-pool])]

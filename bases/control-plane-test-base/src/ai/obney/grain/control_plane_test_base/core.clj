@@ -14,7 +14,6 @@
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
-            [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [com.brunobonacci.mulog :as u]
             [nrepl.server :as nrepl]
             [clj-uuid :as uuid]
@@ -27,25 +26,48 @@
 ;; Schemas             ;;
 ;; ------------------- ;;
 
-(defschemas test-schemas
-  {:test/counter-incremented [:map]
-   :test/counter-processed [:map
-                            [:processed-by/node-id :uuid]
-                            [:processed-by/event-id :uuid]]
-   :test/slow-work [:map]
-   :test/slow-work-done [:map
-                         [:processed-by/node-id :uuid]
-                         [:processed-by/event-id :uuid]
-                         [:processing-time-ms :int]]
-   :test/slow-work-failed [:map [:msg :string]]
-   :test/billing-trigger [:map [:period :string]]
-   :test/billing-done [:map [:period :string]]
-   :test/scheduled-trigger [:map [:period :string]]
-   :test/scheduled-done [:map [:period :string] [:processed-by/node-id :uuid]]
-   :grain/todo-processor-effect-failure [:map
-                                         [:processor/name :keyword]
-                                         [:triggered-by :uuid]
-                                         [:error/message :string]]})
+(es/defevent :test/counter-incremented
+  "A counter increment requested by a live scenario."
+  {:schema [:map]})
+
+(es/defevent :test/counter-processed
+  "A scenario node processed a counter increment."
+  {:schema [:map
+            [:processed-by/node-id :uuid]
+            [:processed-by/event-id :uuid]]})
+
+(es/defevent :test/slow-work
+  "Slow work requested by a reassignment scenario."
+  {:schema [:map]})
+
+(es/defevent :test/slow-work-done
+  "A scenario node completed slow work."
+  {:schema [:map
+            [:processed-by/node-id :uuid]
+            [:processed-by/event-id :uuid]
+            [:processing-time-ms :int]]})
+
+(es/defevent :test/slow-work-failed
+  "Slow scenario work failed."
+  {:schema [:map [:msg :string]]})
+
+(es/defevent :test/billing-trigger
+  "A billing period became eligible for scenario processing."
+  {:schema [:map [:period :string]]})
+
+(es/defevent :test/billing-done
+  "Scenario billing completed for a period."
+  {:schema [:map [:period :string]]})
+
+(es/defevent :test/scheduled-trigger
+  "A scheduled live-scenario period became eligible for processing."
+  {:schema [:map [:period :string]]})
+
+(es/defevent :test/scheduled-done
+  "A scenario node processed a scheduled period."
+  {:schema [:map
+            [:period :string]
+            [:processed-by/node-id :uuid]]})
 
 ;; ------------------- ;;
 ;; Processor           ;;
@@ -87,17 +109,25 @@
                                               :processing-time-ms 2000}})]}))
 
 ;; Register processors so the control plane can discover them
-(tp/register-processor! :test/counter-processor
-  {:topics [:test/counter-incremented]
-   :handler-fn #'counter-processor-handler})
+(tp/defprocessor :test counter-processor
+  {:topics #{:test/counter-incremented}
+   :grain.event-model/produces #{:test/counter-processed}}
+  "Records which control-plane node processed a counter increment."
+  [context]
+  (counter-processor-handler context))
 
-(tp/register-processor! :test/slow-processor
-  {:topics [:test/slow-work]
-   :handler-fn #'slow-work-handler})
+(tp/defprocessor :test slow-processor
+  {:topics #{:test/slow-work}
+   :grain.event-model/produces #{:test/slow-work-done}}
+  "Runs deliberately slow work to exercise reassignment and effect replay."
+  [context]
+  (slow-work-handler context))
 
 ;; Periodic trigger — runs on every node, CAS deduplicates
 (pt/defperiodic :test scheduled-trigger
-  {:schedule {:every 3 :duration :seconds}}
+  {:schedule {:every 3 :duration :seconds}
+   :grain.event-model/produces #{:test/scheduled-trigger}}
+  "Emits one deduplicated scheduled trigger for each period."
   [tenant-id time]
   (let [period (str (.toEpochMilli time))]
     {:result/events
@@ -111,7 +141,9 @@
 
 ;; Processor that handles the trigger
 (tp/defprocessor :test scheduled-handler
-  {:topics #{:test/scheduled-trigger}}
+  {:topics #{:test/scheduled-trigger}
+   :grain.event-model/produces #{:test/scheduled-done}}
+  "Records which control-plane node processed a scheduled trigger."
   [context]
   (let [node-id @node-id-atom]
     {:result/events

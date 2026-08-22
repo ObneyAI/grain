@@ -5,6 +5,7 @@
             [ai.obney.grain.event-store-sqlite-v3.interface]
             [ai.obney.grain.event-retention.interface :as retention]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
+            [ai.obney.grain.fressian-util.interface :as fressian]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
@@ -32,6 +33,18 @@
   "SQLite retention integration event"
   {:schema [:map [:value :int]]
    :history {:retain-at-least "P1D"}})
+
+(es/defevent :sqlite-test/keyed
+  "SQLite keyed retention integration event"
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "P1D"
+             :keep-latest-per {:tags #{:node}}}})
+
+(es/defevent :sqlite-test/composite-keyed
+  "SQLite composite-key retention integration event"
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "P1D"
+             :keep-latest-per {:tags #{:node :region}}}})
 
 ;; -------------------- ;;
 ;; Config & Dynamic Var ;;
@@ -110,6 +123,76 @@
              (mapv :event/id
                    (read-events {:types #{:sqlite-test/ephemeral}}))))
       (is (= 1 (count (read-events {:types #{compaction/compaction-receipt-type}})))))))
+
+(deftest retention-selection-does-not-decode-unrelated-payloads
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        targets (with-redefs [time/now (constantly old)]
+                  (mapv #(append-event! :sqlite-test/ephemeral #{} {:value %})
+                        (range 25)))]
+    (dotimes [n 200]
+      (append-event! :test/alpha #{} {:unrelated n :payload (apply str (repeat 256 "x"))}))
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (let [decode-count (atom 0)
+          original-decode fressian/decode
+          estimate (with-redefs [fressian/decode
+                                 (fn [bytes]
+                                   (swap! decode-count inc)
+                                   (original-decode bytes))]
+                     (retention/estimate admin :sqlite-test/ephemeral *tenant-id* 1))]
+      (is (= [(:event/id (first targets))] (:eligible-event-ids estimate)))
+      ;; One lifecycle decode in the administration layer and one independent
+      ;; authorization decode in the backend; no tenant payload is decoded.
+      (is (= 2 @decode-count)))))
+
+(deftest keyed-estimate-and-compact-share-the-metadata-selector
+  (let [now (OffsetDateTime/now ZoneOffset/UTC)
+        old (.minusDays now 3)
+        node-a (uuid/v4)
+        node-b (uuid/v4)
+        ambiguous-a (uuid/v4)
+        ambiguous-b (uuid/v4)
+        [old-a old-b]
+        (with-redefs [time/now (constantly old)]
+          [(append-event! :sqlite-test/keyed #{[:node node-a]} {:value 1})
+           (append-event! :sqlite-test/keyed #{[:node node-b]} {:value 2})])
+        _new-a (append-event! :sqlite-test/keyed #{[:node node-a]} {:value 4})
+        _new-b (append-event! :sqlite-test/keyed #{[:node node-b]} {:value 5})
+        admin (retention/administration *event-store* {:clock (constantly now)})]
+    (retention/activate! admin :sqlite-test/keyed)
+    (let [ambiguous (with-redefs [time/now (constantly old)]
+                      (append-event! :sqlite-test/keyed
+                                     #{[:node ambiguous-a] [:node ambiguous-b]}
+                                     {:value 3}))
+          estimate (retention/estimate admin :sqlite-test/keyed *tenant-id* 2)
+          receipt (retention/compact! admin :sqlite-test/keyed *tenant-id* 2)
+          expected [(:event/id old-a) (:event/id old-b)]]
+      (is (= expected (:eligible-event-ids estimate)))
+      (is (= (set expected) (:retention/deleted-event-ids receipt)))
+      (is (some #{(:event/id ambiguous)}
+                (map :event/id (read-events {:types #{:sqlite-test/keyed}})))))))
+
+(deftest composite-retention-tags-form-one-key
+  (let [now (OffsetDateTime/now ZoneOffset/UTC)
+        old (.minusDays now 3)
+        node (uuid/v4)
+        east (uuid/v4)
+        west (uuid/v4)
+        [old-east old-west]
+        (with-redefs [time/now (constantly old)]
+          [(append-event! :sqlite-test/composite-keyed
+                          #{[:node node] [:region east]} {:value 1})
+           (append-event! :sqlite-test/composite-keyed
+                          #{[:node node] [:region west]} {:value 2})])
+        _new-east (append-event! :sqlite-test/composite-keyed
+                                 #{[:node node] [:region east]} {:value 3})
+        _new-west (append-event! :sqlite-test/composite-keyed
+                                 #{[:node node] [:region west]} {:value 4})
+        admin (retention/administration *event-store* {:clock (constantly now)})]
+    (retention/activate! admin :sqlite-test/composite-keyed)
+    (is (= [(:event/id old-east) (:event/id old-west)]
+           (:eligible-event-ids
+            (retention/estimate admin :sqlite-test/composite-keyed *tenant-id* 10))))))
 
 (defn- with-configured-store [config f]
   (let [tmp (File/createTempFile "grain-sqlite-policy-" ".sqlite")
