@@ -3,7 +3,9 @@
                         ai.obney.grain.read-model-processor-v2.interface/defreadmodel hooks.grain-v2/defreadmodel
                         ai.obney.grain.todo-processor-v2.interface/defprocessor hooks.grain-v2/defprocessor
                         ai.obney.grain.periodic-task.interface/defperiodic hooks.grain-v2/defperiodic
-                        ai.obney.grain.schema-util.interface/defschemas hooks.grain-v2/defschemas}}
+                        ai.obney.grain.schema-util.interface/defschemas hooks.grain-v2/defschemas
+                        ai.obney.grain.event-store-v3.interface/defevent hooks.grain-v2/defevent
+                        ai.obney.grain.event-store-v3.interface.event-definition/defevent hooks.grain-v2/defevent}}
  :linters {:clojure-lsp/unused-public-var
            {:exclude-when-defined-by #{ai.obney.grain.command-processor-v2.interface/defcommand
                                        ai.obney.grain.query-processor.interface/defquery
