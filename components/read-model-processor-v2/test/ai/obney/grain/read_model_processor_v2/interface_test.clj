@@ -301,7 +301,9 @@
     (try
       (rmp/defreadmodel :test counter-rm
         {:events #{:test/counter-incremented}
-         :version 2}
+         :version 2
+         :schema [:map [:count :int]]}
+        "Counts increment events in the macro registration test."
         [state event]
         (counter-reducer-multi state event))
 
@@ -315,7 +317,8 @@
           (is (some? entry))
           (is (ifn? (:reducer-fn entry)))
           (is (= #{:test/counter-incremented} (:events entry)))
-          (is (= 2 (:version entry)))))
+          (is (= 2 (:version entry)))
+          (is (= [:map [:count :int]] (:schema entry)))))
 
       (testing "registry function matches the defn"
         (let [entry (get @rmp/read-model-registry* :test/counter-rm)]
@@ -325,12 +328,25 @@
       (finally
         (reset! rmp/read-model-registry* prev-registry)))))
 
+(deftest read-model-schema-is-validated-at-registration
+  (let [previous @rmp/read-model-registry*]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Read model state schema is malformed"
+           (rmp/register-read-model! :test/invalid-schema identity
+                                     {:schema [:map [:count :not-a-schema]]})))
+      (is (not (contains? @rmp/read-model-registry* :test/invalid-schema)))
+      (finally
+        (reset! rmp/read-model-registry* previous)))))
+
 (deftest defreadmodel-with-docstring
   (let [prev-registry @rmp/read-model-registry*]
     (try
       (rmp/defreadmodel :test documented-rm
         {:events #{:test/counter-incremented}
-         :version 1}
+         :version 1
+         :schema [:map [:count :int]]}
         "A documented read model."
         [state event]
         (update state :count (fnil inc 0)))

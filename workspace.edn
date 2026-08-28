@@ -38,9 +38,11 @@
                                    :necessary ["control-plane"]}
             "grain-event-store-postgres-v3" {:alias "es-pg-v3"
                                              :necessary ["control-plane"
+                                                         "event-retention"
                                                          "event-store-postgres-v3"]}
             "grain-event-store-sqlite-v3" {:alias "es-sq-v3"
                                            :necessary ["control-plane"
+                                                       "event-retention"
                                                        "event-store-sqlite-v3"]}
             "grain-mulog-aws-cloudwatch-emf-publisher" {:alias "mulog-aws-emf-pub"
                                                         :necessary ["mulog-aws-cloudwatch-emf-publisher"]}}}

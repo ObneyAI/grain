@@ -5,8 +5,14 @@
    def* macros populate the global registries at load time — so the validator
    runs against the LIVE :example area with no `install!`."
   (:require [ai.obney.grain.code-agent-tools.interface :as tools]
+            [ai.obney.grain.command-processor-v2.interface :as cp]
             [ai.obney.grain.event-model.interface :as em]
             [ai.obney.grain.event-model-validator.interface :as emv]
+            [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.periodic-task.interface :as pt]
+            [ai.obney.grain.query-processor.interface :as qp]
+            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.example-base.core]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
@@ -14,6 +20,11 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
+
+(es/defevent :retention-validator/ephemeral
+  "Validator fixture with bounded history."
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "PT1H"}})
 
 (def sample
   "A correct event model for the live :example area. Deliberately exercises both
@@ -43,6 +54,11 @@
                         :consumes #{:example/counter-created
                                     :example/counter-incremented
                                     :example/counter-decremented}
+                        :schema [:map-of :uuid
+                                 [:map
+                                  [:counter/id :uuid]
+                                  [:counter/name :string]
+                                  [:counter/value {:optional true} :int]]]
                         :version 1}}
     :queries
     {:example/counters {:description "all" :schema [:map] :reads #{:example/counters}}
@@ -67,6 +83,58 @@
 
 (defn- types [v] (set (map :type (:findings v))))
 (defn- errors [v] (filter #(= :error (:severity %)) (:findings v)))
+
+(deftest definition-quality-registration-is-consistent-across-macros
+  (let [name :definition-test/aligned
+        definition {:definition/description "Aligned definition"
+                    :definition/source {:ns "test" :file "test.clj" :line 1}
+                    :definition/value {:description "Aligned definition"
+                                       :options {}}}
+        conflict (assoc-in definition [:definition/value :description] "Different")
+        cases [[cp/register-declared! cp/command-registry*]
+               [qp/register-declared! qp/query-registry*]
+               [rmp/register-declared! rmp/read-model-registry*]
+               [tp/register-declared! tp/processor-registry*]
+               [pt/register-declared! pt/periodic-trigger-registry*]]]
+    (doseq [[register! registry*] cases]
+      (try
+        (register! name identity {} definition)
+        (register! name identity {} definition)
+        (is (= "Aligned definition"
+               (get-in @registry* [name :definition/description])))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (register! name identity {} conflict)))
+        (finally
+          (swap! registry* dissoc name))))))
+
+(def retention-model
+  {:retention-validator
+   {:events
+    {:retention-validator/ephemeral
+     {:description "fixture" :schema [:map [:value :int]]}}
+    :read-models
+    {:retention-validator/current
+     {:description "current value"
+      :consumes #{:retention-validator/ephemeral}}}}})
+
+(deftest bounded-history-requires-factual-structural-safety
+  (testing "the modeled and registered schemas must agree"
+    (is (contains? (types (tools/validate-event-model
+                           (assoc-in retention-model
+                                     [:retention-validator :events
+                                      :retention-validator/ephemeral :schema]
+                                     [:map [:value :string]])))
+                   :history/schema-mismatch)))
+  (testing "bounded trigger subscriptions remain unsupported until checkpoint safety exists"
+    (let [with-processor (-> retention-model
+                             (update-in [:retention-validator :read-models] dissoc
+                                        :retention-validator/current)
+                             (assoc-in [:retention-validator :todo-processors
+                                        :retention-validator/react]
+                                       {:description "react"
+                                        :subscribes #{:retention-validator/ephemeral}}))]
+      (is (contains? (types (tools/validate-event-model with-processor))
+                     :history/todo-processor-unsupported)))))
 
 (def ^:private example-allium-declarations
   [[:rule "CreateCounter"]
@@ -158,6 +226,11 @@
     (is (contains? (types (tools/validate-event-model
                            (assoc-in sample [:example :commands :example/create-counter :schema]
                                      [:map [:name :int]])))
+                   :schema/mismatch)))
+  (testing "read-model state schema differs from its live registration -> :schema/mismatch"
+    (is (contains? (types (tools/validate-event-model
+                           (assoc-in sample [:example :read-models :example/counters :schema]
+                                     [:map [:wrong :string]])))
                    :schema/mismatch)))
   (testing "illegal CQRS flow connection -> :flow/illegal-connection"
     (is (contains? (types (tools/validate-event-model

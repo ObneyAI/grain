@@ -65,6 +65,22 @@
 ;; Active Nodes Read Model
 ;; =====================================
 
+(deftest read-model-definitions-register-declarative-metadata
+  (let [active-nodes (get @rmp/read-model-registry* :grain.control/active-nodes)
+        lease-ownership (get @rmp/read-model-registry* :grain.control/lease-ownership)]
+    (is (= "Projects the currently active control-plane nodes."
+           (:definition/description active-nodes)))
+    (is (= [:map-of :uuid
+            [:map
+             [:last-heartbeat-at :int]
+             [:last-heartbeat-id :uuid]
+             [:metadata [:maybe [:map]]]]]
+           (:schema active-nodes)))
+    (is (= "Projects the node currently owning each tenant lease."
+           (:definition/description lease-ownership)))
+    (is (= [:map-of :uuid :uuid]
+           (:schema lease-ownership)))))
+
 (deftest active-nodes-empty-initially
   (is (= {} (project-active-nodes))))
 

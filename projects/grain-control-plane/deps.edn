@@ -5,6 +5,7 @@
 
         ;; Dependencies
         control-plane/event-store-v3 {:local/root "../../components/event-store-v3"}
+        control-plane/event-model {:local/root "../../components/event-model"}
         control-plane/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
         control-plane/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
         control-plane/periodic-task {:local/root "../../components/periodic-task"}

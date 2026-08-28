@@ -9,6 +9,8 @@
    production; code-agent-tools now re-exports from here."
   (:require [ai.obney.grain.command-processor-v2.interface :as cp]
             [ai.obney.grain.event-model.interface :as event-model]
+            [ai.obney.grain.event-retention.interface :as retention]
+            [ai.obney.grain.event-store-v3.interface :as event-store]
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.query-processor.interface :as qp]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
@@ -106,6 +108,7 @@
      :read-models (into {} (map (fn [e] [(key e) (registry-entry :read-model schema-reg e)])) read-models)
      :processors (into {} (map (fn [e] [(key e) (registry-entry :todo-processor schema-reg e)])) processors)
      :periodic-triggers (into {} (map (fn [e] [(key e) (registry-entry :periodic-trigger schema-reg e)])) periodic)
+     :event-definitions (sanitize (event-store/event-definitions))
      :schemas (into {} (map (fn [e] [(key e) (schema-entry e)])) schema-reg)
      :missing-schemas {:commands (missing-schema-names (keys commands))
                        :queries (missing-schema-names (keys queries))
@@ -342,17 +345,32 @@
 
 (defn- check-schema-match [model opts]
   (let [reg (schema-registry)
+        read-models (rmp/global-read-model-registry)
         sev (if (= :lenient (:schema-match opts)) :warning :error)]
-    (for [[area area-map] model
-          [field kind] [[:commands :command] [:events :event] [:queries :query]]
-          [block-key block] (get area-map field)
-          :let [spec-schema (:schema block)]
-          :when (and spec-schema (contains? reg block-key))
-          :let [sf (schema-form spec-schema) lf (schema-form (get reg block-key))]
-          :when (and (not= sf ::unparseable) (not= lf ::unparseable) (not= sf lf))]
-      (finding :schema/mismatch sev
-               {:area area :kind kind :block block-key :spec/schema sf :live/schema lf
-                :message (str "Spec schema for " block-key " differs from the live registered schema.")}))))
+    (concat
+     (for [[area area-map] model
+           [field kind] [[:commands :command] [:events :event] [:queries :query]]
+           [block-key block] (get area-map field)
+           :let [spec-schema (:schema block)]
+           :when (and spec-schema (contains? reg block-key))
+           :let [sf (schema-form spec-schema) lf (schema-form (get reg block-key))]
+           :when (and (not= sf ::unparseable) (not= lf ::unparseable) (not= sf lf))]
+       (finding :schema/mismatch sev
+                {:area area :kind kind :block block-key :spec/schema sf :live/schema lf
+                 :message (str "Spec schema for " block-key " differs from the live registered schema.")}))
+     (for [[area area-map] model
+           [block-key block] (:read-models area-map)
+           :when (contains? read-models block-key)
+           :let [spec-schema (:schema block)
+                 live-schema (get-in read-models [block-key :schema])
+                 sf (when spec-schema (schema-form spec-schema))
+                 lf (when live-schema (schema-form live-schema))]
+           :when (and (not= sf ::unparseable) (not= lf ::unparseable) (not= sf lf))]
+       (finding :schema/mismatch sev
+                {:area area :kind :read-model :block block-key
+                 :spec/schema sf :live/schema lf
+                 :message (str "Spec state schema for " block-key
+                               " differs from the live read-model registration.")})))))
 
 (defn- check-wiring [model live]
   (concat
@@ -414,6 +432,45 @@
     (for [[nm authed?] (:auth live) :when (and (not authed?) (in-spec-area? areas nm))]
       (finding :auth/missing :warning
                {:block nm :message (str "Live command/query " nm " has no :authorized? predicate.")}))))
+
+(defn- bounded-definitions [model]
+  (let [areas (spec-area-names model)]
+    (into {} (filter (fn [[event-type definition]]
+                       (and (:history/normalized definition)
+                            (in-spec-area? areas event-type))))
+          (event-store/event-definitions))))
+
+(defn- check-retention-history [model]
+  (mapcat
+   (fn [[event-type definition]]
+     (let [modeled-event (spec-block model event-type)
+           todo-consumers (for [[area area-map] model
+                                [consumer block] (:todo-processors area-map)
+                                :when (contains? (:subscribes block) event-type)]
+                            [area consumer block])]
+       (concat
+        (when-not (= :event (:kind modeled-event))
+          [(finding :history/event-unmodeled :error
+                    {:event/type event-type
+                     :message (str "Bounded-history event " event-type
+                                   " is not represented in the event model.")})])
+        (when (and (= :event (:kind modeled-event))
+                   (not= (schema-form (:schema definition))
+                         (schema-form (:schema modeled-event))))
+          [(finding :history/schema-mismatch :error
+                    {:event/type event-type
+                     :model/schema (schema-form (:schema modeled-event))
+                     :definition/schema (schema-form (:schema definition))
+                     :message (str "Bounded-history event " event-type
+                                   " has different model and defevent schemas.")})])
+        (for [[area consumer _] todo-consumers]
+          (finding :history/todo-processor-unsupported :error
+                   {:area area :kind :todo-processor :block consumer
+                    :event/type event-type
+                    :message (str "Todo processor " consumer
+                                  " subscribes to bounded-history event " event-type
+                                  ", which is unsupported until checkpoint safety is implemented.")})))))
+   (bounded-definitions model)))
 
 ;; ---- strict-only completeness checks (run only when {:strict true}) --------
 
@@ -483,6 +540,7 @@
                  (check-schema-wellformed model)
                  (check-block-refs model live)
                  (check-flows model live)
+                 (when-not (:structural-only opts) (check-retention-history model))
                  (when present? (check-existence model live))
                  (when present? (check-coverage model live))
                  (when present? (check-missing-schemas model live))
@@ -535,8 +593,29 @@
    `strict-defaults`."
   ([] (verify-event-model! {}))
   ([opts]
-   (let [model (or (:model opts) (event-model/registered-model))]
-     (validate-event-model model (merge strict-defaults (dissoc opts :model))))))
+   (let [model (or (:model opts) (event-model/registered-model))
+         store (:event-store opts)
+         verdict (validate-event-model
+                  model (merge strict-defaults (dissoc opts :model :event-store)))]
+     (if-not store
+       verdict
+       (try
+         (retention/verify-at-boot! (retention/administration store))
+         verdict
+         (catch clojure.lang.ExceptionInfo e
+           (let [new-findings (mapv #(assoc %
+                                             :history/original-finding (:type %)
+                                             :type :history/active-policy-mismatch
+                                             :severity :error)
+                                    (:findings (ex-data e)))
+                 findings (into (:findings verdict) new-findings)]
+             (-> verdict
+                 (assoc :valid? false :findings findings)
+                 (assoc-in [:summary :findings] (count findings))
+                 (update-in [:summary :errors] + (count new-findings))
+                 (update-in [:summary :fatal] + (count new-findings))
+                 (update-in [:summary :by-type]
+                            #(merge-with + % (frequencies (map :type new-findings))))))))))))
 
 (defn verify-or-throw!
   "Boot-guard: `verify-event-model!` and throw ex-info (with the verdict) when the

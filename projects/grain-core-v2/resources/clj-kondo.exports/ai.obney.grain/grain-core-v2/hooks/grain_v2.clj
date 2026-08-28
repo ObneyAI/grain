@@ -59,3 +59,19 @@
                  name-node
                  schema-map-node))
        :defined-by 'ai.obney.grain.schema-util.interface/defschemas})))
+
+(defn defevent
+  "Analyze defevent as its registration call so event type, description, schema,
+   history data, and any symbols embedded in the schema remain visible to kondo."
+  [{:keys [node]}]
+  (let [[_ event-type-node description-node options-node] (:children node)]
+    (when (and event-type-node description-node options-node)
+      {:node (api/list-node
+              (list
+               (api/token-node 'let)
+               (api/vector-node
+                [(api/token-node '_event-type) event-type-node
+                 (api/token-node '_description) description-node
+                 (api/token-node '_options) options-node])
+               (api/token-node nil)))
+       :defined-by 'ai.obney.grain.event-store-v3.interface/defevent})))

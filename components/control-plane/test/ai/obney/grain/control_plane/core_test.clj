@@ -18,6 +18,24 @@
 (defschemas test-schemas
   {:test/lifecycle-event [:map]})
 
+(deftest control-plane-events-are-defined
+  (doseq [event-type [:grain.control/node-heartbeat
+                      :grain.control/node-departed
+                      :grain.control/lease-acquired
+                      :grain.control/lease-released]]
+    (let [definition (es/event-definition event-type)]
+      (is (= event-type (:event/type definition)))
+      (is (string? (:description definition)))
+      (is (some? (:schema definition)))))
+  (is (= {:retain-at-least {:seconds 3600 :nanos 0}
+          :keep-latest-per {:tags #{:node}}}
+         (:history/normalized
+          (es/event-definition :grain.control/node-heartbeat))))
+  (doseq [event-type [:grain.control/node-departed
+                      :grain.control/lease-acquired
+                      :grain.control/lease-released]]
+    (is (nil? (:history (es/event-definition event-type))))))
+
 (defn- delete-dir-recursively [dir]
   (let [f (io/file dir)]
     (when (.exists f)

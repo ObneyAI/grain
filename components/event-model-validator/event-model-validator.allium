@@ -83,6 +83,13 @@ contract StructuralValidation {
         -- areas the model declares, so validating one area never reports on blocks
         -- of another.
 
+    @invariant BoundedHistoryFactsAreReconciled
+        -- Within each declared area, every bounded-history event is modeled and
+        -- its schema agrees with the registered event definition. A todo
+        -- processor subscribing to a bounded-history event is rejected until
+        -- Grain has an implemented checkpoint-safety proof. The validator makes
+        -- no unverified claim about read-model replay correctness.
+
     @invariant ValidityByErrorFindings
         -- A verdict is valid when no finding is fatal. By default a finding is
         -- fatal when its severity is error; callers may additionally mark finding
@@ -112,6 +119,12 @@ contract BootGuard {
         -- strict mode and raises when the verdict is not valid, so a system
         -- cannot start with an invalid or incomplete model. On success it returns
         -- the verdict.
+
+    @invariant ActiveRetentionPoliciesReconciledWhenStoreIsAvailable
+        -- A boot verification supplied with an initialized event store also
+        -- compares every durable active policy by normalized value with its
+        -- loaded definition. A missing, complete-history or unequal definition
+        -- is fatal. Store-free CI validation remains structural and total.
 }
 
 ------------------------------------------------------------

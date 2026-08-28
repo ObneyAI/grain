@@ -2,12 +2,16 @@
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.event-store-postgres-v3.core :as pg-core]
+            [ai.obney.grain.event-retention.interface :as retention]
+            [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
+            [ai.obney.grain.fressian-util.interface :as fressian]
+            [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [clj-uuid :as uuid])
-  (:import [java.time OffsetDateTime]
+  (:import [java.time OffsetDateTime ZoneOffset]
            [java.util UUID]))
 
 ;; -------------------- ;;
@@ -19,6 +23,23 @@
    :test/beta  [:map]
    :test/gamma [:map]
    :hello/world [:map]})
+
+(es/defevent :postgres-test/ephemeral
+  "Postgres retention integration event"
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "P1D"}})
+
+(es/defevent :postgres-test/keyed
+  "Postgres keyed retention integration event"
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "P1D"
+             :keep-latest-per {:tags #{:node}}}})
+
+(es/defevent :postgres-test/composite-keyed
+  "Postgres composite-key retention integration event"
+  {:schema [:map [:value :int]]
+   :history {:retain-at-least "P1D"
+             :keep-latest-per {:tags #{:node :region}}}})
 
 ;; -------------------- ;;
 ;; Config & Dynamic Var ;;
@@ -86,6 +107,88 @@
 
 (defn tx-events [events]
   (filterv #(= :grain/tx (:event/type %)) events))
+
+(deftest privileged-retention-compaction-is-durable
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        deleted (with-redefs [time/now (constantly old)]
+                  (append-event! :postgres-test/ephemeral #{} {:value 1}))
+        retained (append-event! :postgres-test/ephemeral #{} {:value 2})]
+    (retention/activate! admin :postgres-test/ephemeral)
+    (let [receipt (retention/compact! admin :postgres-test/ephemeral *tenant-id* 100)]
+      (is (= #{(:event/id deleted)} (:retention/deleted-event-ids receipt)))
+      (is (= [(:event/id retained)]
+             (mapv :event/id
+                   (read-events {:types #{:postgres-test/ephemeral}}))))
+      (is (= 1 (count (read-events {:types #{compaction/compaction-receipt-type}})))))))
+
+(deftest retention-selection-does-not-decode-unrelated-payloads
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        targets (with-redefs [time/now (constantly old)]
+                  (mapv #(append-event! :postgres-test/ephemeral #{} {:value %})
+                        (range 25)))]
+    (dotimes [n 200]
+      (append-event! :test/alpha #{} {:unrelated n :payload (apply str (repeat 256 "x"))}))
+    (retention/activate! admin :postgres-test/ephemeral)
+    (let [decode-count (atom 0)
+          original-decode fressian/decode
+          estimate (with-redefs [fressian/decode
+                                 (fn [bytes]
+                                   (swap! decode-count inc)
+                                   (original-decode bytes))]
+                     (retention/estimate admin :postgres-test/ephemeral *tenant-id* 1))]
+      (is (= [(:event/id (first targets))] (:eligible-event-ids estimate)))
+      (is (= 2 @decode-count)))))
+
+(deftest keyed-estimate-and-compact-share-the-metadata-selector
+  (let [now (OffsetDateTime/now ZoneOffset/UTC)
+        old (.minusDays now 3)
+        node-a (uuid/v4)
+        node-b (uuid/v4)
+        ambiguous-a (uuid/v4)
+        ambiguous-b (uuid/v4)
+        [old-a old-b]
+        (with-redefs [time/now (constantly old)]
+          [(append-event! :postgres-test/keyed #{[:node node-a]} {:value 1})
+           (append-event! :postgres-test/keyed #{[:node node-b]} {:value 2})])
+        _new-a (append-event! :postgres-test/keyed #{[:node node-a]} {:value 4})
+        _new-b (append-event! :postgres-test/keyed #{[:node node-b]} {:value 5})
+        admin (retention/administration *event-store* {:clock (constantly now)})]
+    (retention/activate! admin :postgres-test/keyed)
+    (let [ambiguous (with-redefs [time/now (constantly old)]
+                      (append-event! :postgres-test/keyed
+                                     #{[:node ambiguous-a] [:node ambiguous-b]}
+                                     {:value 3}))
+          estimate (retention/estimate admin :postgres-test/keyed *tenant-id* 2)
+          receipt (retention/compact! admin :postgres-test/keyed *tenant-id* 2)
+          expected [(:event/id old-a) (:event/id old-b)]]
+      (is (= expected (:eligible-event-ids estimate)))
+      (is (= (set expected) (:retention/deleted-event-ids receipt)))
+      (is (some #{(:event/id ambiguous)}
+                (map :event/id (read-events {:types #{:postgres-test/keyed}})))))))
+
+(deftest composite-retention-tags-form-one-key
+  (let [now (OffsetDateTime/now ZoneOffset/UTC)
+        old (.minusDays now 3)
+        node (uuid/v4)
+        east (uuid/v4)
+        west (uuid/v4)
+        [old-east old-west]
+        (with-redefs [time/now (constantly old)]
+          [(append-event! :postgres-test/composite-keyed
+                          #{[:node node] [:region east]} {:value 1})
+           (append-event! :postgres-test/composite-keyed
+                          #{[:node node] [:region west]} {:value 2})])
+        _new-east (append-event! :postgres-test/composite-keyed
+                                 #{[:node node] [:region east]} {:value 3})
+        _new-west (append-event! :postgres-test/composite-keyed
+                                 #{[:node node] [:region west]} {:value 4})
+        admin (retention/administration *event-store* {:clock (constantly now)})]
+    (retention/activate! admin :postgres-test/composite-keyed)
+    (is (= [(:event/id old-east) (:event/id old-west)]
+           (:eligible-event-ids
+            (retention/estimate admin :postgres-test/composite-keyed *tenant-id* 10))))))
 
 ;; ======================== ;;
 ;; A. Lifecycle (3 tests)   ;;

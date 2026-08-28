@@ -1,12 +1,24 @@
 (ns ai.obney.grain.event-store-v3.interface
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.schemas]
+            [ai.obney.grain.event-store-v3.interface.event-definition :as definitions]
             [ai.obney.grain.event-store-v3.core :as core]
             [ai.obney.grain.event-store-v3.core.in-memory]))
 
 (defn ->event
   [{:keys [_type _body _tags] :as args}]
   (core/->event args))
+
+(defmacro defevent
+  "Register an event definition. Event construction remains unchanged."
+  [event-type description options]
+  `(definitions/defevent ~event-type ~description ~options))
+
+(defn event-definition [event-type]
+  (definitions/event-definition event-type))
+
+(defn event-definitions []
+  (definitions/event-definitions))
 
 (defn start
   [config]

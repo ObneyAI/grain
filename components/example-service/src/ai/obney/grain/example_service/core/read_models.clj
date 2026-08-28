@@ -14,7 +14,13 @@
   {:events #{:example/counter-created
              :example/counter-incremented
              :example/counter-decremented}
-   :version 1}
+   :version 1
+   :schema [:map-of :uuid
+            [:map
+             [:counter/id :uuid]
+             [:counter/name :string]
+             [:counter/value {:optional true} :int]]]}
+  "Projects counters by ID from their lifecycle events."
   [state event]
   (case (:event/type event)
     :example/counter-created

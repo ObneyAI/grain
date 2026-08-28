@@ -1,0 +1,488 @@
+-- allium: 3
+-- event-retention.allium
+--
+-- This specification governs the implemented event-retention component.
+-- This specification is the normative source of truth for event-definition and
+-- retention behaviour.
+--
+-- Scope: Opt-in, policy-governed reduction of explicitly qualified event
+--        history. Application authors register named event definitions with a
+--        description and required payload schema; definitions retain complete
+--        history unless they explicitly declare a bounded-history policy. A
+--        separately activated copy of that policy authorizes an operator-side
+--        retention process to compact matching history through a restricted
+--        event-store capability.
+--
+-- Includes: registration-time event definitions; complete-history-by-default;
+--           positive fixed ISO 8601 retention durations; optional composite
+--           retention keys drawn from event tags; durable activation and
+--           deactivation; equality between loaded and active policy values;
+--           boot-time structural validation; activation-time stored-data
+--           preflight; conservative eligibility; bounded compaction batches;
+--           atomic deletion and exact receipts; tenant isolation; and monotonic
+--           progress.
+--
+-- Excludes (implementation or governed elsewhere):
+--   - event construction and append behaviour, which remain governed by the
+--     event-store and command-processing components
+--   - a prescribed activation workflow: an application may invoke activation
+--     from a REPL, deployment, CI, or another operator-controlled process
+--   - storage layout, SQL, scheduling technology, threads and serialization
+--   - retention of transaction markers, lifecycle facts, failures, leases, or
+--     other infrastructure events unless each is separately registered and
+--     proven eligible under these rules
+--   - guarantees for consumers outside Grain's declared event model
+--
+-- This is a LIBRARY/FRAMEWORK spec. The policy declaration is inert data until
+-- an operator activates it. Activation authorizes future compaction; it does not
+-- itself delete history. The default and every uncertainty are conservative:
+-- keep the event.
+
+use "../event-store-v3/event-store-v3.allium" as store
+use "../event-model/event-model.allium" as model
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- An event payload schema. Its concrete schema language is governed by Grain's
+-- schema registry and is opaque to retention.
+value PayloadSchema {}
+
+-- The name of an event tag whose value participates in a retention identity.
+-- Several names form one composite identity; their order has no meaning.
+value TagName {
+    name: String
+}
+
+-- A positive, fixed-length ISO 8601 duration such as P7D. Calendar-dependent
+-- years and months are not fixed durations and are rejected.
+value RetentionDuration {
+    iso_8601: String
+}
+
+-- A bounded-history declaration. An event remains ineligible until it is older
+-- than retain_at_least. When retention_key_tags is present, the newest event for
+-- every complete composite tag value is retained regardless of age. Each named
+-- tag must occur exactly once on every event governed by the policy.
+value HistoryPolicy {
+    retain_at_least: RetentionDuration
+    retention_key_tags: Set<TagName>?
+}
+
+-- The total, inert result of structural validation.
+value ValidationFinding {
+    type: String
+    message: String
+}
+
+value ValidationVerdict {
+    valid: Boolean
+    findings: List<ValidationFinding>
+}
+
+-- A preflight result over the currently stored history and declared consumers.
+value ActivationAssessment {
+    safe: Boolean
+    findings: List<ValidationFinding>
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A registration-time description of one event type. Schema is mandatory.
+-- history_policy is absent for complete history and present only for an
+-- explicitly bounded event type.
+entity EventDefinition {
+    name: String
+    description: String
+    schema: PayloadSchema
+    history_policy: HistoryPolicy?
+}
+
+-- The current projected operator authorization, backed by eternal Grain policy-
+-- lifecycle events, for exactly one normalized policy value. Policy identity is
+-- by normalized value equality, not by a derived fingerprint.
+entity PolicyActivation {
+    event_name: String
+    policy: HistoryPolicy
+    activated_at: Timestamp
+    active: Boolean
+}
+
+-- Durable evidence of one atomic compaction batch. It names exactly what was
+-- removed and under which activation.
+entity CompactionReceipt {
+    activation: PolicyActivation
+    tenant: store/Tenant
+    deleted_event_ids: Set<String>
+    completed_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract EventDefinitionRegistry {
+    definition: (event_name: String) -> EventDefinition?
+
+    @invariant SchemaRequired
+        -- Every registered event definition has a name, non-empty description
+        -- and well-formed payload schema. A declaration missing any of these is
+        -- rejected and cannot authorize retention. Existing legacy schema-only
+        -- append paths remain unaffected.
+
+    @invariant CompleteHistoryByDefault
+        -- A definition with no history_policy promises complete history. There
+        -- is no implicit TTL, global default duration, or inferred eligibility.
+
+    @invariant PolicyIsData
+        -- A bounded policy is inert data. Its duration is a positive fixed ISO
+        -- 8601 value from the PnDTnHnMnS subset: days, hours, minutes and seconds
+        -- only; no calendar years/months, weeks, signs or zero. Its optional
+        -- retention-key tag names form a set. The registry contains no
+        -- executable deletion predicate. Accepted durations normalize before
+        -- comparison, so equivalent values such as P1D and PT24H are equal.
+
+    @invariant DuplicateRegistrationIsStable
+        -- Re-registering the same definition value is harmless. Registering the
+        -- same event name with a different description, schema, or history
+        -- policy in one running application is rejected as a conflict.
+}
+
+-- Structural validation shared by development checks and the opt-in boot guard.
+contract RetentionValidation {
+    validate: (areas: Set<model/ServiceArea>) -> ValidationVerdict
+    verify_at_boot: (areas: Set<model/ServiceArea>) -> ValidationVerdict
+
+    @invariant TotalValidation
+        -- validate always returns inert findings. For every bounded definition,
+        -- it checks the event is represented in the event model, schemas agree,
+        -- the policy and retention-key tag names are structurally well formed,
+        -- and todo processors do not subscribe to bounded event types until
+        -- checkpoint-safety validation exists. It makes no unverified claim
+        -- about read-model replay correctness.
+        -- Cardinality of constructed tags is checked against stored events by
+        -- activation preflight and again fail-closed by compaction; it cannot be
+        -- inferred from the payload schema. Validation never deletes or
+        -- activates anything. Unbounded and legacy schema-only events remain
+        -- compatible without strict registration coverage.
+
+    @invariant StrictBootGuard
+        -- verify_at_boot refuses startup when structural validation is invalid.
+        -- It additionally compares every active policy with the normalized
+        -- currently loaded definition: missing definitions, complete-history
+        -- definitions, or unequal policy values are fatal.
+
+    @invariant NoStoreScanAtBoot
+        -- Boot validation is registry/model reconciliation only. Potentially
+        -- expensive inspection of existing stored events belongs to activation
+        -- preflight, not every application start.
+}
+
+-- Operator-side policy lifecycle. These operations are primitives; Grain does
+-- not prescribe when or from which deployment mechanism a user invokes them.
+contract RetentionAdministration {
+    assess: (event_name: String) -> ActivationAssessment
+    activate: (event_name: String) -> PolicyActivation
+    deactivate: (event_name: String) -> PolicyActivation
+    estimate: (event_name: String, tenant: store/Tenant) -> Any
+    status: (event_name: String, tenant: store/Tenant) -> Any
+
+    @invariant ExplicitActivation
+        -- Registration, application boot and definition changes never activate
+        -- a policy. Activation requires an explicit operator-side invocation.
+
+    @invariant AdministrationHistoryIsReified
+        -- Activation and deactivation are eternal Grain events appended with CAS
+        -- to the existing reserved system tenant. Current authorization is a
+        -- projection of those facts, not a second mutable persistence paradigm.
+
+    @invariant ActivationUsesCurrentValue
+        -- Activation reads and durably records the normalized bounded policy
+        -- value currently registered for the named event; callers do not supply
+        -- or override it. An absent definition or a complete-history definition
+        -- is rejected. Transaction markers, compaction receipts and any other
+        -- permanently protected type cannot be activated even if misdeclared.
+
+    @invariant StoredDataPreflight
+        -- Before first activation or a changed activation, assessment checks
+        -- existing events can satisfy the schema and retention-key obligations
+        -- for bounded-history compatibility. Unsafe or incomplete evidence
+        -- prevents activation. External undeclared consumers remain an explicit
+        -- operational responsibility.
+
+    @invariant IdempotentByValue
+        -- Activating an already-active equal normalized value is idempotent.
+        -- Changing a registered definition does not silently mutate its durable
+        -- activation; the old activation simply ceases to match and cannot be
+        -- used until the new value is separately assessed and activated.
+
+    @invariant PolicyChangesFailClosedAcrossDeployments
+        -- Changing bounded history safely requires durable deactivation before
+        -- deploying the new value and separate activation afterward. Workers
+        -- holding either old or new code must observe an active matching value
+        -- immediately before commit, preventing mixed-version policy drift.
+
+    @invariant DeactivationStopsNewWork
+        -- Deactivation is durable and prevents new compaction batches. It cannot
+        -- restore events removed by already committed batches.
+
+    @invariant StatusReportsAvailability
+        -- Status reports the current active policy value and activation identity,
+        -- earliest retained id and timestamp, latest compaction, and whether the
+        -- named tenant/type history has been truncated. It does not claim that
+        -- unknown external consumers can replay safely.
+
+    @invariant CompleteReplayConsultsStatus
+        -- A caller that promises complete historical replay checks status first
+        -- and rejects a request whose relevant history has been truncated.
+
+    @invariant PublicEstimateIsAdvisory
+        -- The operator-facing estimate delegates to the backend estimate for the
+        -- current matching activation and does not authorize or delete history.
+}
+
+-- The restricted destructive capability demanded from a conforming event-store
+-- backend. Ordinary event-store callers do not receive this capability.
+contract EventCompaction {
+    estimate: (activation: PolicyActivation, tenant: store/Tenant) -> Any
+    compact: (activation: PolicyActivation, tenant: store/Tenant) -> CompactionReceipt
+
+    @invariant EstimateIsAdvisory
+        -- Estimate predicts eligible count and payload without deleting. It is
+        -- exact only while relevant store state and the backend clock remain
+        -- unchanged; compact performs a fresh authoritative selection.
+
+    @invariant SelectionIsEquivalentAtOneEvaluation
+        -- Estimate and compact apply one eligibility definition. Given the same
+        -- activation, tenant state, fixed evaluation time and batch limit, they
+        -- select exactly the same ordered event ids. Separate calls may differ
+        -- after the clock, activation or relevant tenant state changes.
+
+    @invariant EvaluationClockDoesNotAlterPolicy
+        -- Retention evaluation receives one fixed current time for each
+        -- estimate or compaction attempt. Tests may provide a controlled clock
+        -- and advance it beyond a real policy window, but clock selection never
+        -- rewrites, scales or substitutes the registered or activated policy
+        -- value. A receipt records the resulting fixed cutoff.
+
+    @invariant EligibilityIsConservative
+        -- A batch may select only domain events of the activated event type in
+        -- the named tenant, older than retain_at_least at the batch's fixed
+        -- cutoff. With a retention key it also preserves the newest event for
+        -- every complete composite tag value. Missing, malformed or ambiguous
+        -- tag values make an event ineligible rather than disposable. Additional
+        -- tags not named by the policy do not affect the composite key.
+
+    @invariant ProtectedHistoryIsNeverEligible
+        -- Transaction markers, compaction receipts, unregistered event types and
+        -- definitions without bounded history are never eligible, even if a
+        -- malformed or stale request names them.
+
+    @invariant PolicyMustStillMatch
+        -- Immediately before commit, the activation must still be active and
+        -- its normalized policy value must equal the currently loaded bounded
+        -- definition. Any mismatch aborts without deletion.
+
+    @invariant AtomicDeletionAndReceipt
+        -- Deleting the selected events and durably recording a receipt naming
+        -- exactly their ids is one atomic commit. Either both happen or neither
+        -- happens; an empty selection produces no misleading deletion receipt.
+
+    @invariant ReceiptIsAReifiedTransaction
+        -- The receipt is appended as an eternal Grain event with its own new
+        -- transaction marker in the same commit as deletion. The tenant's
+        -- durable high-watermark advances to that receipt transaction and never
+        -- regresses; original transaction markers are not rewritten.
+
+    @invariant ReceiptsArePermanent
+        -- Compaction receipts are never compacted, expired or deleted. They
+        -- remain durable audit evidence for every committed deletion batch.
+
+    @invariant BoundedAndRetrySafe
+        -- Each batch has a finite configured bound and deterministic selection.
+        -- Retrying after interruption never broadens eligibility and never
+        -- reports an event deleted twice.
+
+    @invariant ConcurrentWorkersDoNotDoubleCompact
+        -- Selection, deletion, receipt append and the policy recheck are
+        -- serialized with appends for the tenant. Concurrent workers cannot
+        -- delete or receipt the same event twice, nor delete a newly appended
+        -- latest event selected under stale state.
+
+    @invariant TenantIsolation
+        -- A batch reads and deletes from exactly one tenant. Its receipt names
+        -- that tenant, and no event from another tenant can be selected.
+
+    @invariant TransactionHistoryIsUnchanged
+        -- Compaction never rewrites an event or its original transaction marker.
+        -- Transaction markers remain immutable historical facts even when some
+        -- domain-event ids they originally named have been compacted; the
+        -- receipt is the durable explanation for those absent events.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RegisterEventDefinition {
+    when: RegisterEventDefinition(author, candidate)
+    requires:
+        candidate.name != ""
+        candidate.description != ""
+        schema_well_formed(candidate.schema)
+        definition(candidate.name) = null
+    ensures:
+        EventDefinition.created(
+            name: candidate.name,
+            description: candidate.description,
+            schema: candidate.schema,
+            history_policy: candidate.history_policy
+        )
+}
+
+rule ReloadIdenticalEventDefinition {
+    when: RegisterEventDefinition(author, candidate)
+    let existing = definition(candidate.name)
+    requires:
+        exists existing
+        definition_values_equal(existing, candidate)
+    ensures: EventDefinitionRegistrationAccepted(event_name: candidate.name)
+}
+
+rule ActivateBoundedHistory {
+    when: ActivateHistory(event_name)
+    let policy = normalized(definition(event_name).history_policy)
+    let assessment = assess(event_name)
+    requires:
+        assessment.safe
+        policy != null
+        active_activation(event_name) = null
+    ensures:
+        PolicyActivation.created(
+            event_name: event_name,
+            policy: policy,
+            activated_at: now,
+            active: true
+        )
+}
+
+rule ConfirmAlreadyActiveHistory {
+    when: ActivateHistory(event_name)
+    let current = active_activation(event_name)
+    requires:
+        exists current
+        normalized(current.policy) = normalized(definition(event_name).history_policy)
+    ensures: PolicyActivationConfirmed(activation: current)
+}
+
+rule DeactivateBoundedHistory {
+    when: DeactivateHistory(event_name)
+    let activation = active_activation(event_name)
+    requires:
+        exists activation
+        activation.active
+    ensures: activation.active = false
+}
+
+rule CompactEligibleBatch {
+    when: CompactHistory(activation, tenant)
+    requires:
+        activation.active
+        normalized(definition(activation.event_name).history_policy) = normalized(activation.policy)
+        eligible_events(activation, tenant).count > 0
+    ensures:
+        let removed = bounded_batch(eligible_events(activation, tenant))
+        CompactionReceipt.created(
+            activation: activation,
+            tenant: tenant,
+            deleted_event_ids: event_ids(removed),
+            completed_at: now
+        )
+        for event in removed:
+            not exists event
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ReceiptExplainsEveryDeletion {
+    for receipt in CompactionReceipts:
+        receipt.deleted_event_ids.count > 0
+}
+
+invariant AtMostOneActivePolicyPerEventType {
+    for a in PolicyActivations:
+        for b in PolicyActivations:
+            a != b and a.event_name = b.event_name implies not (a.active and b.active)
+}
+
+------------------------------------------------------------
+-- Actors and Surfaces
+------------------------------------------------------------
+
+actor ApplicationAuthor {
+    identified_by: String
+}
+
+actor RetentionOperator {
+    identified_by: String
+}
+
+actor RetentionWorker {
+    identified_by: String
+}
+
+surface EventDefinitionRegistration {
+    facing author: ApplicationAuthor
+
+    provides:
+        RegisterEventDefinition(author, candidate)
+
+    contracts:
+        fulfils EventDefinitionRegistry
+        fulfils RetentionValidation
+
+    @guarantee DeclarationDoesNotChangeConstruction
+        -- Registration describes the event type and optional history quality;
+        -- application code continues constructing ordinary event values in the
+        -- same shape and appending them through the normal event-store boundary.
+}
+
+surface RetentionPolicyControl {
+    facing operator: RetentionOperator
+
+    provides:
+        AssessHistoryPolicy(operator, event_name)
+        ActivateHistory(operator, event_name)
+        DeactivateHistory(operator, event_name)
+        RetentionStatus(operator, event_name, tenant)
+        EstimateHistoryCompaction(operator, event_name, tenant)
+
+    contracts:
+        fulfils RetentionAdministration
+
+    @guarantee WorkflowNeutral
+        -- These are explicit Grain primitives. Whether users invoke them from a
+        -- production REPL, on each deploy, from CI, or through their own control
+        -- plane is deliberately their policy, not hidden framework behaviour.
+}
+
+surface RetentionExecution {
+    facing worker: RetentionWorker
+
+    provides:
+        CompactHistory(worker, activation, tenant)
+
+    contracts:
+        demands EventDefinitionRegistry
+        demands EventCompaction
+
+    @guarantee DestructionIsCapabilityRestricted
+        -- Only retention execution receives the compaction capability. Normal
+        -- application event-store access remains append/read and cannot invoke
+        -- policy activation, deletion, or receipt creation.
+}

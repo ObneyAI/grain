@@ -765,6 +765,41 @@
                   (zero? (:uncheckpointed-count diagnostic))))
       (stop-tail-probe! primary-port))))
 
+(defn scenario-18 []
+  (header "Scenario 18: Live bookkeeping retention preserves operation")
+  (let [tenant-id (first @tenant-ids)
+        processed-before (processed-count primary-port tenant-id)
+        result (eval-read primary-port
+                 (format "(app/exercise-retention!
+                            @app/app (java.util.UUID/fromString \"%s\"))"
+                         tenant-id)
+                 30000)]
+    (doseq [[event-type {:keys [before estimated deleted after receipt?]}] result]
+      (info (str event-type ": " (:count before) " -> " (:count after)
+                 ", deleted " deleted))
+      (check (str event-type " had multiple live bookkeeping records")
+             (> (:count before) (count (:keys before))))
+      (check (str event-type " estimate matched the applied deletion")
+             (= estimated deleted))
+      (check (str event-type " emitted a durable compaction receipt") receipt?)
+      (check (str event-type " deleted exactly the non-latest records")
+             (= deleted (- (:count before) (:count after))))
+      (check (str event-type " retained exactly one record per policy key")
+             (and (= (:keys before) (:keys after))
+                  (= (:count after) (count (:keys after))))))
+
+    ;; The todo processor must continue from its preserved newest checkpoint.
+    (increment! primary-port tenant-id)
+    (let [deadline (+ (System/currentTimeMillis) 15000)
+          processed-after (loop []
+                            (let [n (processed-count primary-port tenant-id)]
+                              (if (or (> n processed-before)
+                                      (>= (System/currentTimeMillis) deadline))
+                                n
+                                (do (Thread/sleep 100) (recur)))))]
+      (check "Processor handles new work after checkpoint compaction"
+             (= (inc processed-before) processed-after)))))
+
 ;; -------------------------------- ;;
 ;; Main runner                      ;;
 
@@ -798,6 +833,7 @@
     (scenario-15)
     (scenario-16)
     (scenario-17)
+    (scenario-18)
 
     (catch Throwable t
       (swap! results update :error inc)

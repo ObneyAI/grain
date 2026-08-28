@@ -168,7 +168,16 @@
   ;; (populated by the def* macros at namespace load) and refuse to start if the
   ;; model is invalid or incomplete. Throws ex-info with the verdict on failure.
   (event-model-validator/verify-or-throw!)
-  (ig/init system))
+  (let [app (ig/init system)]
+    (try
+      ;; Once durable state is available, the same guard additionally reconciles
+      ;; every active retention policy with the loaded event definition.
+      (event-model-validator/verify-or-throw!
+       {:event-store (::event-store app)})
+      app
+      (catch Throwable cause
+        (ig/halt! app)
+        (throw cause)))))
 
 (defn stop
   [app]

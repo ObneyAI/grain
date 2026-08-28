@@ -5,8 +5,9 @@
    the system to use. 
    
    Schemas are validated in places such as the command-processor
-   and event-store."
-  (:require [ai.obney.grain.schema-util.interface :refer [defschemas]]))
+  and event-store."
+  (:require [ai.obney.grain.schema-util.interface :refer [defschemas]]
+            [ai.obney.grain.event-store-v3.interface :refer [defevent]]))
 
 ;; The example app is single-tenant. Every event-store append/read, read
 ;; model projection, processor poll, and periodic trigger is scoped to this
@@ -32,24 +33,26 @@
    :example/calculate-average-counter-value
    [:map]})
 
-#_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
-(defschemas events
-  {:example/counter-created
-   [:map
-    [:counter-id :uuid]
-    [:name :string]]
+(defevent :example/counter-created
+  "A counter was created."
+  {:schema [:map
+            [:counter-id :uuid]
+            [:name :string]]})
 
-   :example/counter-incremented
-   [:map
-    [:counter-id :uuid]]
+(defevent :example/counter-incremented
+  "A counter was incremented."
+  {:schema [:map
+            [:counter-id :uuid]]})
 
-   :example/counter-decremented
-   [:map
-    [:counter-id :uuid]]
-   
-   :example/average-calculated
-   [:map
-    [:value :double]]})
+(defevent :example/counter-decremented
+  "A counter was decremented."
+  {:schema [:map
+            [:counter-id :uuid]]})
+
+(defevent :example/average-calculated
+  "The average counter value was calculated."
+  {:schema [:map
+            [:value :double]]})
 
 #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]}
 (defschemas queries

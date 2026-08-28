@@ -58,6 +58,11 @@
      :consumes #{:example/counter-created
                  :example/counter-incremented
                  :example/counter-decremented}
+     :schema [:map-of :uuid
+              [:map
+               [:counter/id :uuid]
+               [:counter/name :string]
+               [:counter/value {:optional true} :int]]]
      :version 1}}
 
    :queries

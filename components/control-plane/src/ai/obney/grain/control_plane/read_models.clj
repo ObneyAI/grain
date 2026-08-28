@@ -5,7 +5,13 @@
 (defreadmodel :grain.control active-nodes
   {:events #{:grain.control/node-heartbeat :grain.control/node-departed}
    :version 1
+   :schema [:map-of :uuid
+            [:map
+             [:last-heartbeat-at :int]
+             [:last-heartbeat-id :uuid]
+             [:metadata [:maybe [:map]]]]]
    :l1-ttl-ms 0}
+  "Projects the currently active control-plane nodes."
   [state event]
   (case (:event/type event)
     :grain.control/node-heartbeat
@@ -22,7 +28,9 @@
 (defreadmodel :grain.control lease-ownership
   {:events #{:grain.control/lease-acquired :grain.control/lease-released}
    :version 2
+   :schema [:map-of :uuid :uuid]
    :l1-ttl-ms 0}
+  "Projects the node currently owning each tenant lease."
   [state event]
   (let [tid (:lease/tenant-id event)]
     (case (:event/type event)

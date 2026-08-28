@@ -4,6 +4,7 @@
    and processes events. The test processor records which node handled
    each event for observability."
   (:require [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.event-retention.interface :as retention]
             [ai.obney.grain.event-store-postgres-v3.interface]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.event-tailer.interface :as event-tailer]
@@ -13,7 +14,6 @@
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
-            [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [com.brunobonacci.mulog :as u]
             [nrepl.server :as nrepl]
             [clj-uuid :as uuid]
@@ -26,25 +26,48 @@
 ;; Schemas             ;;
 ;; ------------------- ;;
 
-(defschemas test-schemas
-  {:test/counter-incremented [:map]
-   :test/counter-processed [:map
-                            [:processed-by/node-id :uuid]
-                            [:processed-by/event-id :uuid]]
-   :test/slow-work [:map]
-   :test/slow-work-done [:map
-                         [:processed-by/node-id :uuid]
-                         [:processed-by/event-id :uuid]
-                         [:processing-time-ms :int]]
-   :test/slow-work-failed [:map [:msg :string]]
-   :test/billing-trigger [:map [:period :string]]
-   :test/billing-done [:map [:period :string]]
-   :test/scheduled-trigger [:map [:period :string]]
-   :test/scheduled-done [:map [:period :string] [:processed-by/node-id :uuid]]
-   :grain/todo-processor-effect-failure [:map
-                                         [:processor/name :keyword]
-                                         [:triggered-by :uuid]
-                                         [:error/message :string]]})
+(es/defevent :test/counter-incremented
+  "A counter increment requested by a live scenario."
+  {:schema [:map]})
+
+(es/defevent :test/counter-processed
+  "A scenario node processed a counter increment."
+  {:schema [:map
+            [:processed-by/node-id :uuid]
+            [:processed-by/event-id :uuid]]})
+
+(es/defevent :test/slow-work
+  "Slow work requested by a reassignment scenario."
+  {:schema [:map]})
+
+(es/defevent :test/slow-work-done
+  "A scenario node completed slow work."
+  {:schema [:map
+            [:processed-by/node-id :uuid]
+            [:processed-by/event-id :uuid]
+            [:processing-time-ms :int]]})
+
+(es/defevent :test/slow-work-failed
+  "Slow scenario work failed."
+  {:schema [:map [:msg :string]]})
+
+(es/defevent :test/billing-trigger
+  "A billing period became eligible for scenario processing."
+  {:schema [:map [:period :string]]})
+
+(es/defevent :test/billing-done
+  "Scenario billing completed for a period."
+  {:schema [:map [:period :string]]})
+
+(es/defevent :test/scheduled-trigger
+  "A scheduled live-scenario period became eligible for processing."
+  {:schema [:map [:period :string]]})
+
+(es/defevent :test/scheduled-done
+  "A scenario node processed a scheduled period."
+  {:schema [:map
+            [:period :string]
+            [:processed-by/node-id :uuid]]})
 
 ;; ------------------- ;;
 ;; Processor           ;;
@@ -86,17 +109,25 @@
                                               :processing-time-ms 2000}})]}))
 
 ;; Register processors so the control plane can discover them
-(tp/register-processor! :test/counter-processor
-  {:topics [:test/counter-incremented]
-   :handler-fn #'counter-processor-handler})
+(tp/defprocessor :test counter-processor
+  {:topics #{:test/counter-incremented}
+   :grain.event-model/produces #{:test/counter-processed}}
+  "Records which control-plane node processed a counter increment."
+  [context]
+  (counter-processor-handler context))
 
-(tp/register-processor! :test/slow-processor
-  {:topics [:test/slow-work]
-   :handler-fn #'slow-work-handler})
+(tp/defprocessor :test slow-processor
+  {:topics #{:test/slow-work}
+   :grain.event-model/produces #{:test/slow-work-done}}
+  "Runs deliberately slow work to exercise reassignment and effect replay."
+  [context]
+  (slow-work-handler context))
 
 ;; Periodic trigger — runs on every node, CAS deduplicates
 (pt/defperiodic :test scheduled-trigger
-  {:schedule {:every 3 :duration :seconds}}
+  {:schedule {:every 3 :duration :seconds}
+   :grain.event-model/produces #{:test/scheduled-trigger}}
+  "Emits one deduplicated scheduled trigger for each period."
   [tenant-id time]
   (let [period (str (.toEpochMilli time))]
     {:result/events
@@ -110,7 +141,9 @@
 
 ;; Processor that handles the trigger
 (tp/defprocessor :test scheduled-handler
-  {:topics #{:test/scheduled-trigger}}
+  {:topics #{:test/scheduled-trigger}
+   :grain.event-model/produces #{:test/scheduled-done}}
+  "Records which control-plane node processed a scheduled trigger."
   [context]
   (let [node-id @node-id-atom]
     {:result/events
@@ -340,6 +373,48 @@
   (es/append (:event-store system)
     {:tenant-id tenant-id
      :events [(es/->event {:type :test/counter-incremented :body {}})]}))
+
+(defn exercise-retention!
+  "Activate and exercise the real bookkeeping policies against the live store.
+   Only retention's evaluation clock is advanced; stored event timestamps and
+   the registered policy values are unchanged. Returns compact summaries rather
+   than the potentially large exact-ID receipts."
+  [system tenant-id]
+  (let [store (:event-store system)
+        admin (retention/administration
+               store {:clock #(.plusHours (java.time.OffsetDateTime/now
+                                            java.time.ZoneOffset/UTC)
+                                           2)})
+        control-tenant ai.obney.grain.control-plane.events/control-plane-tenant-id
+        cases [{:event-type :grain.control/node-heartbeat
+                :tenant-id control-tenant
+                :key-tag :node}
+               {:event-type :grain/todo-processor-checkpoint
+                :tenant-id tenant-id
+                :key-tag :processor}]
+        summarize (fn [{:keys [event-type tenant-id key-tag]}]
+                    (let [events (into [] (es/read store {:tenant-id tenant-id
+                                                          :types #{event-type}}))]
+                      {:count (count events)
+                       :keys (->> events
+                                  (mapcat :event/tags)
+                                  (filter #(= key-tag (first %)))
+                                  (map second)
+                                  set)}))]
+    (into {}
+          (for [{:keys [event-type tenant-id] :as retention-case} cases]
+            (do
+              (retention/activate! admin event-type)
+              (let [before (summarize retention-case)
+                    estimate (retention/estimate admin event-type tenant-id 100000)
+                    receipt (retention/compact! admin event-type tenant-id 100000)
+                    after (summarize retention-case)]
+                [event-type
+                 {:before before
+                  :estimated (:eligible-count estimate)
+                  :deleted (count (:retention/deleted-event-ids receipt))
+                  :after after
+                  :receipt? (boolean receipt)}]))))))
 
 (defn append-checkpoint-gap!
   "Construct A before B without persistence metadata, commit and process B,

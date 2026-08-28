@@ -66,7 +66,8 @@
 
 (defn verify-event-model!
   "Validate the registered event model (or `(:model opts)`) against the live runtime
-   in strict mode; returns the verdict, does not throw."
+   in strict mode; returns the verdict, does not throw. Pass `:event-store` to
+   also reconcile durable active retention policies against loaded definitions."
   ([] (core/verify-event-model!))
   ([opts] (core/verify-event-model! opts)))
 

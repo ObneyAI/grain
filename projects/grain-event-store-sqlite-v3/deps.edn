@@ -1,6 +1,8 @@
 {:deps {org.clojure/clojure {:mvn/version "1.12.0"}
         sqesv3/event-store-sqlite-v3 {:local/root "../../components/event-store-sqlite-v3"}
         sqesv3/event-store-v3 {:local/root "../../components/event-store-v3"}
+        sqesv3/event-retention {:local/root "../../components/event-retention"}
+        sqesv3/event-model {:local/root "../../components/event-model"}
         sqesv3/control-plane {:local/root "../../components/control-plane"}
         sqesv3/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
         sqesv3/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}

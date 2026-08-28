@@ -44,6 +44,7 @@
 --   filtered reads (tags/types/after/as-of)           -> contract StreamReader.read + ReadIsFilteredAndOrdered
 --   reverse + limit (newest-first seek)               -> contract StreamReader.read @invariant
 --   batch read merges + dedupes by id                 -> contract StreamReader.read_batch @invariant
+--   compaction ignores unrelated payloads             -> contract StreamReader.TargetedCompactionMaterialization
 --   CAS true stores / false -> conflict, nothing kept -> rules AppendUnderCas* + OptimisticConcurrency
 --   CAS reads the correct filtered subset             -> contract StreamReader + rule guidance
 --   tenant isolation (no cross-tenant read/write)     -> surface guarantee TenantIsolation + invariant
@@ -229,6 +230,21 @@ contract StreamReader {
         -- A read does not eagerly materialise the whole match set; it can be
         -- reduced incrementally and terminated early, having observed only a
         -- prefix of the matches.
+
+    @invariant TargetedCompactionMaterialization
+        -- Retention selection decodes only the lifecycle records needed to
+        -- authorize the requested event type and does not decode target or
+        -- unrelated tenant payloads. An unkeyed request materializes at most its
+        -- bounded result. A keyed request may inspect relational metadata for
+        -- all events of the requested type to preserve the newest member of each
+        -- complete composite key, but heap use is not proportional to encoded
+        -- tenant payload history.
+
+    @invariant CompactionSelectionParity
+        -- Estimate and destructive compaction share one ordered metadata
+        -- selector. Equal activation, tenant state, cutoff and limit select the
+        -- same ids; destructive compaction rechecks and selects within its
+        -- serialized transaction before deletion.
 }
 
 -- The durable per-tenant watermark, read back across all known tenants. Unlike a

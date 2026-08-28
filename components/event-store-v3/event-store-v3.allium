@@ -3,10 +3,11 @@
 --
 -- Distilled from components/event-store-v3 (grain).
 --
--- Scope: The append-only, tenant-scoped event store at the heart of grain's
---        event-sourced CQRS model. Commands append immutable events; everything
---        else reads them back as an ordered stream. This spec captures the
---        store's behavioural guarantees: what an append durably records, how
+-- Scope: The normally append-only, tenant-scoped event-store boundary at the
+--        heart of grain's event-sourced CQRS model. Commands append immutable
+--        events; ordinary application code reads them back as an ordered stream.
+--        This spec captures the store's behavioural guarantees: what an append
+--        durably records, how
 --        events are identified and ordered, how reads are filtered and merged,
 --        how a conditional (compare-and-swap) append decides whether to commit,
 --        and how tenants are kept isolated.
@@ -30,6 +31,9 @@
 --   - the pubsub transport (core.async topics) — only that appended events
 --     are published carrying the tenant id
 --   - threads, connection pools, logging and metrics
+--   - privileged history compaction, which is a separate capability governed by
+--     event-retention.allium and is never exposed through these append/read
+--     surfaces
 --
 -- Conformance properties ES1..ES9 correspond to the in-memory test suite
 -- (in_memory_test.clj). Where each is captured:
@@ -166,9 +170,11 @@ entity Tenant {
     events: Event with tenant = this
 }
 
--- An immutable fact committed to a tenant's stream. Events are never updated or
--- deleted; the store is append-only. An event's id fixes both its identity and
--- its position in the total order.
+-- An immutable fact committed to a tenant's stream. Events are never updated,
+-- and ordinary event-store callers cannot delete them. A separately supplied
+-- privileged retention capability may remove explicitly eligible events under
+-- event-retention.allium. An event's id fixes both its identity and its position
+-- in the total order.
 entity Event {
     id: EventId
     tenant: Tenant
@@ -438,6 +444,10 @@ surface EventRead {
         -- ES4: events stream in event-id order, regardless of append position:
         -- ascending by default or descending when the read is reversed. A
         -- limit is applied only after that ordering is established.
+
+    @guarantee NoApplicationDeletion
+        -- The ordinary append/read boundary exposes no deletion operation.
+        -- Possession of this event-store surface alone cannot compact history.
 }
 
 -- The administrative boundary: an operator-side caller enumerating every tenant
@@ -459,6 +469,4 @@ surface StoreAdministration {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "A plain append records a transaction marker but a CAS append does not. Should CAS appends also be marker-bracketed, or is the absence of a marker the intended signal that the batch was conditional?"
-open question "The high-watermark is advanced to the transaction marker on a plain append but to the last domain event on a CAS append. Should both advance to the same kind of boundary so consumers reading the watermark see a uniform reference point?"
 open question "Tenants come into existence implicitly on first append. Should tenant lifecycle (creation, retirement, deletion of an entire stream) be modelled here or remain wholly outside the store?"
