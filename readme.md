@@ -34,8 +34,7 @@ Grain makes this grammar executable with a small set of declarative macros. Give
 - `defprocessor` — Todo Processors are reactive background automations. They can watch for events that they are interested in and then react, usually this means executing Commands.
 - `defperiodic` — Periodic Tasks can be thought of as cron job triggers. They can emit an event on a schedule and they will always be paired with a Todo Processor that actually handles the work.
 - `defschemas` - Schemas force us to declare the shape of all the data in a Grain application.
-- `defevent` — Event definitions opt an event type into a runtime catalogue with its payload schema, documentation, and history contract. Definitions do not construct events, and bounded history remains inert until an operator explicitly activates the matching policy.
-- **Event** — Events are the facts that we record in the event store database, from these the current state of the world can always be projected or re-projected, and this is at the core of why systems built this way are more flexible than the alternative.
+- `defevent` — Events are immutable facts recorded in the event store, from which the current state of the world can always be projected or re-projected. `defevent` optionally registers an event type's payload schema, documentation, and history contract, while `->event` constructs event instances. Bounded history remains inert until an operator explicitly activates the matching policy.
 
 ## Getting Started
 
