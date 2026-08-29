@@ -2,7 +2,7 @@
 
 ## grain-core-v2
 
-Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 processors (command, read-model, todo), v2 request handler, query processor, pub/sub, and the event tailer for replaying shared-store events into a node's local pub/sub:
+Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 processors (command, read-model, todo), v2 request handler, query processor, pub/sub, declarative event definitions, opt-in retention administration, and the event tailer for replaying shared-store events into a node's local pub/sub:
 
 ```clojure
 obneyai/grain-core-v2
@@ -23,6 +23,10 @@ obneyai/grain-control-plane
 ```
 
 Includes the core CQRS components (event store, read model processor, todo processor, periodic task, pub/sub).
+
+It also includes event-definition validation and retention administration. A
+declared bounded-history policy remains inert until its exact value is durably
+activated. See [Event Definitions and Retention](event-definitions-and-retention.md).
 
 ## grain-datastar
 
@@ -83,7 +87,7 @@ composition gate that resolves Event Model `:grain/allium` links. See
 
 ## grain-event-store-postgres-v3
 
-Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks, Fressian binary serialization, and tenant-scoped operations. All read and append operations require a tenant ID, ensuring structural data isolation:
+Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks, Fressian binary serialization, tenant-scoped operations, and privileged atomic bounded compaction with durable receipts. All read and append operations require a tenant ID, ensuring structural data isolation:
 
 ```clojure
 obneyai/grain-event-store-postgres-v3
@@ -94,7 +98,7 @@ obneyai/grain-event-store-postgres-v3
 
 ## grain-event-store-sqlite-v3
 
-Embedded SQLite backend implementing the v3 event store protocol for single-process deployments where running Postgres is overkill. WAL mode with a bounded single-writer queue and `BEGIN IMMEDIATE` per append, a tenant-scoped events table plus a normalized `event_tags` join table for indexed superset tag filtering, and Fressian binary serialization. Reads continue to use the connection pool concurrently; increasing the pool size improves available read concurrency but cannot increase SQLite's single-writer throughput. Same tenant-scoped API as the Postgres backend — swap the `:conn` type to move between them:
+Embedded SQLite backend implementing the v3 event store protocol and privileged atomic bounded compaction for single-process deployments where running Postgres is overkill. WAL mode with a bounded single-writer queue and `BEGIN IMMEDIATE` per append, a tenant-scoped events table plus a normalized `event_tags` join table for indexed superset tag filtering, Fressian binary serialization, and durable compaction receipts. Reads continue to use the connection pool concurrently; increasing the pool size improves available read concurrency but cannot increase SQLite's single-writer throughput. Same tenant-scoped API as the Postgres backend — swap the `:conn` type to move between them:
 
 ```clojure
 obneyai/grain-event-store-sqlite-v3

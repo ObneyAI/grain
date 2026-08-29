@@ -1,16 +1,16 @@
 # Opt-in event definitions and safe retention
 
-Status: design proposal
+Status: implemented
 
 The normative behavioral source of truth is
 [`event-retention.allium`](../components/event-retention/event-retention.allium).
-This document records rationale, API sketches, rollout guidance, and backend
+This document records the API, safety model, operational guidance, and backend
 notes. If behavioral wording here diverges from the Allium specification, the
 Allium specification governs.
 
 ## Decision summary
 
-Grain should add an opt-in, registration-only `defevent` macro and an
+Grain provides an opt-in, registration-only `defevent` macro and an
 event-definition registry. Existing event constructors and `->event` calls do
 not change. A registered event is eternal unless its definition contains an
 explicit bounded-history policy and that exact policy is separately activated.
@@ -38,7 +38,7 @@ document defines the reusable event-definition and retention mechanism.
 
 ## `defevent`
 
-### Proposed form
+### Form
 
 `defevent` registers one event definition. It does not construct events or define
 an event factory:
@@ -408,20 +408,20 @@ transaction.
 No deletion API is added. Event construction remains unchanged; retention is a
 v3-only capability.
 
-## Initial rollout
+## Implementation and rollout
 
-1. Add an event-definition namespace to event-store-v3, with the macro, registry
-   tests, and catalogue integration. Do not enable retention.
-2. Migrate representative existing event types to `defevent`, leaving their
-   constructors unchanged, and verify schema and event-model reconciliation.
-3. Add protocol-level retention conformance tests and implement the in-memory
-   backend.
-4. Implement SQLite and Postgres compaction estimates.
-5. Add durable policy activation, compaction receipts, atomic apply, retention
-   status, metrics, and bounded background execution.
-6. Verify bounded-history consumer contracts, restart/replay behavior, malformed
-   key handling, rolling deployments, and transaction audit behavior in a
-   non-production deployment before activating any production policy.
+The event-definition registry, catalogue integration, durable activation,
+preflight assessment, status APIs, bounded compaction, and durable receipts are
+implemented. The in-memory, SQLite, and Postgres v3 stores implement the
+privileged compaction protocol; SQLite and Postgres bound candidate selection in
+the database transaction rather than materializing an unbounded eligible set.
+
+Before activating a production policy, migrate the event type to `defevent`,
+reconcile it with the Event Model, run strict boot verification, inspect
+`retention/assess` and `retention/estimate`, and verify every external consumer's
+bounded-history contract. Exercise restart/replay behavior, malformed retention
+keys, rolling deployments, and transaction audit behavior in a non-production
+deployment first.
 
 ## Required conformance tests
 

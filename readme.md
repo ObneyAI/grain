@@ -24,7 +24,7 @@ The reason that Event Sourcing is a better paradigm for this AI future than clas
 
 Grain's grammar was not invented by us, we delegate out to [Event Modeling](https://eventmodeling.org/posts/what-is-event-modeling/) by [Adam Dymitruk](https://www.linkedin.com/in/eventmodeling/). In this way, we inherit the ability to express any information system and we stand on the shoulder of those who have come before us, which is usually preferable to inventing new methods without cause.
 
-Grain makes this grammar executable by providing 6 macros. Given that Grain is built with Clojure, we've essentially extended Clojure and specialized it for this purpose with these macros. This is what makes Grain a true Domain Specific Language for solving this kind of problem. The added benefits of choosing Clojure are too many to convey in any one place. It's a language designed for building information systems and reducing incidental complexity, so it has every primitive that we could ever need as a platform.
+Grain makes this grammar executable with a small set of declarative macros. Given that Grain is built with Clojure, we've essentially extended Clojure and specialized it for this purpose with these macros. This is what makes Grain a true Domain Specific Language for solving this kind of problem. The added benefits of choosing Clojure are too many to convey in any one place. It's a language designed for building information systems and reducing incidental complexity, so it has every primitive that we could ever need as a platform.
 
 > Full documentation with code examples: [docs/core-concepts.md](docs/core-concepts.md)
 
@@ -34,6 +34,7 @@ Grain makes this grammar executable by providing 6 macros. Given that Grain is b
 - `defprocessor` — Todo Processors are reactive background automations. They can watch for events that they are interested in and then react, usually this means executing Commands.
 - `defperiodic` — Periodic Tasks can be thought of as cron job triggers. They can emit an event on a schedule and they will always be paired with a Todo Processor that actually handles the work.
 - `defschemas` - Schemas force us to declare the shape of all the data in a Grain application.
+- `defevent` — Event definitions opt an event type into a runtime catalogue with its payload schema, documentation, and history contract. Definitions do not construct events, and bounded history remains inert until an operator explicitly activates the matching policy.
 - **Event** — Events are the facts that we record in the event store database, from these the current state of the world can always be projected or re-projected, and this is at the core of why systems built this way are more flexible than the alternative.
 
 ## Getting Started
@@ -89,13 +90,13 @@ Grain Sessions walks through the app as a teaching series:
 
 | Package | Summary |
 | --- | --- |
-| **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store and event tailing |
+| **grain-core-v2** | Multi-tenant CQRS/Event Sourcing with in-memory event store, event definitions, opt-in retention, and event tailing |
 | **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
 | **grain-datastar** | Reactive server-rendered UIs with [Datastar](https://data-star.dev/) over SSE, including distributed live updates |
 | **grain-code-agent-tools** | Dev-only nREPL tools for coding agents working against live Grain apps |
 | **grain-event-model** | Service-area Event Model registration and production boot validation |
-| **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, and Fressian serialization |
-| **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization |
+| **grain-event-store-postgres-v3** | Multi-tenant Postgres backend with RLS, per-tenant advisory locks, Fressian serialization, and atomic bounded compaction |
+| **grain-event-store-sqlite-v3** | Embedded single-process backend — WAL mode, tenant-scoped events with indexed tag filtering, Fressian serialization, and atomic bounded compaction |
 | **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics & dashboards |
 
 ## Multi-Tenancy
@@ -103,6 +104,12 @@ Grain Sessions walks through the app as a teaching series:
 Every event-store operation is scoped to a `:tenant-id`, and the Postgres backend enforces isolation with Row-Level Security and per-tenant advisory locks. Start with an in-memory event store for quick iteration, then swap in SQLite for embedded single-process deployments or Postgres for multi-instance — a single line change either way.
 
 For multi-instance deployments, an opt-in control plane coordinates tenant assignment across nodes using event-sourced leases — no external coordination service required.
+
+## Event Definitions and Retention
+
+> Full documentation: [docs/event-definitions-and-retention.md](docs/event-definitions-and-retention.md)
+
+`defevent` registers an event's payload schema, description, and history contract while leaving `->event` construction unchanged. History is complete by default. A bounded policy is fail-closed and takes effect only after its exact value is durably activated; retention-capable v3 stores compact bounded batches atomically and append an eternal receipt. Unregistered events, transaction markers, and policies that do not match the loaded definition are never compacted.
 
 ## Distributed Coordination
 
@@ -128,7 +135,7 @@ Grain is MIT licensed. We use it in production, but it's actively evolving. The 
 
 ## More Information
 
-- **Docs**: [Core Concepts](docs/core-concepts.md) | [Event Model](docs/event-model.md) | [Allium Specs](docs/allium-specs.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
+- **Docs**: [Core Concepts](docs/core-concepts.md) | [Event Definitions and Retention](docs/event-definitions-and-retention.md) | [Event Model](docs/event-model.md) | [Allium Specs](docs/allium-specs.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
 - **Examples**: [`grain-todo-list`](https://github.com/ObneyAI/grain-todo-list), `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
 - **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians

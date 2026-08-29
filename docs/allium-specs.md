@@ -4,7 +4,7 @@ Behavioural specifications for Grain components and accepted component designs.
 Each spec captures *what* a component does and *why* it matters — not *how* it is
 implemented — and lives at `components/<name>/<name>.allium` (Allium language v3).
 
-**38 components** — 2 domain, 27 library, 9 infrastructure. All pass `allium check` and `allium analyse` with no errors and no findings.
+**39 components** — 2 domain, 28 library, 9 infrastructure. All pass `allium check` and `allium analyse` with no errors and no findings.
 
 Implemented-component specs were distilled and then adversarially audited against
 their source and tests. Spec-first designs are identified explicitly and do not
@@ -30,7 +30,7 @@ A minimal reference CQRS/event-sourced domain service that manages named Counter
 
 <sub>entities 2 · rules 4 · contracts 0 · invariants 1 · surfaces 1</sub>
 
-## Library / Framework (26)
+## Library / Framework (28)
 
 *Reusable mechanisms specified as boundary `contract`s with `@invariant` guarantees plus `surface`s.*
 
@@ -88,6 +88,17 @@ The spec captures event-model as the topology vocabulary and well-formedness gra
 
 <sub>entities 4 · variants 7 · contracts 4 · invariants 3 · surfaces 2 · actors 2</sub>
 
+### [`event-model-validator`](../components/event-model-validator/event-model-validator.allium)
+
+The structural validator and boot guard reconcile a service-area Event Model
+against the live Grain registries without executing application behavior. The
+spec covers total typed findings, area-scoped validation, strict coverage and
+declared-edge checks, and bounded-history facts: registered definitions must be
+modeled with compatible schemas, while todo processors may not subscribe to an
+expiring event until checkpoint safety can be proven.
+
+<sub>entities 2 · contracts 3 · invariants 9 · surfaces 2 · actors 2</sub>
+
 ### [`event-notifier-postgres`](../components/event-notifier-postgres/event-notifier-postgres.allium)
 
 A cross-instance event-notification bridge: when one node appends events for a tenant, every node observes a per-tenant signal and catches that tenant up by reading the new events from the durable store and republishing them onto its local bus with the tenant attached. The spec is a library/framework spec — boundary modelled as contracts (EventSource, LocalBus) plus external-entity placeholders (Tenant, Event), a per-tenant watermark entity, and surfaces — capturing notify-on-append, per-tenant gap-free/duplicate-free at-least-once delivery, ordering, tenant isolation, internal-event filtering, and failure containment.
@@ -96,7 +107,7 @@ A cross-instance event-notification bridge: when one node appends events for a t
 
 ### [`event-retention`](../components/event-retention/event-retention.allium)
 
-**Spec-first design; not yet implemented.** An opt-in event-history compaction boundary: event definitions require a name, description and payload schema, retain complete history by default, and may declare an inert bounded-history policy using a fixed ISO 8601 duration and optional composite tag key. Durable activation is explicit and value-matched; structural boot validation and stored-data preflight fail closed; only a restricted event-store capability may atomically delete conservative bounded batches while recording exact durable receipts. Activation workflow remains application policy rather than framework behaviour.
+An implemented opt-in event-history compaction boundary: event definitions require a name, description and payload schema, retain complete history by default, and may declare an inert bounded-history policy using a fixed ISO 8601 duration and optional composite tag key. Durable activation is explicit and value-matched; structural boot validation and stored-data preflight fail closed; only a restricted event-store capability may atomically delete conservative bounded batches while recording exact durable receipts. Activation workflow remains application policy rather than framework behaviour.
 
 <sub>entities 3 · rules 6 · contracts 4 · invariants 2 · surfaces 3 · actors 3</sub>
 

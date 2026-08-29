@@ -166,7 +166,10 @@ EDN verdict without executing commands:
 ```
 
 Strict mode requires full live-block coverage and declared production/read edges,
-and makes schema, wiring, production, and read mismatches fatal. Applications may
+and makes schema, wiring, production, and read mismatches fatal. Registered
+`defevent` definitions are reconciled with modeled events; a bounded definition
+must be modeled, schema-compatible, and free of todo-processor subscribers before
+boot verification succeeds. Applications may
 register each service area with the `grain-event-model` package:
 
 ```clojure

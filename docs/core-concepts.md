@@ -8,7 +8,7 @@ Code samples in this doc assume the following requires are in scope:
          '[ai.obney.grain.todo-processor-v2.interface     :refer [defprocessor]]
          '[ai.obney.grain.periodic-task.interface         :refer [defperiodic]]
          '[ai.obney.grain.read-model-processor-v2.interface :as rmp :refer [defreadmodel]]
-         '[ai.obney.grain.event-store-v3.interface        :refer [->event]])
+         '[ai.obney.grain.event-store-v3.interface        :refer [->event defevent]])
 ```
 
 ## Multi-Tenancy
@@ -56,6 +56,26 @@ Events are immutable facts about what happened:
 ```
 
 **Always use `->event` to construct events.** It generates UUID v7 IDs (time-ordered) required by the event store for correct ordering and deduplication. Never construct event maps manually with `java.util.UUID/randomUUID` — events with v4 UUIDs will be silently misordered or lost.
+
+### Event Definitions
+
+`defevent` optionally registers an event type's schema, documentation, and
+history contract. It does not construct events, so existing `->event` call sites
+remain unchanged:
+
+```clojure
+(defevent :example/counter-created
+  "A counter was created."
+  {:schema [:map
+            [:counter-id :uuid]
+            [:name :string]]})
+```
+
+Omitting `:history` means permanent, complete history. A bounded history policy
+is inert until its exact normalized value is durably activated, and it is
+subject to boot validation and stored-data preflight checks. See
+[Event Definitions and Retention](event-definitions-and-retention.md) before
+making an event type eligible for compaction.
 
 ## Queries (Read Side)
 
