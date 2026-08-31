@@ -503,8 +503,10 @@
      :context          - optional app context map merged into each handler's context
      :poll-interval-ms - poll frequency (default 250)
      :batch-size       - max events per tenant per cycle (default 100)
-     :thread-pool-size - handler dispatch pool size (default 32)"
-  [{:keys [event-store tenant-ids context poll-interval-ms batch-size thread-pool-size]
+     :thread-pool-size - handler dispatch pool size (default 32)
+     :lease-check-fn   - optional `(fn [tenant-id processor-name])` ownership fence"
+  [{:keys [event-store tenant-ids context poll-interval-ms batch-size
+           thread-pool-size lease-check-fn]
     :or {poll-interval-ms 250
          batch-size 100
          thread-pool-size 32}}]
@@ -520,6 +522,9 @@
         owned-tenants (fn [] (if (instance? clojure.lang.Atom tenant-ids)
                                @tenant-ids
                                tenant-ids))
+        owns-lease? (fn [tenant-id processor-name]
+                      (or (nil? lease-check-fn)
+                          (lease-check-fn tenant-id processor-name)))
         poll-thread
         (Thread.
          (fn []
@@ -551,7 +556,12 @@
                    (when @running
                      (doseq [[proc-name proc-config] registry]
                        (when @running
-                         (let [flight-key [tid proc-name]
+                         (if-not (owns-lease? tid proc-name)
+                           ;; A node may regain this lease without restarting.
+                           ;; Forget node-local progress so the next owned pass
+                           ;; reloads the shared durable processor checkpoint.
+                           (swap! watermarks update tid dissoc proc-name)
+                           (let [flight-key [tid proc-name]
                                wm-entry (get-in @watermarks [tid proc-name] ::uninit)
                                tenant-wm (get tenant-wms tid)
                                skip? (and (not (identical? ::uninit wm-entry))
@@ -565,7 +575,9 @@
                                ^Runnable
                                (fn []
                                  (try
-                                   (let [wm-entry (get-in @watermarks [tid proc-name] ::uninit)
+                                   (if-not (owns-lease? tid proc-name)
+                                     (swap! watermarks update tid dissoc proc-name)
+                                     (let [wm-entry (get-in @watermarks [tid proc-name] ::uninit)
                                          wm (if (identical? ::uninit wm-entry)
                                               (let [db-wm (get-last-processed-id
                                                            event-store tid proc-name)]
@@ -586,58 +598,71 @@
                                              handler-fn (:handler-fn proc-config)
                                              flush-batch (fn []
                                                            (when (seq @batch-source-events)
-                                                             (let [append-result (append-batch-with-checkpoint
-                                                                                  event-store tid proc-name
-                                                                                  (get-in @watermarks
-                                                                                          [tid proc-name])
-                                                                                  @batch-source-events
-                                                                                  @batch-result-events)
-                                                                   last-event-id (:event/id (last @batch-source-events))]
-                                                               (if (anomaly? append-result)
-                                                                 (swap! watermarks assoc-in
-                                                                        [tid proc-name]
-                                                                        (get-last-processed-id event-store tid proc-name))
-                                                                 (swap! watermarks assoc-in [tid proc-name] last-event-id))
-                                                               (reset! batch-source-events [])
-                                                               (reset! batch-result-events []))))]
+                                                             (if-not (owns-lease? tid proc-name)
+                                                               (swap! watermarks update tid dissoc proc-name)
+                                                               (let [append-result (append-batch-with-checkpoint
+                                                                                    event-store tid proc-name
+                                                                                    (get-in @watermarks
+                                                                                            [tid proc-name])
+                                                                                    @batch-source-events
+                                                                                    @batch-result-events)
+                                                                     last-event-id (:event/id (last @batch-source-events))]
+                                                                 (if (anomaly? append-result)
+                                                                   (swap! watermarks assoc-in
+                                                                          [tid proc-name]
+                                                                          (get-last-processed-id event-store tid proc-name))
+                                                                   (swap! watermarks assoc-in [tid proc-name] last-event-id))))
+                                                             (reset! batch-source-events [])
+                                                             (reset! batch-result-events [])))]
                                          ;; Process events sequentially within this tenant
                                          (doseq [event events]
                                            (when @running
-                                             (let [ctx (merge context
-                                                              {:event event
-                                                               :handler-fn handler-fn
-                                                               :event-store event-store
-                                                               :tenant-id tid})
-                                                   result (or (handler-fn ctx) {})]
-                                               (if (or (:result/effect result)
-                                                       (:result/cas result))
-                                                 (do
-                                                   (flush-batch)
-                                                   (process-event (assoc ctx :processor-name proc-name))
-                                                   (when-let [processed-id (get-last-processed-id
-                                                                            event-store tid proc-name)]
-                                                     (swap! watermarks assoc-in
-                                                            [tid proc-name] processed-id)))
-                                                 (do
-                                                   (swap! batch-source-events conj event)
-                                                   (when-let [revents (:result/events result)]
-                                                     (swap! batch-result-events into revents)))))))
+                                             (if-not (owns-lease? tid proc-name)
+                                               (do
+                                                 (reset! batch-source-events [])
+                                                 (reset! batch-result-events [])
+                                                 (swap! watermarks update tid dissoc proc-name))
+                                               (let [ctx (merge context
+                                                                {:event event
+                                                                 :handler-fn handler-fn
+                                                                 :event-store event-store
+                                                                 :tenant-id tid})
+                                                     result (or (handler-fn ctx) {})]
+                                                 (if (or (:result/effect result)
+                                                         (:result/cas result))
+                                                   (do
+                                                     (flush-batch)
+                                                     (process-event
+                                                      (cond-> (assoc ctx :processor-name proc-name)
+                                                        lease-check-fn
+                                                        (assoc :lease-check-fn lease-check-fn)))
+                                                     (if (owns-lease? tid proc-name)
+                                                       (when-let [processed-id (get-last-processed-id
+                                                                                event-store tid proc-name)]
+                                                         (swap! watermarks assoc-in
+                                                                [tid proc-name] processed-id))
+                                                       (swap! watermarks update tid dissoc proc-name)))
+                                                   (do
+                                                     (swap! batch-source-events conj event)
+                                                     (when-let [revents (:result/events result)]
+                                                       (swap! batch-result-events into revents))))))))
                                          ;; Batch checkpoint
                                          (flush-batch))
                                        ;; Fallback read returned nothing. Advance pair_wm
                                        ;; to the probed tenant_wm (only forward) so this
                                        ;; pair becomes eligible to skip on subsequent ticks.
-                                       (when-let [tw tenant-wm]
-                                         (swap! watermarks update-in [tid proc-name]
-                                                (fn [cur]
-                                                  (cond
-                                                    (nil? cur) tw
-                                                    (uuid/< cur tw) tw
-                                                    :else cur))))))
+                                       (when (owns-lease? tid proc-name)
+                                         (when-let [tw tenant-wm]
+                                           (swap! watermarks update-in [tid proc-name]
+                                                  (fn [cur]
+                                                    (cond
+                                                      (nil? cur) tw
+                                                      (uuid/< cur tw) tw
+                                                      :else cur))))))))
                                    (catch Throwable t
                                      (u/log ::poller-handler-error :exception t))
                                    (finally
-                                     (.remove in-flight flight-key))))))))))))
+                                     (.remove in-flight flight-key)))))))))))))
                (catch Throwable t
                  (u/log ::tenant-poller-error :exception t)))
              (Thread/sleep poll-interval-ms))))]

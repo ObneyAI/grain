@@ -949,6 +949,96 @@
 
 ;; 13. Coalesced tenant poller
 
+(deftest coalesced-poller-fences-non-owner-and-reassignment
+  (testing "two processor sets run pure/effect handlers only while they own the tenant"
+    (let [tenant-id (random-uuid)
+          owner (atom :worker-b)
+          pure-calls (atom [])
+          effect-calls (atom [])
+          lease-checks (atom [])
+          previous @core/processor-registry*
+          checkpoint-count
+          (fn []
+            (count (into []
+                         (es/read *event-store*
+                                  {:tenant-id tenant-id
+                                   :types #{:grain/todo-processor-checkpoint}}))))
+          await
+          (fn [pred]
+            (let [deadline (+ (System/currentTimeMillis) 3000)]
+              (loop []
+                (cond
+                  (pred) true
+                  (> (System/currentTimeMillis) deadline) false
+                  :else (do (Thread/sleep 20) (recur))))))
+          pollers (atom [])]
+      (try
+        (core/register-processor!
+         :test/lease-pure
+         {:topics #{:test/event-1}
+          :handler-fn
+          (fn [{:keys [worker-id event]}]
+            (swap! pure-calls conj [worker-id (:num event)])
+            {})})
+        (core/register-processor!
+         :test/lease-effect
+         {:topics #{:test/event-1}
+          :handler-fn
+          (fn [{:keys [worker-id event]}]
+            {:result/checkpoint :after
+             :result/effect
+             #(swap! effect-calls conj [worker-id (:num event)])})})
+        (es/append *event-store*
+                   {:tenant-id tenant-id
+                    :events [(make-event :test/event-1 :body {:num 1})]})
+        (let [start-worker
+              (fn [worker-id]
+                (core/start-tenant-poller
+                 {:event-store *event-store*
+                  :tenant-ids #{tenant-id}
+                  :context {:worker-id worker-id}
+                  :lease-check-fn
+                  (fn [checked-tenant processor-name]
+                    (swap! lease-checks conj
+                           [worker-id checked-tenant processor-name @owner])
+                    (and (= tenant-id checked-tenant)
+                         (= worker-id @owner)))
+                  :poll-interval-ms 25
+                  :batch-size 100}))
+              worker-a (start-worker :worker-a)]
+          (swap! pollers conj worker-a)
+          (Thread/sleep 300)
+          (is (empty? @pure-calls) (pr-str @pure-calls))
+          (is (empty? @effect-calls) (pr-str @effect-calls))
+          (is (zero? (checkpoint-count))
+              "a non-owner cannot advance either processor checkpoint")
+          (is (seq @lease-checks)
+              "the coalesced poller actually consults the supplied lease")
+
+          (let [worker-b (start-worker :worker-b)]
+            (swap! pollers conj worker-b)
+            (is (await #(and (= [[:worker-b 1]] @pure-calls)
+                             (= [[:worker-b 1]] @effect-calls)
+                             (= 2 (checkpoint-count))))
+                (pr-str {:pure @pure-calls
+                         :effect @effect-calls
+                         :checkpoints (checkpoint-count)}))
+
+            (reset! owner :worker-a)
+            (es/append *event-store*
+                       {:tenant-id tenant-id
+                        :events [(make-event :test/event-1 :body {:num 2})]})
+            (is (await #(and (= [[:worker-b 1] [:worker-a 2]] @pure-calls)
+                             (= [[:worker-b 1] [:worker-a 2]] @effect-calls)
+                             (= 4 (checkpoint-count))))
+                (pr-str {:pure @pure-calls
+                         :effect @effect-calls
+                         :checkpoints (checkpoint-count)}))))
+        (finally
+          (doseq [poller @pollers]
+            (core/stop-tenant-poller poller))
+          (reset! core/processor-registry* previous))))))
+
 (deftest tw2-change-detection-completeness
   (testing "TW2: Coalesced poller detects and processes only changed tenants"
     (let [processed (atom {})

@@ -130,6 +130,10 @@
                        {:event-store (:event-store ctx)
                         :tenant-ids tenant-ids-atom
                         :context (::app-context ctx)
+                        :lease-check-fn
+                        (fn [tenant-id _processor-name]
+                          (= node-id
+                             (get (project-lease-ownership ctx) tenant-id)))
                         :poll-interval-ms 250
                         :batch-size 100
                         :thread-pool-size 32})]
