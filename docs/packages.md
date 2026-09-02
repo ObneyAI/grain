@@ -7,7 +7,7 @@ Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 proc
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "589a9ae6d1d60a02a894e1f21dc9bc7a3ab690a3"
+ :git/sha "464fc35e423ea20a2914804307c681f4ca2ac196"
  :deps/root "projects/grain-core-v2"}
 ```
 
@@ -18,7 +18,7 @@ Distributed coordination for multi-instance deployments. Coordinator election, t
 ```clojure
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "589a9ae6d1d60a02a894e1f21dc9bc7a3ab690a3"
+ :git/sha "464fc35e423ea20a2914804307c681f4ca2ac196"
  :deps/root "projects/grain-control-plane"}
 ```
 
@@ -35,7 +35,7 @@ Server-rendered reactive UIs with [Datastar](https://data-star.dev/). Streams hi
 ```clojure
 obneyai/grain-datastar
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "589a9ae6d1d60a02a894e1f21dc9bc7a3ab690a3"
+ :git/sha "464fc35e423ea20a2914804307c681f4ca2ac196"
  :deps/root "projects/grain-datastar"}
 ```
 
@@ -48,7 +48,7 @@ Dev-only nREPL-facing tools for coding agents working against a live Grain app. 
 ```clojure
 obneyai/grain-code-agent-tools
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "589a9ae6d1d60a02a894e1f21dc9bc7a3ab690a3"
+ :git/sha "464fc35e423ea20a2914804307c681f4ca2ac196"
  :deps/root "projects/grain-code-agent-tools"}
 ```
 
@@ -77,7 +77,7 @@ validation does not require Allium source files or the Allium CLI:
 ```clojure
 obneyai/grain-event-model
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "589a9ae6d1d60a02a894e1f21dc9bc7a3ab690a3"
+ :git/sha "464fc35e423ea20a2914804307c681f4ca2ac196"
  :deps/root "projects/grain-event-model"}
 ```
 
@@ -92,7 +92,7 @@ Multi-tenant Postgres backend with Row-Level Security, per-tenant advisory locks
 ```clojure
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "589a9ae6d1d60a02a894e1f21dc9bc7a3ab690a3"
+ :git/sha "464fc35e423ea20a2914804307c681f4ca2ac196"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
@@ -103,7 +103,7 @@ Embedded SQLite backend implementing the v3 event store protocol and privileged 
 ```clojure
 obneyai/grain-event-store-sqlite-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "589a9ae6d1d60a02a894e1f21dc9bc7a3ab690a3"
+ :git/sha "464fc35e423ea20a2914804307c681f4ca2ac196"
  :deps/root "projects/grain-event-store-sqlite-v3"}
 ```
 
@@ -130,7 +130,7 @@ The queue admits one active write plus `:write-queue-capacity` waiting writes. A
 ```clojure
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "589a9ae6d1d60a02a894e1f21dc9bc7a3ab690a3"
+ :git/sha "464fc35e423ea20a2914804307c681f4ca2ac196"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
