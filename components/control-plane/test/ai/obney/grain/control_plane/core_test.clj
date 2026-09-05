@@ -44,6 +44,28 @@
       (run! #(io/delete-file % true)
             (reverse (file-seq f))))))
 
+(deftest reactor-supplies-a-live-lease-predicate-to-the-tenant-poller
+  (let [tenant-id (uuid/v4)
+        node-a (uuid/v4)
+        node-b (uuid/v4)
+        leases (atom {tenant-id node-a})
+        captured (atom nil)
+        poller-atom (atom nil)
+        context {::cp/app-context {:service :test}
+                 :event-store ::store}]
+    (with-redefs [cp/project-lease-ownership (fn [_] @leases)
+                  tp/start-tenant-poller
+                  (fn [config]
+                    (reset! captured config)
+                    {:running (atom true)})]
+      (#'cp/reconcile-tenants! context node-a poller-atom)
+      (let [lease-check (:lease-check-fn @captured)]
+        (is (fn? lease-check) (pr-str @captured))
+        (is (true? (lease-check tenant-id :test/processor)))
+        (reset! leases {tenant-id node-b})
+        (is (false? (lease-check tenant-id :test/processor))
+            "the predicate reprojects ownership instead of capturing startup state")))))
+
 (deftest start-and-stop-lifecycle
   (testing "Control plane starts, emits heartbeats, and stops cleanly"
     (let [dir (str "/tmp/cp-lifecycle-test-" (uuid/v4))
