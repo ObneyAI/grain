@@ -8,6 +8,10 @@
             [ai.obney.grain.fressian-util.interface :as fressian]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.pubsub.interface :as pubsub]
+            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.kv-store.interface :as kv]
+            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [clojure.java.io :as io]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
             [clojure.core.async :as async]
@@ -266,8 +270,9 @@
     (is (contains? table-names "tenants"))
     (is (contains? table-names "events"))
     (is (contains? table-names "event_tags"))
-    (is (contains? index-names "idx_events_tenant_type"))
-    (is (contains? index-names "idx_events_tenant_id_order"))
+    (is (not (contains? index-names "idx_events_tenant_type")))
+    (is (contains? index-names "idx_events_tenant_type_id"))
+    (is (not (contains? index-names "idx_events_tenant_id_order")))
     (is (contains? index-names "idx_event_tags_event"))))
 
 ;; ================================ ;;
@@ -406,6 +411,121 @@
     (is (= 2 (count events)))
     (is (= #{(:event/id evt-a) (:event/id evt-b)}
            (set (map :event/id events))))))
+
+(deftest multi-type-reads-preserve-global-order-bounds-and-limit
+  (let [events (append-events! (mapv #(hash-map :type % :body {})
+                                    [:test/beta :test/alpha :test/gamma :test/beta :test/alpha]))
+        ids (mapv :event/id events)
+        query {:types #{:test/alpha :test/beta}}
+        read-ids #(mapv :event/id (read-events (merge query %)))]
+    (is (= (mapv ids [0 1 3 4]) (read-ids {})))
+    (is (= (mapv ids [3 4]) (read-ids {:after (ids 1)})))
+    (is (= (mapv ids [0 1 3]) (read-ids {:as-of (ids 3)})))
+    (is (= (mapv ids [4 3]) (read-ids {:reverse? true :limit 2})))
+    (is (= (mapv ids [0 1]) (read-ids {:limit 2})))
+    (is (= (mapv ids [3 1]) (read-ids {:as-of (ids 3) :reverse? true :limit 2})))
+    (is (empty? (read-ids {:after (ids 4)})))
+    (is (= (mapv ids [0 1 3 4])
+           (mapv :event/id (read-events [query {:types #{:test/beta}}]))))))
+
+(deftest multi-type-reads-isolate-tenants
+  (let [types #{:test/alpha :test/beta}
+        mine (append-events! [{:type :test/alpha} {:type :test/beta}])
+        other (uuid/v4)]
+    (es/append *event-store* {:tenant-id other
+                             :events [(es/->event {:type :test/alpha})
+                                      (es/->event {:type :test/beta})]})
+    (is (= (mapv :event/id mine) (mapv :event/id (read-events {:types types}))))
+    (is (empty? (into [] (es/read *event-store* {:tenant-id (uuid/v4) :types types}))))))
+
+(deftest type-filter-edge-cases-remain-compatible
+  (let [event (append-event! :test/alpha #{})
+        id (:event/id event)]
+    ;; Exercise backend normalization independently of the public set schema.
+    (doseq [types [[] [:test/alpha :test/alpha :test/beta]
+                   (into [:test/alpha] (map #(keyword "absent" (str %)) (range 499)))
+                   (into [:test/alpha] (map #(keyword "absent" (str %)) (range 500)))]]
+      (let [{:keys [sql params]} (#'sqlite-core/build-single-query
+                                 {:tenant-id *tenant-id* :types types})
+            rows (jdbc/execute! (pool) (into [sql] params)
+                                {:builder-fn rs/as-unqualified-maps})]
+        (is (= (if (empty? types) [] [(str id)]) (mapv :id rows)))))))
+
+(deftest existing-database-gains-type-id-index-idempotently
+  (let [event (append-event! :test/alpha #{})]
+    (jdbc/execute! (pool) ["DROP INDEX idx_events_tenant_type_id"])
+    (jdbc/execute! (pool) ["CREATE INDEX idx_events_tenant_type ON events(tenant_id, type)"])
+    (jdbc/execute! (pool) ["CREATE INDEX idx_events_tenant_id_order ON events(tenant_id, id)"])
+    (dotimes [_ 2]
+      (sqlite-core/init-idempotently {::sqlite-core/connection-pool (pool)}))
+    (is (empty? (jdbc/execute! (pool)
+                              ["SELECT name FROM sqlite_master WHERE name IN ('idx_events_tenant_type', 'idx_events_tenant_id_order')"])))
+    (is (= ["tenant_id" "type" "id"]
+           (mapv :name (jdbc/execute! (pool) ["PRAGMA index_info(idx_events_tenant_type_id)"]
+                                      {:builder-fn rs/as-unqualified-maps}))))
+    (is (= [(:event/id event)] (mapv :event/id (read-events {:types #{:test/alpha}}))))))
+
+(deftest sparse-multi-type-freshness-seeks-past-watermark
+  (let [old (append-event! :test/alpha #{})
+        query {:tenant-id *tenant-id* :types #{:test/alpha :test/beta}
+               :after (:event/id old)}]
+    (append-events! (vec (repeat 2000 {:type :test/gamma})))
+    ;; Match the existing-database startup statistics policy.
+    (sqlite-core/init-idempotently {::sqlite-core/connection-pool (pool)})
+    (let [{:keys [sql params]} (#'sqlite-core/build-single-query query)
+          details (mapv :detail (jdbc/execute! (pool) (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                               {:builder-fn rs/as-unqualified-maps}))]
+      (is (= 2 (count (filter #(re-find #"tenant_id=\? AND type=\? AND id>\?" %) details)))
+          (str details))
+      (is (not-any? #(re-find #"TEMP B-TREE|SCAN events" %) details) (str details)))
+    (is (empty? (read-events query)))
+    (let [new (append-event! :test/beta #{})]
+      (is (= [(:event/id new)] (mapv :event/id (read-events query)))))))
+
+(deftest sqlite-warm-projection-remains-immediately-fresh
+  (let [dir (str *db-file* "-cache")
+        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+        context {:event-store *event-store* :cache cache :tenant-id *tenant-id*}
+        args {:name :sqlite-test/sparse :version 1 :l1-ttl-ms 0
+              :query {:types #{:test/alpha :test/beta}}
+              :f (fn [state event] (update state :ids (fnil conj []) (:event/id event)))}]
+    (try
+      (rmp/l1-clear!)
+      (let [first-event (append-event! :test/alpha #{})
+            expected {:ids [(:event/id first-event)]}]
+        (is (= expected (rmp/p context args)))
+        (append-events! (vec (repeat 100 {:type :test/gamma})))
+        (dotimes [_ 3] (is (= expected (rmp/p context args))))
+        (let [second-event (append-event! :test/beta #{})]
+          (is (= {:ids [(:event/id first-event) (:event/id second-event)]}
+                 (rmp/p context args)))))
+      (finally
+        (rmp/l1-clear!)
+        (kv/stop cache)
+        (doseq [file (reverse (file-seq (io/file dir)))] (io/delete-file file true))))))
+
+(deftest multi-type-cas-serializes-across-store-instances
+  (let [store *event-store*
+        other-store (es/start {:conn {:type :sqlite :database-file *db-file*}})
+        tenant *tenant-id*
+        old (append-event! :test/gamma #{})
+        gate (promise)
+        append (fn [store type]
+                 @gate
+                 (es/append store {:tenant-id tenant :events [(es/->event {:type type})]
+                                   :cas {:types #{:test/alpha :test/beta}
+                                         :after (:event/id old)
+                                         :predicate-fn #(empty? (into [] %))}}))]
+    (try
+      (let [a (future (append store :test/alpha))
+            b (future (append other-store :test/beta))]
+        (deliver gate true)
+        (let [results [(deref a 10000 ::timeout) (deref b 10000 ::timeout)]]
+          (is (not-any? #{::timeout} results))
+          (is (= 1 (count (filter vector? results))))
+          (is (= 1 (count (filter #(= ::anom/conflict (::anom/category %)) results)))))
+        (is (= 1 (count (read-events {:types #{:test/alpha :test/beta}})))))
+      (finally (es/stop other-store)))))
 
 (deftest filter-by-after
   (let [evt1 (append-event! :test/alpha #{} {:n 1})

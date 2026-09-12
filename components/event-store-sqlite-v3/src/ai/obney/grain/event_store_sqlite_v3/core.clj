@@ -39,9 +39,12 @@
      PRIMARY KEY (tenant_id, id)
     );"
 
-   "CREATE INDEX IF NOT EXISTS idx_events_tenant_type     ON events(tenant_id, type);"
+   "CREATE INDEX IF NOT EXISTS idx_events_tenant_type_id ON events(tenant_id, type, id);"
    "CREATE INDEX IF NOT EXISTS idx_events_tenant_type_time_id ON events(tenant_id, type, time, id);"
-   "CREATE INDEX IF NOT EXISTS idx_events_tenant_id_order ON events(tenant_id, id);"
+   ;; Migrate existing stores too: the type prefix is covered by type_id,
+   ;; and the primary key already indexes (tenant_id, id).
+   "DROP INDEX IF EXISTS idx_events_tenant_type;"
+   "DROP INDEX IF EXISTS idx_events_tenant_id_order;"
 
    "CREATE TABLE IF NOT EXISTS event_tags (
      tenant_id TEXT NOT NULL,
@@ -196,6 +199,7 @@
   "Build SQL + params for a single read query.
 
    No-tags case:  SELECT ... FROM events WHERE tenant_id = ? [AND ...] ORDER BY id
+                 Multi-type filters merge per-type SELECTs with UNION ALL.
    Tags case:     SELECT ... FROM events e
                   JOIN event_tags t ON t.tenant_id = e.tenant_id AND t.event_id = e.id
                   WHERE e.tenant_id = ? AND t.tag IN (...) [AND ...]
@@ -235,18 +239,30 @@
                      "ORDER BY e.id" order-dir
                      (when limit " LIMIT ?"))]
         {:sql sql :params params})
-      (let [type-strs (when types (mapv #(str ":" (key-fn %)) types))
+      (let [type-strs (when types (vec (distinct (map #(str ":" (key-fn %)) types))))
+            ;; Each equality branch can stream an id range from the composite
+            ;; index; SQLite merges these streams without sorting dense results.
+            ;; Keep the IN form for empty/unfiltered queries and above SQLite's
+            ;; default 500-term compound-select limit, preserving large filters.
+            union? (<= 2 (count type-strs) 500)
             where-parts (cond-> ["tenant_id = ?"]
-                          types (conj (str "type IN (" (placeholders (count type-strs)) ")"))
+                          types (conj (if union? "type = ?"
+                                          (str "type IN (" (placeholders (count type-strs)) ")")))
                           after (conj "id > ?")
                           as-of (conj "id <= ?"))
-            params (cond-> [tenant-str]
-                     types (into type-strs)
-                     after (conj (str after))
-                     as-of (conj (str as-of))
+            branch-params (fn [selected-types]
+                            (cond-> (into [tenant-str] selected-types)
+                              after (conj (str after))
+                              as-of (conj (str as-of))))
+            params (cond-> (if union?
+                             (into [] (mapcat #(branch-params [%])) type-strs)
+                             (branch-params type-strs))
                      limit (conj limit))
-            sql (str "SELECT id, time, type, data FROM events "
-                     "WHERE " (string/join " AND " where-parts) " "
+            branch (str "SELECT id, time, type, data FROM events "
+                        "WHERE " (string/join " AND " where-parts))
+            sql (str (if union?
+                       (string/join " UNION ALL " (repeat (count type-strs) branch))
+                       branch) " "
                      "ORDER BY id" order-dir
                      (when limit " LIMIT ?"))]
         {:sql sql :params params}))))
