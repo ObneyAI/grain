@@ -1039,6 +1039,117 @@
             (core/stop-tenant-poller poller))
           (reset! core/processor-registry* previous))))))
 
+(deftest coalesced-poller-supplies-live-scoped-lease-ownership
+  (testing "a handler can re-check its captured tenant and processor ownership"
+    (let [tenant-id (random-uuid)
+          owned? (atom true)
+          captured-context (promise)
+          previous @core/processor-registry*]
+      (try
+        (tp/register-processor!
+         :test/live-lease-context
+         {:topics #{:test/event-1}
+          :handler-fn (fn [context]
+                        (deliver captured-context context)
+                        {})})
+        (es/append *event-store*
+                   {:tenant-id tenant-id
+                    :events [(make-event :test/event-1 :body {:num 1})]})
+        (let [poller (tp/start-tenant-poller
+                      {:event-store *event-store*
+                       :tenant-ids #{tenant-id}
+                       :lease-check-fn
+                       (fn [checked-tenant processor-name]
+                         (and @owned?
+                              (= tenant-id checked-tenant)
+                              (= :test/live-lease-context processor-name)))
+                       :poll-interval-ms 25
+                       :batch-size 100})]
+          (try
+            (let [context (deref captured-context 3000 ::timed-out)
+                  lease-owned? (when (map? context) (:lease-owned? context))]
+              (is (map? context) "the owned processor should receive its event")
+              (is (fn? lease-owned?) (pr-str context))
+              (when (fn? lease-owned?)
+                (is (true? (lease-owned?)))
+                (reset! owned? false)
+                (is (false? (lease-owned?))
+                    "the same captured capability must consult live ownership")))
+            (finally
+              (tp/stop-tenant-poller poller))))
+        (finally
+          (reset! core/processor-registry* previous))))))
+
+(deftest coalesced-poller-live-lease-ownership-fails-closed
+  (testing "an ownership-source exception is reported to the handler as lease loss"
+    (let [tenant-id (random-uuid)
+          lease-state (atom :owned)
+          captured-context (promise)
+          previous @core/processor-registry*]
+      (try
+        (tp/register-processor!
+         :test/failing-live-lease-context
+         {:topics #{:test/event-1}
+          :handler-fn (fn [context]
+                        (deliver captured-context context)
+                        {})})
+        (es/append *event-store*
+                   {:tenant-id tenant-id
+                    :events [(make-event :test/event-1 :body {:num 1})]})
+        (let [poller (tp/start-tenant-poller
+                      {:event-store *event-store*
+                       :tenant-ids #{tenant-id}
+                       :lease-check-fn
+                       (fn [_tenant-id _processor-name]
+                         (case @lease-state
+                           :owned true
+                           :error (throw (ex-info "ownership unavailable" {}))))
+                       :poll-interval-ms 25
+                       :batch-size 100})]
+          (try
+            (let [context (deref captured-context 3000 ::timed-out)
+                  lease-owned? (when (map? context) (:lease-owned? context))]
+              (is (fn? lease-owned?) (pr-str context))
+              (when (fn? lease-owned?)
+                (reset! lease-state :error)
+                (is (false? (lease-owned?))
+                    "an unavailable ownership source must fail closed")))
+            (finally
+              (tp/stop-tenant-poller poller))))
+        (finally
+          (reset! core/processor-registry* previous))))))
+
+(deftest standalone-coalesced-poller-does-not-fabricate-lease-ownership
+  (testing "the reserved live-ownership capability is absent without a lease source"
+    (let [tenant-id (random-uuid)
+          captured-context (promise)
+          previous @core/processor-registry*]
+      (try
+        (tp/register-processor!
+         :test/standalone-lease-context
+         {:topics #{:test/event-1}
+          :handler-fn (fn [context]
+                        (deliver captured-context context)
+                        {})})
+        (es/append *event-store*
+                   {:tenant-id tenant-id
+                    :events [(make-event :test/event-1 :body {:num 1})]})
+        (let [poller (tp/start-tenant-poller
+                      {:event-store *event-store*
+                       :tenant-ids #{tenant-id}
+                       :context {:lease-owned? (constantly true)}
+                       :poll-interval-ms 25
+                       :batch-size 100})]
+          (try
+            (let [context (deref captured-context 3000 ::timed-out)]
+              (is (map? context) "the standalone processor should still receive its event")
+              (is (not (contains? context :lease-owned?))
+                  "only a configured Grain lease source may supply the capability"))
+            (finally
+              (tp/stop-tenant-poller poller))))
+        (finally
+          (reset! core/processor-registry* previous))))))
+
 (deftest tw2-change-detection-completeness
   (testing "TW2: Coalesced poller detects and processes only changed tenants"
     (let [processed (atom {})

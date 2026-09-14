@@ -61,13 +61,17 @@
 (defn project-lease-ownership []
   (rmp/project *ctx* :grain.control/lease-ownership))
 
+(defn project-lease-release-history []
+  (rmp/project *ctx* :grain.control/lease-release-history))
+
 ;; =====================================
 ;; Active Nodes Read Model
 ;; =====================================
 
 (deftest read-model-definitions-register-declarative-metadata
   (let [active-nodes (get @rmp/read-model-registry* :grain.control/active-nodes)
-        lease-ownership (get @rmp/read-model-registry* :grain.control/lease-ownership)]
+        lease-ownership (get @rmp/read-model-registry* :grain.control/lease-ownership)
+        release-history (get @rmp/read-model-registry* :grain.control/lease-release-history)]
     (is (= "Projects the currently active control-plane nodes."
            (:definition/description active-nodes)))
     (is (= [:map-of :uuid
@@ -79,7 +83,11 @@
     (is (= "Projects the node currently owning each tenant lease."
            (:definition/description lease-ownership)))
     (is (= [:map-of :uuid :uuid]
-           (:schema lease-ownership)))))
+           (:schema lease-ownership)))
+    (is (= "Projects the durable last release time for each tenant lease."
+           (:definition/description release-history)))
+    (is (= [:map-of :uuid :int]
+           (:schema release-history)))))
 
 (deftest active-nodes-empty-initially
   (is (= {} (project-active-nodes))))
@@ -162,6 +170,33 @@
     (append-control-events! [(events/->lease-released node-a tenant-1)])
     (append-control-events! [(events/->lease-acquired node-b tenant-1)])
     (is (= node-b (get (project-lease-ownership) tenant-1)))))
+
+(deftest lease-release-history-uses-the-latest-store-assigned-timestamp
+  (let [node-a (uuid/v7)
+        node-b (uuid/v7)
+        tenant-id (uuid/v4)
+        [first-release] (append-control-events!
+                          [(events/->lease-released node-a tenant-id)])
+        first-released-at (-> first-release :event/timestamp .toInstant .toEpochMilli)]
+    (is (= {tenant-id first-released-at}
+           (project-lease-release-history)))
+    (let [[second-release] (append-control-events!
+                             [(events/->lease-released node-b tenant-id)])
+          second-released-at (-> second-release :event/timestamp .toInstant .toEpochMilli)]
+      (is (= {tenant-id second-released-at}
+             (project-lease-release-history)))
+      (is (= second-released-at
+             (->> (es/read (:event-store *ctx*)
+                           {:tenant-id events/control-plane-tenant-id
+                            :types #{:grain.control/lease-released}
+                            :reverse? true
+                            :limit 1})
+                  (into [])
+                  first
+                  :event/timestamp
+                  .toInstant
+                  .toEpochMilli))
+          "raw release history and the projection agree"))))
 
 ;; =====================================
 ;; CP8: Tenant Isolation

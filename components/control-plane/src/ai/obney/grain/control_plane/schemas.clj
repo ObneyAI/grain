@@ -56,4 +56,9 @@
     {:description "Current tenant lease ownership."
      :consumes #{:grain.control/lease-acquired :grain.control/lease-released}
      :schema [:map-of :uuid :uuid]
-     :version 2}}})
+     :version 2}
+    :grain.control/lease-release-history
+    {:description "Durable last release time for each tenant lease."
+     :consumes #{:grain.control/lease-released}
+     :schema [:map-of :uuid :int]
+     :version 1}}})

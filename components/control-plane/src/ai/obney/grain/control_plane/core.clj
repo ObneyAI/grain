@@ -28,6 +28,11 @@
   [ctx]
   (rmp/project ctx :grain.control/lease-ownership))
 
+(defn project-lease-release-history
+  "Project each tenant lease's last event-store-assigned release time in ms."
+  [ctx]
+  (rmp/project ctx :grain.control/lease-release-history))
+
 (defn emit-heartbeat!
   "Append a heartbeat event for this node."
   [ctx node-id metadata]
@@ -77,22 +82,59 @@
       (when (seq acquisitions)
         (u/log :metric/metric :metric/name "LeaseAcquired" :metric/value (count acquisitions) :metric/resolution :low)))))
 
+(defn- acquisition-eligible?
+  [current-leases release-history reassignment-interval-ms now-ms
+   {:keys [tenant-id]}]
+  (or (zero? reassignment-interval-ms)
+      (and (not (contains? current-leases tenant-id))
+           (if-let [released-at-ms (get release-history tenant-id)]
+             (>= (- now-ms released-at-ms) reassignment-interval-ms)
+             true))))
+
+(defn- validate-reassignment-interval!
+  [reassignment-interval-ms]
+  (when-not (and (integer? reassignment-interval-ms)
+                 (not (neg? reassignment-interval-ms)))
+    (throw (ex-info "reassignment interval must be a nonnegative integer"
+                    {:reassignment-interval-ms reassignment-interval-ms})))
+  reassignment-interval-ms)
+
 (defn run-assignment!
   "Run one assignment cycle: project state, compute assignment, emit diffs.
-   Only the coordinator should call this."
-  [ctx node-id staleness-threshold-ms strategy]
-  (u/trace ::assignment-cycle
-    [:metric/name "AssignmentCycle" :metric/resolution :low :node-id node-id]
-    (let [active-nodes (project-active-nodes ctx staleness-threshold-ms)
-          current-leases (project-lease-ownership ctx)
-          domain-tenants (-> (es/tenants (:event-store ctx))
-                             keys
-                             set
-                             (disj events/control-plane-tenant-id))
-          desired (assignment/assign active-nodes domain-tenants current-leases strategy)
-          {:keys [release acquire]} (compute-lease-diff desired current-leases)]
-      (when (or (seq release) (seq acquire))
-        (emit-lease-changes! ctx release acquire)))))
+   Only the coordinator should call this. The optional fifth argument accepts
+   :reassignment-interval-ms and :clock-ms-fn."
+  ([ctx node-id staleness-threshold-ms strategy]
+   (run-assignment! ctx node-id staleness-threshold-ms strategy {}))
+  ([ctx node-id staleness-threshold-ms strategy
+    {:keys [reassignment-interval-ms clock-ms-fn]
+     :or {reassignment-interval-ms 0
+          clock-ms-fn #(System/currentTimeMillis)}}]
+   (validate-reassignment-interval! reassignment-interval-ms)
+   (u/trace ::assignment-cycle
+     [:metric/name "AssignmentCycle" :metric/resolution :low :node-id node-id]
+     (let [active-nodes (project-active-nodes ctx staleness-threshold-ms)
+           current-leases (project-lease-ownership ctx)
+           positive-interval? (pos? reassignment-interval-ms)
+           release-history (if positive-interval?
+                             (project-lease-release-history ctx)
+                             {})
+           domain-tenants (-> (es/tenants (:event-store ctx))
+                              keys
+                              set
+                              (disj events/control-plane-tenant-id))
+           desired (assignment/assign active-nodes domain-tenants current-leases strategy)
+           {:keys [release acquire]} (compute-lease-diff desired current-leases)
+           now-ms (when positive-interval?
+                    (clock-ms-fn))
+           ;; This delay narrows the probability that old and new owners overlap;
+           ;; it is not a correctness fence. Processor checks and durable CAS
+           ;; remain responsible for rejecting stale work.
+           eligible-acquisitions (filterv #(acquisition-eligible?
+                                             current-leases release-history
+                                             reassignment-interval-ms now-ms %)
+                                          acquire)]
+       (when (or (seq release) (seq eligible-acquisitions))
+         (emit-lease-changes! ctx release eligible-acquisitions))))))
 
 (defn- heartbeat-handler
   "Called periodically to emit a heartbeat for this node."
@@ -143,14 +185,16 @@
   "Called periodically to run the assignment cycle if this node is coordinator,
    then reconcile local processors with lease assignments."
   [{:keys [ctx node-id staleness-threshold-ms strategy
-           poller-atom]}]
+           reassignment-interval-ms clock-ms-fn poller-atom]}]
   (fn [_time]
     (try
       (let [active-nodes (project-active-nodes ctx staleness-threshold-ms)
             coordinator (assignment/coordinator active-nodes)]
         (when (= node-id coordinator)
           (u/log ::running-assignment :node-id node-id)
-          (run-assignment! ctx node-id staleness-threshold-ms strategy)))
+          (run-assignment! ctx node-id staleness-threshold-ms strategy
+                           {:reassignment-interval-ms reassignment-interval-ms
+                            :clock-ms-fn clock-ms-fn})))
       ;; Reconcile tenants regardless of coordinator status
       (reconcile-tenants! ctx node-id poller-atom)
       (catch Throwable t
@@ -167,13 +211,19 @@
      :node-metadata        - optional metadata map for this node
      :heartbeat-interval-ms - heartbeat period (default 5000)
      :staleness-threshold-ms - time before a node is considered dead (default 15000)
-     :strategy             - assignment strategy (default :round-robin)"
+     :strategy             - assignment strategy (default :round-robin)
+     :reassignment-interval-ms - delay before reacquiring a released lease (default 0)
+     :clock-ms-fn          - zero-argument millisecond clock (default system clock)"
   [{:keys [event-store cache context node-id node-metadata
-           heartbeat-interval-ms staleness-threshold-ms strategy]
+           heartbeat-interval-ms staleness-threshold-ms strategy
+           reassignment-interval-ms clock-ms-fn]
     :or {heartbeat-interval-ms 5000
          staleness-threshold-ms 15000
          strategy :round-robin
+         reassignment-interval-ms 0
+         clock-ms-fn #(System/currentTimeMillis)
          node-metadata {}}}]
+  (validate-reassignment-interval! reassignment-interval-ms)
   (let [node-id (or node-id (uuid/v7))
         ctx {:event-store event-store
              :cache cache
@@ -190,6 +240,8 @@
                                                     :node-id node-id
                                                     :staleness-threshold-ms staleness-threshold-ms
                                                     :strategy strategy
+                                                    :reassignment-interval-ms reassignment-interval-ms
+                                                    :clock-ms-fn clock-ms-fn
                                                     :poller-atom poller-atom}))]
     (u/log ::control-plane-started :node-id node-id)
     ;; Emit initial heartbeat immediately
@@ -213,7 +265,7 @@
    1. Stop heartbeating — coordinator will detect staleness and reassign
    2. Stop coordinator loop — no more assignment cycles from this node
    3. Drain in-flight work — let the tenant poller finish current batch
-   4. Emit departure event — explicit signal for immediate reassignment"
+   4. Emit departure event — signal the coordinator to reassign"
   [{:keys [node-id ctx heartbeat-schedule coordinator-schedule poller-atom]}]
   (u/log ::control-plane-stopping :node-id node-id)
   ;; 1. Stop heartbeating first — signals intent to leave
@@ -226,6 +278,7 @@
     (tp/stop-tenant-poller poller)
     (reset! poller-atom nil)
     (u/log ::drain-complete :node-id node-id))
-  ;; 4. Emit departure — triggers immediate reassignment by coordinator
+  ;; 4. Emit departure. Release happens on the next assignment cycle; a
+  ;; configured reassignment interval may intentionally delay acquisition.
   (emit-node-departed! ctx node-id)
   (u/log ::control-plane-stopped :node-id node-id))

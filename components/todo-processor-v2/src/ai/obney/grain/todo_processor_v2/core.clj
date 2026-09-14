@@ -504,7 +504,10 @@
      :poll-interval-ms - poll frequency (default 250)
      :batch-size       - max events per tenant per cycle (default 100)
      :thread-pool-size - handler dispatch pool size (default 32)
-     :lease-check-fn   - optional `(fn [tenant-id processor-name])` ownership fence"
+     :lease-check-fn   - optional `(fn [tenant-id processor-name])` ownership fence.
+                         When configured, handlers receive `:lease-owned?`, a
+                         fail-closed zero-argument live check bound to their
+                         current tenant and processor."
   [{:keys [event-store tenant-ids context poll-interval-ms batch-size
            thread-pool-size lease-check-fn]
     :or {poll-interval-ms 250
@@ -524,7 +527,14 @@
                                tenant-ids))
         owns-lease? (fn [tenant-id processor-name]
                       (or (nil? lease-check-fn)
-                          (lease-check-fn tenant-id processor-name)))
+                          (try
+                            (boolean (lease-check-fn tenant-id processor-name))
+                            (catch Throwable t
+                              (u/log ::lease-check-failed
+                                     :tenant-id tenant-id
+                                     :processor-name processor-name
+                                     :exception t)
+                              false))))
         poll-thread
         (Thread.
          (fn []
@@ -622,11 +632,15 @@
                                                  (reset! batch-source-events [])
                                                  (reset! batch-result-events [])
                                                  (swap! watermarks update tid dissoc proc-name))
-                                               (let [ctx (merge context
-                                                                {:event event
-                                                                 :handler-fn handler-fn
-                                                                 :event-store event-store
-                                                                 :tenant-id tid})
+                                               (let [ctx (cond-> (merge (dissoc context :lease-owned?)
+                                                                        {:event event
+                                                                         :handler-fn handler-fn
+                                                                         :event-store event-store
+                                                                         :tenant-id tid})
+                                                           lease-check-fn
+                                                           (assoc :lease-owned?
+                                                                  (fn []
+                                                                    (owns-lease? tid proc-name))))
                                                      result (or (handler-fn ctx) {})]
                                                  (if (or (:result/effect result)
                                                          (:result/cas result))
