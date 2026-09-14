@@ -41,7 +41,10 @@
 -- the control plane; the control plane only decides which node owns each. The
 -- reserved control-plane coordination tenant is NOT a Tenant instance, so it is
 -- naturally excluded from assignment (CP8).
-external entity Tenant {}
+external entity Tenant {
+    lease: Lease with tenant = this
+    release_state: LeaseReleaseState with tenant = this
+}
 
 ------------------------------------------------------------
 -- Contracts
@@ -74,6 +77,17 @@ contract AssignmentPolicy {
     @invariant BalancedDistribution
         -- Under round_robin, tenants are spread evenly: the most- and
         -- least-loaded live nodes differ by at most one tenant.
+
+    @invariant DurableReassignmentInterval
+        -- A previously owned tenant is not acquired again before its configured
+        -- reassignment interval has elapsed from the latest recorded release.
+        -- That release time survives coordinator and cache restarts. A tenant
+        -- with no release history remains immediately assignable, and a zero
+        -- interval preserves same-cycle release and acquisition.
+        --
+        -- The interval reduces likely overlap with a draining former owner; it
+        -- does not grant exclusivity. Lease checks and durable checkpoint
+        -- fencing remain the correctness boundary for stale work.
 }
 
 -- The processing runtime each node embeds. The control plane DEMANDS these
@@ -115,6 +129,9 @@ config {
     staleness_threshold: Duration = heartbeat_interval * 3
     -- The default tenant-distribution strategy.
     strategy: AssignmentStrategy = round_robin
+    -- How long a previously owned tenant remains unassigned after release.
+    -- Zero retains the original immediate handover behaviour.
+    reassignment_interval: Duration = 0.seconds
 }
 
 ------------------------------------------------------------
@@ -150,6 +167,14 @@ entity Lease {
     owner: Node
 }
 
+-- The latest durable release observation for a tenant. It remains after a new
+-- Lease is acquired so a later handover can replace its timestamp, and so the
+-- interval can be reconstructed after a coordinator or cache restart.
+entity LeaseReleaseState {
+    tenant: Tenant
+    released_at: Timestamp
+}
+
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
@@ -171,13 +196,12 @@ rule NodeHeartbeat {
     ensures: node.last_heartbeat_at = now
 }
 
--- A node leaves the cluster gracefully. It gives up its leases immediately so
--- its tenants can be reassigned without waiting for the staleness timeout.
+-- A node leaves the cluster gracefully. Reconciliation records and releases
+-- its leases without waiting for the staleness timeout; acquisition may then
+-- wait for the configured reassignment interval.
 rule NodeDeparts {
     when: NodeStops(node)
     ensures:
-        for lease in node.leases:
-            not exists lease
         not exists node
         ReassignmentNeeded()
 }
@@ -200,9 +224,10 @@ rule TenantAppears {
 }
 
 -- The coordinator reconciles leases toward the desired assignment: every domain
--- tenant owned by exactly one live node, balanced per the strategy. A tenant
--- whose current owner differs from the desired owner (because a node joined,
--- departed or died) is moved; a tenant with no live node to host it is released.
+-- tenant owned by exactly one live node, balanced per the strategy. Moving a
+-- previously owned tenant records its release and, for a positive interval,
+-- leaves it unowned until a later cycle reaches the boundary. A never-owned
+-- tenant is immediately assignable; zero preserves same-cycle handover.
 rule ReconcileLeases {
     when: ReassignmentNeeded()
 
@@ -214,12 +239,17 @@ rule ReconcileLeases {
     for tenant in all_tenants:
         let desired_owner = assigned_owner(tenant, all_tenants, live_nodes, config.strategy)
         ensures:
-            -- The tenant ends owned by exactly the desired live node: any
-            -- existing lease is released and the desired one acquired. A tenant
-            -- with no live node to host it is left unowned.
-            not exists Lease{tenant: tenant}
-            if exists desired_owner:
-                Lease.created(tenant: tenant, owner: desired_owner)
+            if exists tenant.lease and tenant.lease.owner != desired_owner:
+                not exists tenant.lease
+                if exists tenant.release_state:
+                    tenant.release_state.released_at = now
+                else:
+                    LeaseReleaseState.created(tenant: tenant, released_at: now)
+                if config.reassignment_interval = 0.seconds and exists desired_owner:
+                    Lease.created(tenant: tenant, owner: desired_owner)
+            else if not exists tenant.lease and exists desired_owner:
+                if not exists tenant.release_state or tenant.release_state.released_at + config.reassignment_interval <= now:
+                    Lease.created(tenant: tenant, owner: desired_owner)
 
     @guidance
         -- Reconciliation is performed by a single node, the coordinator: the
@@ -239,7 +269,9 @@ rule ReconcileLeases {
         -- particular has no direct code path); instead a periodic loop on each
         -- node recomputes the assignment when that node is the coordinator, and
         -- only emits the diff between current and desired leases rather than
-        -- releasing and reacquiring unchanged ones.
+        -- releasing and reacquiring unchanged ones. The same periodic cycle
+        -- observes elapsed reassignment intervals; no process-local timer is
+        -- authoritative.
 }
 
 -- A request for a tenant must be handled by the node that owns the tenant's
@@ -282,6 +314,18 @@ invariant OneLeasePerTenant {
     for a in Leases:
         for b in Leases:
             a != b implies a.tenant != b.tenant
+}
+
+-- The release observation is a per-tenant durable register, not an append-only
+-- collection whose ordering would have to be inferred by each coordinator.
+invariant OneReleaseStatePerTenant {
+    for a in LeaseReleaseStates:
+        for b in LeaseReleaseStates:
+            a != b implies a.tenant != b.tenant
+}
+
+invariant NonnegativeReassignmentInterval {
+    config.reassignment_interval >= 0.seconds
 }
 
 -- The eventual / behavioural conformance properties not expressible as a single

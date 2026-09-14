@@ -31,6 +31,9 @@
 (defn project-lease-ownership [ctx]
   (core/project-lease-ownership ctx))
 
+(defn project-lease-release-history [ctx]
+  (core/project-lease-release-history ctx))
+
 (defn route-for-tenant
   "Pure routing decision. See routing/route-for-tenant."
   [lease-ownership active-nodes this-node-id tenant-id]

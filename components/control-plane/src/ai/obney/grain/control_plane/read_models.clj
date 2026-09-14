@@ -41,3 +41,14 @@
       (dissoc state tid)
 
       state)))
+
+(defreadmodel :grain.control lease-release-history
+  {:events #{:grain.control/lease-released}
+   :version 1
+   :schema [:map-of :uuid :int]
+   :l1-ttl-ms 0}
+  "Projects the durable last release time for each tenant lease."
+  [state event]
+  (assoc state
+         (:lease/tenant-id event)
+         (.toEpochMilli (.toInstant (:event/timestamp event)))))

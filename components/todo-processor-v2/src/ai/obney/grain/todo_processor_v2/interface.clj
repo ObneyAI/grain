@@ -32,7 +32,10 @@
          [context]
          ... handler body ...)
 
-   The handler receives a context map with :event, :event-store, :tenant-id.
+   The handler receives a context map with :event, :event-store, :tenant-id and,
+   when run by a lease-fenced coalesced poller, :lease-owned?. The optional
+   :lease-owned? value is a zero-argument live ownership check scoped to the
+   current tenant and processor; it returns false if ownership cannot be read.
    It must return one of:
      {:result/events [...]}                  — pure result, batch checkpointed
      {:result/effect fn :result/checkpoint :after/:before}  — side effect
@@ -82,6 +85,12 @@
   (core/stop-polling polling-processor))
 
 (defn start-tenant-poller
+  "Start the coalesced tenant poller.
+
+   The optional two-argument :lease-check-fn remains the ownership source. When
+   present, each handler context receives a reserved zero-argument
+   :lease-owned? capability bound to that event's tenant and processor. Without
+   a lease source the capability is absent, including from caller app context."
   [config]
   (core/start-tenant-poller config))
 
