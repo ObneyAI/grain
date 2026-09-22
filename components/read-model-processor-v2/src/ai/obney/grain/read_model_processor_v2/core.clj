@@ -112,17 +112,16 @@
 ;; Cache read/write (unpartitioned)
 ;; ---------------------------------------------------------------------------
 
-(defn- read-cache
-  "Read from cache, handling both legacy monolithic and segmented formats."
-  [cache base-key]
-  (when-let [raw (kv/get! cache {:k base-key})]
+(defn- read-cache-snapshot
+  [get-value base-key]
+  (when-let [raw (get-value {:k base-key})]
     (let [decoded (fressian-util/decode raw)]
       (if (:segmented decoded)
         ;; Segmented: read all segments and merge
         (let [{:keys [segment-count watermark checksums]} decoded
               state (reduce
                      (fn [acc idx]
-                       (if-let [seg-bytes (kv/get! cache {:k (segment-key base-key idx)})]
+                       (if-let [seg-bytes (get-value {:k (segment-key base-key idx)})]
                          (merge acc (fressian-util/decode seg-bytes))
                          acc))
                      {}
@@ -134,6 +133,11 @@
            :checksums checksums})
         ;; Legacy monolithic format
         decoded))))
+
+(defn- read-cache
+  "Read state and watermark from one snapshot, including every segment."
+  [cache base-key]
+  (kv/read-snapshot cache #(read-cache-snapshot % base-key)))
 
 (defn- write-monolithic!
   "Write state as a single cache entry (legacy format)."
