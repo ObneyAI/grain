@@ -2,8 +2,7 @@
   "Live projection checks using the supplied event store and isolated LMDB caches."
   (:require [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
-            [ai.obney.grain.read-model-processor-v2.core :as core]
-            [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]
+            [ai.obney.grain.read-model-processor-v2.interface.testing :as cache-testing]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store.interface.protocol :as kp]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
@@ -43,7 +42,7 @@
         cache (kv/start (lmdb/->KV-Store-LMDB
                         {:storage-dir dir :db-name "projection" :map-size (* 64 1024 1024)}))
         name :live-read-model/counter
-        key (core/format-scoped-key name 1 tenant)
+        key (cache-testing/format-scoped-key name 1 tenant)
         l1-key (String. ^bytes key)
         query {:tenant-id tenant :types #{:live-read-model/seed :live-read-model/increment}}
         args {:name name :version 1 :f reducer :query (dissoc query :tenant-id) :l1-ttl-ms 0}
@@ -53,20 +52,20 @@
                                         :body {:key-count (if segmented? 10001 0)}})])
       (f {:cache cache :key key :l1-key l1-key :context ctx :args args
           :project #(rmp/p ctx args)
-          :evict! #(l1/invalidate! l1-key)
+          :evict! #(cache-testing/evict-l1! l1-key)
           :append! (fn [n]
                      (append! store tenant (mapv (fn [_] (es/->event {:type :live-read-model/increment}))
                                                  (range n))))
           :events #(into [] (es/read store query))})
       (finally
-        (l1/invalidate! l1-key)
+        (cache-testing/evict-l1! l1-key)
         (kv/stop cache)
         (doseq [file (reverse (file-seq (io/file dir)))] (io/delete-file file true))))))
 
 (defn lifecycle [store]
   (with-model store false
     (fn [{:keys [cache key l1-key project evict! append! events]}]
-      (let [absent? (and (nil? (l1/get-entry l1-key)) (nil? (kv/get! cache {:k key})))
+      (let [absent? (and (nil? (cache-testing/l1-entry l1-key)) (nil? (kv/get! cache {:k key})))
             _ (append! 3)
             expected-cold (reduce reducer {} (events))
             cold (project)
@@ -176,7 +175,7 @@
                   (let [old-state (await! older)]
                     (deliver release-reader true)
                     (let [state (await! reader)
-                          cached (l1/get-entry l1-key)
+                          cached (cache-testing/l1-entry l1-key)
                           again (project)]
                       {"Race reached old and new checkpoints" (= [10 20] (mapv :count [old-state newer]))
                        "Reader captured the latest manifest before the older commit" (= head (:watermark manifest))
