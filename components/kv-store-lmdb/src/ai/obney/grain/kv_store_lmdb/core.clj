@@ -12,7 +12,7 @@
 (def default-max-readers
   "Default LMDB max concurrent reader slots. Each unique thread that opens a
    read transaction claims a slot that persists until the thread dies AND
-   readersCheck() is called. Applications using futures or thread pools
+   readerCheck() is called. Applications using futures or thread pools
    (e.g., ORC node execution, GEPA optimization) create many short-lived
    threads. The lmdbjava default of 126 is too low for these workloads."
   1024)
@@ -35,28 +35,35 @@
   (.close db)
   (.close env))
 
-(defn- get!*
-  "Internal: read a value from LMDB within a read transaction."
-  [^Env env db k]
-  (with-open [txn (.txnRead env)]
-    (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
-          _ (.. k-buf (put k) flip)
-          found (.get db txn k-buf)]
-      (when found
-        (let [val-buf (.val txn)
-              arr (byte-array (.remaining val-buf))]
-          (.get val-buf arr)
-          arr)))))
+(defn- read-value
+  "Copy a value out of an existing LMDB read transaction."
+  [^Env env db txn k]
+  (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
+        _ (.. k-buf (put k) flip)
+        found (.get db txn k-buf)]
+    (when found
+      (let [val-buf (.val txn)
+            arr (byte-array (.remaining val-buf))]
+        (.get val-buf arr)
+        arr))))
+
+(defn- open-read-transaction [^Env env]
+  (try
+    (.txnRead env)
+    (catch org.lmdbjava.Env$ReadersFullException _
+      (.readerCheck env)
+      (.txnRead env))))
+
+(defn read-snapshot
+  [{:keys [env db]} f]
+  (with-open [txn (open-read-transaction env)]
+    (f (fn [{:keys [k]}] (read-value env db txn k)))))
 
 (defn get!
   "Read a value from LMDB. On ReadersFullException, reclaims stale reader
-   slots from dead threads via readersCheck() and retries once."
-  [{:keys [env db] :as _cache} {:keys [k]}]
-  (try
-    (get!* env db k)
-    (catch org.lmdbjava.Env$ReadersFullException _
-      (.readersCheck ^Env env)
-      (get!* env db k))))
+   slots from dead threads via readerCheck() and retries once."
+  [cache args]
+  (read-snapshot cache (fn [get-value] (get-value args))))
 
 (defn put!
   [{:keys [env db] :as _cache} {:keys [k v]}]
@@ -82,5 +89,6 @@
   (start [this] (start this))
   (stop [this] (stop this))
   (get! [this args] (get! this args))
+  (read-snapshot [this f] (read-snapshot this f))
   (put! [this args] (put! this args))
   (put-batch! [this args] (put-batch! this args)))

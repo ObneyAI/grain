@@ -5,5 +5,6 @@
   (start [this])
   (stop [this])
   (get! [this args])
+  (read-snapshot [this f])
   (put! [this args])
   (put-batch! [this args]))
