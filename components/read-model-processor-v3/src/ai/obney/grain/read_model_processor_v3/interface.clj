@@ -31,7 +31,11 @@
            (fn [registry]
              (when-let [existing (get registry rm-name)]
                (when (and (= (:version existing 1) (:version entry 1))
-                          (not= (:descriptor existing) (:descriptor entry)))
+                          (or (not= (:descriptor existing) (:descriptor entry))
+                              (and (:definition/value existing)
+                                   (:definition/value entry)
+                                   (not= (:definition/value existing)
+                                         (:definition/value entry)))))
                  (core/fail! rm-name :definition-version-conflict
                              "Definition changed; bump :version and rebuild" {})))
              (assoc registry rm-name entry)))))

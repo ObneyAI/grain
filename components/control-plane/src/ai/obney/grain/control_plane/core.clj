@@ -152,6 +152,22 @@
       (catch Throwable t
         (u/log ::coordinator-error :exception t)))))
 
+(defn- draining-schedule
+  "Stop scheduling without interrupting an active callback's transaction."
+  [times handler]
+  (let [gate (Object.)
+        stopped? (atom false)
+        schedule (chime/chime-at times
+                                (fn [time]
+                                  (locking gate
+                                    (when-not @stopped?
+                                      (handler time)))))]
+    (reify java.lang.AutoCloseable
+      (close [_]
+        (locking gate
+          (reset! stopped? true)
+          (.close ^java.lang.AutoCloseable schedule))))))
+
 (defn start
   "Start the control plane for this node. Returns a map that can be passed to `stop`.
 
@@ -177,10 +193,10 @@
              ::app-context context}
         poller-atom (atom nil)
         interval (Duration/ofMillis heartbeat-interval-ms)
-        heartbeat-schedule (chime/chime-at
+        heartbeat-schedule (draining-schedule
                             (chime/periodic-seq (Instant/now) interval)
                             (heartbeat-handler {:ctx ctx :node-id node-id :metadata node-metadata}))
-        coordinator-schedule (chime/chime-at
+        coordinator-schedule (draining-schedule
                               (chime/periodic-seq (Instant/now) interval)
                               (coordinator-handler {:ctx ctx
                                                     :node-id node-id

@@ -1,6 +1,7 @@
 (ns ai.obney.grain.control-plane.core-test
   "Tests for the control plane start/stop lifecycle with periodic loops and reactor."
   (:require [clojure.test :refer :all]
+            [chime.core :as chime]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.control-plane.core :as cp]
             [ai.obney.grain.control-plane.events :as events]
@@ -408,3 +409,37 @@
           (es/stop store)
           (delete-dir-recursively dir-a)
           (delete-dir-recursively dir-b))))))
+
+(deftest schedule-close-drains-active-callback
+  (let [callback (atom nil)
+        entered (promise)
+        release (promise)
+        closing (promise)
+        closed? (atom false)
+        calls (atom 0)]
+    (with-redefs [chime/chime-at
+                  (fn [_ handler]
+                    (reset! callback handler)
+                    (reify java.lang.AutoCloseable
+                      (close [_] (reset! closed? true))))]
+      (let [schedule (#'cp/draining-schedule []
+                      (fn [_]
+                        (swap! calls inc)
+                        (deliver entered true)
+                        @release))
+            running (future (@callback nil))]
+        (try
+          (is (= true (deref entered 5000 :timeout)))
+          (let [stopping (future (deliver closing true) (.close schedule) :closed)]
+            (is (= true (deref closing 5000 :timeout)))
+            (is (= :waiting (deref stopping 100 :waiting)))
+            (is (false? @closed?))
+            (deliver release true)
+            (is (= true (deref running 5000 :timeout)))
+            (is (= :closed (deref stopping 5000 :timeout)))
+            (@callback nil)
+            (is (= 1 @calls))
+            (is (true? @closed?)))
+          (finally
+            (deliver release true)
+            (.close schedule)))))))

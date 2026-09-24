@@ -843,26 +843,36 @@
 ;; =========================== ;;
 
 (defn- parse-sse-events
-  "Reads SSE frames from an InputStream. Returns a vector of {:name :data} maps.
-   Reads until `n` events collected or `timeout-ms` elapsed."
+  "Read up to n SSE frames, closing the stream when the deadline expires."
   [^InputStream input-stream n timeout-ms]
-  (let [reader (BufferedReader. (InputStreamReader. input-stream))
-        deadline (+ (System/currentTimeMillis) timeout-ms)]
-    (loop [events [] current-name nil current-data []]
-      (if (or (>= (count events) n)
-              (> (System/currentTimeMillis) deadline))
-        events
-        (let [line (.readLine reader)]
-          (cond
-            (nil? line) events
-            (str/starts-with? line "event:") (recur events (str/trim (subs line 6)) current-data)
-            (str/starts-with? line "data:") (recur events current-name (conj current-data (str/trim (subs line 5))))
-            (str/blank? line) (if current-name
-                                (recur (conj events {:name current-name
-                                                     :data (str/join "\n" current-data)})
-                                       nil [])
-                                (recur events nil []))
-            :else (recur events current-name current-data)))))))
+  (let [events (atom [])
+        reading (future
+                  (with-open [reader (BufferedReader. (InputStreamReader. input-stream))]
+                    (loop [current-name nil current-data []]
+                      (when (< (count @events) n)
+                        (when-let [line (.readLine reader)]
+                          (cond
+                            (str/starts-with? line "event:")
+                            (recur (str/trim (subs line 6)) current-data)
+
+                            (str/starts-with? line "data:")
+                            (recur current-name (conj current-data (str/trim (subs line 5))))
+
+                            (str/blank? line)
+                            (do
+                              (when current-name
+                                (swap! events conj {:name current-name
+                                                    :data (str/join "\n" current-data)}))
+                              (recur nil []))
+
+                            :else
+                            (recur current-name current-data)))))))]
+    (try
+      (deref reading timeout-ms nil)
+      @events
+      (finally
+        (.close input-stream)
+        (future-cancel reading)))))
 
 (defn- take-event
   [ch timeout-ms]
