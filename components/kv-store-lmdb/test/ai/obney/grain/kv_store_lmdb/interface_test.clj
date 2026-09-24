@@ -43,6 +43,64 @@
 (deftest get-missing-key-returns-nil
   (is (nil? (kv/get! *cache* {:k (.getBytes "nonexistent")}))))
 
+(deftest read-snapshot-closes-on-callback-exception
+  (let [k (.getBytes "snapshot-key")
+        failure (ex-info "Callback failed" {:reason ::test})]
+    (kv/put! *cache* {:k k :v (.getBytes "value")})
+    (let [caught (try
+                   (kv/read-snapshot *cache*
+                     (fn [get-value]
+                       (is (= "value" (String. (get-value {:k k}))))
+                       (throw failure)))
+                   nil
+                   (catch Exception e e))]
+      (is (identical? failure caught) "The original callback exception propagates"))
+    ;; A leaked read transaction prevents another transaction on this thread
+    ;; with the default LMDB flags used by our cache.
+    (is (= "value"
+           (kv/read-snapshot *cache*
+             (fn [get-value] (String. (get-value {:k k}))))))))
+
+(deftest read-snapshot-returns-callback-result-and-closes-normally
+  (let [k (.getBytes "snapshot-key")
+        result (Object.)]
+    (kv/put! *cache* {:k k :v (.getBytes "old")})
+    (is (identical? result
+                   (kv/read-snapshot *cache*
+                     (fn [get-value]
+                       (is (= "old" (String. (get-value {:k k}))))
+                       result))))
+    (is (nil? (kv/read-snapshot *cache*
+                (fn [get-value]
+                  (is (= "old" (String. (get-value {:k k}))))
+                  nil))))
+    ;; Both callbacks have released their snapshots. A new snapshot observes
+    ;; the intervening commit instead of retaining the earlier view.
+    (kv/put! *cache* {:k k :v (.getBytes "new")})
+    (is (= "new"
+           (kv/read-snapshot *cache*
+             (fn [get-value] (String. (get-value {:k k}))))))))
+
+(deftest read-snapshot-retains-values-across-concurrent-commit
+  (let [a (.getBytes "snapshot-a")
+        b (.getBytes "snapshot-b")
+        entries (fn [value] (mapv (fn [k] {:k k :v (.getBytes value)}) [a b]))]
+    (kv/put-batch! *cache* {:entries (entries "old")})
+    (let [values (kv/read-snapshot
+                  *cache*
+                  (fn [get-value]
+                    (let [first-value (get-value {:k a})
+                          writer (future (kv/put-batch! *cache* {:entries (entries "new")}))]
+                      (try
+                        (is (not= ::timeout (deref writer 10000 ::timeout)))
+                        (is (nil? (get-value {:k (.getBytes "missing")})))
+                        [first-value (get-value {:k b}) (get-value {:k a})]
+                        (finally (future-cancel writer))))))]
+      ;; Copied values remain usable after the snapshot closes.
+      (is (= ["old" "old" "old"] (mapv #(String. ^bytes %) values)))
+      (is (= "new" (String. (kv/get! *cache* {:k a}))))
+      (is (= "new" (String. (kv/get! *cache* {:k b})))))))
+
 ;; ---------------------------------------------------------------------------
 ;; put-batch!
 ;; ---------------------------------------------------------------------------
@@ -98,3 +156,26 @@
         (finally
           (kv/stop cache)
           (delete-dir-recursively dir))))))
+
+(deftest exhausted-readers-report-the-original-lmdb-error
+  (let [dir (str "/tmp/kv-lmdb-exhausted-" (random-uuid))
+        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"
+                                             :max-readers 1}))
+        ready (promise)
+        release (promise)
+        holder (future
+                 (kv/read-snapshot cache
+                   (fn [_]
+                     (deliver ready true)
+                     (deref release 10000 ::timeout))))]
+    (try
+      (is (= true (deref ready 10000 ::timeout)))
+      ;; The occupied slot is live, so readerCheck cannot reclaim it. The
+      ;; retry must report ReadersFullException, not a missing Java method.
+      (is (thrown? org.lmdbjava.Env$ReadersFullException
+                   (kv/get! cache {:k (.getBytes "key")})))
+      (finally
+        (deliver release true)
+        (deref holder 10000 ::timeout)
+        (kv/stop cache)
+        (delete-dir-recursively dir)))))

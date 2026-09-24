@@ -5,7 +5,7 @@
         pgesv3/event-retention {:local/root "../../components/event-retention"}
         pgesv3/event-model {:local/root "../../components/event-model"}
         pgesv3/control-plane {:local/root "../../components/control-plane"}
-        pgesv3/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        pgesv3/read-model-processor-v3 {:local/root "../../components/read-model-processor-v3"}
         pgesv3/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
         pgesv3/pubsub {:local/root "../../components/pubsub"}
         pgesv3/kv-store {:local/root "../../components/kv-store"}

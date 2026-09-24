@@ -5,7 +5,7 @@
    `:<ns>/<name>` — no manual registry map is needed.
 
    Query handlers take a context that includes any necessary dependencies
-   wired in the base for the service (`:event-store`, `:cache`,
+   wired in the base for the service (`:event-store`, `:projection-store`,
    `:tenant-id`). A query-request-handler (HTTP) or a direct `process-query`
    call (REPL) looks the handler up in the registry. Queries either return
    a cognitect anomaly or a map with a `:query/result`.

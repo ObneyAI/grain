@@ -8,9 +8,8 @@
             [ai.obney.grain.fressian-util.interface :as fressian]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.pubsub.interface :as pubsub]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
-            [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface.testing :as projection-testing]
             [clojure.java.io :as io]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
@@ -483,14 +482,13 @@
       (is (= [(:event/id new)] (mapv :event/id (read-events query)))))))
 
 (deftest sqlite-warm-projection-remains-immediately-fresh
-  (let [dir (str *db-file* "-cache")
-        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
-        context {:event-store *event-store* :cache cache :tenant-id *tenant-id*}
-        args {:name :sqlite-test/sparse :version 1 :l1-ttl-ms 0
+  (let [dir (str *db-file* "-projection-store")
+        projection-store (rmp/open-store {:storage-dir dir :backend :file})
+        context {:event-store *event-store* :projection-store projection-store :tenant-id *tenant-id*}
+        args {:name :sqlite-test/sparse :version 1
               :query {:types #{:test/alpha :test/beta}}
               :f (fn [state event] (update state :ids (fnil conj []) (:event/id event)))}]
     (try
-      (rmp/l1-clear!)
       (let [first-event (append-event! :test/alpha #{})
             expected {:ids [(:event/id first-event)]}]
         (is (= expected (rmp/p context args)))
@@ -500,8 +498,7 @@
           (is (= {:ids [(:event/id first-event) (:event/id second-event)]}
                  (rmp/p context args)))))
       (finally
-        (rmp/l1-clear!)
-        (kv/stop cache)
+        (projection-testing/release-store! projection-store)
         (doseq [file (reverse (file-seq (io/file dir)))] (io/delete-file file true))))))
 
 (deftest multi-type-cas-serializes-across-store-instances

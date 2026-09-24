@@ -3,7 +3,7 @@
 
         ;; v2 processors (event-store-v3 / multi-tenant)
         gcv2/command-processor-v2 {:local/root "../../components/command-processor-v2"}
-        gcv2/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        gcv2/read-model-processor-v3 {:local/root "../../components/read-model-processor-v3"}
         gcv2/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
         gcv2/command-request-handler-v2 {:local/root "../../components/command-request-handler-v2"}
 
@@ -25,5 +25,5 @@
         gcv2/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}
         gcv2/fressian-util {:local/root "../../components/fressian-util"}}
 
- :aliases {:test {:extra-paths []
-                  :extra-deps  {}}}}
+ :aliases {:test {:extra-paths ["../../components/read-model-processor-v3/test"]
+                  :extra-deps {gcv2/event-store-sqlite-v3 {:local/root "../../components/event-store-sqlite-v3"}}}}}

@@ -11,7 +11,7 @@
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.query-processor.interface :as qp]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.example-base.core]
             [clojure.data.json :as json]

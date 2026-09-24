@@ -1,0 +1,6 @@
+{:paths ["src" "resources"]
+ :deps {org.replikativ/datahike {:mvn/version "0.8.1897"}
+        org.replikativ/datahike-lmdb {:mvn/version "0.1.9"}
+        org.replikativ/persistent-sorted-set {:mvn/version "0.5.144"}
+        metosin/malli {:mvn/version "0.16.4"}}
+ :aliases {:test {:extra-paths ["test"] :extra-deps {}}}}

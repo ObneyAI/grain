@@ -8,6 +8,11 @@ execution tools.
 The package is intended for local development and debugging. It is not a
 production API.
 
+Read-model catalogs and projections use the v3 registry. The installed context
+must supply `:projection-store`, `:event-store`, and a trusted `:tenant-id` for
+projection calls. Diagnostics include projection-store lifecycle and retention
+status. See [v3 usage](core-concepts.md#read-models--projections).
+
 It also exposes Grain's Event Model validation APIs. Runtime validation compares
 service topology with the live registries; composition validation additionally
 resolves `:grain/allium` links during development and CI.
@@ -44,7 +49,7 @@ include:
 
 - `:system` - the Integrant system map.
 - `:context` - the Grain request context, usually containing `:event-store`,
-  `:cache`, `:tenant-id`, and application services.
+  `:projection-store`, `:tenant-id`, and application services.
 - `:mode :dev` - required when `:mode` is supplied. Any other mode throws.
 
 From nREPL:
@@ -192,7 +197,7 @@ Accepted keys:
 
 ### `projection`
 
-Projects a registered read model:
+Projects a read model registered with v3:
 
 ```clojure
 (tools/projection :example/counters)
@@ -214,7 +219,7 @@ Returns runtime health and discovery information:
 ;; => {:runtime {...}
 ;;     :registries {:commands 3, :queries 2, ...}
 ;;     :event-store {:present? true, :tenants {...}}
-;;     :cache {:present? true, :l1 {...}}
+;;     :projection-store {:present? true, :status {...}}
 ;;     :control-plane {...}}
 ```
 

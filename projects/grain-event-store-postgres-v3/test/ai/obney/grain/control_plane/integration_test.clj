@@ -5,7 +5,6 @@
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.event-store-postgres-v3.core :as pg-core]
             [ai.obney.grain.control-plane.test-kit :as test-kit]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [next.jdbc :as jdbc]))
 
 (defn pg-config []
@@ -31,9 +30,7 @@
 (defn each-fixture [f]
   (let [pool (get-in *store* [:state ::pg-core/connection-pool])]
     (jdbc/execute! pool ["TRUNCATE grain.tenants CASCADE"]))
-  (rmp/l1-clear!)
-  (f)
-  (rmp/l1-clear!))
+  (f))
 
 (use-fixtures :once once-fixture)
 (use-fixtures :each each-fixture)

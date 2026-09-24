@@ -6,9 +6,8 @@
             [ai.obney.grain.control-plane.events :as events]
             [ai.obney.grain.control-plane.read-models]
             [ai.obney.grain.control-plane.assignment :as assignment]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
-            [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface.testing :as projection-testing]
             [clj-uuid :as uuid]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [clojure.java.io :as io]))
@@ -29,22 +28,20 @@
             (reverse (file-seq f))))))
 
 (def ^:dynamic *ctx* nil)
-(def ^:dynamic *cache-dir* nil)
+(def ^:dynamic *projection-store-dir* nil)
 
 (defn test-fixture [f]
   (let [dir   (str "/tmp/cp-read-model-test-" (random-uuid))
         store (es/start {:conn {:type :in-memory}})
-        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+        projection-store (rmp/open-store {:storage-dir dir :backend :file})]
     (binding [*ctx* {:event-store store
-                     :cache cache
+                     :projection-store projection-store
                      :tenant-id events/control-plane-tenant-id}
-              *cache-dir* dir]
+              *projection-store-dir* dir]
       (try
-        (rmp/l1-clear!)
         (f)
         (finally
-          (rmp/l1-clear!)
-          (kv/stop cache)
+          (projection-testing/release-store! projection-store)
           (es/stop store)
           (delete-dir-recursively dir))))))
 

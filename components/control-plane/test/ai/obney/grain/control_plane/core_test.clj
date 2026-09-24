@@ -6,11 +6,10 @@
             [ai.obney.grain.control-plane.events :as events]
             [ai.obney.grain.control-plane.assignment :as assignment]
             [ai.obney.grain.control-plane.harness :as harness]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface.testing :as projection-testing]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.pubsub.interface :as pubsub]
-            [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [clj-uuid :as uuid]
             [clojure.java.io :as io]))
@@ -48,31 +47,29 @@
   (testing "Control plane starts, emits heartbeats, and stops cleanly"
     (let [dir (str "/tmp/cp-lifecycle-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+          projection-store (rmp/open-store {:storage-dir dir :backend :file})]
       (try
         (let [cp-instance (cp/start {:event-store store
-                                     :cache cache
+                                     :projection-store projection-store
                                                                           :heartbeat-interval-ms 200
                                      :staleness-threshold-ms 1000})]
           (try
-            (let [ctx {:event-store store :cache cache
+            (let [ctx {:event-store store :projection-store projection-store
                        :tenant-id events/control-plane-tenant-id}]
               (harness/wait-for
-               #(do (rmp/l1-clear!)
-                    (= 1 (count (rmp/project ctx :grain.control/active-nodes)))))
+               #(= 1 (count (rmp/project ctx :grain.control/active-nodes))))
               (let [nodes (rmp/project ctx :grain.control/active-nodes)]
                 (is (= 1 (count nodes)))
                 (is (contains? nodes (:node-id cp-instance)))))
             (finally
               (cp/stop cp-instance)))
           ;; After stop, departure event should exist
-          (rmp/l1-clear!)
-          (let [ctx {:event-store store :cache cache
+          (let [ctx {:event-store store :projection-store projection-store
                      :tenant-id events/control-plane-tenant-id}
                 nodes (rmp/project ctx :grain.control/active-nodes)]
             (is (= 0 (count nodes)))))
         (finally
-          (kv/stop cache)
+          (projection-testing/release-store! projection-store)
           (es/stop store)
           (delete-dir-recursively dir))))))
 
@@ -80,22 +77,21 @@
   (testing "Control plane coordinator automatically assigns tenant-processor pairs"
     (let [dir (str "/tmp/cp-coord-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          projection-store (rmp/open-store {:storage-dir dir :backend :file})
           tenant-1 (uuid/v4)]
       (try
         ;; Create a domain tenant
         (es/append store {:tenant-id tenant-1
                           :events [(es/->event {:type :test/lifecycle-event :body {}})]})
         (let [cp-instance (cp/start {:event-store store
-                                     :cache cache
+                                     :projection-store projection-store
                                                                           :heartbeat-interval-ms 200
                                      :staleness-threshold-ms 1000})]
           (try
-            (let [ctx {:event-store store :cache cache
+            (let [ctx {:event-store store :projection-store projection-store
                        :tenant-id events/control-plane-tenant-id}]
               (harness/wait-for
-               #(do (rmp/l1-clear!)
-                    (= 1 (count (rmp/project ctx :grain.control/lease-ownership)))))
+               #(= 1 (count (rmp/project ctx :grain.control/lease-ownership))))
               (let [leases (rmp/project ctx :grain.control/lease-ownership)]
                 (is (= 1 (count leases)))
                 (is (= (:node-id cp-instance)
@@ -103,7 +99,7 @@
             (finally
               (cp/stop cp-instance))))
         (finally
-          (kv/stop cache)
+          (projection-testing/release-store! projection-store)
           (es/stop store)
           (delete-dir-recursively dir))))))
 
@@ -115,7 +111,7 @@
   (testing "Control plane reactor starts a todo processor when a lease is assigned"
     (let [dir (str "/tmp/cp-reactor-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          projection-store (rmp/open-store {:storage-dir dir :backend :file})
           tenant-1 (uuid/v4)
           processed (atom [])]
       (try
@@ -132,7 +128,7 @@
                               :events [(es/->event {:type :test/lifecycle-event :body {}})]})
             ;; Start the control plane — poller will pick up the event
             (let [cp-instance (cp/start {:event-store store
-                                         :cache cache
+                                         :projection-store projection-store
                                          :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
               (try
@@ -150,7 +146,7 @@
             (finally
               (reset! tp/processor-registry* prev-registry))))
         (finally
-          (kv/stop cache)
+          (projection-testing/release-store! projection-store)
           (es/stop store)
           (delete-dir-recursively dir))))))
 
@@ -158,7 +154,7 @@
   (testing "Control plane reactor stops todo processors when the control plane stops"
     (let [dir (str "/tmp/cp-reactor-stop-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          projection-store (rmp/open-store {:storage-dir dir :backend :file})
           tenant-1 (uuid/v4)]
       (try
         (let [prev-registry @tp/processor-registry*]
@@ -170,7 +166,7 @@
             (es/append store {:tenant-id tenant-1
                               :events [(es/->event {:type :test/lifecycle-event :body {}})]})
             (let [cp-instance (cp/start {:event-store store
-                                         :cache cache
+                                         :projection-store projection-store
                                          :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
               (harness/wait-for
@@ -185,7 +181,7 @@
             (finally
               (reset! tp/processor-registry* prev-registry))))
         (finally
-          (kv/stop cache)
+          (projection-testing/release-store! projection-store)
           (es/stop store)
           (delete-dir-recursively dir))))))
 
@@ -197,7 +193,7 @@
   (testing "DR1: departure event is emitted only after in-flight work has drained"
     (let [dir (str "/tmp/cp-dr1-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))
+          projection-store (rmp/open-store {:storage-dir dir :backend :file})
           tenant-1 (uuid/v4)
           effect-started (promise)
           effect-gate (promise)]
@@ -220,7 +216,7 @@
                               :events [(es/->event {:type :test/lifecycle-event :body {}})]})
             ;; Start control plane — will assign tenant and start processing
             (let [cp-instance (cp/start {:event-store store
-                                         :cache cache
+                                         :projection-store projection-store
                                          :heartbeat-interval-ms 200
                                          :staleness-threshold-ms 1000})]
               ;; Wait for the effect to start (proves assignment fired, poller picked up the event, and the effect ran)
@@ -230,7 +226,6 @@
                 ;; Give stop a moment to begin draining
                 (Thread/sleep 500)
                 ;; Check: departure event should NOT exist yet (drain still in progress)
-                (rmp/l1-clear!)
                 (let [all-events (into []
                                    (remove #(= :grain/tx (:event/type %)))
                                    (es/read store {:tenant-id events/control-plane-tenant-id}))
@@ -242,7 +237,6 @@
                 ;; Wait for stop to finish
                 (deref stop-future 10000 :timeout)
                 ;; Now departure should exist
-                (rmp/l1-clear!)
                 (let [all-events (into []
                                    (remove #(= :grain/tx (:event/type %)))
                                    (es/read store {:tenant-id events/control-plane-tenant-id}))
@@ -252,7 +246,7 @@
             (finally
               (reset! tp/processor-registry* prev-registry))))
         (finally
-          (kv/stop cache)
+          (projection-testing/release-store! projection-store)
           (es/stop store)
           (delete-dir-recursively dir))))))
 
@@ -264,10 +258,10 @@
   (testing "DR2: no new heartbeats appear after stop completes"
     (let [dir (str "/tmp/cp-dr2-test-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+          projection-store (rmp/open-store {:storage-dir dir :backend :file})]
       (try
         (let [cp-instance (cp/start {:event-store store
-                                     :cache cache
+                                     :projection-store projection-store
                                      :heartbeat-interval-ms 200
                                      :staleness-threshold-ms 1000})
               hb-count (fn []
@@ -297,7 +291,7 @@
               (is (= hb-count-after-stop hb-count-later)
                   "No new heartbeats after stop completes"))))
         (finally
-          (kv/stop cache)
+          (projection-testing/release-store! projection-store)
           (es/stop store)
           (delete-dir-recursively dir))))))
 
@@ -314,8 +308,8 @@
     (let [dir-a (str "/tmp/cp-ptcas3-a-" (uuid/v4))
           dir-b (str "/tmp/cp-ptcas3-b-" (uuid/v4))
           store (es/start {:conn {:type :in-memory}})
-          cache-a (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir-a :db-name "test"}))
-          cache-b (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir-b :db-name "test"}))
+          projection-store-a (rmp/open-store {:storage-dir dir-a :backend :file})
+          projection-store-b (rmp/open-store {:storage-dir dir-b :backend :file})
           tenant-1 (uuid/v4)
           tenant-2 (uuid/v4)
           cycle-count (atom 0)]
@@ -335,20 +329,19 @@
             (es/append store {:tenant-id tenant-2
                               :events [(es/->event {:type :test/lifecycle-event :body {}})]})
             ;; Start two control plane instances
-            (let [cp-a (cp/start {:event-store store :cache cache-a
+            (let [cp-a (cp/start {:event-store store :projection-store projection-store-a
                                   :heartbeat-interval-ms 200
                                   :staleness-threshold-ms 1000})
                   _ (Thread/sleep 100)
-                  cp-b (cp/start {:event-store store :cache cache-b
+                  cp-b (cp/start {:event-store store :projection-store projection-store-b
                                   :heartbeat-interval-ms 200
                                   :staleness-threshold-ms 1000})]
               (try
                 ;; Wait for assignment — each tenant gets a lease
-                (let [ctx {:event-store store :cache cache-a
+                (let [ctx {:event-store store :projection-store projection-store-a
                            :tenant-id events/control-plane-tenant-id}]
                   (harness/wait-for
-                   #(do (rmp/l1-clear!)
-                        (= 2 (count (rmp/project ctx :grain.control/lease-ownership))))))
+                   #(= 2 (count (rmp/project ctx :grain.control/lease-ownership)))))
                 ;; Both "nodes" try to append billing triggers with CAS
                 ;; Simulate 3 periodic cycles
                 (dotimes [i 3]
@@ -410,8 +403,8 @@
             (finally
               (reset! tp/processor-registry* prev-registry))))
         (finally
-          (kv/stop cache-a)
-          (kv/stop cache-b)
+          (projection-testing/release-store! projection-store-a)
+          (projection-testing/release-store! projection-store-b)
           (es/stop store)
           (delete-dir-recursively dir-a)
           (delete-dir-recursively dir-b))))))

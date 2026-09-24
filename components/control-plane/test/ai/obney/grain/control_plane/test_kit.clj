@@ -10,7 +10,6 @@
             [ai.obney.grain.control-plane.core :as cp]
             [ai.obney.grain.control-plane.assignment :as assignment]
             [ai.obney.grain.control-plane.read-models]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.todo-processor-v2.core :as tp]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
@@ -48,7 +47,6 @@
         (harness/emit-heartbeat! inst-a)
         (harness/emit-heartbeat! inst-b)
         (harness/run-assignment! inst-a staleness-ms :round-robin)
-        (rmp/l1-clear!)
         (let [leases-a (harness/project-lease-ownership inst-a)
               leases-b (harness/project-lease-ownership inst-b)]
           (is (= leases-a leases-b) "Both instances see the same leases")
@@ -74,7 +72,6 @@
         (let [ra (future (harness/run-assignment! inst-a staleness-ms :round-robin))
               rb (future (harness/run-assignment! inst-b staleness-ms :round-robin))]
           @ra @rb)
-        (rmp/l1-clear!)
         (let [leases (harness/project-lease-ownership inst-a)]
           (is (= 1 (count leases)) "Exactly one lease for the tenant")
           (is (contains? #{(:node-id inst-a) (:node-id inst-b)}
@@ -95,7 +92,6 @@
       (try
         (harness/emit-heartbeat! inst-a)
         (harness/emit-heartbeat! inst-b)
-        (rmp/l1-clear!)
         (let [active-a (harness/project-active-nodes inst-a staleness-ms)
               active-b (harness/project-active-nodes inst-b staleness-ms)
               coord-a (assignment/coordinator active-a)
@@ -122,13 +118,10 @@
         (harness/emit-heartbeat! inst-a)
         (harness/emit-heartbeat! inst-b)
         (harness/run-assignment! inst-a staleness-ms :round-robin)
-        (rmp/l1-clear!)
         (let [leases-before (harness/project-lease-ownership inst-a)]
           (is (= 1 (count leases-before)))
           (harness/emit-departed! inst-a)
-          (rmp/l1-clear!)
           (harness/run-assignment! inst-b staleness-ms :round-robin)
-          (rmp/l1-clear!)
           (let [leases-after (harness/project-lease-ownership inst-b)]
             (is (= 1 (count leases-after)) "All work reassigned")
             (is (every? #(= (:node-id inst-b) %) (vals leases-after))
@@ -181,7 +174,6 @@
                           :events [(es/->event {:type :test/domain-event :body {:n 2}})]})
         (harness/emit-heartbeat! inst-a)
         (harness/run-assignment! inst-a staleness-ms :round-robin)
-        (rmp/l1-clear!)
         (let [leases-before (harness/project-lease-ownership inst-a)]
           (is (= 2 (count leases-before)))
           (is (every? #(= node-a-id %) (vals leases-before))))
@@ -190,9 +182,7 @@
               inst-b (harness/make-instance store node-b-id)]
           (try
             (harness/emit-heartbeat! inst-b)
-            (rmp/l1-clear!)
             (harness/run-assignment! inst-a staleness-ms :round-robin)
-            (rmp/l1-clear!)
             (let [leases-after (harness/project-lease-ownership inst-a)
                   owners (set (vals leases-after))]
               (is (= 2 (count leases-after)))

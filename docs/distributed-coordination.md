@@ -33,12 +33,16 @@ For multi-instance deployments, the `grain-control-plane` package provides distr
 
 ## Starting the Control Plane
 
+The control plane uses [v3 projections](core-concepts.md#read-models--projections).
+Supply an application-owned `:projection-store`; stop the control plane before
+closing it. Each node must use its own local store path.
+
 ```clojure
 (require '[ai.obney.grain.control-plane.interface :as control-plane])
 
 (def cp (control-plane/start
           {:event-store event-store
-           :cache cache                          ; LMDB KV store for read model L2
+           :projection-store projection-store    ; v3 store opened with rmp/open-store
            :node-metadata {:address "node-a:8080"} ; included in heartbeats
            :heartbeat-interval-ms 2000
            :staleness-threshold-ms 6000

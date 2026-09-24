@@ -13,7 +13,7 @@
             [ai.obney.grain.event-store-v3.interface :as event-store]
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.query-processor.interface :as qp]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
             [ai.obney.grain.schema-util.interface :as schema-util]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [clojure.edn :as edn]

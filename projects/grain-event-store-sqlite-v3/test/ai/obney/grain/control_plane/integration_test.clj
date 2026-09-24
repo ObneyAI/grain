@@ -5,7 +5,6 @@
             [ai.obney.grain.event-store-sqlite-v3.core :as sqlite-core]
             [ai.obney.grain.event-store-sqlite-v3.interface]
             [ai.obney.grain.control-plane.test-kit :as test-kit]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [next.jdbc :as jdbc])
   (:import [java.io File]))
 
@@ -37,9 +36,7 @@
     (jdbc/execute! pool ["DELETE FROM event_tags"])
     (jdbc/execute! pool ["DELETE FROM events"])
     (jdbc/execute! pool ["DELETE FROM tenants"]))
-  (rmp/l1-clear!)
-  (f)
-  (rmp/l1-clear!))
+  (f))
 
 (use-fixtures :once once-fixture)
 (use-fixtures :each each-fixture)

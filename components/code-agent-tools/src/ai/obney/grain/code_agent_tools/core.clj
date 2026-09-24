@@ -6,7 +6,7 @@
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.query-processor.interface :as qp]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [clojure.data.json :as json]
@@ -235,8 +235,8 @@
 (defn event-store [ctx]
   (or (:event-store ctx) (throw (ex-info "No :event-store is available in the installed context" {}))))
 
-(defn cache [ctx]
-  (or (:cache ctx) (throw (ex-info "No :cache is available in the installed context" {}))))
+(defn projection-store [ctx]
+  (or (:projection-store ctx) (throw (ex-info "No :projection-store is available in the installed context" {}))))
 
 (defn validation-result
   [schema value]
@@ -303,8 +303,8 @@
    (let [ctx (base-context)
          tenant-id (require-tenant-id ctx (or scope {}))
          call-ctx (assoc ctx :tenant-id tenant-id
-                         :event-store (event-store ctx) :cache (cache ctx))]
-     (rmp/project call-ctx read-model-name scope))))
+                         :event-store (event-store ctx) :projection-store (projection-store ctx))]
+     (rmp/project call-ctx read-model-name (dissoc scope :tenant-id)))))
 
 (defn system-value
   [system key-name]
@@ -348,8 +348,12 @@
                     :tenants (when (:event-store ctx)
                                (try (es/tenants (:event-store ctx))
                                     (catch Exception e {:error/message (.getMessage e)})))}
-      :cache {:present? (contains? ctx :cache)
-              :l1 (try (rmp/l1-stats) (catch Exception e {:error/message (.getMessage e)}))}
+      :projection-store {:present? (contains? ctx :projection-store)
+                         :status (when-let [store (:projection-store ctx)]
+                                   (update-vals (rmp/store-status store)
+                                     #(if (instance? Throwable %)
+                                        {:error/message (.getMessage ^Throwable %)}
+                                        %)))}
       :control-plane (control-plane-diagnostics rt ctx args)})))
 
 ;; ===========================================================================

@@ -4,12 +4,11 @@
    two JVMs sharing Postgres with LISTEN/NOTIFY."
   (:require [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.pubsub.interface :as pubsub]
-            [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [ai.obney.grain.control-plane.events :as events]
             [ai.obney.grain.control-plane.core :as cp]
             [ai.obney.grain.control-plane.assignment :as assignment]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface.testing :as projection-testing]
             [clojure.java.io :as io]))
 
 (defn delete-dir-recursively [dir]
@@ -21,22 +20,22 @@
             (reverse (file-seq f))))))
 
 (defn make-instance
-  "Creates a simulated Grain instance with its own cache and context,
+  "Creates a simulated Grain instance with its own projection-store and context,
    sharing the given event store."
   [shared-store node-id]
   (let [dir (str "/tmp/cp-harness-" node-id)
-        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "test"}))]
+        projection-store (rmp/open-store {:storage-dir dir :backend :file})]
     {:node-id node-id
      :event-store shared-store
-     :cache cache
-     :cache-dir dir
+     :projection-store projection-store
+     :projection-store-dir dir
      :ctx {:event-store shared-store
-           :cache cache
+           :projection-store projection-store
            :tenant-id events/control-plane-tenant-id}}))
 
-(defn stop-instance [{:keys [cache cache-dir]}]
-  (kv/stop cache)
-  (delete-dir-recursively cache-dir))
+(defn stop-instance [{:keys [projection-store projection-store-dir]}]
+  (projection-testing/release-store! projection-store)
+  (delete-dir-recursively projection-store-dir))
 
 (defn emit-heartbeat!
   ([instance] (emit-heartbeat! instance {}))

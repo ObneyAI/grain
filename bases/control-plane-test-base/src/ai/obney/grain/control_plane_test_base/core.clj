@@ -11,9 +11,7 @@
             [ai.obney.grain.control-plane.interface :as control-plane]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.periodic-task.interface :as pt]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
-            [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
             [com.brunobonacci.mulog :as u]
             [nrepl.server :as nrepl]
             [clj-uuid :as uuid]
@@ -215,7 +213,7 @@
         nrepl-port (Integer/parseInt (or (System/getenv "NREPL_PORT") "7888"))
         http-port (Integer/parseInt (or (System/getenv "HTTP_PORT") "8080"))
         node-hostname (or (System/getenv "NODE_HOSTNAME") "localhost")
-        cache-dir (str "/tmp/grain-cp-test-" (uuid/v4))
+        projection-store-dir (str "/tmp/grain-cp-test-" (uuid/v4))
 
         ;; Core infrastructure
         event-pubsub (pubsub/start {:type :core-async :topic-fn :event/type})
@@ -225,11 +223,11 @@
                                            :event-pubsub event-pubsub
                                            :poll-interval-ms 100
                                            :batch-size 100})
-        cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir cache-dir :db-name "cp-test"}))
+        projection-store (rmp/open-store {:storage-dir projection-store-dir})
 
         ;; Control plane — include address in node metadata for routing
         cp (control-plane/start {:event-store event-store
-                                 :cache cache
+                                 :projection-store projection-store
                                  :event-pubsub event-pubsub
                                  :node-metadata {:address (str node-hostname ":" http-port)}
                                  :heartbeat-interval-ms 2000
@@ -247,14 +245,14 @@
                 :event-pubsub event-pubsub
                 :event-tailer event-tailer
                 :tail-probe (atom nil)
-                :cache cache
-                :cache-dir cache-dir
+                :projection-store projection-store
+                :projection-store-dir projection-store-dir
                 :control-plane cp
                 :periodic-triggers periodic-triggers
                 :nrepl-server nrepl-server
                 :console-stop console-stop
                 :ctx {:event-store event-store
-                      :cache cache
+                      :projection-store projection-store
                       :tenant-id ai.obney.grain.control-plane.events/control-plane-tenant-id}}
 
         ;; HTTP server with routing interceptor
@@ -334,7 +332,7 @@
 
 (defn stop
   "Stop the test app."
-  [{:keys [control-plane periodic-triggers nrepl-server http-server event-tailer event-pubsub event-store cache console-stop]
+  [{:keys [control-plane periodic-triggers nrepl-server http-server event-tailer event-pubsub event-store projection-store console-stop]
     :as system}]
   (stop-tail-probe! system)
   (stop-http-server http-server)
@@ -343,7 +341,7 @@
   (nrepl/stop-server nrepl-server)
   (event-tailer/stop event-tailer)
   (pubsub/stop event-pubsub)
-  (kv/stop cache)
+  (rmp/close-store! projection-store)
   (es/stop event-store)
   (console-stop)
   (println "Stopped."))
@@ -455,13 +453,11 @@
 (defn active-nodes
   "Show active (non-stale) nodes."
   [system]
-  (rmp/l1-clear!)
   (control-plane/project-active-nodes (:ctx system) 6000))
 
 (defn leases
   "Show current lease ownership."
   [system]
-  (rmp/l1-clear!)
   (rmp/project (:ctx system) :grain.control/lease-ownership))
 
 (defn processed-events
@@ -523,7 +519,6 @@
 (defn route-for-tenant-check
   "Check routing decision for a tenant from this node's perspective."
   [system tenant-id]
-  (rmp/l1-clear!)
   (let [cp (:control-plane system)
         ctx (:ctx system)
         leases (control-plane/project-lease-ownership ctx)

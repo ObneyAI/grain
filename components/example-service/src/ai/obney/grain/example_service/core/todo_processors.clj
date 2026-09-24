@@ -6,7 +6,7 @@
 
    The handler receives a context with `:event`, `:event-store`,
    `:tenant-id` (plus anything merged from the poller's `:context`, e.g.
-   `:cache`). It subscribes to events via the `:topics` opt and processes
+   `:projection-store`). It subscribes to events via the `:topics` opt and processes
    one event at a time. It must return `{:result/events [...]}`,
    `{:result/effect (fn [] ...)}`, or `{}`.
 

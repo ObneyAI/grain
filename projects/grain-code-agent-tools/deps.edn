@@ -8,7 +8,7 @@
         cat/core-async-thread-pool {:local/root "../../components/core-async-thread-pool"}
         cat/query-processor {:local/root "../../components/query-processor"}
         cat/query-schema {:local/root "../../components/query-schema"}
-        cat/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        cat/read-model-processor-v3 {:local/root "../../components/read-model-processor-v3"}
         cat/todo-processor-v2 {:local/root "../../components/todo-processor-v2"}
         cat/periodic-task {:local/root "../../components/periodic-task"}
         cat/event-store-v3 {:local/root "../../components/event-store-v3"}

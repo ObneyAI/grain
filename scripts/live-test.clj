@@ -4,6 +4,7 @@
 ;; Parameterized for arbitrary node count. Manages Docker lifecycle.
 ;;
 ;; Usage: clojure -M:dev scripts/live-test.clj
+;; Read-model scenarios only: clojure -M:dev scripts/live-test.clj read-models
 
 (require '[nrepl.core :as nrepl])
 (require '[clojure.java.shell :refer [sh]])
@@ -89,8 +90,7 @@
         (cond
           ready? :ok
           (> (System/currentTimeMillis) deadline)
-          (binding [*out* *err*]
-            (println (str "Node on port " port " did not become ready within 180s")))
+          (throw (ex-info "Node did not become ready within 180s" {:port port}))
           :else (do (Thread/sleep 1000) (recur)))))))
 
 (defn node-status [port]
@@ -484,7 +484,7 @@
         (check "Every increment processed exactly once" (= increments after))))))
 
 (defn scenario-12 []
-  (header "Scenario 12: Stale L1 cache after lease transfer")
+  (header "Scenario 12: Projection catch-up after lease transfer")
   (restart-victim!)
   (Thread/sleep 6000)
   ;; Find a tenant on primary, kill primary, verify victim processes it
@@ -801,44 +801,68 @@
              (= (inc processed-before) processed-after)))))
 
 ;; -------------------------------- ;;
+;; Read model scenarios             ;;
+;; -------------------------------- ;;
+
+(defn- read-model-scenario! [operation]
+  (let [result (eval-read primary-port
+                 (format "(do
+                            (require '[ai.obney.grain.control-plane-test-base.read-model-scenarios :as rms])
+                            (rms/%s (:event-store @app/app)))" operation)
+                 180000)]
+    (when (check "Read-model scenario returned assertions"
+                 (and (map? (:checks result)) (seq (:checks result))))
+      (doseq [[description passed?] (:checks result)]
+        (check description (true? passed?))))))
+
+(defn scenario-19 []
+  (header "Scenario 19: Durable projection build, reopen, and catch-up")
+  (read-model-scenario! "lifecycle"))
+
+(defn scenario-20 []
+  (header "Scenario 20: Concurrent projections and retained LMDB snapshots")
+  (read-model-scenario! "concurrent"))
+
+;; -------------------------------- ;;
 ;; Main runner                      ;;
 
-(defn run-all []
+(defn run-all [& [read-models-only?]]
   (println "\n╔══════════════════════════════════════════╗")
   (println (str "║  Grain Control Plane Live Test Suite     ║"))
   (println (str "║  " n-nodes " nodes, " n-tenants " tenants                       ║"))
   (println "╚══════════════════════════════════════════╝")
 
-  (when-not (start-cluster!)
-    (println "\nFailed to start cluster. Aborting.")
-    (stop-cluster!)
-    (System/exit 1))
-
   (try
-    (scenario-1)
-    (scenario-2)
-    (scenario-3)
-    (scenario-3b)
-    (scenario-4)
-    (scenario-5)
-    (scenario-6)
-    (scenario-7)
-    (scenario-8)
-    (scenario-9)
-    (scenario-10)
-    (scenario-11)
-    (scenario-12)
-    (scenario-13)
-    (scenario-14)
-    (scenario-15)
-    (scenario-16)
-    (scenario-17)
-    (scenario-18)
+    (when-not (start-cluster!)
+      (throw (ex-info "Failed to start cluster" {})))
+    (when-not read-models-only?
+      (scenario-1)
+      (scenario-2)
+      (scenario-3)
+      (scenario-3b)
+      (scenario-4)
+      (scenario-5)
+      (scenario-6)
+      (scenario-7)
+      (scenario-8)
+      (scenario-9)
+      (scenario-10)
+      (scenario-11)
+      (scenario-12)
+      (scenario-13)
+      (scenario-14)
+      (scenario-15)
+      (scenario-16)
+      (scenario-17)
+      (scenario-18))
+    (scenario-19)
+    (scenario-20)
 
     (catch Throwable t
       (swap! results update :error inc)
       (println (str "\n  !! Unexpected error: " (.getMessage t)))
-      (.printStackTrace t)))
+      (.printStackTrace t)
+      (println (:out (compose "logs" "--no-color" "--tail" "150")))))
 
   (let [{:keys [pass fail error]} @results
         total (+ pass fail error)]
@@ -854,6 +878,7 @@
 ;; Entry point
 (let [cmd (first *command-line-args*)]
   (case cmd
+    "read-models" (run-all true)
     "check-status" (do (doseq [p all-ports] (setup-node! p))
                        (header "Status check")
                        (doseq [s (all-statuses)]

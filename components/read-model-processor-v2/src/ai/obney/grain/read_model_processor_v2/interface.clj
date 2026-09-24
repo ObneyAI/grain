@@ -34,9 +34,9 @@
    **L2 (LMDB):** Fressian-serialized state on disk. Survives process restarts.
    Three storage strategies selected automatically:
 
-   - **Monolithic**: Single cache entry for small state (< 10K keys).
-   - **Segmented**: 64 hash-based segments for large state (>= 10K keys).
-     Only changed segments are written back.
+   - **Monolithic**: Single cache entry for small state (<= 10K keys).
+   - **Segmented**: 64 hash-based segments for large state (> 10K keys).
+     Catch-up from L2 writes changed segments; catch-up from L1 writes all segments.
    - **Partitioned**: Per-partition cache entries with a global manifest.
      Requires `:partition-fn` and `:entity-id-fn` in opts.
 
@@ -127,7 +127,14 @@
      :partition-fn  — `(entity -> partition-key)` for partitioned projections
      :entity-id-fn  — `(event -> entity-id)` for partitioned projections
      :partition-key — Read a single partition (partitioned models only)
-     :l1-ttl-ms     — L1 cache TTL in ms (default 0 = always revalidate)"
+     :l1-ttl-ms     — L1 cache TTL in ms (default 0 = always revalidate)
+     :l1-max-entries — Maximum decoded entries (default 10000)
+
+   Unpartitioned experiments may additionally set :cache-mode (:none, :l1,
+   :l2, or default :both), :checkpoint-threshold (default 10 events per read),
+   :segment-threshold (default 10000 keys, strictly greater), and :segment-count
+   (default 64). Use isolated cache identities/stores for each configuration;
+   these controls do not invalidate existing entries or change partitioned reads."
   [{:keys [_event-store _cache _tenant-id] :as context}
    {:keys [_f _query _name _version _scope _partition-fn _entity-id-fn _partition-key] :as args}]
   (core/p context args))

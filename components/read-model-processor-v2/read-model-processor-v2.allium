@@ -194,10 +194,10 @@ contract Projection {
         -- served them.
 
     @invariant NoReprocessing
-        -- RM4: across successive reads, each event is folded at most once. A read
-        -- that finds new events folds only those past the stored watermark onto
-        -- the cached state; a read that finds none folds nothing. The cumulative
-        -- result equals a from-scratch fold over all events seen so far.
+        -- RM4: a catch-up from a retained cache entry folds only events after
+        -- that entry's watermark. When no cache entry is available, the engine
+        -- folds from the beginning; losing L1 may repeat work since the durable
+        -- checkpoint. Both cases equal a from-scratch fold at the same prefix.
 }
 
 -- The cache guarantee: the two tiers are an optimisation, never a source of
@@ -213,9 +213,17 @@ contract Cache {
         -- RM9: state is stored monolithically when small and split into a fixed
         -- set of hash segments when large, migrating between the two as it grows.
         -- The choice and the segment boundaries are invisible to a reader: the
-        -- reassembled state equals the projection either way, and on an
-        -- incremental update only the segments that actually changed are
-        -- rewritten.
+        -- reassembled state equals the projection either way. A catch-up from
+        -- a segmented durable checkpoint writes changed segments; catch-up
+        -- from decoded state may write a complete checkpoint.
+
+    @invariant OptionalTiers
+        -- Unpartitioned callers may choose neither tier, only decoded state,
+        -- only durable state, or both (the default). Disabled tiers perform no
+        -- lookup or population; disabling durable state also skips checkpoint
+        -- encoding. Losing decoded state does not flush it to durable storage.
+        -- Cache tuning is fixed for an experiment's isolated cache identity;
+        -- changing tuning does not invalidate existing checkpoints.
 }
 
 -- The partitioning guarantee for read models that shard their state by a
@@ -249,6 +257,12 @@ contract Partitioning {
 ------------------------------------------------------------
 
 config {
+    -- Unpartitioned low-level experiments; ordinary registered projections
+    -- keep both tiers. Valid choices: none, l1, l2, both.
+    cache_mode: String = "both"
+    segment_threshold: Integer = 10000
+    segment_count: Integer = 64
+
     -- How long the in-process tier may serve a cached projection without
     -- re-checking the event store. Zero means always re-check, so reads are
     -- never stale; a positive window trades freshness for sub-millisecond reads

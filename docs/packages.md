@@ -2,7 +2,7 @@
 
 ## grain-core-v2
 
-Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes v2 processors (command, read-model, todo), v2 request handler, query processor, pub/sub, declarative event definitions, opt-in retention administration, and the event tailer for replaying shared-store events into a node's local pub/sub:
+Multi-tenant CQRS/Event Sourcing with an in-memory event store. Includes command and todo processors v2, read-model processor v3, the v2 command request handler, query processor, pub/sub, declarative event definitions, opt-in retention administration, and the event tailer. The [v3 read-model processor](core-concepts.md#read-models--projections) uses a Datahike projection store with optional secondary indexes; its default LMDB backend requires Java 22+ and native LMDB.
 
 ```clojure
 obneyai/grain-core-v2

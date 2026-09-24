@@ -90,7 +90,7 @@
   (core/events args))
 
 (defn projection
-  "Projects a registered read model against the installed event store/cache.
+  "Projects a registered read model against the installed event/projection stores.
 
   With one argument, projects `read-model-name` using the installed context.
   With `scope`, passes scope through to the read-model processor; scope may
@@ -103,8 +103,8 @@
 (defn diagnostics
   "Returns runtime diagnostics for the installed app.
 
-  Includes runtime summary, registry counts, event-store/cache presence, tenant
-  info when available, L1 cache stats, and control-plane diagnostics when the
+  Includes runtime summary, registry counts, event/projection-store presence, tenant
+  info when available, projection-store status, and control-plane diagnostics when the
   installed Integrant system contains a control plane. `args` may include
   `:tenant-id` for tenant routing diagnostics and `:staleness-threshold-ms` for
   active-node checks."

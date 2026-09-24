@@ -41,7 +41,7 @@
   (def-handler-macro ctx 'ai.obney.grain.query-processor.interface/defquery))
 
 (defn defreadmodel [ctx]
-  (def-handler-macro ctx 'ai.obney.grain.read-model-processor-v2.interface/defreadmodel))
+  (def-handler-macro ctx 'ai.obney.grain.read-model-processor-v3.interface/defreadmodel))
 
 (defn defprocessor [ctx]
   (def-handler-macro ctx 'ai.obney.grain.todo-processor-v2.interface/defprocessor))

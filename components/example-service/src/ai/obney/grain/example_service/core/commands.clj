@@ -5,7 +5,7 @@
    registry under `:<ns>/<name>` — no manual registry map is needed.
 
    Command handlers take a context that includes any necessary dependencies
-   wired in the base for the service (`:event-store`, `:cache`, `:tenant-id`).
+   wired in the base for the service (`:event-store`, `:projection-store`, `:tenant-id`).
    A command-request-handler-v2 (HTTP) or a direct `process-command` call
    (REPL) looks the handler up in the registry. Commands either return a
    cognitect anomaly or a map that optionally has a `:command-result/events`

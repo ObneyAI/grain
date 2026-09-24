@@ -1,6 +1,8 @@
 (ns ai.obney.grain.code-agent-tools.interface-test
   (:require [ai.obney.grain.code-agent-tools.interface :as tools]
             [ai.obney.grain.example-base.core :as example-base]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
+            [clojure.edn :as edn]
             [clojure.test :refer [deftest is testing]]
             [integrant.core :as ig]))
 
@@ -28,7 +30,7 @@
 (deftest installed-runtime-executes-against-example-app
   (let [app (ig/init (select-keys example-base/system
                                   [::example-base/event-store
-                                   ::example-base/cache
+                                   ::example-base/projection-store
                                    ::example-base/context]))
         ctx (::example-base/context app)]
     (try
@@ -46,7 +48,24 @@
         (is (= 1 (count (tools/events {:types #{:example/counter-created}
                                        :limit 10})))))
       (testing "project read model"
-        (is (= 1 (count (tools/projection :example/counters)))))
+        (is (= 1 (count (tools/projection :example/counters))))
+        (is (empty? (tools/projection :example/counters {:tenant-id (random-uuid)}))))
+      (testing "v3 store diagnostics"
+        (let [diagnostics (tools/diagnostics)]
+          (is (true? (get-in diagnostics [:projection-store :present?])))
+          (is (map? (get-in diagnostics [:projection-store :status])))
+          (is (not (contains? diagnostics :cache)))))
+      (testing "store failures remain readable EDN"
+        (with-redefs [rmp/store-status (constantly {:last-error (ex-info "Collection failed" {})})]
+          (let [status (get-in (tools/diagnostics) [:projection-store :status])]
+            (is (= {:last-error {:error/message "Collection failed"}} status))
+            (is (= status (edn/read-string (pr-str status)))))))
+      (testing "projection requires a v3 store"
+        (tools/install! {:context (dissoc ctx :projection-store) :mode :dev})
+        (try
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No :projection-store"
+                               (tools/projection :example/counters)))
+          (finally (tools/install! {:system app :context ctx :mode :dev}))))
       (testing "diagnostics degrade without control plane"
         (is (= false (get-in (tools/diagnostics) [:control-plane :control-plane/present?]))))
       (finally

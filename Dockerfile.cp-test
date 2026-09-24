@@ -1,8 +1,8 @@
-FROM eclipse-temurin:21-noble
+FROM eclipse-temurin:25-noble
 
 # Install Clojure CLI
 RUN apt-get update && \
-    apt-get install -y curl rlwrap && \
+    apt-get install -y curl rlwrap liblmdb0 && \
     curl -L -O https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh && \
     chmod +x linux-install.sh && \
     ./linux-install.sh && \

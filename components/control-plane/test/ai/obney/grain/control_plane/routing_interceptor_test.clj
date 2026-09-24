@@ -6,14 +6,12 @@
             [ai.obney.grain.control-plane.harness :as harness]
             [ai.obney.grain.control-plane.core :as cp]
             [ai.obney.grain.event-store-v3.interface :as es]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [clj-uuid :as uuid]))
 
 (defschemas routing-test-schemas
   {:test/domain-event [:map [:n :int]]})
 
-(use-fixtures :each (fn [f] (rmp/l1-clear!) (f)))
 
 (def staleness-ms 15000)
 
@@ -51,7 +49,6 @@
         (cp/emit-heartbeat! (:ctx inst-a) node-a-id {:address "10.0.1.1:8080"})
         (cp/emit-heartbeat! (:ctx inst-b) node-b-id {:address "10.0.1.2:8080"})
         (harness/run-assignment! inst-a staleness-ms :round-robin)
-        (rmp/l1-clear!)
 
         ;; Find which node owns tenant-1
         (let [leases (harness/project-lease-ownership inst-a)
@@ -90,7 +87,6 @@
         (cp/emit-heartbeat! (:ctx inst-a) node-a-id {:address "10.0.1.1:8080"})
         (cp/emit-heartbeat! (:ctx inst-b) node-b-id {:address "10.0.1.2:8080"})
         (harness/run-assignment! inst-a staleness-ms :round-robin)
-        (rmp/l1-clear!)
 
         ;; Find which node does NOT own tenant-1
         (let [leases (harness/project-lease-ownership inst-a)
@@ -127,7 +123,6 @@
         (cp/emit-heartbeat! (:ctx inst-a) node-a-id {:address "10.0.1.1:8080"})
         (cp/emit-heartbeat! (:ctx inst-b) node-b-id {:address "10.0.1.2:8080"})
         (harness/run-assignment! inst-a staleness-ms :round-robin)
-        (rmp/l1-clear!)
 
         (let [leases (harness/project-lease-ownership inst-a)
               owner-id (get leases tenant-1)
@@ -163,7 +158,6 @@
       (try
         ;; Don't create tenant — no lease exists
         (cp/emit-heartbeat! (:ctx inst-a) node-a-id {:address "10.0.1.1:8080"})
-        (rmp/l1-clear!)
 
         (let [interceptor (make-interceptor inst-a)
               enter-fn (:enter interceptor)
@@ -197,7 +191,6 @@
         (cp/emit-heartbeat! (:ctx inst-a) node-a-id {:address "10.0.1.1:8080"})
         (cp/emit-heartbeat! (:ctx inst-b) node-b-id {:address "10.0.1.2:8080"})
         (harness/run-assignment! inst-a staleness-ms :round-robin)
-        (rmp/l1-clear!)
 
         (let [leases (harness/project-lease-ownership inst-a)
               owner-id (get leases tenant-1)
@@ -211,12 +204,10 @@
           (if (= owner-id node-a-id)
             (harness/emit-departed! inst-a)
             (harness/emit-departed! inst-b))
-          (rmp/l1-clear!)
 
           ;; Surviving node runs reassignment
           (let [survivor-inst (if (= owner-id node-a-id) inst-b inst-a)]
             (harness/run-assignment! survivor-inst staleness-ms :round-robin)
-            (rmp/l1-clear!)
 
             ;; Old owner now returns 503 (or local with stale-owner since it departed)
             ;; New owner serves locally
@@ -240,7 +231,6 @@
           inst-a (harness/make-instance store node-a-id)]
       (try
         (cp/emit-heartbeat! (:ctx inst-a) node-a-id {:address "10.0.1.1:8080"})
-        (rmp/l1-clear!)
         (let [interceptor (make-interceptor inst-a)
               enter-fn (:enter interceptor)
               result (enter-fn (pedestal-ctx nil))]

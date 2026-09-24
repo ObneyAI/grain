@@ -30,7 +30,7 @@ Grain makes this grammar executable with a small set of declarative macros. Give
 
 - `defcommand` — Commands are the C in CQRS. A command is a request to change the state of the system. It makes decisions and enforces business logic and invariants and produces zero or more events.
 - `defquery` — Queries are the Q in CQRS. Q query is a composition of domain data by way of Read Models that serves a screen or some other surface that users both human and automated interact with.
-- `defreadmodel` — Read Models are reductions over event streams that project the current state of the world resulting in a perspective about a set of facts that occurred over time. Concretely, these tend to be domain entities constructed by way of business logic. If you're coming from the relational database paradigm, Read Models tend to be like your tables with rows and columns, except that in Event Sourced systems, entities are emergent, rather than determined upfront.
+- `defreadmodel` — Defines a deterministic reducer over events. The [v3 processor](docs/core-concepts.md#read-models--projections) persists projection state and watermarks in Datahike and supports point reads, secondary indexes, cursor pages, and streaming reductions.
 - `defprocessor` — Todo Processors are reactive background automations. They can watch for events that they are interested in and then react, usually this means executing Commands.
 - `defperiodic` — Periodic Tasks can be thought of as cron job triggers. They can emit an event on a schedule and they will always be paired with a Todo Processor that actually handles the work.
 - `defschemas` - Schemas force us to declare the shape of all the data in a Grain application.

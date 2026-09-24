@@ -5,6 +5,8 @@ Grain integrates with [Datastar](https://data-star.dev/) for building reactive s
 For checked client-side Datastar attributes, route references, explicit command/query payloads, and automatic signal scoping, use the [Datastar UI DSL](datastar-ui.md).
 
 ```clojure
+(require '[ai.obney.grain.read-model-processor-v3.interface :as rmp])
+
 (defquery :example counter-view
   {:authorized?       (constantly true)
    :datastar/path     "/counters"
@@ -17,6 +19,11 @@ For checked client-side Datastar attributes, route references, explicit command/
                         (for [[id c] counters]
                           [:p (str (:name c) ": " (:value c))])]}))
 ```
+
+Supply `:projection-store`, `:event-store`, and the request's trusted `:tenant-id`
+in the query context. See [v3 read models](core-concepts.md#read-models--projections).
+`:grain/read-models` resolves event subscriptions from the v3 registry. Load
+model declarations before creating event-driven streams.
 
 ## Interceptors
 
@@ -224,5 +231,5 @@ The adapter logs warnings for common misconfigurations that would otherwise caus
 | `:datastar/interceptors` | Additional Pedestal interceptors for this query | `[]` |
 | `:datastar/gate` | Context-dependent gate `{:check fn :redirect path-or-fn}` | — |
 | `:datastar/emit-signals?` | Allow the query to push a one-shot `:datastar/signals` patch alongside its hiccup | `false` |
-| `:grain/read-models` | Read models to subscribe to (enables event-driven mode) | — |
+| `:grain/read-models` | V3 read models whose event types enable event-driven mode | — |
 | `:authorized?` | Auth predicate `(fn [ctx] boolean)` | — |

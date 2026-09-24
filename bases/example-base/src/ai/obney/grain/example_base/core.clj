@@ -6,7 +6,7 @@
    `defperiodic`) and register themselves in global registries when their
    namespaces load — so this base only requires the example-service
    interface namespaces and wires the runtime: an in-memory event-store-v3,
-   an LMDB read-model cache, the HTTP request handlers, a standalone tenant
+   a durable projection store, the HTTP request handlers, a standalone tenant
    poller for processors (no control plane), and the periodic triggers.
 
    The app is single-tenant: every event-store append/read, projection,
@@ -17,8 +17,7 @@
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.event-model-validator.interface :as event-model-validator]
-            [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
             [ai.obney.grain.webserver.interface :as ws]
             [ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface :as cloudwatch-emf]
             [clojure.set :as set]
@@ -56,16 +55,16 @@
                          :password "password"
                          :database-name "obneyai"}}
 
-   ::cache {}
+   ::projection-store {}
 
    ::context {:event-store (ig/ref ::event-store)
-              :cache (ig/ref ::cache)
+              :projection-store (ig/ref ::projection-store)
               :tenant-id service-schemas/example-tenant-id}
 
    ;; Standalone tenant poller — runs every registered defprocessor for the
    ;; single example tenant. No control plane / pubsub.
    ::processors {:event-store (ig/ref ::event-store)
-                 :cache (ig/ref ::cache)
+                 :projection-store (ig/ref ::projection-store)
                  :tenant-id service-schemas/example-tenant-id}
 
    ;; Runs every registered defperiodic trigger on its schedule.
@@ -106,25 +105,23 @@
 (defmethod ig/halt-key! ::event-store [_ event-store]
   (es/stop event-store))
 
-(defmethod ig/init-key ::cache [_ _]
-  (kv/start
-   (lmdb/->KV-Store-LMDB {:storage-dir (str "/tmp/grain-example-" (random-uuid))
-                          :db-name "example"})))
+(defmethod ig/init-key ::projection-store [_ _]
+  (rmp/open-store {:storage-dir (str "/tmp/grain-example-" (random-uuid))}))
 
-(defmethod ig/halt-key! ::cache [_ cache]
-  (kv/stop cache))
+(defmethod ig/halt-key! ::projection-store [_ projection-store]
+  (rmp/close-store! projection-store))
 
 (defmethod ig/init-key ::context [_ context]
   context)
 
-(defmethod ig/init-key ::processors [_ {:keys [event-store cache tenant-id]}]
+(defmethod ig/init-key ::processors [_ {:keys [event-store projection-store tenant-id]}]
   (tp/start-tenant-poller
    {:event-store event-store
     :tenant-ids #{tenant-id}
     ;; Merged into each handler's context (the poller injects
-    ;; :event-store/:tenant-id/:event itself); :cache is needed so the
+    ;; :event-store/:tenant-id/:event itself); :projection-store is needed so the
     ;; processor's command can project the read model.
-    :context {:cache cache}
+    :context {:projection-store projection-store}
     :poll-interval-ms 250}))
 
 (defmethod ig/halt-key! ::processors [_ poller]

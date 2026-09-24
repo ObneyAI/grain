@@ -4,7 +4,7 @@
             [ai.obney.grain.control-plane.events :as events]
             [ai.obney.grain.control-plane.assignment :as assignment]
             [ai.obney.grain.control-plane.read-models]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [chime.core :as chime]
             [com.brunobonacci.mulog :as u]
@@ -157,14 +157,14 @@
 
    config keys:
      :event-store          - the event store instance
-     :cache                - the kv-store for read model L2 cache
+     :projection-store     - application-owned v3 projection store
      :context              - optional app context map passed to todo processor handlers
      :node-id              - UUID v7 identifying this node (generated if not provided)
      :node-metadata        - optional metadata map for this node
      :heartbeat-interval-ms - heartbeat period (default 5000)
      :staleness-threshold-ms - time before a node is considered dead (default 15000)
      :strategy             - assignment strategy (default :round-robin)"
-  [{:keys [event-store cache context node-id node-metadata
+  [{:keys [event-store projection-store context node-id node-metadata
            heartbeat-interval-ms staleness-threshold-ms strategy]
     :or {heartbeat-interval-ms 5000
          staleness-threshold-ms 15000
@@ -172,7 +172,7 @@
          node-metadata {}}}]
   (let [node-id (or node-id (uuid/v7))
         ctx {:event-store event-store
-             :cache cache
+             :projection-store projection-store
              :tenant-id events/control-plane-tenant-id
              ::app-context context}
         poller-atom (atom nil)

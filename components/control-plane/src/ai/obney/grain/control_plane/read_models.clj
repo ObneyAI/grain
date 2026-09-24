@@ -1,5 +1,5 @@
 (ns ai.obney.grain.control-plane.read-models
-  (:require [ai.obney.grain.read-model-processor-v2.interface :refer [defreadmodel]]
+  (:require [ai.obney.grain.read-model-processor-v3.interface :refer [defreadmodel]]
             [ai.obney.grain.control-plane.schemas]))
 
 (defreadmodel :grain.control active-nodes
@@ -9,8 +9,7 @@
             [:map
              [:last-heartbeat-at :int]
              [:last-heartbeat-id :uuid]
-             [:metadata [:maybe [:map]]]]]
-   :l1-ttl-ms 0}
+             [:metadata [:maybe [:map]]]]]}
   "Projects the currently active control-plane nodes."
   [state event]
   (case (:event/type event)
@@ -28,8 +27,7 @@
 (defreadmodel :grain.control lease-ownership
   {:events #{:grain.control/lease-acquired :grain.control/lease-released}
    :version 2
-   :schema [:map-of :uuid :uuid]
-   :l1-ttl-ms 0}
+   :schema [:map-of :uuid :uuid]}
   "Projects the node currently owning each tenant lease."
   [state event]
   (let [tid (:lease/tenant-id event)]

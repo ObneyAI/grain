@@ -81,11 +81,6 @@
 (def ^:const segment-count 64)
 (def ^:const segment-threshold 10000)
 
-(defn- should-segment?
-  "Returns true if state map has enough keys to warrant segmentation."
-  [state]
-  (> (count state) segment-threshold))
-
 (defn- split-into-segments
   "Partition a map into N segments by top-level key hash."
   [state-map n]
@@ -112,17 +107,16 @@
 ;; Cache read/write (unpartitioned)
 ;; ---------------------------------------------------------------------------
 
-(defn- read-cache
-  "Read from cache, handling both legacy monolithic and segmented formats."
-  [cache base-key]
-  (when-let [raw (kv/get! cache {:k base-key})]
+(defn- read-cache-snapshot
+  [get-value base-key]
+  (when-let [raw (get-value {:k base-key})]
     (let [decoded (fressian-util/decode raw)]
       (if (:segmented decoded)
         ;; Segmented: read all segments and merge
         (let [{:keys [segment-count watermark checksums]} decoded
               state (reduce
                      (fn [acc idx]
-                       (if-let [seg-bytes (kv/get! cache {:k (segment-key base-key idx)})]
+                       (if-let [seg-bytes (get-value {:k (segment-key base-key idx)})]
                          (merge acc (fressian-util/decode seg-bytes))
                          acc))
                      {}
@@ -135,6 +129,11 @@
         ;; Legacy monolithic format
         decoded))))
 
+(defn- read-cache
+  "Read state and watermark from one snapshot, including every segment."
+  [cache base-key]
+  (kv/read-snapshot cache #(read-cache-snapshot % base-key)))
+
 (defn- write-monolithic!
   "Write state as a single cache entry (legacy format)."
   [cache base-key state watermark]
@@ -143,7 +142,7 @@
 
 (defn- write-segmented!
   "Write state as segmented cache entries with manifest."
-  [cache base-key state watermark]
+  [cache base-key state watermark segment-count]
   (let [segments (split-into-segments state segment-count)
         entries (into []
                       (mapcat
@@ -194,11 +193,14 @@
     (kv/put-batch! cache {:entries all-entries})))
 
 (defn- write-cache!
-  "Write state to cache, choosing monolithic or segmented based on size."
-  [cache base-key state watermark]
-  (if (should-segment? state)
-    (write-segmented! cache base-key state watermark)
-    (write-monolithic! cache base-key state watermark)))
+  "Write state using the configured key-count boundary and segment count."
+  ([cache base-key state watermark]
+   (write-cache! cache base-key state watermark {}))
+  ([cache base-key state watermark opts]
+   (if (> (count state) (get opts :segment-threshold segment-threshold))
+     (write-segmented! cache base-key state watermark
+                       (get opts :segment-count segment-count))
+     (write-monolithic! cache base-key state watermark))))
 
 ;; ---------------------------------------------------------------------------
 ;; Partitioned projections
@@ -624,17 +626,30 @@
 (defn- p-unpartitioned
   "Unpartitioned projection with L1 + L2 tiered caching."
   [{:keys [event-store cache tenant-id]}
-   {:keys [f query name version scope l1-ttl-ms l1-max-entries]}]
+   {:keys [f query name version scope l1-ttl-ms l1-max-entries
+            cache-mode checkpoint-threshold] :as args
+     :or {cache-mode :both checkpoint-threshold 10}}]
+  (when-not (#{:none :l1 :l2 :both} cache-mode)
+    (throw (ex-info "Unknown cache mode" {:cache-mode cache-mode})))
+  (doseq [[k v minimum] [[:checkpoint-threshold checkpoint-threshold 1]
+                         [:segment-threshold (get args :segment-threshold segment-threshold) 0]
+                         [:segment-count (get args :segment-count segment-count) 1]
+                         [:l1-max-entries (or l1-max-entries default-l1-max-entries) 1]
+                         [:l1-ttl-ms (or l1-ttl-ms default-l1-ttl-ms) 0]]]
+    (when-not (and (integer? v) (>= v minimum))
+      (throw (ex-info "Invalid cache tuning" {:parameter k :value v :minimum minimum}))))
   (u/with-context {:read-model/name name
                    :read-model/version version})
   (let [cache-key (format-scoped-key name version (if scope [tenant-id scope] tenant-id))
+        l1? (#{:l1 :both} cache-mode)
+        l2? (#{:l2 :both} cache-mode)
         l1-key (String. ^bytes cache-key)
         query (inject-tenant-id query tenant-id)
         ttl-ms (or l1-ttl-ms default-l1-ttl-ms)
         max-entries (or l1-max-entries default-l1-max-entries)]
 
     ;; ── L1 check ──
-    (if-let [l1 (l1/get-entry l1-key)]
+    (if-let [l1 (when l1? (l1/get-entry l1-key))]
       (let [now (System/currentTimeMillis)]
         (if (< (- now (:validated-at l1)) ttl-ms)
           ;; L1 hit within TTL — no I/O at all
@@ -662,15 +677,15 @@
                         :read-model/cache-tier "l1-stale"
                         :read-model/events-processed event-count]
                        (do (l1/update-entry! l1-key state wm)
-                           (when (>= event-count 10)
-                             (write-cache! cache cache-key state wm))
+                           (when (and l2? (>= event-count checkpoint-threshold))
+                             (write-cache! cache cache-key state wm args))
                            state))))))
 
       ;; ── L1 miss — fall through to L2 ──
       (u/trace ::l1-miss
                [:metric/name "ReadModelL1Miss" :metric/resolution :high
                 :read-model/cache-tier "l1-miss"]
-               (if-let [cached (read-cache cache cache-key)]
+               (if-let [cached (when l2? (read-cache cache cache-key))]
                  ;; L2 hit
                  (u/trace ::l2-hit
                           [:metric/name "ReadModelL2Hit" :metric/resolution :high
@@ -679,15 +694,15 @@
                                 events (es/read event-store (add-watermark query watermark))
                                 {:keys [state event-count new-watermark]} (process-events data events f)
                                 wm (or new-watermark watermark)]
-                            (when (>= event-count 10)
+                            (when (and l2? (>= event-count checkpoint-threshold))
                               (if segmented
                                 (let [changed (changed-segments data state segment-count)]
                                   (when (seq changed)
                                     (write-changed-segments! cache cache-key checksums state
                                                             wm segment-count changed)))
-                                (write-cache! cache cache-key state wm)))
+                                (write-cache! cache cache-key state wm args)))
                             ;; Populate L1
-                            (l1/put-entry! l1-key state wm max-entries)
+                            (when l1? (l1/put-entry! l1-key state wm max-entries))
                             state))
 
                  ;; L2 miss — full projection
@@ -696,9 +711,9 @@
                            :read-model/cache-tier "l2-miss"]
                           (let [events (es/read event-store query)
                                 {:keys [state _event-count new-watermark]} (process-events {} events f)]
-                            (write-cache! cache cache-key state new-watermark)
+                            (when l2? (write-cache! cache cache-key state new-watermark args))
                             ;; Populate L1
-                            (l1/put-entry! l1-key state new-watermark max-entries)
+                            (when l1? (l1/put-entry! l1-key state new-watermark max-entries))
                             state)))))))
 
 (defn p

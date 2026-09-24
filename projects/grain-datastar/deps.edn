@@ -3,7 +3,7 @@
         ds/datastar {:local/root "../../components/datastar"}
         ds/command-processor-v2 {:local/root "../../components/command-processor-v2"}
         ds/query-processor {:local/root "../../components/query-processor"}
-        ds/read-model-processor-v2 {:local/root "../../components/read-model-processor-v2"}
+        ds/read-model-processor-v3 {:local/root "../../components/read-model-processor-v3"}
         ds/pubsub {:local/root "../../components/pubsub"}
         ds/event-tailer {:local/root "../../components/event-tailer"}
         ds/event-store-v3 {:local/root "../../components/event-store-v3"}
@@ -12,8 +12,6 @@
         ds/schema-util {:local/root "../../components/schema-util"}
         ds/time {:local/root "../../components/time"}
         ds/webserver {:local/root "../../components/webserver"}
-        ds/kv-store {:local/root "../../components/kv-store"}
-        ds/kv-store-lmdb {:local/root "../../components/kv-store-lmdb"}
         ds/query-schema {:local/root "../../components/query-schema"}
         ds/fressian-util {:local/root "../../components/fressian-util"}}
 

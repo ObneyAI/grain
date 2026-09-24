@@ -35,7 +35,7 @@
                                poly/read-model-processor {:local/root "components/read-model-processor"}
                                poly/command-processor-v2 {:local/root "components/command-processor-v2"}
                                poly/command-request-handler-v2 {:local/root "components/command-request-handler-v2"}
-                               poly/read-model-processor-v2 {:local/root "components/read-model-processor-v2"}
+                               poly/read-model-processor-v3 {:local/root "components/read-model-processor-v3"}
                                poly/todo-processor-v2 {:local/root "components/todo-processor-v2"}
                                poly/control-plane {:local/root "components/control-plane"}
                                poly/event-notifier-postgres {:local/root "components/event-notifier-postgres"}
@@ -48,12 +48,14 @@
                                poly/example-base {:local/root "bases/example-base"}
                                poly/control-plane-test-base {:local/root "bases/control-plane-test-base"}
                                poly/example-service {:local/root "components/example-service"}}
-                  :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                  :jvm-opts ["--enable-native-access=ALL-UNNAMED"
+                             "--add-opens=java.base/java.nio=ALL-UNNAMED"
                              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}
 
             :test {:extra-paths []}
 
             :poly {:main-opts ["-m" "polylith.clj.core.poly-cli.core"]
                    :extra-deps {polylith/clj-poly {:mvn/version "0.2.21"}}
-                   :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                   :jvm-opts ["--enable-native-access=ALL-UNNAMED"
+                             "--add-opens=java.base/java.nio=ALL-UNNAMED"
                               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}}}

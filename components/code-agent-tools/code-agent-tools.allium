@@ -157,7 +157,7 @@ enum EnvelopeKind { command | query | event }
 -- store-touching execution tools (invoke command/query, read events, project,
 -- diagnostics) — introspection and validation read process-wide state and need
 -- no installation. Its context optionally carries a default tenant, the event
--- store and the read-model cache.
+-- store and the v3 projection store.
 entity Installation {
     -- Always normalized to dev on install.
     mode: InstallMode
@@ -168,8 +168,8 @@ entity Installation {
     -- Whether the installed context exposes an event store. Reads that need it
     -- fail when it is absent.
     has_event_store: Boolean
-    -- Whether the installed context exposes a read-model cache.
-    has_cache: Boolean
+    -- Whether the installed context exposes a v3 projection store.
+    has_projection_store: Boolean
     -- Whether the installed application embeds a control plane. When false,
     -- diagnostics still succeed but report it absent.
     has_control_plane: Boolean
@@ -184,7 +184,7 @@ entity Installation {
 -- the install time, and supersedes any previous installation (at most one is
 -- ever active).
 rule InstallRuntime {
-    when: InstallRequested(requested_mode?, default_tenant_id?, has_event_store, has_cache, has_control_plane)
+    when: InstallRequested(requested_mode?, default_tenant_id?, has_event_store, has_projection_store, has_control_plane)
     requires: requested_mode = null or requested_mode = dev
     ensures:
         for prior in Installations:
@@ -194,7 +194,7 @@ rule InstallRuntime {
             installed_at: now,
             default_tenant_id: default_tenant_id,
             has_event_store: has_event_store,
-            has_cache: has_cache,
+            has_projection_store: has_projection_store,
             has_control_plane: has_control_plane
         )
 }
@@ -202,7 +202,7 @@ rule InstallRuntime {
 -- A request to install with a non-dev mode is refused; no installation results.
 -- This is the production guard: the toolkit is strictly a development affordance.
 rule RejectNonDevInstall {
-    when: InstallRequested(requested_mode?, default_tenant_id?, has_event_store, has_cache, has_control_plane)
+    when: InstallRequested(requested_mode?, default_tenant_id?, has_event_store, has_projection_store, has_control_plane)
     requires: requested_mode != null
     requires: requested_mode != dev
     ensures: InstallRejected(requested_mode: requested_mode)
@@ -249,13 +249,13 @@ rule ReadEvents {
 }
 
 -- The agent projects a registered read model. Requires an installation whose
--- context exposes both an event store and a cache, and a resolvable tenant.
+-- context exposes both an event store and a projection store, and a resolvable tenant.
 rule ProjectReadModel {
     when: ProjectionRequested(read_model, scope?, tenant_id?)
     let installation = Installations.first
     requires: exists installation
     requires: installation.has_event_store
-    requires: installation.has_cache
+    requires: installation.has_projection_store
     let resolved_tenant_id = tenant_id ?? installation.default_tenant_id
     requires: resolved_tenant_id != null
     ensures: ReadModelProjected(tenant_id: resolved_tenant_id, read_model: read_model)
@@ -316,7 +316,7 @@ surface RuntimeInstallation {
         agent.mode
         agent.installed_at
         agent.has_event_store
-        agent.has_cache
+        agent.has_projection_store
         agent.has_control_plane
 
     provides:
@@ -387,5 +387,5 @@ surface RuntimeExecutionSurface {
 ------------------------------------------------------------
 
 open question "normalize_request fills a missing id and timestamp on commands and queries. Should re-submitting an already-stamped request be treated as idempotent by id, or is that purely the command processor's concern?"
-open question "Reads degrade by rejecting when the installed context lacks an event store or cache. Should the toolkit instead report the missing capability as data (as diagnostics does for the control plane), for a uniform degradation model?"
+open question "Reads degrade by rejecting when the installed context lacks an event store or projection store. Should the toolkit instead report the missing capability as data (as diagnostics does for the control plane), for a uniform degradation model?"
 open question "Installation is modelled as at-most-one global handle. Is a single shared installation per REPL the intended contract, or should installations be scoped (e.g. per session) so concurrent agents do not clobber one another?"

@@ -12,7 +12,7 @@
   ;;
   ;; Start Service
   ;;
-  ;; The service context already carries :event-store, :cache, and
+  ;; The service context already carries :event-store, :projection-store, and
   ;; :tenant-id — everything the macro handlers / read models need.
   (do
     (def service (service/start))
@@ -75,7 +75,7 @@
                     :counter-id (:counter/id counter)}))
 
 
-  ;; Projects the :example/counters read model (read-model-processor-v2).
+  ;; Projects the :example/counters read model (read-model-processor-v3).
   (rm/root context)
 
   ;; The :example/calculate-average-counter-value processor reacts to the

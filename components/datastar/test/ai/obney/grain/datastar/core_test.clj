@@ -10,7 +10,7 @@
             [ai.obney.grain.command-processor-v2.interface :as cp :refer [defcommand]]
             [ai.obney.grain.command-processor-v2.interface.schemas]
             [ai.obney.grain.query-schema.interface]
-            [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v3.interface :as rmp]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.event-tailer.interface :as event-tailer]
             [ai.obney.grain.time.interface :as time]

@@ -1,0 +1,219 @@
+-- allium: 3
+-- Read model processor v3.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+-- Tenant identity is governed by event-store-v3/event-store-v3.allium.
+external entity Tenant { id: Any }
+external entity Caller { tenant: Tenant }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+value PageRequest { index: Any, prefix: List<Any>, limit: Integer, after: String? }
+value PageResult { items: List<Any>, watermark: Any?, next_cursor: String? }
+value RecordResult { item: Any?, watermark: Any? }
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+contract ProjectionDefinitions {
+    register: (name: Any, version: Integer, reducer: Any, options: Any) -> Any
+
+    @invariant ReducerState
+        -- Reducers take state and a complete event and return the next state.
+        -- Initial state is {}. Returning an ordinary map replaces the entire
+        -- state; {} clears it. Roots and map values may be any supported
+        -- serializable value.
+
+    @invariant RegistrationValidation
+        -- Model names are qualified Clojure keywords; index names are Clojure
+        -- keywords. Tenant IDs and non-null watermarks are UUID values.
+        -- Versions are positive signed 64-bit integers.
+        -- Validate schema, reducer and indexes before changing the registry.
+        -- Registration failure preserves the existing definition.
+        -- Schema is optional unless indexes are declared. Indexes require a
+        -- map-of schema with string or UUID keys and one to six fields per index.
+        -- Index paths traverse required, nonnullable string, keyword, signed
+        -- integer or UUID fields. Field types are derived from the record schema.
+        -- Values outside indexed paths may be nested or nonscalar.
+        -- Reject unknown index options, malformed paths and unsupported storage
+        -- or cache configuration. Validation errors identify the model, option,
+        -- index, path and expected shape where applicable.
+
+    @invariant DeterministicReducers
+        -- Reducers are deterministic and side-effect free. Reducer changes
+        -- require a new version and rebuild. Conflicting declaration descriptors
+        -- at the same name and version are rejected before registry mutation.
+        -- A new version may replace the registered definition.
+}
+
+contract ProjectionUpdates {
+    project: (caller: Caller, name: Any, scope: Any) -> Any
+
+    @invariant DurableUpdates
+        -- Each successful event atomically commits its selected state changes,
+        -- index changes, root shape, metadata and watermark. A no-op event
+        -- advances the watermark. Map entries are individually readable without
+        -- decoding sibling values.
+
+    @invariant ScopeIsolation
+        -- Projection identity includes trusted tenant, qualified model name,
+        -- version and normalized scope. Tags and custom queries define scopes.
+        -- Every event query is constrained to the caller's tenant, including
+        -- each query in a query vector. Partition selections share the full
+        -- projection's state and watermark.
+        -- Unknown models, absent stores and invalid scopes are rejected.
+
+    @invariant EventAtomicity
+        -- Capture a finite matching event head per request. Read bounded batches
+        -- and process matching events in ascending total order through that head,
+        -- regardless of custom query ordering.
+        -- Each event starts from the result of earlier committed events.
+        -- Reducer maps are immutable: each derived map sees its own edits.
+        -- Reducers may traverse the full input and update any number of records.
+        -- Commit only the returned branch; discard abandoned branches.
+        -- Event failure preserves earlier commits and publishes none of the
+        -- failing event. A caught map-write validation error still aborts it.
+        -- An ambiguous persistence or snapshot-protection failure stops further
+        -- work on the handle. Reopen recovers the durable watermark before replay.
+
+    @invariant CatchUpCoordination
+        -- Serialize catch-up for the same tenant, model, version and scope.
+        -- Concurrent callers cannot replay a committed event or regress its
+        -- watermark. Partition selections share this coordination.
+        -- Event fetching and reduction do not block unrelated projections.
+        -- Committed snapshot reads do not wait for catch-up of any projection.
+        -- Query traversal and reduction callbacks do not exclude writers.
+        -- Database commits may serialize.
+
+    @invariant MapLifetime
+        -- Committed maps are read-only. They and their lazy traversals remain
+        -- readable across later commits, collection and store close.
+        -- Metadata and with-meta are supported. into {} produces an editable
+        -- map. Backed maps reject transient conversion; reducers may return
+        -- ordinary maps constructed using transients.
+        -- Intermediate backed maps are valid only on the reducer thread during
+        -- that event's invocation. Storage reads and lazy traversal outside that
+        -- lifetime are rejected. Materialized record values are ordinary data.
+        -- Project returns only committed state.
+
+    @invariant PartitionSelection
+        -- partition-fn determines membership from record values. A move removes
+        -- old membership and adds new membership atomically. Full project
+        -- returns all records. Reducers receive complete state and every matching
+        -- event regardless of the requested partition.
+        -- entity-id-fn is accepted and does not affect event selection.
+
+    @invariant ResourceBudgets
+        -- Optional request budgets may stop catch-up with a retryable structured
+        -- error. Retrying resumes after the durable watermark. An event exceeding
+        -- its byte allowance commits nothing. Memory use for an atomic event may
+        -- scale with the size of its updates.
+}
+
+contract ProjectionQueries {
+    record: (caller: Caller, name: Any, id: Any, scope: Any) -> RecordResult
+    page: (caller: Caller, name: Any, request: PageRequest, scope: Any) -> PageResult
+    reduce_records: (caller: Caller, name: Any, request: Any, reducer: Any, initial: Any, scope: Any) -> Any
+
+    @invariant PointAndStreamingReads
+        -- record and reduce-records catch up once and use one committed snapshot.
+        -- Point reads distinguish absent entries from stored nil values.
+        -- An empty reduction request traverses all entries; an index and equality
+        -- prefix select a range. Honor reduced and propagate callback failures.
+        -- Traversal does not require eager materialization of the collection.
+        -- Map-only queries reject non-map roots. Records, index membership and
+        -- the reported watermark agree within each query.
+
+    @invariant OrderedPages
+        -- Prefixes match consecutive leading index fields by equality.
+        -- Order ascending by the index's scalar tuple, with string-form record
+        -- ID as the final tie-breaker. Strings use case-sensitive ordering without
+        -- locale collation. Seek exclusively after the cursor.
+        -- Decode only emitted record values, with bounded lookahead.
+        -- partition-key is supported by project, point reads and plain traversal.
+        -- Indexed partition queries use the partition field in an equality
+        -- prefix. Combining partition-key with an index is rejected.
+        -- Reject unsupported index queries without falling back to a full scan.
+
+    @invariant IndexValueBounds
+        -- Indexed text and string record IDs must contain valid Unicode.
+        -- The encoded sort position, including record ID, must not exceed
+        -- config.max_sort_position_bytes. Violations abort the event.
+
+    @invariant CursorValidity
+        -- Bounded opaque cursors bind tenant, model, version, scope, store
+        -- generation, index, prefix and full sort position. Record deletion
+        -- does not invalidate its cursor position. Tenant scope is determined
+        -- from the caller independently of the cursor. Fresh storage invalidates
+        -- old cursors. Each page reads current committed data independently;
+        -- concurrent updates may move records across page boundaries.
+
+    @invariant PageBudgets
+        -- limit is a required positive maximum. Byte and time budgets may return
+        -- fewer items. Return a continuation cursor whenever matching entries
+        -- remain; it identifies the last emitted tuple. Never skip an unreturned
+        -- entry. Reject a first record exceeding the byte allowance. Time expiry
+        -- before progress produces a retryable error. Empty ranges succeed.
+        -- Reduction budget exhaustion produces an error.
+}
+
+contract StoreLifecycle {
+    open: (options: Any) -> Any
+    close: (store: Any) -> Any
+    collect: (store: Any) -> Any
+    status: (store: Any) -> Any
+
+    @invariant Ownership
+        -- Exactly one open owner controls a storage path, including across
+        -- processes. Ownership remains exclusive until storage is released.
+
+    @invariant Persistence
+        -- Support LMDB and file backends; LMDB is the default.
+        -- Serialized payloads and opaque storage identifiers use binary values.
+        -- Identifier equality is by byte content. External cursors are strings.
+        -- Supported state values and metadata retain their types across reopen.
+        -- Incompatible storage formats are rejected and require a fresh store
+        -- and event replay.
+
+    @invariant RetentionAndClose
+        -- Protect committed results continuously until they become unreachable.
+        -- Retention leases expire after owner failure. Lost protection rejects
+        -- further backed reads. Reclamation timing depends on reachability and
+        -- lease and collection scheduling.
+        -- Closing rejects new work and drops the store's own result reference
+        -- after admitted work finishes. Outstanding committed maps remain usable.
+        -- Release storage and ownership after all work and retained results end.
+        -- Collection runs independently of catch-up and preserves live results.
+        -- Store status exposes manual and scheduled collection failures.
+        -- A successful collection clears the previous collection error.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+config {
+    max_sort_position_bytes: Integer = 65536
+    batch_events: Integer = 128
+    collection_interval_ms: Integer = 300000
+    pin_ttl_ms: Integer = 3600000
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+actor Application { identified_by: Caller }
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+surface ReadModelProcessor {
+    facing caller: Application
+    contracts:
+        fulfils ProjectionDefinitions
+        fulfils ProjectionUpdates
+        fulfils ProjectionQueries
+        fulfils StoreLifecycle
+}

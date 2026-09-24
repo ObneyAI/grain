@@ -11,6 +11,10 @@ The `event-model` component defines the topology format. The shippable
 `event-model-validator` reconciles it with a live Grain runtime; the dev-only
 `code-agent-tools` additionally verifies explicit links to Allium declarations.
 
+Runtime read-model discovery uses the [v3 registry](core-concepts.md#read-models--projections).
+Load the namespaces containing `defreadmodel` declarations before running runtime
+validation.
+
 ## Model shape
 
 An Event Model is EDN keyed first by service area and then by runtime block name:
