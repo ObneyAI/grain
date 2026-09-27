@@ -150,6 +150,11 @@
   "Scan the query registry for entries with `:datastar/path` metadata and generate
    Pedestal routes. Each query produces three routes:
 
+   Event-driven queries may declare :datastar/refresh-key, a cheap context -> value
+   function such as the current business date. The stream samples it on its
+   30-second liveness check and re-runs the authorized query only when it changes.
+   This does not create events or invalidate read-model state.
+
      1. GET  `/path`           — Shim page (HTML shell that boots Datastar)
      2. GET  `/path/__stream` — SSE connection (reuses existing session if nonce matches)
      3. POST `/path/__stream` — Signal updates on existing SSE (Datastar's `@post`)

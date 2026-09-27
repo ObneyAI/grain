@@ -1,5 +1,26 @@
 (ns ai.obney.grain.read-model-processor-v2.interface
-  "Read model projection engine with two-tier caching and optional partitioning.
+  "Pure event folds with legacy projections and opt-in keyed materialization.
+
+   Add :key (event -> instance-id) to a declaration for independent keyed folds.
+   Optional :initial defaults to {}, and :result (state -> value) defaults to
+   identity. Grain atomically persists affected state, results, indexes and
+   progress. Read with value, state, values or page; compose in read-session.
+   Keyed context requires :event-source, :tenant-id, :event-store and :cache.
+   Tenant identity always comes from context; declarations have no tenant key.
+
+   Optional :include? (result -> truthy) controls result membership. Excluded
+   instances retain state, but have no readable result, index entries or count.
+   Omission includes every result, including nil. Membership changes commit with
+   state and progress; no application storage mutations are needed.
+
+   :indexes maps index names to pure result -> sort-value functions. Supported
+   sort values are nil, booleans, strings, signed 64-bit integers, UUIDs, keywords,
+   and tuples (vectors) of these. Keys must fit the backend's 511-byte encoding
+   limit. Change the model version when changing routing, initial state, reducer,
+   result, inclusion, schemas or indexes. :state-schema and :result-schema are optional.
+
+   The caching and partitioning options below describe legacy project calls.
+   Keyed folds do not use L1/TTL caching or legacy scopes.
 
    Read models are pure reducer functions `(state, event) -> state` that project
    event streams into queryable state. This processor handles caching, incremental
@@ -103,6 +124,7 @@
    Context fields `:read-model/name` and `:read-model/cache-tier` are attached
    to every metric event for observability."
   (:require [ai.obney.grain.read-model-processor-v2.core :as core]
+            [ai.obney.grain.read-model-processor-v2.keyed :as keyed]
             [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]
             [malli.core :as m]))
 
@@ -145,6 +167,7 @@
   "Register a read model reducer and its opts under `rm-name` (qualified keyword).
    Called automatically by `defreadmodel`; use directly for programmatic registration."
   [rm-name reducer-fn opts]
+  (keyed/validate! rm-name opts)
   (when-let [schema (:schema opts)]
     (try
       (m/schema schema)
@@ -155,6 +178,7 @@
   (swap! read-model-registry* assoc rm-name (merge {:reducer-fn reducer-fn} opts)))
 
 (defn ^:no-doc register-declared! [rm-name reducer-fn opts definition]
+  (keyed/validate! rm-name opts)
   (when-let [schema (:schema opts)]
     (try
       (m/schema schema)
@@ -216,7 +240,8 @@
                       :definition/value
                       {:description docstring
                        :options (select-keys opts #{:events :version :schema
-                                                    :l1-ttl-ms})}})]
+                                                    :l1-ttl-ms :key :initial :result :include?
+                                                    :indexes :state-schema :result-schema})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
@@ -243,6 +268,8 @@
   ([context rm-name] (project context rm-name nil))
   ([context rm-name scope]
    (let [entry (get @read-model-registry* rm-name)
+         _ (when (keyed/keyed? entry)
+             (throw (ex-info "Use value, state, values or page for a keyed fold" {:model rm-name})))
          query (cond
                  (:queries scope) (:queries scope)
                  (:tags scope)    {:types (:events entry) :tags (:tags scope)}
@@ -258,7 +285,64 @@
                   (:l1-ttl-ms entry)    (assoc :l1-ttl-ms (:l1-ttl-ms entry)))))))
 
 ;; ---------------------------------------------------------------------------
-;; L1 In-Process Cache
+;; Keyed folds
+;; ---------------------------------------------------------------------------
+
+(defn- keyed-definition [context name]
+  (let [definition (or (keyed/session-definition context name)
+                       (get @read-model-registry* name))]
+    (when-not (keyed/keyed? definition)
+      (throw (ex-info "Expected a registered keyed fold" {:model name})))
+    definition))
+
+(defn value
+  "Read a keyed fold's materialized result after catch-up. Supply not-found to
+   distinguish an absent or explicitly excluded result from a stored nil.
+   Missing defaults to nil. Optional :include? controls result publication while
+   retaining accumulated state; omitted means include every result."
+  ([context name key] (value context name key nil))
+  ([context name key not-found]
+   (keyed/point context name (keyed-definition context name) key :value not-found)))
+
+(defn state
+  "Read a keyed fold's detached accumulator, not its completion value."
+  ([context name key] (state context name key nil))
+  ([context name key not-found]
+   (keyed/point context name (keyed-definition context name) key :state not-found)))
+
+(defn values
+  "Return a reducible of {:key instance-id :value result}. Selection accepts
+   :index (default :identity), :direction and :equals. A standalone reduction
+   catches up once and owns a snapshot; inside a read-session consume it there."
+  ([context name] (values context name {}))
+  ([context name selection]
+   (keyed/values context name (keyed-definition context name) selection)))
+
+(defn page
+  "Read an indexed result page with exact counts and clamping. Returns :entries,
+   :total, :total-pages, :page, :page-size, and progress/work counters. Options:
+   :index, :direction, :equals, :page (1 by default), :limit (25 by default)."
+  [context name options]
+  (keyed/page context name (keyed-definition context name) options))
+
+(defn progress
+  "Read a keyed model's committed replay progress after catch-up."
+  [context name]
+  (keyed/progress context name (keyed-definition context name)))
+
+(defn read-session
+  "Catch up the named keyed folds once, then invoke f with a scoped context.
+   All reads through it share a snapshot and must finish during f. The two-argument
+   form accepts explicit [[context model-names] ...] requests sharing one store;
+   f receives their prepared contexts in order. This is an application integration
+   boundary, not tenant routing in model declarations."
+  ([context model-names f]
+   (read-session [[context model-names]] (fn [[prepared]] (f prepared))))
+  ([requests f]
+   (keyed/read-session requests @read-model-registry* f)))
+
+;; ---------------------------------------------------------------------------
+;; Legacy L1 cache
 ;; ---------------------------------------------------------------------------
 
 (defn l1-clear!

@@ -92,6 +92,20 @@ contract Store {
     put: (key: Any, value: Any) -> Any
     -- Write a list of entries as one atomic unit.
     put_batch: (entries: List<Entry>) -> Any
+    transact: (mode: String, callback: Any) -> Any
+
+    @invariant ScopedTransactions
+        -- Read callbacks observe one snapshot. Write callbacks see earlier
+        -- mutations and commit get/put/delete/range-reduce operations together.
+        -- Callback or operation failure rolls back, including caught operation
+        -- errors. Read callbacks cannot mutate. Transaction operations are
+        -- thread-confined and expire when the callback returns. Nested
+        -- transactions on the same store/thread fail. Returned bytes are copied.
+
+    @invariant OrderedRanges
+        -- A reducible range visits the intersection of its byte-prefix and
+        -- half-open lower/upper bounds in unsigned byte order or its reverse.
+        -- It honours early termination and closes its cursor on any exit.
 
     @invariant WriteThenReadConsistency
         -- A value written under a key is read back unchanged by a subsequent
@@ -258,5 +272,4 @@ surface KeyValueAccess {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "The store exposes no delete operation: callers can only overwrite a key, never remove its binding. Is delete genuinely out of scope, or is it an unfilled gap in the boundary?"
 open question "On exceeding max_stored_size, is the failure surfaced to the caller as a distinct capacity error, or does it manifest as a generic write failure? The tests size the store generously and do not exercise the boundary."

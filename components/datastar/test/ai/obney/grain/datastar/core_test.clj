@@ -1615,6 +1615,41 @@
     ;; Second render should contain updated value
     (is (str/includes? (:data (second stream-events)) "42"))))
 
+(deftest event-driven-query-clock-refreshes-only-on-change
+  (let [clock (atom "2026-09-26") allowed? (atom true) calls (atom 0)
+        state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        event-ch (async/chan 10)
+        context {:test-state state :event-pubsub ps :tenant-id (random-uuid)
+                 :query-registry (-> @qp/query-registry*
+                                     (assoc-in [:test/event-counters :authorized?] (fn [_] @allowed?))
+                                     (assoc-in [:test/event-counters :datastar/refresh-key] (fn [_] @clock)))}
+        original-timeout async/timeout original-poll ds/poll-and-render]
+    (try
+      (with-redefs [async/timeout (fn [^long milliseconds]
+                                   (original-timeout (if (= 30000 milliseconds) 20 milliseconds)))
+                    ds/poll-and-render (fn [query-context previous-result]
+                                         (when (= (:tenant-id context) (:tenant-id query-context))
+                                           (swap! calls inc))
+                                         (original-poll query-context previous-result))]
+        (let [stream (future (#'ds/stream-view-loop-events
+                              event-ch {:request {:query-params {} :path-params {}}}
+                              context :test/event-counters ps #{:test/counter-incremented} 0 {} nil))]
+          (is (= "datastar-patch-elements" (:name (take-event event-ch 1000))))
+          (swap! state assoc-in [:counters 0 :value] 42)
+          (Thread/sleep 80)
+          (is (= 1 @calls) "Equal clock keys do not run the query")
+          (reset! clock "2026-09-27")
+          (is (str/includes? (:data (take-event event-ch 1000)) "42"))
+          (is (= 2 @calls))
+          (reset! allowed? false)
+          (reset! clock "2026-09-28")
+          (is (= "datastar-patch-signals" (:name (take-event event-ch 1000))))
+          (is (eventually? #(realized? stream) 1000))
+          (is (= 3 @calls) "Refresh uses the normal authorization gate")))
+      (finally (async/close! event-ch) (pubsub/stop ps)))))
+
 (deftest event-driven-stream-registers-with-event-tailer-test
   (let [tenant-id (random-uuid)
         state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"

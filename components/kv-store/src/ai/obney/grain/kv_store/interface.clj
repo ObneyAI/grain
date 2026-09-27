@@ -28,3 +28,10 @@
 (defn put-batch!
   [kv-store args]
   (p/put-batch! kv-store args))
+
+(defn transact
+  "Run f in a read snapshot or atomic write transaction. Operations accept byte
+   keys/values; :reduce accepts {:prefix :from :to :reverse?}, a reducer, and an
+   initial value. Bounds are [from,to). Operations cannot escape the callback."
+  [kv-store mode f]
+  (p/transact kv-store mode f))

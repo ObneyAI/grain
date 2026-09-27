@@ -28,6 +28,67 @@
 
 (use-fixtures :each test-fixture)
 
+(deftest transactional-mutations-rollback-and-lifetime
+  (let [k (.getBytes "transaction-key") v (.getBytes "value") escaped (atom nil)]
+    (kv/transact *cache* :write
+      (fn [tx]
+        (reset! escaped tx)
+        ((:put tx) k v)
+        (is (= "value" (String. ((:get tx) k))))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"escaped"
+                         ((:get @escaped) k)))
+    (is (thrown? Exception
+                 (kv/transact *cache* :write
+                   (fn [tx] ((:delete tx) k) (throw (ex-info "abort" {}))))))
+    (is (= "value" (String. (kv/get! *cache* {:k k}))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"aborted"
+                         (kv/transact *cache* :write
+                           (fn [tx]
+                             ((:delete tx) k)
+                             (try ((:put tx) (byte-array 600) v) (catch Exception _ nil))))))
+    (is (= "value" (String. (kv/get! *cache* {:k k}))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot write"
+                         (kv/transact *cache* :read #((:delete %) k))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Nested"
+                         (kv/transact *cache* :read
+                           (fn [_] (kv/transact *cache* :read identity)))))
+    (kv/transact *cache* :write (fn [tx] ((:delete tx) k) (is (nil? ((:get tx) k)))))
+    (is (nil? (kv/get! *cache* {:k k})))))
+
+(deftest transactional-ranges-and-read-snapshots
+  (kv/transact *cache* :write
+    (fn [tx]
+      (doseq [s ["a0" "a1" "a2" "b0"]]
+        ((:put tx) (.getBytes s) (.getBytes s)))))
+  (kv/transact *cache* :read
+    (fn [tx]
+      (let [read-keys (fn [opts] ((:reduce tx) opts #(conj %1 (String. ^bytes (:k %2))) []))]
+        (is (= ["a1" "a2"] (read-keys {:prefix (.getBytes "a") :from (.getBytes "a1")})))
+        (is (= ["a1" "a0"] (read-keys {:prefix (.getBytes "a") :to (.getBytes "a2") :reverse? true})))
+        (is (= [] (read-keys {:from (.getBytes "b") :to (.getBytes "a")})))
+        (is (= ["a0" "a1" "a2" "b0"] (read-keys {:prefix (byte-array 0)})))
+        (is (= ["a0" "a1" "a2" "b0"] (read-keys {:from (byte-array 0)})))
+        (is (= [] (read-keys {:to (byte-array 0) :reverse? true})))
+        (is (= "a0" ((:reduce tx) {} (fn [_ entry] (reduced (String. ^bytes (:k entry)))) nil)))
+        (let [write (future (kv/transact *cache* :write
+                             #((:put %) (.getBytes "a3") (.getBytes "new"))))]
+          (is (not= ::timeout (deref write 10000 ::timeout)))
+          (is (= ["a0" "a1" "a2"] (read-keys {:prefix (.getBytes "a")})))))))
+  (is (= "new" (String. (kv/get! *cache* {:k (.getBytes "a3")})))))
+
+(deftest unsigned-byte-prefix-at-upper-bound
+  (kv/transact *cache* :write
+    (fn [tx]
+      (doseq [k [[0] [127] [-128] [-1] [-1 0] [-1 -1]]]
+        ((:put tx) (byte-array k) (byte-array [1])))))
+  (kv/transact *cache* :read
+    (fn [tx]
+      (let [read-keys (fn [opts] ((:reduce tx) opts #(conj %1 (vec (:k %2))) []))]
+        (is (= [[0] [127] [-128] [-1] [-1 0] [-1 -1]] (read-keys {})))
+        (is (= [[-1] [-1 0] [-1 -1]] (read-keys {:prefix (byte-array [-1])})))
+        (is (= [[-1 -1] [-1 0] [-1]]
+               (read-keys {:prefix (byte-array [-1]) :reverse? true})))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Basic put/get
 ;; ---------------------------------------------------------------------------

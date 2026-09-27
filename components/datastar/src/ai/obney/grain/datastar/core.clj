@@ -539,6 +539,9 @@
                        (strip-params raw-query ds-nonce-param grain-connect-param))
         initial-context (merge context additional-context {:query decoded-query})
         context-atom (atom initial-context)
+        refresh-key-fn (get-in (or (:query-registry initial-context) @qp/query-registry*)
+                               [query-name :datastar/refresh-key])
+        refresh-key #(when refresh-key-fn (refresh-key-fn @context-atom))
         signal-ch (async/chan (async/sliding-buffer 1))
         user-id (get-in additional-context [:auth-claims :user-id])
         session-key [user-id query-name nonce]
@@ -552,7 +555,8 @@
       (when (and event-tailer tenant-id)
         (event-tailer/subscribe! event-tailer tenant-id event-types))
       ;; Initial render
-      (let [initial (poll-and-render @context-atom nil)]
+      (let [initial-refresh-key (refresh-key)
+            initial (poll-and-render @context-atom nil)]
         (when initial
           (async/>!! event-ch (:event initial))
           (when-let [se (:signals-event initial)]
@@ -560,19 +564,22 @@
         (when (:stop? initial)
           (throw (ex-info "stop" {:stop true})))
         ;; Event loop — listens to domain events AND signal updates
-        (loop [prev-result (:result initial)]
-          (let [[val _port] (async/alts!! [sub-chan signal-ch (async/timeout 30000)])]
+        (loop [prev-result (:result initial) previous-key initial-refresh-key]
+          (let [[val _port] (async/alts!! [sub-chan signal-ch (async/timeout 30000)])
+                next-key (refresh-key)]
             (cond
               ;; Channel closed (pubsub shutting down or signal-ch closed)
               (and (nil? val) (or (async-protocols/closed? sub-chan)
                                   (async-protocols/closed? signal-ch)))
               nil
 
-              ;; Timeout — liveness check
-              (nil? val)
-              (if (async-protocols/closed? event-ch)
-                nil
-                (recur prev-result))
+              (and (nil? val) (async-protocols/closed? event-ch))
+              nil
+
+              ;; A date (or another explicitly declared query input) can change
+              ;; without an event. Equal keys keep this a cheap liveness check.
+              (and (nil? val) (= previous-key next-key))
+              (recur prev-result previous-key)
 
               ;; Event or signal update received. Debounce then drain BOTH channels
               ;; before re-rendering. Draining both is a correctness requirement, not
@@ -599,11 +606,11 @@
                         (do
                           (when-let [se (:signals-event poll-result)]
                             (async/>!! event-ch se))
-                          (recur (:result poll-result)))
+                          (recur (:result poll-result) next-key))
                         nil))
 
                     :else
-                    (recur prev-result))))))))
+                    (recur prev-result next-key))))))))
       (catch Exception e
         (when-not (= "stop" (.getMessage e))
           (u/log ::stream-view-events-error :error e)))

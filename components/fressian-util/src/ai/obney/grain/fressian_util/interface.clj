@@ -93,4 +93,7 @@
   collections are converted to Clojure equivalents."
   [^bytes bytes]
   (deep-clojurize
-   (fressian/read (ByteArrayInputStream. bytes) :handlers read-handlers)))
+   ;; Bytes are already resident. The convenience read function wraps streams
+   ;; in an unnecessary BufferedInputStream for every small result lookup.
+   (fressian/read-object
+    (fressian/create-reader (ByteArrayInputStream. bytes) :handlers read-handlers))))

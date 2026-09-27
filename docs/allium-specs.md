@@ -195,6 +195,13 @@ Captures the read side of grain's CQRS model: a projection engine that folds a t
 
 <sub>entities 4 · rules 3 · contracts 6 · invariants 9 · surfaces 2</sub>
 
+Spec-first extension: [keyed folds with queryable results](../components/read-model-processor-v2/keyed-folds.allium)
+preserves independent pure reducers and gives each keyed fold a materialized result
+with the same lifecycle as its accumulated state. Grain implementation and AA
+adoption are **in progress**, with acceptance still outstanding; see
+the [implementation plan](keyed-fold-read-models-plan.md) for delivery, AA adoption,
+and unresolved ownership, identity-integration, and performance decisions.
+
 ### [`todo-processor`](../components/todo-processor/todo-processor.allium)
 
 A LIBRARY/FRAMEWORK spec for the first-generation (now deprecated) reactive event-handler runtime: a processor subscribes to event topics on an in-process pub/sub bus and invokes one consumer-supplied handler per delivered event, atomically appending the handler's emitted events to the single store it is bound to. It captures the real test-proven guarantees — per-event delivery, atomic append, fault isolation, bounded backpressure with no drops — and the explicit non-guarantee of transient at-most-once delivery with no checkpoints or replay (the gap v2 closes).

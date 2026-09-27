@@ -1,0 +1,205 @@
+-- allium: 3
+-- Spec-first extension: pure keyed folds with materialized results.
+-- Status: implemented and verified locally; AA baseline test failures documented.
+-- The existing processor contract
+-- remains in read-model-processor-v2.allium. Delivery and AA adoption decisions
+-- are in ../../docs/keyed-fold-read-models-plan.md.
+-- Opaque Any signatures represent application-defined serializable values and
+-- callbacks at a library boundary, not unconstrained application data schemas.
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract KeyedFoldDefinition {
+    initial: () -> Any
+    key: (event: Any) -> Any
+    step: (state: Any, event: Any) -> Any
+    result: (state: Any) -> Any
+    include: (result: Any) -> Boolean
+
+    @invariant IndependentPureFunctions
+        -- Each model is independently defined. Initial state, routing, reduction,
+        -- result calculation, and result-index extraction are deterministic.
+        -- Reducers receive ordinary immutable detached state and the original
+        -- event; result functions receive only that model instance's state.
+        -- No callback requires transaction handles, storage mutations, another
+        -- projection, request context, a clock, or external effects. The caller
+        -- supplies functions honouring this obligation; runtime enforcement of
+        -- arbitrary program purity is not promised.
+
+    @invariant StableOwnership
+        -- Each subscribed event has exactly one supported non-null stable key
+        -- obtained from that event. A model is admissible only when each key's
+        -- reduction has all the state it needs inside that instance. Missing or
+        -- ambiguous ownership is an error, never silent omission. The processor
+        -- does not infer ownership by probing a reducer with empty state.
+
+    @invariant LocalCompletion
+        -- The result is a pure function of accumulated state, not an independently
+        -- advancing projection. Omitting the function means identity. Completion
+        -- is nondestructive: later events continue from accumulated state, not
+        -- from the compact result. It may be evaluated after a batch rather than
+        -- after every event without changing the observable answer.
+
+    @invariant ExplicitResultMembership
+        -- An optional pure inclusion predicate decides whether a completion is
+        -- published as a readable result. It defaults to inclusion, including
+        -- nil. Excluded keys retain accumulated state so later events can make
+        -- them eligible. Inclusion changes atomically add or remove the result,
+        -- every index entry and the counted membership with state and progress.
+        -- Exclusion does not evaluate index extractors. Predicate failure rolls
+        -- back the batch. Changing this predicate requires a new model version.
+
+    @invariant EvolutionAndCompatibility
+        -- Changes to routing, reduction, result calculation, initial state,
+        -- schemas, or indexes require a new model version and fresh fold.
+        -- Existing declarations without keyed execution retain their previous
+        -- projection behaviour and return shapes. Keyed and legacy identities
+        -- cannot accidentally read one another's materializations.
+}
+
+contract KeyedFoldMaterialization {
+    catch_up: (context: Any, model: Any) -> Any
+
+    @invariant FoldEquivalence
+        -- At committed progress H, each instance state equals reduction from the
+        -- declared initial state over exactly the subscribed tenant events routed
+        -- to its key through H, preserving their store order. Its result equals
+        -- result(state). Batch boundaries, prior read choices, restart, and
+        -- interleaving other keys cannot change that answer.
+
+    @invariant ContextSuppliesTenancy
+        -- Tenant and event-source identities come from trusted caller context.
+        -- State, results, indexes, progress, and read positions are isolated by
+        -- source, tenant, model, and version; instances are further distinguished
+        -- by key. Definitions contain no tenant-routing or cross-tenant selector.
+        -- A single-tenant deployment uses the same definitions and contracts.
+
+    @invariant CoordinatedPublication
+        -- A successful batch publishes all its affected accumulated states,
+        -- results, index changes, counts, and model progress together. Every
+        -- event covered by advanced progress has its complete effects committed.
+        -- Result calculation and indexing have no independent refresh checkpoint.
+
+    @invariant FailureAndRestart
+        -- Failure in routing, reduction, completion, validation, encoding, or
+        -- indexing publishes none of that batch. Earlier successful batches
+        -- remain committed. Recovery resumes from durable progress and agrees
+        -- with a clean replay. An uncertain commit outcome must be resolved from
+        -- persisted progress before replaying, not guessed from in-memory state.
+
+    @invariant ConcurrentProgress
+        -- Concurrent readers and catch-up attempts cannot double-apply committed
+        -- events, regress progress, or overwrite newer state with an older fold.
+        -- Application reducers do not coordinate writers themselves.
+
+    @invariant FiniteFreshness
+        -- A read captures a finite source head and catches its model up through
+        -- that head before serving fresh data. Newer committed state may be
+        -- observed; later events cannot cause an unbounded chase. A failed
+        -- catch-up is an error rather than a successful stale fallback.
+
+    @invariant EqualResultsPreserveState
+        -- If new state has an equal result, changed state and progress still
+        -- commit. Result/index replacement may be omitted. A result equality
+        -- check must never discard state required to interpret the next event.
+
+    @invariant TimeDoesNotMutateMaterialization
+        -- Advancing the query date alone does not change accumulated state,
+        -- results, indexes, or model progress. Time-dependent answers evaluate
+        -- date-independent results with an explicit query date. Ordinary event
+        -- catch-up remains allowed when a date-changing query also sees events.
+}
+
+contract KeyedFoldReads {
+    state: (context: Any, model: Any, key: Any, not_found: Any) -> Any
+    value: (context: Any, model: Any, key: Any, not_found: Any) -> Any
+    values: (context: Any, model: Any, selection: Any) -> Any
+    page: (context: Any, model: Any, selection: Any) -> Any
+
+    @invariant StateAndValueAreDistinct
+        -- State reads return accumulated state; value, result traversal, and
+        -- result pages return completion values with their instance identities.
+        -- Returned values are detached and remain usable after reads complete.
+        -- Callers never receive a mutable storage handle as projection state.
+
+    @invariant AbsenceIsExplicit
+        -- Reading a never-seen key returns not_found and does not instantiate
+        -- state or add a row to traversal. Stored nil is a present value, distinct
+        -- from absence when the caller supplies a distinct not_found marker.
+        -- Empty accumulated state does not implicitly delete an instance.
+        -- Explicitly excluded results return not_found and do not appear in
+        -- traversal or counts; their accumulated state remains readable.
+        -- Domain membership can exclude a present result; storage presence
+        -- alone is not a claim that a student belongs in the admin list.
+
+    @invariant ResultReadIsolation
+        -- When no catch-up is needed, result-only reads and traversals do not
+        -- load accumulated-state payloads. Catch-up loads the states of affected
+        -- keys, not the whole model population. One large key may remain costly;
+        -- this contract does not bound the size of an application's local state.
+
+    @invariant IndexAgreement
+        -- Index membership and ordering are calculated only from committed
+        -- results. Replacing a result removes obsolete index positions. A page's
+        -- entries, order, count, and progress agree within one committed snapshot.
+        -- Equal sort values use the string form of the instance key ascending
+        -- as the final tie-breaker in both sort directions.
+        -- Oversized storage keys fail with an identifiable key-too-large error
+        -- before committing the affected batch; values are never truncated.
+
+    @invariant TraversalAndLifetime
+        -- Traversal can be consumed without materializing the full result set,
+        -- honours early termination, and releases read resources on completion
+        -- or failure. Its valid consumption lifetime is explicit. Detached
+        -- accumulated state or result values do not expire with the traversal.
+
+    @invariant CompositionRemainsAQuery
+        -- Queries can combine independent models' results in a scoped read
+        -- session after source catch-up, without each addressed read starting
+        -- another replay. This creates no shared model definition, version, or
+        -- checkpoint and no persisted cross-model dependency graph. No historical
+        -- atomic snapshot across independent event logs is implied.
+
+    @invariant SelectionBeforePaging
+        -- Application membership, search, computed ordering, and missing-value
+        -- rules apply to the complete candidate population before pagination.
+        -- A direct source index may be used only when it preserves these rules.
+        -- Query composition may scan compact results. Exact counts, arbitrary
+        -- substring matches, computed sorts, and deep pages have no constant-time
+        -- guarantee and may require work proportional to the candidate population.
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface KeyedFoldBoundary {
+    contracts:
+        demands KeyedFoldDefinition
+        fulfils KeyedFoldMaterialization
+        fulfils KeyedFoldReads
+
+    @guarantee OneProjectionLifecycle
+        -- Application code supplies independent pure folds and optional result
+        -- functions. It does not maintain transactions, cache writes, checkpoints,
+        -- result invalidation, or a second summary-refresh lifecycle.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- KF-OWNERSHIP resolved for AA's adopted business folds: payload ownership or an
+-- explicit User tag; imports use Student identity. Irrelevant provider links
+-- stay on detail projections. Applications retain scoped fallback. Missing or
+-- ambiguous ownership still fails; future subscriptions require their own audit.
+-- KF-IDENTITY resolved for AA: the authorized query explicitly supplies its
+-- identity context. AA's single tenant also supplies the existing live event
+-- subscription. Separate tenant logs would require an explicit subscription to
+-- each log, not a declaration-level tenant selector or implied atomic history.
+-- KF-PERFORMANCE latency resolved by the user: warm end-to-end p95 below 250 ms
+-- for ordinary pages and below 1 second for computed sorts. The implementation
+-- plan records the AA benchmark obligation; this reusable library contract does
+-- not promise workload-independent latency. Memory consumption must be reported.
