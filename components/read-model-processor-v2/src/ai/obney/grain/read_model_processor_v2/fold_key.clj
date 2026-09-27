@@ -1,6 +1,6 @@
 (ns ai.obney.grain.read-model-processor-v2.fold-key
   "Self-delimiting ordered keys for local keyed-fold storage."
-  (:import [java.io ByteArrayOutputStream DataOutputStream]
+  (:import [java.io ByteArrayOutputStream DataOutputStream ByteArrayInputStream DataInputStream]
            [java.security MessageDigest]
            [java.util UUID]))
 
@@ -39,6 +39,35 @@
     (write-key! (DataOutputStream. out) value)
     (.toByteArray out)))
 
+(defn- read-key! [^DataInputStream in]
+  (case (.readUnsignedByte in)
+    1 nil 2 false 3 true
+    16 (let [out (StringBuilder.)
+             read-unit (fn [] (let [b (.readUnsignedByte in)]
+                               (if (zero? b)
+                                 (case (.readUnsignedByte in) 0 -1 255 0
+                                   (throw (ex-info "Invalid ordered string escape" {}))) b)))]
+         (loop []
+           (let [hi (read-unit)]
+             (if (= -1 hi) (.toString out)
+               (let [lo (read-unit)]
+                 (when (= -1 lo) (throw (ex-info "Truncated ordered character" {})))
+                 (.append out (char (+ (bit-shift-left hi 8) lo))) (recur))))))
+    32 (bit-xor (.readLong in) Long/MIN_VALUE)
+    48 (UUID. (.readLong in) (.readLong in))
+    56 (keyword (subs (read-key! in) 1))
+    64 (loop [out []]
+         (.mark in 1)
+         (if (zero? (.readUnsignedByte in)) out
+           (do (.reset in) (recur (conj out (read-key! in))))))
+    (throw (ex-info "Invalid ordered key type" {}))))
+
+(defn decode
+  "Decode one ordered value, optionally within a compact metadata field."
+  ([^bytes value] (decode value 0 (alength value)))
+  ([^bytes value offset length]
+   (read-key! (DataInputStream. (ByteArrayInputStream. value offset length)))))
+
 (defn descending ^bytes [^bytes key]
   (byte-array (map #(unchecked-byte (bit-xor 255 (bit-and 255 %))) key)))
 
@@ -59,7 +88,9 @@
                      (uuid? (:event-source context))))
     (throw (ex-info "Keyed folds require a UUID :tenant-id and stable :event-source identifier"
                     {:model name})))
-  (join (byte-array [75 70 50])
+  ;; KF3 adds forward ordering metadata. Existing KF2 progress must not make
+  ;; key-page silently omit old results; the new address space replays normally.
+  (join (byte-array [75 70 51])
         (.digest (MessageDigest/getInstance "SHA-256")
                  (encode [(:event-source context) (:tenant-id context) name version]))))
 

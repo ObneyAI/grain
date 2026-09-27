@@ -19,10 +19,14 @@
    limit. Change the model version when changing routing, initial state, reducer,
    result, inclusion, schemas or indexes. :state-schema and :result-schema are optional.
 
+   :searches maps names to pure result -> string-or-nil functions. Text postings
+   commit with the result and progress. search-keys returns exact matching IDs;
+   key-page orders candidate IDs using compact index values, without full rows.
+   Search extraction changes require a model version change, like other indexes.
+
    Direct index pages use stored ranks for offsets and equality counts. Grain
-   maintains those ranks in the fold transaction. Existing unranked indexes are
-   upgraded atomically on first preparation, without replaying business events;
-   this one-time upgrade visits their entries and can delay the first read.
+   maintains those ranks in the fold transaction. Incompatible derived storage
+   uses a fresh format identity and materializes through normal event replay.
 
    The caching and partitioning options below describe legacy project calls.
    Keyed folds do not use L1/TTL caching or legacy scopes.
@@ -246,7 +250,7 @@
                       {:description docstring
                        :options (select-keys opts #{:events :version :schema
                                                     :l1-ttl-ms :key :initial :result :include?
-                                                    :indexes :state-schema :result-schema})}})]
+                                                    :indexes :searches :state-schema :result-schema})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
@@ -339,6 +343,25 @@
    Use a read-session when composing these counts with other index reads."
   [context name index]
   (keyed/index-groups context name (keyed-definition context name) index))
+
+(defn search-keys
+  "Exact case-insensitive literal matching over a declared text index. Options:
+   :index, :query, :mode (:contains by default; :prefix or :suffix for composed
+   boundaries). Contains requires >=3 Unicode code points, boundaries >=1.
+   Returns detached IDs, without decoding result/state payloads. Use read-session
+   when combining searches and membership reads from independent folds."
+  [context name options]
+  (keyed/search-keys context name (keyed-definition context name) options))
+
+(defn key-page
+  "Order distinct candidate keys belonging to this model's included results.
+   Options: :index (:identity), :direction (:asc), :page (1), :limit (25), and
+   optional :sort-value (fn [id stored-index-value] computed-order-value).
+   Returns :keys, exact counts/clamped page and :sort-keys-read. Reads compact
+   forward metadata for candidates; never decodes their full result/state.
+   Work scales with candidates, not page size. Ties stay ascending by string ID."
+  [context name keys options]
+  (keyed/key-page context name (keyed-definition context name) keys options))
 
 (defn index-keys
   "Read instance identities from an equality group without loading results.

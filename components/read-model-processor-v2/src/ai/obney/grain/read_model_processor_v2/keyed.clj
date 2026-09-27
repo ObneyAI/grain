@@ -5,11 +5,15 @@
             [ai.obney.grain.fressian-util.interface :as codec]
             [ai.obney.grain.read-model-processor-v2.fold-key :as key]
             [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
+            [ai.obney.grain.read-model-processor-v2.text-search :as search]
+            [ai.obney.grain.read-model-processor-v2.sort-data :as sort-data]
             [malli.core :as m]))
 
 (defn keyed? [definition] (contains? definition :key))
 
 (defn validate! [name opts]
+  (when (and (contains? opts :searches) (not (keyed? opts)))
+    (throw (ex-info "Text search requires a keyed fold" {:model name})))
   (when (keyed? opts)
     (when-not (and (qualified-keyword? name) (pos-int? (:version opts 1))
                    (set? (:events opts)) (seq (:events opts))
@@ -17,6 +21,8 @@
                    (ifn? (:key opts)) (ifn? (:result opts identity))
                    (ifn? (:include? opts (constantly true)))
                    (map? (:indexes opts {}))
+                   (map? (:searches opts {}))
+                   (every? (fn [[k f]] (and (keyword? k) (ifn? f))) (:searches opts))
                    (every? (fn [[k f]] (and (keyword? k) (not= :identity k) (ifn? f)))
                            (:indexes opts))
                    (not-any? #(contains? opts %)
@@ -125,16 +131,20 @@
             (vswap! added + (- (if included? 1 0) (if old 1 0)))
             (if-not included?
               (when old
+                (search/update! tx b (:searches d) id old nil)
                 (doseq [[index position] (:indexes old) direction [:asc :desc]]
                   (remove-index! tx b index direction position id))
+                ((:delete tx) (address b 11 id))
                 ((:delete tx) result-k))
               (when (or (nil? old) (not= (:value old) value))
+                (search/update! tx b (:searches d) id old {:value value})
                 (doseq [[index position] indexes
                         direction [:asc :desc]
                         :when (or (nil? old) (not= position (get-in old [:indexes index])))]
                   (when old
                     (remove-index! tx b index direction (get-in old [:indexes index]) id))
                   (add-index! ctx tx b index direction position id))
+                ((:put tx) (address b 11 id) (sort-data/encode id (dissoc indexes :identity)))
                 (write-observed! ctx tx :result-written result-k {:key id :value value :indexes indexes})))))
         (when (seq events)
           (when-not (zero? @added) (write! tx (count-key b) (+ count-before @added)))
@@ -250,6 +260,36 @@
 
 (defn progress [ctx name d]
   (with-reader ctx name d (fn [tx b _d _read] (read-meta tx (progress-key b)))))
+
+(defn search-keys [ctx name d options]
+  (with-reader ctx name d
+    (fn [tx b _ _read]
+      (search/search-keys tx b (:searches d) options #(observe! ctx %1 %2)))))
+
+(defn key-page [ctx name d keys options]
+  (let [{:keys [index direction page limit sort-value]
+         :or {index :identity direction :asc page 1 limit 25}} options]
+    (when-not (and (map? options) (every? #{:index :direction :page :limit :sort-value} (clojure.core/keys options))
+                   (or (= index :identity) (contains? (:indexes d) index))
+                   (#{:asc :desc} direction) (pos-int? page) (pos-int? limit)
+                   (or (nil? sort-value) (ifn? sort-value)))
+      (throw (ex-info "Invalid matching-key page" {:model name :options options})))
+    (with-reader ctx name d
+      (fn [_tx _b _d read]
+        (let [field (sort-data/field (:indexes d) index)
+              seen (java.util.HashSet.) entries (java.util.ArrayList.)]
+          (doseq [id keys :when (.add seen id)]
+            (when-let [raw (read 11 id)]
+              (observe! ctx :sort-key-read (alength ^bytes raw))
+              (.add entries (ai.obney.grain.read_model_processor_v2.sort_data.Entry.
+                              id raw (when sort-value (key/encode (sort-value id (sort-data/value raw field))))))))
+          (.sort entries (sort-data/comparator field (= direction :desc) (some? sort-value)))
+          (let [total (.size entries) pages (max 1 (quot (+ total (dec limit)) limit))
+                page (min page pages) offset (* (dec page) limit)]
+            {:keys (mapv #(.-id ^ai.obney.grain.read_model_processor_v2.sort_data.Entry (.get entries %))
+                         (range offset (min total (+ offset limit))))
+             :total total :total-pages pages :page page :page-size limit
+             :sort-keys-read total}))))))
 
 (defn- validate-selection! [name d options]
   (when-not (and (map? options)

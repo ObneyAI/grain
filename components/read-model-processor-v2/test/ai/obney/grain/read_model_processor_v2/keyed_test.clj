@@ -89,7 +89,7 @@
   (let [name (register! (fn [_ e] (:group e)) {:indexes {:group identity}})
         current-prefix (key/prefix *ctx* name 1)
         old-prefix (aclone current-prefix)]
-    (aset-byte old-prefix 2 (byte 49))
+    (aset-byte old-prefix 2 (byte 50))
     (append! [{:owner "a" :group "same"} {:owner "b" :group "same"}])
     (let [head (:event/id (first (into [] (es/read (:event-store *ctx*)
                                                  {:tenant-id (:tenant-id *ctx*) :reverse? true :limit 1}))))

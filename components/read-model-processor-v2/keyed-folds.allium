@@ -125,6 +125,36 @@ contract KeyedFoldReads {
     index_groups: (context: Any, model: Any, index: Any) -> Any
     index_keys: (context: Any, model: Any, selection: Any) -> Any
     index_rank: (context: Any, model: Any, selection: Any, key: Any) -> Any
+    search_keys: (context: Any, model: Any, selection: Any) -> Any
+    key_page: (context: Any, model: Any, keys: Any, selection: Any) -> Any
+
+    @invariant SearchPublication
+        -- Named searchable text is extracted purely from each included result.
+        -- Text changes, exclusion and re-entry update exact substring matches
+        -- in the same transaction as results and progress. Failure leaves none
+        -- of the batch visible. Restart uses persisted search entries, with no
+        -- second checkpoint, external search service or application cache writes.
+        -- Changing text extraction requires a new model version and fresh fold.
+
+    @invariant ExactTextMatching
+        -- Matching uses Locale-independent lowercasing and Unicode code points.
+        -- Contains queries require at least three code points. Explicit prefix
+        -- and suffix queries support nonempty fragments for query-time composition.
+        -- Repeated grams, positions and boundaries are significant: results are
+        -- exact literal matches, not approximate candidates or token matches.
+        -- Search returns detached instance identities without loading result or
+        -- accumulated-state payloads. Source, tenant, model and version isolation
+        -- and prepared read-session lifetime are the same as other keyed reads.
+
+    @invariant MatchingKeyPages
+        -- A query may supply candidate identities and order their existing result
+        -- membership using stored compact sort values before selecting a page.
+        -- Duplicate identities count once and excluded or absent identities do
+        -- not count. Counts, clamping and ascending string-key ties are exact.
+        -- Optional query-time sort calculation receives identity and the chosen
+        -- stored sort value, without loading complete results or changing them.
+        -- Matching-key sorting may visit all candidates; this is not filtered
+        -- rank seeking. Only the application-selected rows need full hydration.
 
     @invariant StateAndValueAreDistinct
         -- State reads return accumulated state; value, result traversal, and
