@@ -105,13 +105,10 @@ contract KeyedFoldMaterialization {
         -- commit. Result/index replacement may be omitted. A result equality
         -- check must never discard state required to interpret the next event.
 
-    @invariant StoredIndexUpgrade
-        -- Upgrading an existing unranked index preserves its stored membership,
-        -- ordering, state, results and event progress without replaying history
-        -- or running application callbacks. The replacement and its completion
-        -- marker publish atomically. Failure leaves the prior storage intact;
-        -- the next preparation can retry. A first upgrade may visit every stored
-        -- index entry, but subsequent warm reads do not repeat that work.
+    @invariant DisposableMaterialization
+        -- Incompatible stored formats are not migrated. A new storage-format
+        -- identity materializes through normal event folding; old derived data
+        -- is unused and may be discarded independently of the event history.
 
     @invariant TimeDoesNotMutateMaterialization
         -- Advancing the query date alone does not change accumulated state,
@@ -125,6 +122,9 @@ contract KeyedFoldReads {
     value: (context: Any, model: Any, key: Any, not_found: Any) -> Any
     values: (context: Any, model: Any, selection: Any) -> Any
     page: (context: Any, model: Any, selection: Any) -> Any
+    index_groups: (context: Any, model: Any, index: Any) -> Any
+    index_keys: (context: Any, model: Any, selection: Any) -> Any
+    index_rank: (context: Any, model: Any, selection: Any, key: Any) -> Any
 
     @invariant StateAndValueAreDistinct
         -- State reads return accumulated state; value, result traversal, and
@@ -186,6 +186,18 @@ contract KeyedFoldReads {
         -- Rank metadata commits with index membership in the fold transaction.
         -- Navigation has probabilistic bounds; this promises neither constant
         -- time nor page-sized work for arbitrary cross-model composition.
+
+    @invariant ReadOnlyIndexComposition
+        -- Queries may enumerate distinct sort values and their exact counts,
+        -- seek a bounded slice of instance identities within an equality group,
+        -- and obtain a key's insertion rank and presence within that group.
+        -- Identity slices and rank probes do not load result or state payloads.
+        -- Group enumeration reads one maintained count per distinct value,
+        -- without loading representative Student results. Counts change in the
+        -- same transaction as membership; empty groups disappear.
+        -- All operations respect the same read-session snapshot and identity.
+        -- Missing groups have zero count; slices beyond their end are empty.
+        -- These reads create no stored join, mutation API or refresh lifecycle.
 }
 
 ------------------------------------------------------------

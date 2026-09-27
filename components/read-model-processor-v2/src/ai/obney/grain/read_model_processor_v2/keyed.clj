@@ -48,15 +48,27 @@
 (defn- index-member [direction value id]
   (key/join (sort-bytes value direction) (key/encode (str id)) (key/encode id)))
 
+(defn- update-group! [tx b index value delta]
+  ;; Levels 0..5 are the RankedSet. Level 6 stores one count per sort value,
+  ;; shared by both directions; no duplicated Student membership collection.
+  (let [k (key/checked (key/join (ranked/prefix (index-config b index :asc) 6) (key/encode value)))
+        before (some-> ((:get tx) k) codec/decode :total)
+        total (+ (or before 0) delta)]
+    (when (neg? total) (throw (ex-info "Negative index group count" {:index index :value value})))
+    (if (zero? total) ((:delete tx) k)
+      ((:put tx) k (codec/encode {:value value :total total})))))
+
 (defn- remove-index! [tx b index direction position id]
-  (ranked/remove! tx (index-config b index direction) (index-member direction position id)))
+  (when (ranked/remove! tx (index-config b index direction) (index-member direction position id))
+    (when (= direction :asc) (update-group! tx b index position -1))))
 
 (defn- add-index! [ctx tx b index direction position id]
   (let [cfg (index-config b index direction)
         member (index-member direction position id)
         payload (codec/encode id)]
     (ranked/ensure-init! tx cfg)
-    (ranked/add! tx cfg member payload)
+    (when (ranked/add! tx cfg member payload)
+      (when (= direction :asc) (update-group! tx b index position 1)))
     (observe! ctx :index-written (alength ^bytes payload))))
 
 (defn- read-meta [tx k] (some-> ((:get tx) k) codec/decode))
@@ -126,46 +138,14 @@
                 (write-observed! ctx tx :result-written result-k {:key id :value value :indexes indexes})))))
         (when (seq events)
           (when-not (zero? @added) (write! tx (count-key b) (+ count-before @added)))
-          (write! tx (progress-key b) (assoc before-progress :watermark (:event/id (peek events))
-                                           :index-format :ranked-v1)))))))
-
-(defn- upgrade-indexes! [ctx b d progress]
-  (if (or (nil? progress) (= :ranked-v1 (:index-format progress))) progress
-    (kv/transact (:cache ctx) :write
-      (fn [tx]
-        (let [progress (read-meta tx (progress-key b))]
-          (if (= :ranked-v1 (:index-format progress)) progress
-            (do
-              (doseq [index (conj (vec (keys (:indexes d))) :identity)
-                      direction [:asc :desc]]
-                (let [legacy-prefix (key/join b (byte-array [3]) (key/encode [index direction]))
-                      cfg (index-config b index direction)]
-                  ;; Close each cursor before deleting its entries. The upgrade
-                  ;; remains one atomic transaction, with bounded working memory.
-                  (loop []
-                    (let [batch ((:reduce tx) {:prefix legacy-prefix}
-                                 (fn [batch entry]
-                                   (let [batch (conj batch entry)]
-                                     (if (= 128 (count batch)) (reduced batch) batch))) [])]
-                      (when (seq batch)
-                        (ranked/ensure-init! tx cfg)
-                        (doseq [{:keys [k v]} batch]
-                          (ranked/add! tx cfg
-                                       (java.util.Arrays/copyOfRange ^bytes k (alength ^bytes legacy-prefix)
-                                                                     (alength ^bytes k)) v)
-                          ((:delete tx) k))
-                        (recur))))))
-              (let [progress (assoc progress :index-format :ranked-v1)]
-                (write! tx (progress-key b) progress)
-                progress))))))))
+          (write! tx (progress-key b) (assoc before-progress :watermark (:event/id (peek events)))))))))
 
 (defn- head [ctx]
   (reduce (fn [_ event] (reduced (:event/id event))) nil
           (es/read (:event-store ctx) {:tenant-id (:tenant-id ctx) :reverse? true :limit 1})))
 
 (defn- catch-up! [ctx name d b through]
-  (let [progress (upgrade-indexes! ctx b d
-                                  (kv/transact (:cache ctx) :read #(read-meta % (progress-key b))))
+  (let [progress (kv/transact (:cache ctx) :read #(read-meta % (progress-key b)))
         after (last (sort (keep #(get progress %) [:checked-through :watermark])))
         batch-size (:read-model/batch-size ctx 128)]
     (when-not (pos-int? batch-size)
@@ -187,7 +167,7 @@
         (fn [tx]
           (let [p (read-meta tx (progress-key b)) old (:checked-through p)]
             (when (or (nil? old) (pos? (compare through old)))
-              (write! tx (progress-key b) (assoc p :checked-through through :index-format :ranked-v1)))))))))
+              (write! tx (progress-key b) (assoc p :checked-through through)))))))))
 
 (defn- identity-of [ctx] [(:event-source ctx) (:tenant-id ctx)])
 
@@ -348,3 +328,65 @@
          :rows-examined (count entries) :rank-entries-examined @rank-examined
          :results-decoded (count entries)
          :progress (read-meta tx (progress-key b))}))))
+
+(defn- navigation-reader [ctx tx]
+  (assoc tx :reduce
+         (fn [bounds rf initial]
+           ((:reduce tx) bounds
+            (fn [acc entry] (observe! ctx :rank-entry 0) (rf acc entry)) initial))))
+
+(defn- group-bounds [tx cfg direction value]
+  (let [prefix (sort-bytes value direction)
+        first (ranked/rank tx cfg prefix false)
+        end (if-let [end (key/prefix-end prefix)]
+              (ranked/rank tx cfg end false) (ranked/size tx cfg))]
+    [first end]))
+
+(defn index-groups [ctx name d index]
+  (validate-selection! name d {:index index})
+  (with-reader ctx name d
+    (fn [tx b _ _read]
+      ((:reduce tx) {:prefix (ranked/prefix (index-config b index :asc) 6)}
+       (fn [groups {:keys [v]}]
+         (observe! ctx :index-group 0)
+         (conj groups (codec/decode v))) []))))
+
+(defn- validate-group! [name d selection]
+  (validate-selection! name d selection)
+  (when-not (contains? selection :equals)
+    (throw (ex-info "Index composition requires an equality group" {:model name :selection selection}))))
+
+(defn index-keys [ctx name d options]
+  (let [selection (select-keys options [:index :direction :equals])]
+    (when-not (and (map? options)
+                   (every? #{:index :direction :equals :offset :limit} (keys options))
+                   (nat-int? (:offset options 0)) (pos-int? (:limit options 25)))
+      (throw (ex-info "Invalid index identity slice" {:options options})))
+    (validate-group! name d selection)
+    (with-reader ctx name d
+      (fn [tx b _ _read]
+        (let [tx (navigation-reader ctx tx)
+              cfg (index-config b (:index options :identity) (:direction options :asc))
+              [first end] (group-bounds tx cfg (:direction options :asc) (:equals options))
+              offset (:offset options 0) limit (:limit options 25)]
+          (if (>= offset (- end first)) []
+            (let [start (ranked/get-nth tx cfg (+ first offset))]
+              ((:reduce tx) {:prefix (key/join (ranked/prefix cfg 0)
+                                             (sort-bytes (:equals options) (:direction options :asc)))
+                             :from (ranked/pack cfg 0 start)}
+               (fn [ids {:keys [v]}]
+                 (observe! ctx :index-entry 0)
+                 (let [ids (conj ids (codec/decode v))]
+                   (if (= limit (count ids)) (reduced ids) ids))) []))))))))
+
+(defn index-rank [ctx name d selection id]
+  (validate-group! name d selection)
+  (when (nil? id) (throw (ex-info "Instance key cannot be nil" {:model name})))
+  (with-reader ctx name d
+    (fn [tx b _ _read]
+      (let [tx (navigation-reader ctx tx) direction (:direction selection :asc)
+            cfg (index-config b (:index selection :identity) direction)
+            member (index-member direction (:equals selection) id)
+            first (ranked/rank tx cfg (sort-bytes (:equals selection) direction) false)]
+        {:rank (- (ranked/rank tx cfg member false) first)
+         :present? (ranked/contains? tx cfg member)}))))

@@ -59,7 +59,7 @@
                      (uuid? (:event-source context))))
     (throw (ex-info "Keyed folds require a UUID :tenant-id and stable :event-source identifier"
                     {:model name})))
-  (join (byte-array [75 70 49])
+  (join (byte-array [75 70 50])
         (.digest (MessageDigest/getInstance "SHA-256")
                  (encode [(:event-source context) (:tenant-id context) name version]))))
 

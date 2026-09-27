@@ -333,6 +333,27 @@
   [context name options]
   (keyed/page context name (keyed-definition context name) options))
 
+(defn index-groups
+  "Return distinct index values in ascending order as {:value v :total n}.
+   Reads maintained group counts without loading any member results.
+   Use a read-session when composing these counts with other index reads."
+  [context name index]
+  (keyed/index-groups context name (keyed-definition context name) index))
+
+(defn index-keys
+  "Read instance identities from an equality group without loading results.
+   Options: :index, :equals (required), :direction, zero-based :offset (0),
+   :limit (25). Beyond-end offsets return []. Ties remain ascending by ID."
+  [context name options]
+  (keyed/index-keys context name (keyed-definition context name) options))
+
+(defn index-rank
+  "Return {:rank insertion-position :present? boolean} for an instance identity
+   in an equality group. Selection: :index, :equals (required), :direction.
+   Loads index metadata only; absent identities still have an insertion rank."
+  [context name selection id]
+  (keyed/index-rank context name (keyed-definition context name) selection id))
+
 (defn progress
   "Read a keyed model's committed replay progress after catch-up."
   [context name]
