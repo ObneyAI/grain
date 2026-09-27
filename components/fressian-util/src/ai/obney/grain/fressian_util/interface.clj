@@ -46,7 +46,8 @@
 (defn- deep-clojurize
   "Recursively convert Java collections to Clojure equivalents.
   clojure.walk/postwalk doesn't recurse into Java collections (they fail coll?),
-  so nested structures like sets-of-vectors round-trip as sets-of-ArrayLists."
+  so nested structures like sets-of-vectors round-trip as sets-of-ArrayLists.
+  Reuse Clojure collections whose keys and children need no conversion."
   [x]
   (cond
     (and (instance? java.util.Map x) (not (map? x)))
@@ -64,17 +65,27 @@
     (mapv deep-clojurize x)
 
     (map? x)
-    (persistent!
-     (reduce-kv (fn [m k v] (assoc! m (deep-clojurize k) (deep-clojurize v)))
-                (transient {}) x))
+    (reduce-kv (fn [m k v]
+                 (let [k' (deep-clojurize k)
+                       v' (deep-clojurize v)]
+                   ;; After a change, replay later entries in case keys converge.
+                   (if (and (identical? m x) (identical? k k') (identical? v v'))
+                     m
+                     ;; assoc alone can retain an equal, unconverted key.
+                     (assoc (if (identical? k k') m (dissoc m k)) k' v'))))
+               x x)
 
     (set? x)
-    (persistent!
-     (reduce (fn [s v] (conj! s (deep-clojurize v)))
-             (transient #{}) x))
+    (reduce (fn [s v]
+              (let [v' (deep-clojurize v)]
+                (if (identical? v v') s (conj (disj s v) v'))))
+            x x)
 
     (vector? x)
-    (mapv deep-clojurize x)
+    (reduce-kv (fn [v i child]
+                 (let [child' (deep-clojurize child)]
+                   (if (identical? child child') v (assoc v i child'))))
+               x x)
 
     :else x))
 

@@ -51,12 +51,17 @@
   (let [bytes (codec/encode value)]
     ((:put tx) k bytes)
     (observe! ctx operation (alength ^bytes bytes))))
-(defn- assert-schema! [schema value name kind]
-  (when (and schema (not (m/validate schema value)))
-    (throw (ex-info "Keyed-fold schema validation failed"
-                    {:model name :kind kind :explanation (m/explain schema value)}))))
+(defn- prepare-validation [schema name kind]
+  (if schema
+    (let [schema (m/schema schema)
+          valid? (m/validator schema)]
+      (fn [value]
+        (when-not (valid? value)
+          (throw (ex-info "Keyed-fold schema validation failed"
+                          {:model name :kind kind :explanation (m/explain schema value)})))))
+    (constantly nil)))
 
-(defn- apply-batch! [ctx name d b events]
+(defn- apply-batch! [ctx name d b validate-state! validate-result! events]
   (kv/transact (:cache ctx) :write
     (fn [tx]
       (let [before-progress (read-meta tx (progress-key b))
@@ -74,14 +79,14 @@
                                       (if-let [raw ((:get tx) k)]
                                         (decode ctx :state-decoded raw) (:initial d {})))
                               next ((:reducer-fn d) state event)]
-                          (assert-schema! (or (:state-schema d) (:schema d)) next name :state)
+                          (validate-state! next)
                           (observe! ctx :event-applied 0)
                           (assoc states id next)))) {} events)
             count-before (or (read-meta tx (count-key b)) 0)
             added (volatile! 0)]
         (doseq [[id state] states]
           (let [value ((:result d identity) state)
-                _ (assert-schema! (:result-schema d) value name :result)
+                _ (validate-result! value)
                 result-k (address b 2 id)
                 old (decode ctx :result-decoded ((:get tx) result-k))
                 included? ((:include? d (constantly true)) value)
@@ -120,16 +125,18 @@
     (when-not (pos-int? batch-size)
       (throw (ex-info "Keyed-fold batch size must be positive" {:batch-size batch-size})))
     (when (and through (or (nil? after) (pos? (compare through after))))
-      (let [remaining (reduce
+      (let [validate-state! (prepare-validation (or (:state-schema d) (:schema d)) name :state)
+            validate-result! (prepare-validation (:result-schema d) name :result)
+            remaining (reduce
                        (fn [batch event]
                          (if (pos? (compare (:event/id event) through)) (reduced batch)
                            (let [batch (conj batch event)]
                              (if (= batch-size (count batch))
-                               (do (apply-batch! ctx name d b batch) []) batch))))
+                               (do (apply-batch! ctx name d b validate-state! validate-result! batch) []) batch))))
                        [] (es/read (:event-store ctx)
                                    (cond-> {:tenant-id (:tenant-id ctx) :types (:events d)}
                                      after (assoc :after after))))]
-        (when (seq remaining) (apply-batch! ctx name d b remaining)))
+        (when (seq remaining) (apply-batch! ctx name d b validate-state! validate-result! remaining)))
       (kv/transact (:cache ctx) :write
         (fn [tx]
           (let [p (read-meta tx (progress-key b)) old (:checked-through p)]

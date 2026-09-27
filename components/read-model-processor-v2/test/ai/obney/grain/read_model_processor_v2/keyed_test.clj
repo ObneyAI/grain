@@ -6,7 +6,8 @@
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [ai.obney.grain.fressian-util.interface :as codec]
-            [ai.obney.grain.schema-util.interface :refer [defschemas]]
+            [ai.obney.grain.schema-util.interface :as schemas :refer [defschemas]]
+            [malli.core :as m]
             [clojure.java.io :as io]))
 
 (defschemas schemas {:keyed/change [:map] :keyed/other [:map]})
@@ -268,6 +269,52 @@
         (is (= before (stored-bytes)) "Includes indexes, counts and progress")
         (when (= phase :codec)
           (is (= {"a" {:total 1} "b" {:total 99}} (results ctx name))))))))
+
+(deftest validators-are-reused-across-catch-up-batches
+  (let [state-schema [:map [:history [:vector :int]]]
+        result-schema [:map [:total :int]]
+        name (register! history-step {:state-schema state-schema :result-schema result-schema
+                                      :result total})
+        ctx (assoc *ctx* :read-model/batch-size 2)
+        prepared (atom []) checked (atom []) original m/validator]
+    (append! [{:owner "a" :delta 1} {:owner "a" :delta 2}
+              {:owner "b" :delta 3} {:owner "b" :delta 4} {:owner "c" :delta 5}])
+    (with-redefs [m/validator (fn [schema]
+                               (let [form (m/form schema) valid? (original schema nil)]
+                                 (swap! prepared conj form)
+                                 (fn [value] (swap! checked conj form) (valid? value))))]
+      (is (= {"a" {:total 3} "b" {:total 7} "c" {:total 5}} (results ctx name)))
+      (is (= {state-schema 1 result-schema 1} (frequencies @prepared)))
+      (is (= {state-schema 5 result-schema 3} (frequencies @checked)))
+      (reset! prepared []) (reset! checked [])
+      (is (= {:total 3} (rmp/value ctx name "a")))
+      (is (empty? @prepared) "An already current model needs no validators")
+      (is (empty? @checked)))))
+
+(deftest later-catch-ups-resolve-current-schemas-and-preserve-failure-details
+  (doseq [option [:schema :state-schema :result-schema]]
+    (let [schema-name (keyword "keyed-test" (str (random-uuid)))
+          ctx (assoc *ctx* :tenant-id (random-uuid))
+          kind (if (= option :result-schema) :result :state)]
+      (try
+        (schemas/register! {schema-name [:int {:max 10}]})
+        (let [name (register! (fn [_ event] (:delta event)) {option schema-name})]
+          (append! ctx [{:owner "a" :delta 1}])
+          (is (= 1 (rmp/value ctx name "a")))
+          ;; Change the registry between operations to detect stale validators.
+          (schemas/register! {schema-name [:int {:max 2}]})
+          (append! ctx [{:owner "a" :delta 2} {:owner "b" :delta 3}])
+          (let [before (stored-bytes)
+                error (try (rmp/value ctx name "a") nil
+                           (catch clojure.lang.ExceptionInfo e e))]
+            (is (= "Keyed-fold schema validation failed" (some-> error ex-message)))
+            (is (= {:model name :kind kind} (select-keys (ex-data error) [:model :kind])))
+            (is (= 3 (get-in (ex-data error) [:explanation :value])))
+            (is (seq (get-in (ex-data error) [:explanation :errors])))
+            (is (= before (stored-bytes)) "Invalid state or result rolls back the whole batch"))
+          (schemas/register! {schema-name [:int {:max 10}]})
+          (is (= {"a" 2 "b" 3} (results ctx name)) "Retry resolves the schema again"))
+        (finally (swap! schemas/registry* dissoc schema-name))))))
 
 (deftest initial-state-source-and-version-isolation
   (let [name (register! (fn [s e] (+ s (:delta e))) {:initial 10})
