@@ -1,6 +1,7 @@
 (ns ai.obney.grain.read-model-processor-v2.keyed-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v2.fold-key :as key]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
@@ -336,3 +337,52 @@
           (is (= {:total 3} (deref new-reader 5000 ::timeout)))
           (is (= [{:total 1} {:total 1}] (deref old-reader 5000 ::timeout)))
           (finally (deliver advanced true)))))))
+
+(deftest prepared-readers-reuse-addresses-without-sharing-results-or-lifetimes
+  (let [name (register! history-step {:result total :indexes {:total :total}})
+        second-model (register! history-step {:result total})
+        ctx (assoc *ctx* :read-model/batch-size 1)
+        other (assoc ctx :tenant-id (random-uuid))
+        calls (atom []) original key/prefix]
+    (append! [{:owner "a" :delta 1} {:owner "a" :delta 2} {:owner "b" :delta 4}])
+    (append! other [{:owner "a" :delta 9}])
+    (let [escaped
+          (with-redefs [key/prefix (fn [ctx name version]
+                                    (swap! calls conj [(:tenant-id ctx) name version])
+                                    (original ctx name version))]
+            (rmp/read-session [[ctx [name name second-model]] [other [name]] [ctx [name]]]
+              (fn [[a b duplicate]]
+                (is (= (repeat 10 [{:total 3} {:history [1 2]} {:total 9} {:total 3}])
+                       (repeatedly 10 #(vector (rmp/value a name "a") (rmp/state a name "a")
+                                               (rmp/value b name "a") (rmp/value duplicate name "a")))))
+                (is (= {:total 3} (rmp/value a second-model "a")))
+                (is (= [{:key "a" :value {:total 3}} {:key "b" :value {:total 4}}]
+                       (into [] (rmp/values a name {:index :total}))))
+                (is (= [{:key "b" :value {:total 4}}]
+                       (:entries (rmp/page a name {:index :total :direction :desc :limit 1}))))
+                (is (some? (:watermark (rmp/progress a name))))
+                (doseq [changed [(assoc a :tenant-id (:tenant-id other))
+                                 (assoc a :event-source "another-source")
+                                 (assoc a :cache nil)]]
+                  (is (thrown? clojure.lang.ExceptionInfo (rmp/value changed name "a"))))
+                (is (thrown? clojure.lang.ExceptionInfo (rmp/value b second-model "a")))
+                a)))]
+      (is (= {[(:tenant-id ctx) name 1] 1
+              [(:tenant-id ctx) second-model 1] 1
+              [(:tenant-id other) name 1] 1}
+             (frequencies @calls))
+          "Address preparation is bounded by distinct source/tenant/model identities, including cold batches")
+      (is (thrown? clojure.lang.ExceptionInfo (rmp/value escaped name "a"))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Transaction aborted"
+          (rmp/read-session ctx [name]
+            (fn [prepared]
+              (is (= :rejected @(future
+                                 (try (rmp/value prepared name "a")
+                                      (catch clojure.lang.ExceptionInfo _ :rejected)))))))))
+    (append! [{:owner "a" :delta 5}])
+    (is (= {:total 8} (rmp/value ctx name "a")) "The next session catches up; no result cache")
+    (rmp/register-read-model! name history-step
+                             {:events #{:keyed/change} :version 2 :key :owner
+                              :result (fn [s] {:total (* 2 (:total (total s)))})})
+    (is (= {:total 16} (rmp/value ctx name "a")))
+    (is (= {:total 18} (rmp/value other name "a")))))

@@ -56,67 +56,65 @@
     (throw (ex-info "Keyed-fold schema validation failed"
                     {:model name :kind kind :explanation (m/explain schema value)}))))
 
-(defn- apply-batch! [ctx name d events]
-  (let [b (base ctx name d)]
-    (kv/transact (:cache ctx) :write
-      (fn [tx]
-        (let [before-progress (read-meta tx (progress-key b))
-              events (filterv #(or (nil? (:watermark before-progress))
-                                  (pos? (compare (:event/id %) (:watermark before-progress)))) events)
-              states (reduce
-                      (fn [states event]
-                        (let [id ((:key d) event)]
-                          (when (nil? id)
-                            (throw (ex-info "Keyed-fold event has no owner"
-                                            {:model name :event-id (:event/id event)
-                                             :event-type (:event/type event)})))
-                          (let [k (address b 1 id)
-                                state (if (contains? states id) (get states id)
-                                        (if-let [raw ((:get tx) k)]
-                                          (decode ctx :state-decoded raw) (:initial d {})))
-                                next ((:reducer-fn d) state event)]
-                            (assert-schema! (or (:state-schema d) (:schema d)) next name :state)
-                            (observe! ctx :event-applied 0)
-                            (assoc states id next)))) {} events)
-              count-before (or (read-meta tx (count-key b)) 0)
-              added (volatile! 0)]
-          (doseq [[id state] states]
-            (let [value ((:result d identity) state)
-                  _ (assert-schema! (:result-schema d) value name :result)
-                  result-k (address b 2 id)
-                  old (decode ctx :result-decoded ((:get tx) result-k))
-                  included? ((:include? d (constantly true)) value)
-                  indexes (when included?
-                            (assoc (into {} (map (fn [[index f]] [index (f value)])) (:indexes d))
-                                   :identity (str id)))]
-              (observe! ctx :result-calculated 0)
-              ;; State must advance even when its completion value is equal.
-              (write-observed! ctx tx :state-written (address b 1 id) state)
-              (vswap! added + (- (if included? 1 0) (if old 1 0)))
-              (if-not included?
-                (when old
-                  (doseq [[index position] (:indexes old) direction [:asc :desc]]
-                    ((:delete tx) (index-address b index direction position id)))
-                  ((:delete tx) result-k))
-                (when (or (nil? old) (not= (:value old) value))
-                  (doseq [[index position] indexes
-                          direction [:asc :desc]
-                          :when (or (nil? old) (not= position (get-in old [:indexes index])))]
-                    (when old
-                      ((:delete tx) (index-address b index direction (get-in old [:indexes index]) id)))
-                    (write-observed! ctx tx :index-written (index-address b index direction position id) id))
-                  (write-observed! ctx tx :result-written result-k {:key id :value value :indexes indexes})))))
-          (when (seq events)
-            (when-not (zero? @added) (write! tx (count-key b) (+ count-before @added)))
-            (write! tx (progress-key b) (assoc before-progress :watermark (:event/id (peek events))))))))))
+(defn- apply-batch! [ctx name d b events]
+  (kv/transact (:cache ctx) :write
+    (fn [tx]
+      (let [before-progress (read-meta tx (progress-key b))
+            events (filterv #(or (nil? (:watermark before-progress))
+                                (pos? (compare (:event/id %) (:watermark before-progress)))) events)
+            states (reduce
+                    (fn [states event]
+                      (let [id ((:key d) event)]
+                        (when (nil? id)
+                          (throw (ex-info "Keyed-fold event has no owner"
+                                          {:model name :event-id (:event/id event)
+                                           :event-type (:event/type event)})))
+                        (let [k (address b 1 id)
+                              state (if (contains? states id) (get states id)
+                                      (if-let [raw ((:get tx) k)]
+                                        (decode ctx :state-decoded raw) (:initial d {})))
+                              next ((:reducer-fn d) state event)]
+                          (assert-schema! (or (:state-schema d) (:schema d)) next name :state)
+                          (observe! ctx :event-applied 0)
+                          (assoc states id next)))) {} events)
+            count-before (or (read-meta tx (count-key b)) 0)
+            added (volatile! 0)]
+        (doseq [[id state] states]
+          (let [value ((:result d identity) state)
+                _ (assert-schema! (:result-schema d) value name :result)
+                result-k (address b 2 id)
+                old (decode ctx :result-decoded ((:get tx) result-k))
+                included? ((:include? d (constantly true)) value)
+                indexes (when included?
+                          (assoc (into {} (map (fn [[index f]] [index (f value)])) (:indexes d))
+                                 :identity (str id)))]
+            (observe! ctx :result-calculated 0)
+            ;; State must advance even when its completion value is equal.
+            (write-observed! ctx tx :state-written (address b 1 id) state)
+            (vswap! added + (- (if included? 1 0) (if old 1 0)))
+            (if-not included?
+              (when old
+                (doseq [[index position] (:indexes old) direction [:asc :desc]]
+                  ((:delete tx) (index-address b index direction position id)))
+                ((:delete tx) result-k))
+              (when (or (nil? old) (not= (:value old) value))
+                (doseq [[index position] indexes
+                        direction [:asc :desc]
+                        :when (or (nil? old) (not= position (get-in old [:indexes index])))]
+                  (when old
+                    ((:delete tx) (index-address b index direction (get-in old [:indexes index]) id)))
+                  (write-observed! ctx tx :index-written (index-address b index direction position id) id))
+                (write-observed! ctx tx :result-written result-k {:key id :value value :indexes indexes})))))
+        (when (seq events)
+          (when-not (zero? @added) (write! tx (count-key b) (+ count-before @added)))
+          (write! tx (progress-key b) (assoc before-progress :watermark (:event/id (peek events)))))))))
 
 (defn- head [ctx]
   (reduce (fn [_ event] (reduced (:event/id event))) nil
           (es/read (:event-store ctx) {:tenant-id (:tenant-id ctx) :reverse? true :limit 1})))
 
-(defn- catch-up! [ctx name d through]
-  (let [b (base ctx name d)
-        progress (kv/transact (:cache ctx) :read #(read-meta % (progress-key b)))
+(defn- catch-up! [ctx name d b through]
+  (let [progress (kv/transact (:cache ctx) :read #(read-meta % (progress-key b)))
         after (last (sort (keep #(get progress %) [:checked-through :watermark])))
         batch-size (:read-model/batch-size ctx 128)]
     (when-not (pos-int? batch-size)
@@ -127,11 +125,11 @@
                          (if (pos? (compare (:event/id event) through)) (reduced batch)
                            (let [batch (conj batch event)]
                              (if (= batch-size (count batch))
-                               (do (apply-batch! ctx name d batch) []) batch))))
+                               (do (apply-batch! ctx name d b batch) []) batch))))
                        [] (es/read (:event-store ctx)
                                    (cond-> {:tenant-id (:tenant-id ctx) :types (:events d)}
                                      after (assoc :after after))))]
-        (when (seq remaining) (apply-batch! ctx name d remaining)))
+        (when (seq remaining) (apply-batch! ctx name d b remaining)))
       (kv/transact (:cache ctx) :write
         (fn [tx]
           (let [p (read-meta tx (progress-key b)) old (:checked-through p)]
@@ -148,6 +146,12 @@
     (or (get (:definitions s) name)
         (throw (ex-info "Model was not prepared in this read session" {:model name})))))
 
+(defn- prepare-reader [tx b d]
+  ;; Both point reads and traversals use the same prepared address space.
+  ;; The transaction still enforces callback/thread lifetime on every access.
+  (let [read (fn [kind id] ((:get tx) (address b kind id)))]
+    (fn [f] (f tx b d read))))
+
 (defn read-session
   "Prepare explicit [context model-names] requests, then pass their contexts to f.
    All requests must share a cache. Callers explicitly supply any trusted identity
@@ -156,52 +160,65 @@
   (when-not (seq requests) (throw (ex-info "Read session requires at least one request" {})))
   (let [cache (:cache (ffirst requests))]
     (when-not cache (throw (ex-info "Read session requires :cache" {})))
-    (doseq [[ctx names] requests]
-      (when (::session ctx) (throw (ex-info "Cannot open a nested keyed-fold read session" {})))
-      (when-not (identical? cache (:cache ctx))
-        (throw (ex-info "Read-session contexts must share one store" {})))
-      (doseq [name names]
-        (let [d (get registry name)]
-          (when-not (keyed? d) (throw (ex-info "Expected a registered keyed fold" {:model name})))
-          (base ctx name d))))
-    (let [prepared
+    (let [prefixes
+          (reduce (fn [prefixes [ctx names]]
+                    (when (::session ctx)
+                      (throw (ex-info "Cannot open a nested keyed-fold read session" {})))
+                    (when-not (identical? cache (:cache ctx))
+                      (throw (ex-info "Read-session contexts must share one store" {})))
+                    (reduce (fn [prefixes name]
+                              (let [id [(identity-of ctx) name]
+                                    d (get registry name)]
+                                (when-not (keyed? d)
+                                  (throw (ex-info "Expected a registered keyed fold" {:model name})))
+                                (if (contains? prefixes id) prefixes
+                                  (assoc prefixes id (base ctx name d)))))
+                            prefixes names)) {} requests)
+          prepared
           (locking cache
             (let [heads (reduce (fn [heads [ctx _]]
-                            (let [id (identity-of ctx)]
-                              (if (contains? heads id) heads (assoc heads id (head ctx))))) {} requests)
-                  prepared (mapv (fn [[ctx names]]
-                             (doseq [name (distinct names)]
-                               (catch-up! ctx name (get registry name) (get heads (identity-of ctx))))
-                             [ctx (select-keys registry names)]) requests)]
-              prepared))]
+                                 (let [id (identity-of ctx)]
+                                   (if (contains? heads id) heads (assoc heads id (head ctx))))) {} requests)]
+              (mapv (fn [[ctx names]]
+                      (doseq [name (distinct names)]
+                        (catch-up! ctx name (get registry name)
+                                   (get prefixes [(identity-of ctx) name])
+                                   (get heads (identity-of ctx))))
+                      [ctx (select-keys registry names)]) requests)))]
       ;; Catch-up is serialized; detached result composition can run concurrently.
       ;; A writer may advance before this snapshot opens, which the finite-head
       ;; contract permits. The snapshot still includes all captured-head effects.
       (kv/transact cache :read
-          (fn [tx]
-            (f (mapv (fn [[ctx definitions]]
-                       (assoc ctx ::session {:tx tx :cache cache :identity (identity-of ctx)
-                                             :definitions definitions})) prepared)))))))
+        (fn [tx]
+          (f (mapv (fn [[ctx definitions]]
+                     (assoc ctx ::session
+                            {:cache cache :identity (identity-of ctx)
+                             :definitions definitions
+                             :readers (into {} (map (fn [[name d]]
+                                                      [name (prepare-reader tx
+                                                              (get prefixes [(identity-of ctx) name]) d)]))
+                                            definitions)})) prepared)))))))
 
 (defn- with-reader [ctx name d f]
   (if-let [s (::session ctx)]
-    (let [d (session-definition ctx name)] (f (:tx s) d))
+    (do (session-definition ctx name)
+        ((get (:readers s) name) f))
     (read-session [[ctx [name]]] {name d}
-                  (fn [[prepared]] (f (get-in prepared [::session :tx]) d)))))
+                  (fn [[prepared]] ((get-in prepared [::session :readers name]) f)))))
 
 (defn point [ctx name d id kind not-found]
   (when (nil? id) (throw (ex-info "Instance key cannot be nil" {:model name})))
   (with-reader ctx name d
-    (fn [tx d]
-      (if-let [raw ((:get tx) (address (base ctx name d) (if (= kind :state) 1 2) id))]
+    (fn [_tx _b _d read]
+      (if-let [raw (read (if (= kind :state) 1 2) id)]
         (let [decoded (decode ctx (if (= kind :state) :state-decoded :result-decoded) raw)]
           (if (= kind :state) decoded (:value decoded)))
         not-found))))
 
 (defn progress [ctx name d]
-  (with-reader ctx name d (fn [tx d] (read-meta tx (progress-key (base ctx name d))))))
+  (with-reader ctx name d (fn [tx b _d _read] (read-meta tx (progress-key b)))))
 
-(defn- selection [ctx name d options]
+(defn- validate-selection! [name d options]
   (when-not (and (map? options)
                  (every? #{:index :direction :equals} (keys options)))
     (throw (ex-info "Result selection accepts :index, :direction and :equals" {:options options})))
@@ -209,25 +226,31 @@
     (when-not (and (#{:asc :desc} direction)
                    (or (= :identity index) (contains? (:indexes d) index)))
       (throw (ex-info "Unknown result index or direction" {:model name :options options})))
-    (cond-> (index-prefix (base ctx name d) index direction)
+    nil))
+
+(defn- selection [b name d options]
+  (validate-selection! name d options)
+  (let [direction (:direction options :asc)]
+    (cond-> (index-prefix b (:index options :identity) direction)
       (contains? options :equals) (key/join (sort-bytes (:equals options) direction)))))
 
-(defn- reduce-results [ctx name d tx options rf initial]
-  (let [b (base ctx name d) prefix (selection ctx name d options)]
+(defn- reduce-results [ctx name d tx b read options rf initial]
+  (let [prefix (selection b name d options)]
     ((:reduce tx) {:prefix prefix}
      (fn [acc {:keys [v]}]
        (observe! ctx :index-entry 0)
        (let [id (codec/decode v)
-             entry (decode ctx :result-decoded ((:get tx) (address b 2 id)))]
+             entry (decode ctx :result-decoded (read 2 id))]
          (rf acc (select-keys entry [:key :value])))) initial)))
 
 (defn values [ctx name d options]
   ;; No resource is opened until reduction. A session-bound reducible must be
   ;; consumed during its session; storage operations enforce that lifetime.
-  (selection ctx name d options)
+  (validate-selection! name d options)
   (reify clojure.lang.IReduceInit
     (reduce [_ rf initial]
-      (with-reader ctx name d #(reduce-results ctx name %2 %1 options rf initial)))))
+      (with-reader ctx name d
+        (fn [tx b d read] (reduce-results ctx name d tx b read options rf initial))))))
 
 (defn page [ctx name d options]
   (when-not (and (map? options)
@@ -235,10 +258,9 @@
                  (pos-int? (:page options 1)) (pos-int? (:limit options 25)))
     (throw (ex-info "Invalid keyed-fold page" {:options options})))
   (with-reader ctx name d
-    (fn [tx d]
+    (fn [tx b d read]
       (let [selection-options (select-keys options [:index :direction :equals])
-            prefix (selection ctx name d selection-options)
-            b (base ctx name d)
+            prefix (selection b name d selection-options)
             examined (volatile! 0)
             total (if (contains? options :equals)
                     ((:reduce tx) {:prefix prefix}
@@ -256,7 +278,7 @@
                           (vswap! examined inc)
                           (if (< seen offset) {:seen (inc seen) :entries entries}
                             (let [id (codec/decode v)
-                                  entry (decode ctx :result-decoded ((:get tx) (address b 2 id)))
+                                  entry (decode ctx :result-decoded (read 2 id))
                                   entries (conj entries (select-keys entry [:key :value]))
                                   next {:seen (inc seen) :entries entries}]
                               (if (= limit (count entries)) (reduced next) next))))

@@ -9,15 +9,18 @@
     (doseq [^bytes a arrays] (.write out a 0 (alength a)))
     (.toByteArray out)))
 
-(declare write-key!)
 (defn- write-key! [^DataOutputStream out value]
   (cond
     (nil? value) (.writeByte out 1)
     (boolean? value) (.writeByte out (if value 3 2))
     (string? value)
     (do (.writeByte out 16)
-        (doseq [c value b [(bit-shift-right (int c) 8) (bit-and 255 (int c))]]
-          (.writeByte out b) (when (zero? b) (.writeByte out 255)))
+        (dotimes [i (.length ^String value)]
+          (let [c (int (.charAt ^String value i))
+                hi (bit-shift-right c 8)
+                lo (bit-and 255 c)]
+            (.writeByte out hi) (when (zero? hi) (.writeByte out 255))
+            (.writeByte out lo) (when (zero? lo) (.writeByte out 255))))
         (.writeShort out 0))
     (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
     (do (.writeByte out 32) (.writeLong out (bit-xor (long value) Long/MIN_VALUE)))

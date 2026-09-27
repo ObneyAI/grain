@@ -22,3 +22,22 @@
       (is (not= a (take (count a) b)))))
   (doseq [unsupported [1.1 1/2 (inc (bigint Long/MAX_VALUE)) {} #{} '(1)]]
     (is (thrown? clojure.lang.ExceptionInfo (key/encode unsupported)))))
+
+(deftest string-encoding-preserves-stored-bytes
+  ;; These are the existing wire bytes, expressed as unsigned decimal values.
+  (doseq [[value expected] [["" [16 0 0]]
+                           ["Ada" [16 0 255 65 0 255 100 0 255 97 0 0]]
+                           ["\u0000" [16 0 255 0 255 0 0]]
+                           ["\u00ff\u0100" [16 0 255 255 1 0 255 0 0]]
+                           ["\ud83d\ude00" [16 216 61 222 0 255 0 0]]
+                           ["\ud800" [16 216 0 255 0 0]]
+                           ["\udfff" [16 223 255 0 0]]]]
+    (is (= expected (mapv #(bit-and 255 %) (key/encode value)))))
+  ;; Cover every UTF-16 code unit, including unpaired surrogates. The digest
+  ;; freezes the old encoding; the length also checks zero-byte escaping.
+  (let [value (String. (char-array (map char (range 65536))))
+        encoded (key/encode value)]
+    (is (= 131587 (alength ^bytes encoded)))
+    (is (= "039b63a1afbedb79d5cd86d3e4fd896ec8d041380f1f6d7850fd21f1d1957d76"
+           (.formatHex (java.util.HexFormat/of)
+                       (.digest (java.security.MessageDigest/getInstance "SHA-256") encoded))))))
