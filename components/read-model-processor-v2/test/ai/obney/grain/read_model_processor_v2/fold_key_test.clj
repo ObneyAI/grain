@@ -5,6 +5,11 @@
 (defn encoded-order [xs encode]
   (sort #(java.util.Arrays/compareUnsigned ^bytes (encode %1) ^bytes (encode %2)) xs))
 
+(deftest prefix-upper-bounds
+  (doseq [[prefix end] [[[0] [1]] [[1 -1] [2]] [[1 2 -1] [1 3]]
+                        [[-2 -1] [-1]] [[-1] nil] [[-1 -1] nil] [[] nil]]]
+    (is (= end (some-> (key/prefix-end (byte-array prefix)) vec)))))
+
 (deftest ordered-keys-preserve-scalar-and-tuple-order
   (doseq [xs [[Long/MIN_VALUE -1000 -1 0 1 255 256 65536 Long/MAX_VALUE]
               ["" "\u0000" "\u0000\u0000" "a" "a\u0000" "aa" "b" "\u00ff" "\u0100" "\uffff"]

@@ -42,6 +42,16 @@
 (defn descending ^bytes [^bytes key]
   (byte-array (map #(unchecked-byte (bit-xor 255 (bit-and 255 %))) key)))
 
+(defn prefix-end
+  "Exclusive upper bound of a byte prefix, or nil when it has no upper bound."
+  ^bytes [^bytes prefix]
+  (loop [i (dec (alength prefix))]
+    (when (>= i 0)
+      (if (= 255 (bit-and 255 (aget prefix i))) (recur (dec i))
+        (let [end (java.util.Arrays/copyOf prefix (inc i))]
+          (aset-byte end i (unchecked-byte (inc (bit-and 255 (aget prefix i)))))
+          end)))))
+
 (defn prefix ^bytes [context name version]
   (when-not (and (uuid? (:tenant-id context))
                  (some? (:event-source context))

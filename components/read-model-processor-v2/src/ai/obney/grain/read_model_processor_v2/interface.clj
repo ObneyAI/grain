@@ -19,6 +19,11 @@
    limit. Change the model version when changing routing, initial state, reducer,
    result, inclusion, schemas or indexes. :state-schema and :result-schema are optional.
 
+   Direct index pages use stored ranks for offsets and equality counts. Grain
+   maintains those ranks in the fold transaction. Existing unranked indexes are
+   upgraded atomically on first preparation, without replaying business events;
+   this one-time upgrade visits their entries and can delay the first read.
+
    The caching and partitioning options below describe legacy project calls.
    Keyed folds do not use L1/TTL caching or legacy scopes.
 
@@ -321,7 +326,10 @@
 (defn page
   "Read an indexed result page with exact counts and clamping. Returns :entries,
    :total, :total-pages, :page, :page-size, and progress/work counters. Options:
-   :index, :direction, :equals, :page (1 by default), :limit (25 by default)."
+   :index, :direction, :equals, :page (1 by default), :limit (25 by default).
+   :rows-examined counts selected index rows; :rank-entries-examined separately
+   counts navigation entries visited, including repeated visits. Only returned
+   result payloads are decoded. Rank navigation has probabilistic bounds."
   [context name options]
   (keyed/page context name (keyed-definition context name) options))
 

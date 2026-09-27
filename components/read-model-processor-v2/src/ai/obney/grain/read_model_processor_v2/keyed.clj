@@ -4,6 +4,7 @@
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.fressian-util.interface :as codec]
             [ai.obney.grain.read-model-processor-v2.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
             [malli.core :as m]))
 
 (defn keyed? [definition] (contains? definition :key))
@@ -37,13 +38,26 @@
 (defn- address [b kind id] (key/checked (key/join b (byte-array [kind]) (key/encode id))))
 (defn- progress-key [b] (key/join b (byte-array [0])))
 (defn- count-key [b] (key/join b (byte-array [4])))
+(defn- index-config [b index direction]
+  (ranked/config (key/join b (byte-array [5]) (key/encode index)
+                           (byte-array [(if (= direction :desc) 1 0)]))))
 (defn- index-prefix [b index direction]
-  (key/join b (byte-array [3]) (key/encode [index direction])))
+  (ranked/prefix (index-config b index direction) 0))
 (defn- sort-bytes [value direction]
   (cond-> (key/encode value) (= direction :desc) key/descending))
-(defn- index-address [b index direction value id]
-  (key/checked (key/join (index-prefix b index direction) (sort-bytes value direction)
-                         (key/encode (str id)) (key/encode id))))
+(defn- index-member [direction value id]
+  (key/join (sort-bytes value direction) (key/encode (str id)) (key/encode id)))
+
+(defn- remove-index! [tx b index direction position id]
+  (ranked/remove! tx (index-config b index direction) (index-member direction position id)))
+
+(defn- add-index! [ctx tx b index direction position id]
+  (let [cfg (index-config b index direction)
+        member (index-member direction position id)
+        payload (codec/encode id)]
+    (ranked/ensure-init! tx cfg)
+    (ranked/add! tx cfg member payload)
+    (observe! ctx :index-written (alength ^bytes payload))))
 
 (defn- read-meta [tx k] (some-> ((:get tx) k) codec/decode))
 (defn- write! [tx k v] ((:put tx) k (codec/encode v)))
@@ -100,26 +114,58 @@
             (if-not included?
               (when old
                 (doseq [[index position] (:indexes old) direction [:asc :desc]]
-                  ((:delete tx) (index-address b index direction position id)))
+                  (remove-index! tx b index direction position id))
                 ((:delete tx) result-k))
               (when (or (nil? old) (not= (:value old) value))
                 (doseq [[index position] indexes
                         direction [:asc :desc]
                         :when (or (nil? old) (not= position (get-in old [:indexes index])))]
                   (when old
-                    ((:delete tx) (index-address b index direction (get-in old [:indexes index]) id)))
-                  (write-observed! ctx tx :index-written (index-address b index direction position id) id))
+                    (remove-index! tx b index direction (get-in old [:indexes index]) id))
+                  (add-index! ctx tx b index direction position id))
                 (write-observed! ctx tx :result-written result-k {:key id :value value :indexes indexes})))))
         (when (seq events)
           (when-not (zero? @added) (write! tx (count-key b) (+ count-before @added)))
-          (write! tx (progress-key b) (assoc before-progress :watermark (:event/id (peek events)))))))))
+          (write! tx (progress-key b) (assoc before-progress :watermark (:event/id (peek events))
+                                           :index-format :ranked-v1)))))))
+
+(defn- upgrade-indexes! [ctx b d progress]
+  (if (or (nil? progress) (= :ranked-v1 (:index-format progress))) progress
+    (kv/transact (:cache ctx) :write
+      (fn [tx]
+        (let [progress (read-meta tx (progress-key b))]
+          (if (= :ranked-v1 (:index-format progress)) progress
+            (do
+              (doseq [index (conj (vec (keys (:indexes d))) :identity)
+                      direction [:asc :desc]]
+                (let [legacy-prefix (key/join b (byte-array [3]) (key/encode [index direction]))
+                      cfg (index-config b index direction)]
+                  ;; Close each cursor before deleting its entries. The upgrade
+                  ;; remains one atomic transaction, with bounded working memory.
+                  (loop []
+                    (let [batch ((:reduce tx) {:prefix legacy-prefix}
+                                 (fn [batch entry]
+                                   (let [batch (conj batch entry)]
+                                     (if (= 128 (count batch)) (reduced batch) batch))) [])]
+                      (when (seq batch)
+                        (ranked/ensure-init! tx cfg)
+                        (doseq [{:keys [k v]} batch]
+                          (ranked/add! tx cfg
+                                       (java.util.Arrays/copyOfRange ^bytes k (alength ^bytes legacy-prefix)
+                                                                     (alength ^bytes k)) v)
+                          ((:delete tx) k))
+                        (recur))))))
+              (let [progress (assoc progress :index-format :ranked-v1)]
+                (write! tx (progress-key b) progress)
+                progress))))))))
 
 (defn- head [ctx]
   (reduce (fn [_ event] (reduced (:event/id event))) nil
           (es/read (:event-store ctx) {:tenant-id (:tenant-id ctx) :reverse? true :limit 1})))
 
 (defn- catch-up! [ctx name d b through]
-  (let [progress (kv/transact (:cache ctx) :read #(read-meta % (progress-key b)))
+  (let [progress (upgrade-indexes! ctx b d
+                                  (kv/transact (:cache ctx) :read #(read-meta % (progress-key b))))
         after (last (sort (keep #(get progress %) [:checked-through :watermark])))
         batch-size (:read-model/batch-size ctx 128)]
     (when-not (pos-int? batch-size)
@@ -141,7 +187,7 @@
         (fn [tx]
           (let [p (read-meta tx (progress-key b)) old (:checked-through p)]
             (when (or (nil? old) (pos? (compare through old)))
-              (write! tx (progress-key b) (assoc p :checked-through through)))))))))
+              (write! tx (progress-key b) (assoc p :checked-through through :index-format :ranked-v1)))))))))
 
 (defn- identity-of [ctx] [(:event-source ctx) (:tenant-id ctx)])
 
@@ -243,7 +289,7 @@
 
 (defn- reduce-results [ctx name d tx b read options rf initial]
   (let [prefix (selection b name d options)]
-    ((:reduce tx) {:prefix prefix}
+    ((:reduce tx) {:prefix prefix :from (ranked/after prefix)}
      (fn [acc {:keys [v]}]
        (observe! ctx :index-entry 0)
        (let [id (codec/decode v)
@@ -268,28 +314,37 @@
     (fn [tx b d read]
       (let [selection-options (select-keys options [:index :direction :equals])
             prefix (selection b name d selection-options)
-            examined (volatile! 0)
-            total (if (contains? options :equals)
-                    ((:reduce tx) {:prefix prefix}
-                     (fn [n _] (observe! ctx :index-entry 0) (vswap! examined inc) (inc n)) 0)
+            cfg (index-config b (:index options :identity) (:direction options :asc))
+            rank-examined (volatile! 0)
+            navigation-tx (assoc tx :reduce
+                                 (fn [bounds rf initial]
+                                   ((:reduce tx) bounds
+                                    (fn [acc entry]
+                                      (observe! ctx :rank-entry 0)
+                                      (vswap! rank-examined inc)
+                                      (rf acc entry)) initial)))
+            equals? (contains? options :equals)
+            member-prefix (when equals? (sort-bytes (:equals options) (:direction options :asc)))
+            first-rank (if equals? (ranked/rank navigation-tx cfg member-prefix false) 0)
+            total (if equals?
+                    (- (if-let [end (key/prefix-end member-prefix)]
+                         (ranked/rank navigation-tx cfg end false)
+                         (ranked/size navigation-tx cfg)) first-rank)
                     (or (read-meta tx (count-key b)) 0))
             limit (:limit options 25)
             pages (max 1 (quot (+ total (dec limit)) limit))
             page (min (:page options 1) pages)
             offset (* (dec page) limit)
-            entries (if (zero? total) []
-                      (:entries
-                       ((:reduce tx) {:prefix prefix}
-                        (fn [{:keys [seen entries]} {:keys [v]}]
-                          (observe! ctx :index-entry 0)
-                          (vswap! examined inc)
-                          (if (< seen offset) {:seen (inc seen) :entries entries}
-                            (let [id (codec/decode v)
-                                  entry (decode ctx :result-decoded (read 2 id))
-                                  entries (conj entries (select-keys entry [:key :value]))
-                                  next {:seen (inc seen) :entries entries}]
-                              (if (= limit (count entries)) (reduced next) next))))
-                        {:seen 0 :entries []})))]
+            start (when (pos? total) (ranked/get-nth navigation-tx cfg (+ first-rank offset)))
+            entries (if-not start []
+                      ((:reduce tx) {:prefix prefix :from (ranked/pack cfg 0 start)}
+                       (fn [entries {:keys [v]}]
+                         (observe! ctx :index-entry 0)
+                         (let [id (codec/decode v)
+                               entry (decode ctx :result-decoded (read 2 id))
+                               entries (conj entries (select-keys entry [:key :value]))]
+                           (if (= limit (count entries)) (reduced entries) entries))) []))]
         {:entries entries :total total :total-pages pages :page page :page-size limit
-         :rows-examined @examined :results-decoded (count entries)
+         :rows-examined (count entries) :rank-entries-examined @rank-examined
+         :results-decoded (count entries)
          :progress (read-meta tx (progress-key b))}))))

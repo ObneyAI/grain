@@ -105,6 +105,14 @@ contract KeyedFoldMaterialization {
         -- commit. Result/index replacement may be omitted. A result equality
         -- check must never discard state required to interpret the next event.
 
+    @invariant StoredIndexUpgrade
+        -- Upgrading an existing unranked index preserves its stored membership,
+        -- ordering, state, results and event progress without replaying history
+        -- or running application callbacks. The replacement and its completion
+        -- marker publish atomically. Failure leaves the prior storage intact;
+        -- the next preparation can retry. A first upgrade may visit every stored
+        -- index entry, but subsequent warm reads do not repeat that work.
+
     @invariant TimeDoesNotMutateMaterialization
         -- Advancing the query date alone does not change accumulated state,
         -- results, indexes, or model progress. Time-dependent answers evaluate
@@ -167,8 +175,17 @@ contract KeyedFoldReads {
         -- rules apply to the complete candidate population before pagination.
         -- A direct source index may be used only when it preserves these rules.
         -- Query composition may scan compact results. Exact counts, arbitrary
-        -- substring matches, computed sorts, and deep pages have no constant-time
+        -- substring matches and computed sorts have no constant-time
         -- guarantee and may require work proportional to the candidate population.
+
+    @invariant RankedSourcePages
+        -- A direct index page uses maintained ranks to seek its offset and to
+        -- count an equality selection, rather than enumerating all preceding or
+        -- matching members. Only returned result payloads are decoded. Counts,
+        -- clamping, ascending key ties and read-session isolation are unchanged.
+        -- Rank metadata commits with index membership in the fold transaction.
+        -- Navigation has probabilistic bounds; this promises neither constant
+        -- time nor page-sized work for arbitrary cross-model composition.
 }
 
 ------------------------------------------------------------

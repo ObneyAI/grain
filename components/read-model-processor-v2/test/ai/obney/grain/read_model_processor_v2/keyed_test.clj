@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.read-model-processor-v2.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
@@ -53,6 +54,141 @@
 (defn stored-bytes []
   (kv/transact (:cache *ctx*) :read
     #((:reduce %) {} (fn [out {:keys [k v]}] (assoc out (vec k) (vec v))) {})))
+
+(defn page-keys [ctx name options]
+  (mapv :key (:entries (rmp/page ctx name options))))
+
+(deftest ranked-pages-match-oracle-through-membership-changes
+  (let [name (register! (fn [_ e] (select-keys e [:score :included?]))
+                        {:include? :included? :indexes {:score :score}})
+        scores [nil false true "" "a" "a\u0000" "aa" "\uffff" -10 0 10
+                :a :b #uuid "00000000-0000-0000-0000-000000000001" [] [nil] ["a" 1]]
+        ids (vec (concat [1 "1" :a] (map #(str "id-" %) (range 80)) (repeatedly 5 random-uuid)))
+        expected (atom {}) random (java.util.Random. 33)
+        compare-rows (fn [direction [id-a a] [id-b b]]
+                       (let [c (java.util.Arrays/compareUnsigned ^bytes (key/encode (:score a))
+                                                               ^bytes (key/encode (:score b)))]
+                         (if (zero? c)
+                           (let [c (compare (str id-a) (str id-b))]
+                             (if (zero? c)
+                               (java.util.Arrays/compareUnsigned ^bytes (key/encode id-a) ^bytes (key/encode id-b)) c))
+                           (if (= direction :desc) (- c) c))))]
+    (dotimes [_ 5]
+      (let [events (mapv (fn [id] {:owner id :score (nth scores (.nextInt random (count scores)))
+                                  :included? (.nextBoolean random)}) ids)]
+        (append! events)
+        (doseq [{:keys [owner] :as event} events]
+          (swap! expected assoc owner (select-keys event [:score :included?]))))
+      (doseq [direction [:asc :desc]
+              selection (cons {} (map #(hash-map :equals %) (conj scores "absent")))]
+        (let [rows (->> @expected
+                        (filter (fn [[_ v]] (and (:included? v)
+                                                (or (not (contains? selection :equals))
+                                                    (= (:score v) (:equals selection))))))
+                        (sort (partial compare-rows direction)))
+              expected-keys (mapv first rows)
+              options (merge {:index :score :direction direction} selection)]
+          (is (= expected-keys (mapv :key (into [] (rmp/values *ctx* name options)))))
+          (doseq [requested [1 2 999]]
+            (let [page (rmp/page *ctx* name (assoc options :page requested :limit 7))
+                  page-number (min requested (max 1 (quot (+ 6 (count rows)) 7)))]
+              (is (= (count rows) (:total page)))
+              (is (= page-number (:page page)))
+              (is (= (vec (take 7 (drop (* 7 (dec page-number)) expected-keys)))
+                     (mapv :key (:entries page)))))))))
+    (is (= @expected (into {} (map (fn [id] [id (rmp/state *ctx* name id)])) ids)))))
+
+(deftest deep-pages-and-equality-counts-skip-members
+  (let [name (register! (fn [_ e] (select-keys e [:score])) {:indexes {:score :score}})
+        random (java.util.Random. 92)
+        seen (atom []) ctx (assoc *ctx* :read-model/observer #(swap! seen conj %))]
+    ;; Fixed random promotions make the work regression assertion reproducible.
+    (with-redefs [ranked/random-hash (fn [_] (.nextInt random))]
+      (append! (mapv #(hash-map :owner (format "%05d" %) :score (if (< % 3000) 0 1)) (range 4096)))
+      (rmp/page ctx name {}))
+    (doseq [options [{:index :score :page 164}
+                     {:index :score :equals 0 :page 120}
+                     {:index :score :equals 0 :direction :desc :page 120}]]
+      (reset! seen [])
+      (let [page (rmp/page ctx name options)
+            equality? (contains? options :equals)]
+        (is (= (if equality? 3000 4096) (:total page)))
+        (is (= (if equality? "02975" "04075") (:key (first (:entries page)))))
+        (is (= (count (:entries page)) (:rows-examined page) (:results-decoded page)))
+        (is (< (:rank-entries-examined page) 1000))
+        (is (= (:rank-entries-examined page) (count (filter #(= :rank-entry (:operation %)) @seen))))
+        (is (empty? (filter #(#{:state-decoded :event-applied} (:operation %)) @seen)))))))
+
+(defn install-legacy-indexes! [name n]
+  ;; Real KF1 addresses and payloads, independent of the new index writer.
+  (let [b (key/prefix *ctx* name 1)
+        head (:event/id (first (into [] (es/read (:event-store *ctx*)
+                                              {:tenant-id (:tenant-id *ctx*) :reverse? true :limit 1}))))
+        progress {:watermark head :checked-through head}]
+    (kv/transact (:cache *ctx*) :write
+      (fn [tx]
+        (doseq [i (range n)]
+          (let [id (str i) value {:score (mod i 3)} indexes {:identity id :score (:score value)}]
+            ((:put tx) (key/join b (byte-array [1]) (key/encode id)) (codec/encode value))
+            ((:put tx) (key/join b (byte-array [2]) (key/encode id))
+             (codec/encode {:key id :value value :indexes indexes}))
+            (doseq [[index value] indexes direction [:asc :desc]]
+              ((:put tx) (key/join b (byte-array [3]) (key/encode [index direction])
+                                   (cond-> (key/encode value) (= direction :desc) key/descending)
+                                   (key/encode id) (key/encode id)) (codec/encode id)))))
+        ((:put tx) (key/join b (byte-array [4])) (codec/encode n))
+        ((:put tx) (key/join b (byte-array [0])) (codec/encode progress))))
+    [b progress]))
+
+(deftest legacy-upgrade-is-atomic-and-needs-no-event-replay
+  (let [name (register! (fn [_ e] {:score (:score e)}) {:indexes {:score :score}})]
+    (append! [{:owner "old-head" :score 0}])
+    (let [[b progress] (install-legacy-indexes! name 400)
+          before (stored-bytes) original-add ranked/add! calls (atom 0)]
+      (with-redefs [ranked/add! (fn [& args]
+                                (when (= 150 (swap! calls inc)) (throw (ex-info "upgrade failed" {})))
+                                (apply original-add args))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"upgrade failed" (rmp/page *ctx* name {}))))
+      (is (= before (stored-bytes)) "Old indexes, results and progress survive a partial upgrade")
+      (let [original-read es/read]
+        (with-redefs [es/read (fn [store query]
+                               (when-not (:reverse? query) (throw (ex-info "History unavailable" {})))
+                               (original-read store query))]
+          (is (= 400 (:total (rmp/page *ctx* name {:page 999}))))
+          (is (= 134 (:total (rmp/page *ctx* name {:index :score :equals 0}))))
+          (is (= progress (dissoc (rmp/progress *ctx* name) :index-format)))))
+      (kv/transact (:cache *ctx*) :read
+        #(is (zero? ((:reduce %) {:prefix (key/join b (byte-array [3]))} (fn [n _] (inc n)) 0))))
+      (let [upgraded (stored-bytes)]
+        (rmp/page *ctx* name {:index :score :direction :desc :page 10})
+        (is (= upgraded (stored-bytes)) "Warm reads do not rebuild or mutate the index"))
+      (is (= (into {} (map (fn [i] [(str i) {:score (mod i 3)}])) (range 400))
+             (results *ctx* name)))
+      (append! [{:owner "0" :score 9} {:owner "new" :score 9}])
+      (is (= ["0" "new"] (page-keys *ctx* name {:index :score :equals 9})))
+      (is (= 401 (:total (rmp/page *ctx* name {}))))
+      (let [cache (:cache *ctx*)]
+        (kv/stop cache)
+        (reset! *cache-handle* nil)
+        (let [reopened (kv/start (lmdb/->KV-Store-LMDB (:config cache)))
+              ctx (assoc *ctx* :cache reopened)]
+          (reset! *cache-handle* reopened)
+          (is (= ["0" "new"] (page-keys ctx name {:index :score :equals 9 :direction :desc})))
+          (is (= 133 (:total (rmp/page ctx name {:index :score :equals 0 :page 999})))))))))
+
+(deftest ranked-index-write-failure-rolls-back-business-batch
+  (let [name (register! (fn [_ e] {:score (:score e)}) {:indexes {:score :score}})]
+    (append! [{:owner "a" :score 1}])
+    (rmp/page *ctx* name {})
+    (let [before (stored-bytes) original ranked/add!]
+      (append! [{:owner "a" :score 2}])
+      (with-redefs [ranked/add! (fn [& args]
+                                (apply original args)
+                                (throw (ex-info "rank write failed" {})))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"rank write failed" (rmp/page *ctx* name {}))))
+      (is (= before (stored-bytes)))
+      (is (= ["a"] (page-keys *ctx* name {:index :score :equals 2})))
+      (is (= 0 (:total (rmp/page *ctx* name {:index :score :equals 1})))))))
 
 (deftest pure-fold-equivalence-across-batches-and-keys
   (let [events (mapv (fn [i] {:owner (str (mod i 7)) :delta (- (mod i 13) 6)}) (range 257))
