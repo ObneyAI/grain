@@ -35,12 +35,35 @@
   (.close db)
   (.close env))
 
+(def ^:private no-put-flags (into-array PutFlags []))
+(def ^:private max-retained-value-size (* 64 1024))
+
+(defn- fill-buffer ^ByteBuffer [^ByteBuffer buffer ^bytes value]
+  (doto buffer (.clear) (.put value) (.flip)))
+
+(defn- value-buffer-writer
+  "Scratch storage for one write transaction; oversized values are not retained."
+  []
+  (let [retained (volatile! nil)]
+    (fn [^bytes value]
+      (let [size (alength value)
+            ^ByteBuffer previous @retained
+            buffer (if (and previous (<= size (.capacity previous)))
+                     previous
+                     (let [capacity (if (> size max-retained-value-size)
+                                      size
+                                      (min max-retained-value-size
+                                           (max size (* 2 (if previous (.capacity previous) 1)))))
+                           buffer (ByteBuffer/allocateDirect capacity)]
+                       (when (<= capacity max-retained-value-size)
+                         (vreset! retained buffer))
+                       buffer))]
+        (fill-buffer buffer value)))))
+
 (defn- read-value
   "Copy a value out of an existing LMDB read transaction."
-  [^Env env ^Dbi db ^Txn txn ^bytes k]
-  (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
-        _ (.. k-buf (put k) flip)
-        found (.get db txn k-buf)]
+  [^Dbi db ^Txn txn ^ByteBuffer k-buf ^bytes k]
+  (let [found (.get db txn (fill-buffer k-buf k))]
     (when found
       (let [^ByteBuffer val-buf (.val txn)
             arr (byte-array (.remaining val-buf))]
@@ -55,9 +78,16 @@
       (.txnRead env))))
 
 (defn read-snapshot
-  [{:keys [env db]} f]
+  [{:keys [^Env env db]} f]
   (with-open [txn (open-read-transaction env)]
-    (f (fn [{:keys [k]}] (read-value env db txn k)))))
+    (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
+          owner (Thread/currentThread) active (volatile! true)]
+      (try
+        (f (fn [{:keys [k]}]
+             (when-not (and @active (identical? owner (Thread/currentThread)))
+               (throw (ex-info "Read snapshot escaped its callback or thread" {})))
+             (read-value db txn k-buf k)))
+        (finally (vreset! active false))))))
 
 (defn get!
   "Read a value from LMDB. On ReadersFullException, reclaims stale reader
@@ -74,18 +104,13 @@
     (.put db k-buf v-buf)))
 
 (defn put-batch!
-  [{:keys [env db] :as _cache} {:keys [entries]}]
+  [{:keys [^Env env ^Dbi db] :as _cache} {:keys [entries]}]
   (with-open [txn (.txnWrite env)]
-    (doseq [{:keys [k v]} entries]
-      (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
-            _ (.. k-buf (put k) flip)
-            v-buf (ByteBuffer/allocateDirect (count v))
-            _ (.. v-buf (put v) flip)]
-        (.put db txn k-buf v-buf (into-array org.lmdbjava.PutFlags []))))
+    (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
+          value-buffer (value-buffer-writer)]
+      (doseq [{:keys [k v]} entries]
+        (.put db txn (fill-buffer k-buf k) (value-buffer v) no-put-flags)))
     (.commit txn)))
-
-(defn- buffer ^ByteBuffer [^bytes value]
-  (doto (ByteBuffer/allocateDirect (alength value)) (.put value) (.flip)))
 
 (defn- copy-buffer [^ByteBuffer value]
   (let [view (.duplicate value) out (byte-array (.remaining view))]
@@ -105,7 +130,7 @@
             (aset-byte out i (unchecked-byte (inc (bit-and 255 (aget prefix i)))))
             out))))))
 
-(defn- scan [^Dbi db ^Txn txn {:keys [prefix from to reverse?] :as options} rf initial check!]
+(defn- scan [^Dbi db ^Txn txn ^ByteBuffer k-buf {:keys [prefix from to reverse?] :as options} rf initial check!]
   (when-not (every? #{:prefix :from :to :reverse?} (keys options))
     (throw (ex-info "Unknown transaction range option" {:options options})))
   (let [prefix (when (seq prefix) prefix)
@@ -121,10 +146,10 @@
       (with-open [^Cursor cursor (.openCursor db txn)]
       (let [found (if reverse?
                     (if upper
-                      (if (.get cursor (buffer upper) org.lmdbjava.GetOp/MDB_SET_RANGE)
+                      (if (.get cursor (fill-buffer k-buf upper) org.lmdbjava.GetOp/MDB_SET_RANGE)
                         (.prev cursor) (.last cursor))
                       (.last cursor))
-                    (if lower (.get cursor (buffer lower) org.lmdbjava.GetOp/MDB_SET_RANGE)
+                    (if lower (.get cursor (fill-buffer k-buf lower) org.lmdbjava.GetOp/MDB_SET_RANGE)
                         (.first cursor)))]
         (loop [found found acc initial]
           (check! false)
@@ -158,12 +183,14 @@
                           (catch Throwable e (compare-and-set! failure nil e) (throw e))))]
         (with-open [^Txn txn (if (= mode :write) (.txnWrite env) (open-read-transaction env))]
           (try
-            (let [result (f {:get (fn [k] (invoke false #(read-value env db txn k)))
+            (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
+                  value-buffer (when (= mode :write) (value-buffer-writer))
+                  result (f {:get (fn [k] (invoke false #(read-value db txn k-buf k)))
                              :put (fn [k v]
-                                    (invoke true #(.put db txn (buffer k) (buffer v) (into-array PutFlags []))))
-                             :delete (fn [k] (invoke true #(.delete db txn (buffer k))))
+                                    (invoke true #(.put db txn (fill-buffer k-buf k) (value-buffer v) no-put-flags)))
+                             :delete (fn [k] (invoke true #(.delete db txn (fill-buffer k-buf k))))
                              :reduce (fn [options rf initial]
-                                       (invoke false #(scan db txn options rf initial check!)))})]
+                                       (invoke false #(scan db txn k-buf options rf initial check!)))})]
               (when-let [cause @failure]
                 (throw (ex-info "Transaction aborted after an operation failed" {} cause)))
               (when (= mode :write) (.commit txn))

@@ -2,6 +2,7 @@
   (:require [clojure.test :as test :refer :all]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
+            [ai.obney.grain.kv-store-lmdb.core :as core]
             [clojure.java.io :as io]))
 
 (defn- delete-dir-recursively [dir]
@@ -27,6 +28,82 @@
           (delete-dir-recursively dir))))))
 
 (use-fixtures :each test-fixture)
+
+(deftest scratch-reuse-preserves-lengths-and-detached-values
+  (let [entries (mapv (fn [i key-size value-size]
+                        {:k (byte-array (repeat key-size (inc i)))
+                         :v (byte-array (repeat value-size (+ 10 i)))})
+                      (range) [511 1 128 2 3 4] [8192 0 65536 70000 1 17])
+        expected (mapv #(vec (:v %)) entries)]
+    (doseq [write! [(fn [] (kv/put-batch! *cache* {:entries entries}))
+                   (fn [] (kv/transact *cache* :write
+                            (fn [tx] (doseq [{:keys [k v]} entries] ((:put tx) k v)))))]]
+      (write!)
+      (doseq [read! [(fn [] (kv/read-snapshot *cache*
+                             (fn [get-value]
+                               (mapv (fn [entry] (get-value (select-keys entry [:k]))) entries))))
+                    (fn [] (kv/transact *cache* :read
+                             (fn [tx] (mapv #((:get tx) (:k %)) entries))))]]
+        (let [values (read!)]
+          (is (= expected (mapv vec values)))
+          (kv/transact *cache* :write
+            (fn [tx]
+              (let [k (:k (first entries)) before ((:get tx) k)]
+                ((:put tx) k (byte-array [42]))
+                (is (= [42] (vec ((:get tx) k))))
+                ((:delete tx) k)
+                (is (nil? ((:get tx) k)))
+                (is (= (first expected) (vec before))))))
+          (is (= expected (mapv vec values)) "Later operations do not mutate returned arrays")
+          (write!))))))
+
+(deftest scratch-reuse-supports-nested-cursors-and-point-reads
+  (kv/put-batch! *cache* {:entries (mapv #(hash-map :k (.getBytes %) :v (.getBytes (str % "-value")))
+                                        ["a0" "a1" "a2" "b0"])})
+  (doseq [reverse? [false true]]
+    (let [saved (kv/transact *cache* :read
+                  (fn [tx]
+                    ((:reduce tx) {:prefix (.getBytes "a") :reverse? reverse?}
+                     (fn [out entry]
+                       (is (= "b0-value" (String. ^bytes ((:get tx) (.getBytes "b0")))))
+                       (is (nil? ((:get tx) (.getBytes "a-missing-key"))))
+                       (is (= ["b0"] ((:reduce tx) {:prefix (.getBytes "b")}
+                                      #(conj %1 (String. ^bytes (:k %2))) [])))
+                       (conj out entry)) [])))]
+      (is (= (if reverse? ["a2" "a1" "a0"] ["a0" "a1" "a2"])
+             (mapv #(String. ^bytes (:k %)) saved)))
+      (is (= (mapv #(str (String. ^bytes (:k %)) "-value") saved)
+             (mapv #(String. ^bytes (:v %)) saved))))))
+
+(deftest value-scratch-growth-is-bounded
+  (let [write-buffer (#'core/value-buffer-writer)
+        small (write-buffer (byte-array [1 2 3]))
+        grown (write-buffer (byte-array 8192))
+        oversized (write-buffer (byte-array (inc @#'core/max-retained-value-size)))]
+    (is (not (identical? small grown)))
+    (is (> (.capacity ^java.nio.ByteBuffer oversized) @#'core/max-retained-value-size))
+    (is (identical? grown (write-buffer (byte-array [9]))) "Oversized buffers are not retained")
+    (is (= 1 (.remaining ^java.nio.ByteBuffer grown)))
+    (is (= 9 (.get ^java.nio.ByteBuffer grown)))
+    (is (= 0 (.remaining ^java.nio.ByteBuffer (write-buffer (byte-array 0)))))))
+
+(deftest shared-scratch-rejects-escaped-and-cross-thread-operations
+  (let [k (.getBytes "key") escaped (atom nil)]
+    (kv/put! *cache* {:k k :v (.getBytes "value")})
+    (kv/read-snapshot *cache*
+      (fn [get-value]
+        (reset! escaped get-value)
+        (is (= :rejected @(future (try (get-value {:k k}) :accepted
+                                      (catch clojure.lang.ExceptionInfo _ :rejected)))))
+        (is (= "value" (String. ^bytes (get-value {:k k}))))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"escaped" (@escaped {:k k})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"aborted"
+          (kv/transact *cache* :write
+            (fn [tx]
+              ((:put tx) k (.getBytes "changed"))
+              (is (= :rejected @(future (try ((:get tx) k) :accepted
+                                            (catch clojure.lang.ExceptionInfo _ :rejected)))))))))
+    (is (= "value" (String. ^bytes (kv/get! *cache* {:k k}))))))
 
 (deftest transactional-mutations-rollback-and-lifetime
   (let [k (.getBytes "transaction-key") v (.getBytes "value") escaped (atom nil)]
