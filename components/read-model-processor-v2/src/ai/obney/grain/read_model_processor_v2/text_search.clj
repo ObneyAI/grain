@@ -4,6 +4,7 @@
    cover the query as in NGramPhraseQuery. No Lucene storage or copied source."
   (:require [ai.obney.grain.read-model-processor-v2.fold-key :as key]
             [ai.obney.grain.read-model-processor-v2.sort-data :as data]
+            [ai.obney.grain.read-model-processor-v2.instance-ids :as ids]
             [ai.obney.grain.fressian-util.interface :as codec])
   (:import [java.nio ByteBuffer]
            [java.util Locale Arrays]))
@@ -15,16 +16,6 @@
 
 (defn- number-bytes ^bytes [n] (.array (doto (ByteBuffer/allocate 4) (.putInt (int n)))))
 (defn- slot [b kind suffix] (key/checked (key/join b (byte-array [kind]) suffix)))
-(defn- ordinal! [tx b id]
-  (let [k (slot b 7 (key/encode id))]
-    (if-let [raw ((:get tx) k)] (data/int-at raw 0)
-      (let [counter (slot b 9 (byte-array 0))
-            next (if-let [raw ((:get tx) counter)] (data/int-at raw 0) 0)]
-        (when (>= next Integer/MAX_VALUE)
-          (throw (ex-info "Search ordinal space exhausted" {})))
-        ((:put tx) k (number-bytes next))
-        ((:put tx) (slot b 8 (number-bytes next)) (codec/encode id))
-        ((:put tx) counter (number-bytes (inc next))) next))))
 
 (defn- config [b index] (slot b 6 (key/encode index)))
 (defn- term-key [cfg kind term] (key/checked (key/join cfg (byte-array [kind]) (key/encode term))))
@@ -55,7 +46,7 @@
    result entries or nil. Removed identities retain their ordinal for re-entry."
   [tx b searches id before after]
   (when (seq searches)
-    (let [ordinal (ordinal! tx b id)]
+    (let [ordinal (ids/ensure-ordinal! tx b id)]
       (doseq [[index extract] searches
               :let [old (when before (normalize (extract (:value before))))
                     next (when after (normalize (extract (:value after))))]

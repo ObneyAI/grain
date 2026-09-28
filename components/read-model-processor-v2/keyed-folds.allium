@@ -127,6 +127,39 @@ contract KeyedFoldReads {
     index_rank: (context: Any, model: Any, selection: Any, key: Any) -> Any
     search_keys: (context: Any, model: Any, selection: Any) -> Any
     key_page: (context: Any, model: Any, keys: Any, selection: Any) -> Any
+    ranked_key_page: (context: Any, model: Any, keys: Any, selection: Any) -> Any
+    joined_page: (context: Any, membership_model: Any, ordering_model: Any, selection: Any) -> Any
+
+    @invariant RankedJoinWithMissingValues
+        -- An identity join may take membership from one model and stored ordering
+        -- from another within one read session. Only included membership-model
+        -- instances qualify. Optional candidate identities restrict that set.
+        -- Missing or excluded ordering results take the caller's explicit default
+        -- sort value, interleaved with real equal-valued results by ascending
+        -- string identity in both directions. No default result is persisted.
+        -- Exact totals, clamping and page keys match full join-and-sort semantics.
+        -- The ordering index must opt into rank membership. Query-time computed
+        -- sorting is unsupported. Selection decodes no result or state payloads.
+        -- Without candidates, selection traverses membership identities. With
+        -- candidates, it probes their membership metadata. Defaulted identities
+        -- may be sorted for tie ordering; all work and allocation remain measured.
+        -- This does not imply constant-time joins or page-sized total metadata work.
+
+    @invariant ExperimentalFilteredRanks
+        -- A model may opt selected stored indexes into experimental membership
+        -- summaries. Enabling or changing this selection requires a new model
+        -- version. Summaries publish atomically with ordinary index changes.
+        -- Ranked matching-key pages have the same membership, order, counts,
+        -- clamping and ties as matching-key pages with a stored sort order.
+        -- Duplicate, excluded and absent keys do not inflate counts. Candidate
+        -- identities are resolved in the target model; model-local numeric
+        -- identities are never interchangeable across independent models.
+        -- Query-time sort callbacks and indexes not opted in are rejected.
+        -- Navigation counts matching members in stored spans and skips spans
+        -- before the requested offset, without sorting candidate values or
+        -- decoding complete result/state payloads. Resolving candidates and
+        -- intersecting summaries may still require population-proportional work.
+        -- The existing matching-key page remains available for comparison.
 
     @invariant SearchPublication
         -- Named searchable text is extracted purely from each included result.

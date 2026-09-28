@@ -7,11 +7,18 @@
             [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
             [ai.obney.grain.read-model-processor-v2.text-search :as search]
             [ai.obney.grain.read-model-processor-v2.sort-data :as sort-data]
-            [malli.core :as m]))
+            [ai.obney.grain.read-model-processor-v2.instance-ids :as ids]
+            [ai.obney.grain.read-model-processor-v2.span-membership :as membership]
+            [malli.core :as m])
+  (:import [org.roaringbitmap RoaringBitmap]
+           [java.util Arrays ArrayList HashSet]
+           [ai.obney.grain.read_model_processor_v2.ranked_set VirtualMember]))
 
 (defn keyed? [definition] (contains? definition :key))
 
 (defn validate! [name opts]
+  (when (and (contains? opts :ranked-indexes) (not (keyed? opts)))
+    (throw (ex-info "Rank membership requires a keyed fold" {:model name})))
   (when (and (contains? opts :searches) (not (keyed? opts)))
     (throw (ex-info "Text search requires a keyed fold" {:model name})))
   (when (keyed? opts)
@@ -22,6 +29,8 @@
                    (ifn? (:include? opts (constantly true)))
                    (map? (:indexes opts {}))
                    (map? (:searches opts {}))
+                   (set? (:ranked-indexes opts #{}))
+                   (every? #(or (= :identity %) (contains? (:indexes opts) %)) (:ranked-indexes opts))
                    (every? (fn [[k f]] (and (keyword? k) (ifn? f))) (:searches opts))
                    (every? (fn [[k f]] (and (keyword? k) (not= :identity k) (ifn? f)))
                            (:indexes opts))
@@ -49,6 +58,8 @@
                            (byte-array [(if (= direction :desc) 1 0)]))))
 (defn- index-prefix [b index direction]
   (ranked/prefix (index-config b index direction) 0))
+(defn- membership-config [b d index direction]
+  (assoc (index-config b index direction) :membership? (contains? (:ranked-indexes d) index)))
 (defn- sort-bytes [value direction]
   (cond-> (key/encode value) (= direction :desc) key/descending))
 (defn- index-member [direction value id]
@@ -64,16 +75,17 @@
     (if (zero? total) ((:delete tx) k)
       ((:put tx) k (codec/encode {:value value :total total})))))
 
-(defn- remove-index! [tx b index direction position id]
-  (when (ranked/remove! tx (index-config b index direction) (index-member direction position id))
+(defn- remove-index! [tx b d index direction position id]
+  (when (ranked/remove! tx (membership-config b d index direction) (index-member direction position id))
     (when (= direction :asc) (update-group! tx b index position -1))))
 
-(defn- add-index! [ctx tx b index direction position id]
-  (let [cfg (index-config b index direction)
+(defn- add-index! [ctx tx b d index direction position id]
+  (let [cfg (membership-config b d index direction)
         member (index-member direction position id)
         payload (codec/encode id)]
     (ranked/ensure-init! tx cfg)
-    (when (ranked/add! tx cfg member payload)
+    (when (ranked/add! tx cfg member payload
+                       (when (:membership? cfg) (ids/ensure-ordinal! tx b id)))
       (when (= direction :asc) (update-group! tx b index position 1)))
     (observe! ctx :index-written (alength ^bytes payload))))
 
@@ -96,7 +108,8 @@
 (defn- apply-batch! [ctx name d b validate-state! validate-result! events]
   (kv/transact (:cache ctx) :write
     (fn [tx]
-      (let [before-progress (read-meta tx (progress-key b))
+      (let [tx (if (seq (:ranked-indexes d)) (membership/transaction tx) tx)
+            before-progress (read-meta tx (progress-key b))
             events (filterv #(or (nil? (:watermark before-progress))
                                 (pos? (compare (:event/id %) (:watermark before-progress)))) events)
             states (reduce
@@ -133,7 +146,7 @@
               (when old
                 (search/update! tx b (:searches d) id old nil)
                 (doseq [[index position] (:indexes old) direction [:asc :desc]]
-                  (remove-index! tx b index direction position id))
+                  (remove-index! tx b d index direction position id))
                 ((:delete tx) (address b 11 id))
                 ((:delete tx) result-k))
               (when (or (nil? old) (not= (:value old) value))
@@ -142,10 +155,11 @@
                         direction [:asc :desc]
                         :when (or (nil? old) (not= position (get-in old [:indexes index])))]
                   (when old
-                    (remove-index! tx b index direction (get-in old [:indexes index]) id))
-                  (add-index! ctx tx b index direction position id))
+                    (remove-index! tx b d index direction (get-in old [:indexes index]) id))
+                  (add-index! ctx tx b d index direction position id))
                 ((:put tx) (address b 11 id) (sort-data/encode id (dissoc indexes :identity)))
                 (write-observed! ctx tx :result-written result-k {:key id :value value :indexes indexes})))))
+        (membership/flush! tx #(observe! ctx %1 %2))
         (when (seq events)
           (when-not (zero? @added) (write! tx (count-key b) (+ count-before @added)))
           (write! tx (progress-key b) (assoc before-progress :watermark (:event/id (peek events)))))))))
@@ -290,6 +304,82 @@
                          (range offset (min total (+ offset limit))))
              :total total :total-pages pages :page page :page-size limit
              :sort-keys-read total}))))))
+
+(defn ranked-key-page [ctx name d keys options]
+  (let [{:keys [index direction page limit]
+         :or {index :identity direction :asc page 1 limit 25}} options]
+    (when-not (and (map? options) (every? #{:index :direction :page :limit} (clojure.core/keys options))
+                   (contains? (:ranked-indexes d) index)
+                   (#{:asc :desc} direction) (pos-int? page) (pos-int? limit))
+      (throw (ex-info "Ranked key page requires an opted-in stored index" {:model name :options options})))
+    (with-reader ctx name d
+      (fn [tx b _d _read]
+        (let [candidates (RoaringBitmap.) examined (volatile! 0)]
+          (doseq [id keys]
+            (vswap! examined inc)
+            (let [ordinal (ids/ordinal tx b id)]
+              (observe! ctx :candidate-ordinal-read (if (some? ordinal) 4 0))
+              (when (some? ordinal) (.add candidates (int ordinal)))))
+          (let [result (ranked/filtered-page tx (membership-config b d index direction)
+                                            candidates page limit #(observe! ctx %1 %2))]
+            (-> result
+                (dissoc :payloads)
+                (assoc :keys (mapv codec/decode (:payloads result))
+                       :candidate-keys-read @examined :sort-keys-read 0))))))))
+
+(defn joined-page [ctx membership-name membership-d name d options]
+  (let [{:keys [index direction page limit missing-value]
+         :or {index :identity direction :asc page 1 limit 25}} options]
+    (when-not (and (map? options)
+                   (every? #{:index :direction :page :limit :missing-value :keys} (clojure.core/keys options))
+                   (contains? options :missing-value) (contains? (:ranked-indexes d) index)
+                   (#{:asc :desc} direction) (pos-int? page) (pos-int? limit))
+      (throw (ex-info "Joined page requires a ranked index and an explicit missing value"
+                      {:model name :options options})))
+    (let [missing-prefix (sort-bytes missing-value direction)]
+      (if-not (::session ctx)
+        (read-session [[ctx [membership-name name]]] {membership-name membership-d name d}
+                      (fn [[prepared]] (joined-page prepared membership-name membership-d name d options)))
+        (with-reader ctx membership-name membership-d
+          (fn [tx membership-base _ membership-read]
+            (with-reader ctx name d
+              (fn [_ b _ _]
+                (let [cfg (membership-config b d index direction)
+                      observe #(observe! ctx %1 %2)
+                      live (ranked/members tx cfg observe)
+                      candidates (RoaringBitmap.) virtual (ArrayList.)
+                      examined (volatile! 0)
+                      collect! (fn [id]
+                                 (vswap! examined inc)
+                                 (let [ordinal (ids/ordinal tx b id)]
+                                   (observe :candidate-ordinal-read (if (some? ordinal) 4 0))
+                                   (if (and (some? ordinal) (.contains live (int ordinal)))
+                                     (.add candidates (int ordinal))
+                                     (do (observe :join-default-key 0)
+                                         (.add virtual (VirtualMember.
+                                                         (key/join missing-prefix (key/encode (str id)) (key/encode id))
+                                                         (codec/encode id)))))))]
+                  (if (contains? options :keys)
+                    (let [seen (HashSet.)]
+                      (doseq [id (:keys options) :when (.add seen id)]
+                        (let [raw (membership-read 11 id)]
+                          (observe :join-membership-probe (if raw (alength ^bytes raw) 0))
+                          (when raw (collect! id))))
+                      ;; Only absent/excluded ordering keys need this tie sort.
+                      (.sort virtual
+                             (fn [^VirtualMember a ^VirtualMember b]
+                               (Arrays/compareUnsigned (.-member a) (.-member b)))))
+                    ;; Identity order supplies default ties directly, even for desc.
+                    (let [prefix (index-prefix membership-base :identity :asc)]
+                      ((:reduce tx) {:prefix prefix :from (ranked/after prefix)}
+                       (fn [_ {:keys [v]}]
+                         (observe :join-membership-entry (alength ^bytes v))
+                         (collect! (codec/decode v)) nil) nil)))
+                  (let [result (ranked/filtered-page tx cfg candidates page limit observe virtual)]
+                    (-> result (dissoc :payloads)
+                        (assoc :keys (mapv codec/decode (:payloads result))
+                               :membership-keys-examined @examined
+                               :defaulted-keys (.size virtual) :sort-keys-read 0))))))))))))
 
 (defn- validate-selection! [name d options]
   (when-not (and (map? options)

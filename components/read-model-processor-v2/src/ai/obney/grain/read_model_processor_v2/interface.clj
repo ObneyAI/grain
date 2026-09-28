@@ -24,6 +24,10 @@
    key-page orders candidate IDs using compact index values, without full rows.
    Search extraction changes require a model version change, like other indexes.
 
+   Experimental :ranked-indexes is a set of stored index names (including optional
+   :identity) to maintain span membership for ranked-key-page. Enable it with a
+   new model version. Ordinary models incur no membership storage/write overhead.
+
    Direct index pages use stored ranks for offsets and equality counts. Grain
    maintains those ranks in the fold transaction. Incompatible derived storage
    uses a fresh format identity and materializes through normal event replay.
@@ -250,7 +254,7 @@
                       {:description docstring
                        :options (select-keys opts #{:events :version :schema
                                                     :l1-ttl-ms :key :initial :result :include?
-                                                    :indexes :searches :state-schema :result-schema})}})]
+                                                    :indexes :searches :ranked-indexes :state-schema :result-schema})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
@@ -362,6 +366,30 @@
    Work scales with candidates, not page size. Ties stay ascending by string ID."
   [context name keys options]
   (keyed/key-page context name (keyed-definition context name) keys options))
+
+(defn ranked-key-page
+  "Experimental matching-key pagination through stored rank-span membership.
+   The model must opt the chosen index into :ranked-indexes and use a new version.
+   Accepts :index (:identity), :direction (:asc), :page (1), :limit (25).
+   Matches key-page's stored-order semantics; no query-time sort callback.
+   Resolves candidate IDs into target-model ordinals, counts span intersections,
+   and skips spans to select the page without decoding or sorting full results.
+   Candidate resolution and bitmap work are not bounded by page size."
+  [context name keys options]
+  (keyed/ranked-key-page context name (keyed-definition context name) keys options))
+
+(defn joined-page
+  "Experimental identity join: membership from one model, ordering from another.
+   Options: :index, :direction, :page, :limit, required :missing-value, optional
+   :keys restricting candidates. The ordering index must opt into :ranked-indexes.
+   Missing/excluded ordering results use the supplied value and share ascending
+   string-ID ties with real equal values. Both models use one prepared snapshot.
+   Reads membership/ordinal metadata, not full results; unsearched selection visits
+   all membership IDs. Supplied candidates use point membership probes instead.
+   Defaulted candidate IDs may be sorted; no result or default entry is persisted."
+  [context membership-model ordering-model options]
+  (keyed/joined-page context membership-model (keyed-definition context membership-model)
+                     ordering-model (keyed-definition context ordering-model) options))
 
 (defn index-keys
   "Read instance identities from an equality group without loading results.
