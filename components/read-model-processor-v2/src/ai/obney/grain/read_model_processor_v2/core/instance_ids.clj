@@ -1,6 +1,6 @@
-(ns ai.obney.grain.read-model-processor-v2.instance-ids
+(ns ai.obney.grain.read-model-processor-v2.core.instance-ids
   "Stable model-local ordinals shared by text postings and rank summaries."
-  (:require [ai.obney.grain.read-model-processor-v2.fold-key :as key]
+  (:require [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
             [ai.obney.grain.fressian-util.interface :as codec])
   (:import [java.nio ByteBuffer]))
 

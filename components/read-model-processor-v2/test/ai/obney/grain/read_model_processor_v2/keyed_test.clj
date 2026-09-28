@@ -1,8 +1,8 @@
 (ns ai.obney.grain.read-model-processor-v2.keyed-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
-            [ai.obney.grain.read-model-processor-v2.fold-key :as key]
-            [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
+            [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
@@ -22,8 +22,7 @@
         cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "folds"
                                              :map-size (* 64 1024 1024)}))
         registry (rmp/global-read-model-registry)]
-    (binding [*ctx* {:cache cache :event-store store :tenant-id (random-uuid)
-                    :event-source "keyed-tests"}
+    (binding [*ctx* {:cache cache :event-store store :tenant-id (random-uuid)}
               *directory* dir
               *cache-handle* (atom cache)]
       (try (f)
@@ -299,7 +298,7 @@
                  :indexes {:total (fn [v]
                                     (when (and @fail? (= phase :index) (>= (:total v) 99))
                                       (throw (ex-info "fail-index" {}))) (:total v))}})
-          ctx (assoc *ctx* :event-source (str "failure-" phase) :read-model/batch-size 1)]
+          ctx (assoc *ctx* :read-model/batch-size 1)]
       ;; An independent tenant keeps each failure scenario's history small.
       (let [ctx (assoc ctx :tenant-id (random-uuid))]
         (append! ctx [{:owner "a" :delta 1} {:owner "a" :delta 99}])
@@ -368,7 +367,9 @@
     (is (thrown? clojure.lang.ExceptionInfo (register! history-step opts))))
   (let [name (register! history-step {:result total})]
     (is (thrown? clojure.lang.ExceptionInfo (rmp/project *ctx* name)))
-    (is (thrown? clojure.lang.ExceptionInfo (rmp/value (dissoc *ctx* :event-source) name "a")))
+    (is (thrown? clojure.lang.ExceptionInfo (rmp/value (dissoc *ctx* :tenant-id) name "a")))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"share one event store"
+                          (rmp/read-session [[*ctx* [name]] [(dissoc *ctx* :event-store) [name]]] identity)))
     (is (thrown? clojure.lang.ExceptionInfo (rmp/page *ctx* name {:limit 0})))
     (is (thrown? clojure.lang.ExceptionInfo (rmp/page *ctx* name {:index :unknown})))))
 
@@ -440,20 +441,17 @@
           (is (= {"a" 2 "b" 3} (results ctx name)) "Retry resolves the schema again"))
         (finally (swap! schemas/registry* dissoc schema-name))))))
 
-(deftest initial-state-source-and-version-isolation
+(deftest initial-state-tenant-and-version-isolation
   (let [name (register! (fn [s e] (+ s (:delta e))) {:initial 10})
-        other-store (es/start {:conn {:type :in-memory}})
-        other (assoc *ctx* :event-store other-store :event-source "another-log")]
-    (try
-      (append! [{:owner "a" :delta 1}])
-      (append! other [{:owner "a" :delta 2}])
-      (is (= 11 (rmp/value *ctx* name "a")))
-      (is (= 12 (rmp/value other name "a")))
-      (rmp/register-read-model! name (fn [s e] (+ s (* 2 (:delta e))))
-                                {:events #{:keyed/change} :key :owner :version 2 :initial 20})
-      (is (= 22 (rmp/value *ctx* name "a")))
-      (is (= 24 (rmp/value other name "a")))
-      (finally (es/stop other-store)))))
+        other (assoc *ctx* :tenant-id (random-uuid))]
+    (append! [{:owner "a" :delta 1}])
+    (append! other [{:owner "a" :delta 2}])
+    (is (= 11 (rmp/value *ctx* name "a")))
+    (is (= 12 (rmp/value other name "a")))
+    (rmp/register-read-model! name (fn [s e] (+ s (* 2 (:delta e))))
+                              {:events #{:keyed/change} :key :owner :version 2 :initial 20})
+    (is (= 22 (rmp/value *ctx* name "a")))
+    (is (= 24 (rmp/value other name "a")))))
 
 (deftest finite-head-and-unrelated-events
   (let [append-once? (atom true)
@@ -533,16 +531,18 @@
                        (:entries (rmp/page a name {:index :total :direction :desc :limit 1}))))
                 (is (some? (:watermark (rmp/progress a name))))
                 (doseq [changed [(assoc a :tenant-id (:tenant-id other))
-                                 (assoc a :event-source "another-source")
+                                 (assoc a :event-store nil)
                                  (assoc a :cache nil)]]
                   (is (thrown? clojure.lang.ExceptionInfo (rmp/value changed name "a"))))
                 (is (thrown? clojure.lang.ExceptionInfo (rmp/value b second-model "a")))
                 a)))]
       (is (= {[(:tenant-id ctx) name 1] 1
               [(:tenant-id ctx) second-model 1] 1
-              [(:tenant-id other) name 1] 1}
+              [(:tenant-id other) name 1] 1
+              [(:tenant-id ctx) :grain.read-query/shared-identities 1] 1
+              [(:tenant-id other) :grain.read-query/shared-identities 1] 1}
              (frequencies @calls))
-          "Address preparation is bounded by distinct source/tenant/model identities, including cold batches")
+          "Address preparation is bounded by distinct tenant/model identities, including cold batches")
       (is (thrown? clojure.lang.ExceptionInfo (rmp/value escaped name "a"))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Transaction aborted"
           (rmp/read-session ctx [name]

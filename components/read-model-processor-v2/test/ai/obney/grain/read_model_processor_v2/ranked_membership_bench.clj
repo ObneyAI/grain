@@ -3,8 +3,8 @@
    Run with component tests on the classpath. Arguments: population report.edn."
   (:refer-clojure :exclude [bean run!])
   (:require [ai.obney.grain.read-model-processor-v2.interface :as rmp]
-            [ai.obney.grain.read-model-processor-v2.fold-key :as key]
-            [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
+            [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
             [ai.obney.grain.read-model-processor-v2.ranked-set-test :as rank-test]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
@@ -43,7 +43,7 @@
         store (es/start {:conn {:type :in-memory}})
         cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir dir :db-name "folds"
                                              :map-size (* 4 1024 1024 1024)}))
-        ctx {:cache cache :event-store store :tenant-id (random-uuid) :event-source "rank-benchmark"}
+        ctx {:cache cache :event-store store :tenant-id (random-uuid)}
         ids (mapv #(UUID. 0 %) (range n))
         events (mapv (fn [i] (es/->event {:type :rank-benchmark/change
                                          :body {:owner (ids i)

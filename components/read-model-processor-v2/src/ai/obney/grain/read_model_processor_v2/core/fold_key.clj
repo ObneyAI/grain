@@ -1,4 +1,4 @@
-(ns ai.obney.grain.read-model-processor-v2.fold-key
+(ns ai.obney.grain.read-model-processor-v2.core.fold-key
   "Self-delimiting ordered keys for local keyed-fold storage."
   (:import [java.io ByteArrayOutputStream DataOutputStream ByteArrayInputStream DataInputStream]
            [java.security MessageDigest]
@@ -82,17 +82,15 @@
           end)))))
 
 (defn prefix ^bytes [context name version]
-  (when-not (and (uuid? (:tenant-id context))
-                 (some? (:event-source context))
-                 (or (string? (:event-source context)) (keyword? (:event-source context))
-                     (uuid? (:event-source context))))
-    (throw (ex-info "Keyed folds require a UUID :tenant-id and stable :event-source identifier"
+  (when-not (uuid? (:tenant-id context))
+    (throw (ex-info "Keyed folds require a UUID :tenant-id"
                     {:model name})))
-  ;; KF3 adds forward ordering metadata. Existing KF2 progress must not make
-  ;; key-page silently omit old results; the new address space replays normally.
-  (join (byte-array [75 70 51])
+  ;; KF5 addresses models by tenant and version within the configured cache.
+  ;; The unindexed partition is private to the oversized-key query fallback.
+  (join (byte-array [75 70 53])
         (.digest (MessageDigest/getInstance "SHA-256")
-                 (encode [(:event-source context) (:tenant-id context) name version]))))
+                 (encode (cond-> [(:tenant-id context) name version]
+                           (::unindexed context) (conj :unindexed))))))
 
 (defn checked ^bytes [^bytes key]
   (when (> (alength key) 511)

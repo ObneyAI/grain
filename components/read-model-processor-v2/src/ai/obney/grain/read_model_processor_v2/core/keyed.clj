@@ -1,18 +1,18 @@
-(ns ai.obney.grain.read-model-processor-v2.keyed
+(ns ai.obney.grain.read-model-processor-v2.core.keyed
   "Independent pure keyed folds. Application callbacks receive detached values."
   (:require [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.fressian-util.interface :as codec]
-            [ai.obney.grain.read-model-processor-v2.fold-key :as key]
-            [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
-            [ai.obney.grain.read-model-processor-v2.text-search :as search]
-            [ai.obney.grain.read-model-processor-v2.sort-data :as sort-data]
-            [ai.obney.grain.read-model-processor-v2.instance-ids :as ids]
-            [ai.obney.grain.read-model-processor-v2.span-membership :as membership]
+            [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
+            [ai.obney.grain.read-model-processor-v2.core.text-search :as search]
+            [ai.obney.grain.read-model-processor-v2.core.sort-data :as sort-data]
+            [ai.obney.grain.read-model-processor-v2.core.instance-ids :as ids]
+            [ai.obney.grain.read-model-processor-v2.core.span-membership :as membership]
             [malli.core :as m])
   (:import [org.roaringbitmap RoaringBitmap]
            [java.util Arrays ArrayList HashSet]
-           [ai.obney.grain.read_model_processor_v2.ranked_set VirtualMember]))
+           [ai.obney.grain.read_model_processor_v2.core.ranked_set VirtualMember]))
 
 (defn keyed? [definition] (contains? definition :key))
 
@@ -53,6 +53,7 @@
 (defn- address [b kind id] (key/checked (key/join b (byte-array [kind]) (key/encode id))))
 (defn- progress-key [b] (key/join b (byte-array [0])))
 (defn- count-key [b] (key/join b (byte-array [4])))
+(defn- included-key [b] (key/join b (byte-array [12])))
 (defn- index-config [b index direction]
   (ranked/config (key/join b (byte-array [5]) (key/encode index)
                            (byte-array [(if (= direction :desc) 1 0)]))))
@@ -67,7 +68,7 @@
 
 (defn- update-group! [tx b index value delta]
   ;; Levels 0..5 are the RankedSet. Level 6 stores one count per sort value,
-  ;; shared by both directions; no duplicated Student membership collection.
+  ;; shared by both directions; no duplicated root membership collection.
   (let [k (key/checked (key/join (ranked/prefix (index-config b index :asc) 6) (key/encode value)))
         before (some-> ((:get tx) k) codec/decode :total)
         total (+ (or before 0) delta)]
@@ -108,7 +109,8 @@
 (defn- apply-batch! [ctx name d b validate-state! validate-result! events]
   (kv/transact (:cache ctx) :write
     (fn [tx]
-      (let [tx (if (seq (:ranked-indexes d)) (membership/transaction tx) tx)
+      (let [tx (membership/transaction tx)
+            identity-base (force (::shared-identity-prefix ctx))
             before-progress (read-meta tx (progress-key b))
             events (filterv #(or (nil? (:watermark before-progress))
                                 (pos? (compare (:event/id %) (:watermark before-progress)))) events)
@@ -142,6 +144,12 @@
             ;; State must advance even when its completion value is equal.
             (write-observed! ctx tx :state-written (address b 1 id) state)
             (vswap! added + (- (if included? 1 0) (if old 1 0)))
+            (when (not= (boolean included?) (boolean old))
+              (let [ordinal (ids/ensure-ordinal! tx identity-base id)
+                    bits (membership/bitmap tx (included-key b))]
+                (if included? (.add ^RoaringBitmap bits (int ordinal))
+                    (.remove ^RoaringBitmap bits (int ordinal)))
+                (membership/put! tx (included-key b) bits)))
             (if-not included?
               (when old
                 (search/update! tx b (:searches d) id old nil)
@@ -193,12 +201,13 @@
             (when (or (nil? old) (pos? (compare through old)))
               (write! tx (progress-key b) (assoc p :checked-through through)))))))))
 
-(defn- identity-of [ctx] [(:event-source ctx) (:tenant-id ctx)])
+(defn- identity-of [ctx] [(:tenant-id ctx) (boolean (::key/unindexed ctx))])
 
 (defn session-definition [ctx name]
   (when-let [s (::session ctx)]
     (when-not (and (= (:identity s) (identity-of ctx))
-                   (identical? (:cache s) (:cache ctx)))
+                   (identical? (:cache s) (:cache ctx))
+                   (identical? (:event-store s) (:event-store ctx)))
       (throw (ex-info "Read-session context identity was changed" {:model name})))
     (or (get (:definitions s) name)
         (throw (ex-info "Model was not prepared in this read session" {:model name})))))
@@ -211,11 +220,12 @@
 
 (defn read-session
   "Prepare explicit [context model-names] requests, then pass their contexts to f.
-   All requests must share a cache. Callers explicitly supply any trusted identity
+   All requests must share a cache and event store. Callers supply trusted tenant
    context; definitions never select tenants. No transaction escapes to callbacks."
   [requests registry f]
   (when-not (seq requests) (throw (ex-info "Read session requires at least one request" {})))
-  (let [cache (:cache (ffirst requests))]
+  (let [cache (:cache (ffirst requests))
+        event-store (:event-store (ffirst requests))]
     (when-not cache (throw (ex-info "Read session requires :cache" {})))
     (let [prefixes
           (reduce (fn [prefixes [ctx names]]
@@ -223,6 +233,8 @@
                       (throw (ex-info "Cannot open a nested keyed-fold read session" {})))
                     (when-not (identical? cache (:cache ctx))
                       (throw (ex-info "Read-session contexts must share one store" {})))
+                    (when-not (identical? event-store (:event-store ctx))
+                      (throw (ex-info "Read-session contexts must share one event store" {})))
                     (reduce (fn [prefixes name]
                               (let [id [(identity-of ctx) name]
                                     d (get registry name)]
@@ -231,6 +243,9 @@
                                 (if (contains? prefixes id) prefixes
                                   (assoc prefixes id (base ctx name d)))))
                             prefixes names)) {} requests)
+          identity-prefixes (into {} (map (fn [[ctx _]]
+                                            [(identity-of ctx)
+                                             (delay (key/prefix ctx :grain.read-query/shared-identities 1))])) requests)
           prepared
           (locking cache
             (let [heads (reduce (fn [heads [ctx _]]
@@ -238,7 +253,8 @@
                                    (if (contains? heads id) heads (assoc heads id (head ctx))))) {} requests)]
               (mapv (fn [[ctx names]]
                       (doseq [name (distinct names)]
-                        (catch-up! ctx name (get registry name)
+                        (catch-up! (assoc ctx ::shared-identity-prefix (get identity-prefixes (identity-of ctx)))
+                                   name (get registry name)
                                    (get prefixes [(identity-of ctx) name])
                                    (get heads (identity-of ctx))))
                       [ctx (select-keys registry names)]) requests)))]
@@ -249,7 +265,7 @@
         (fn [tx]
           (f (mapv (fn [[ctx definitions]]
                      (assoc ctx ::session
-                            {:cache cache :identity (identity-of ctx)
+                            {:cache cache :event-store event-store :identity (identity-of ctx)
                              :definitions definitions
                              :readers (into {} (map (fn [[name d]]
                                                       [name (prepare-reader tx
@@ -271,6 +287,20 @@
         (let [decoded (decode ctx (if (= kind :state) :state-decoded :result-decoded) raw)]
           (if (= kind :state) decoded (:value decoded)))
         not-found))))
+
+(defn same-members? [ctx a ad b bd]
+  ;; The shared ordinal namespace is tenant scoped; these are exact sets,
+  ;; not cardinality or hash-based guesses. Called within a prepared session.
+  (with-reader ctx a ad
+    (fn [tx ab _ _]
+      (with-reader ctx b bd
+        (fn [_ bb _ _]
+          (let [left ((:get tx) (included-key ab))
+                right ((:get tx) (included-key bb))]
+            (observe! ctx :identity-membership-read (+ (if left (alength ^bytes left) 0)
+                                                     (if right (alength ^bytes right) 0)))
+            (= (if left (membership/decode left) (RoaringBitmap.))
+               (if right (membership/decode right) (RoaringBitmap.)))))))))
 
 (defn progress [ctx name d]
   (with-reader ctx name d (fn [tx b _d _read] (read-meta tx (progress-key b)))))
@@ -295,12 +325,12 @@
           (doseq [id keys :when (.add seen id)]
             (when-let [raw (read 11 id)]
               (observe! ctx :sort-key-read (alength ^bytes raw))
-              (.add entries (ai.obney.grain.read_model_processor_v2.sort_data.Entry.
+              (.add entries (ai.obney.grain.read_model_processor_v2.core.sort_data.Entry.
                               id raw (when sort-value (key/encode (sort-value id (sort-data/value raw field))))))))
           (.sort entries (sort-data/comparator field (= direction :desc) (some? sort-value)))
           (let [total (.size entries) pages (max 1 (quot (+ total (dec limit)) limit))
                 page (min page pages) offset (* (dec page) limit)]
-            {:keys (mapv #(.-id ^ai.obney.grain.read_model_processor_v2.sort_data.Entry (.get entries %))
+            {:keys (mapv #(.-id ^ai.obney.grain.read_model_processor_v2.core.sort_data.Entry (.get entries %))
                          (range offset (min total (+ offset limit))))
              :total total :total-pages pages :page page :page-size limit
              :sort-keys-read total}))))))

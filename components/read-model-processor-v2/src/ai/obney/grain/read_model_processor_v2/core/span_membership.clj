@@ -1,4 +1,4 @@
-(ns ai.obney.grain.read-model-processor-v2.span-membership
+(ns ai.obney.grain.read-model-processor-v2.core.span-membership
   "Experimental rank-span bitmaps. Mutable values never leave a transaction.
    A write batch coalesces repeated changes to the same span before serialization."
   (:import [java.nio ByteBuffer]

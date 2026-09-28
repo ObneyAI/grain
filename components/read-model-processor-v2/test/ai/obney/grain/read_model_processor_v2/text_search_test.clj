@@ -3,8 +3,8 @@
             [clojure.string :as str]
             [ai.obney.grain.read-model-processor-v2.keyed-test :as fixture]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
-            [ai.obney.grain.read-model-processor-v2.fold-key :as key]
-            [ai.obney.grain.read-model-processor-v2.text-search :as search]
+            [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.text-search :as search]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]))
 

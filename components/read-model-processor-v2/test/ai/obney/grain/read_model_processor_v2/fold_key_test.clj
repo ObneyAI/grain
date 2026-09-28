@@ -1,6 +1,6 @@
 (ns ai.obney.grain.read-model-processor-v2.fold-key-test
   (:require [clojure.test :refer [deftest is]]
-            [ai.obney.grain.read-model-processor-v2.fold-key :as key]))
+            [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]))
 
 (defn encoded-order [xs encode]
   (sort #(java.util.Arrays/compareUnsigned ^bytes (encode %1) ^bytes (encode %2)) xs))

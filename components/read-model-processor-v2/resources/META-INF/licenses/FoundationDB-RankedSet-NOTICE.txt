@@ -1,4 +1,4 @@
-Grain's ai.obney.grain.read-model-processor-v2.ranked-set is adapted from:
+Grain's ai.obney.grain.read-model-processor-v2.core.ranked-set is adapted from:
 
 FoundationDB fdb-record-layer, RankedSet.java
 Copyright 2015-2018 Apple Inc. and the FoundationDB project authors

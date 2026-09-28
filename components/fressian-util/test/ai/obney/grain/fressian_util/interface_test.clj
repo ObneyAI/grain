@@ -60,16 +60,16 @@
                  {:name "Ada" :count 3 :optional nil}
                  (into {} (map (fn [i] [i {:items [i]}]) (range 40)))
                  #{[:a :b] {:id 1}}
-                 [{:courses #{[1 2]}} nil]
-                 {[:course 1] {:labels #{"A"}}}]]
+                 [{:projects #{[1 2]}} nil]
+                 {[:project 1] {:labels #{"A"}}}]]
     (is (identical? value (#'fu/deep-clojurize value)))))
 
 (deftest normalization-replaces-only-changed-branches
-  (let [unchanged {:name "Ada" :tags #{"student"}}
-        java-list (java.util.ArrayList. ["course"])
+  (let [unchanged {:name "Ada" :tags #{"customer"}}
+        java-list (java.util.ArrayList. ["project"])
         nested {:items [unchanged java-list] :untouched unchanged}
         result (#'fu/deep-clojurize nested)]
-    (is (= {:items [unchanged ["course"]] :untouched unchanged} result))
+    (is (= {:items [unchanged ["project"]] :untouched unchanged} result))
     (is (not (identical? nested result)))
     (is (not (identical? (:items nested) (:items result))))
     (is (identical? unchanged (:untouched result)))
@@ -79,7 +79,7 @@
     (is (identical? result (#'fu/deep-clojurize result)))))
 
 (deftest normalization-converts-keys-set-members-and-nested-java-collections
-  (let [java-key (java.util.ArrayList. ["course" 1])
+  (let [java-key (java.util.ArrayList. ["project" 1])
         java-map (doto (java.util.HashMap.) (.put java-key (java.util.HashSet. [java-key])))
         native-map {java-key {:members #{java-key}}}
         native-set #{java-key}
@@ -87,19 +87,19 @@
         normalized-set (#'fu/deep-clojurize native-set)
         normalized-java (#'fu/deep-clojurize java-map)]
     (is (vector? (first (keys normalized-map))))
-    (is (= {:members #{["course" 1]}} (get normalized-map ["course" 1])))
-    (is (vector? (first (:members (get normalized-map ["course" 1])))))
+    (is (= {:members #{["project" 1]}} (get normalized-map ["project" 1])))
+    (is (vector? (first (:members (get normalized-map ["project" 1])))))
     (is (vector? (first normalized-set)))
-    (is (contains? normalized-set ["course" 1]))
+    (is (contains? normalized-set ["project" 1]))
     (is (map? normalized-java))
-    (is (set? (get normalized-java ["course" 1])))
-    (is (vector? (first (get normalized-java ["course" 1]))))
+    (is (set? (get normalized-java ["project" 1])))
+    (is (vector? (first (get normalized-java ["project" 1]))))
     (is (identical? java-key (first (keys native-map))))
     (is (identical? java-key (first native-set))))
   (testing "conversion survives an actual codec round-trip, including hashed lookups"
-    (let [value {[:course 1] #{[:student 2] [:student 3]}}
+    (let [value {[:project 1] #{[:customer 2] [:customer 3]}}
           result (fu/decode (fu/encode value))]
       (is (= value result))
       (is (every? vector? (keys result)))
-      (is (every? vector? (get result [:course 1])))
-      (is (contains? (get result [:course 1]) [:student 2])))))
+      (is (every? vector? (get result [:project 1])))
+      (is (contains? (get result [:project 1]) [:customer 2])))))

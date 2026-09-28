@@ -7,7 +7,7 @@
 ;; License and attribution: resources/META-INF/licenses/.
 (ns ai.obney.grain.read-model-processor-v2.ranked-set-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
+            [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [clojure.java.io :as io])

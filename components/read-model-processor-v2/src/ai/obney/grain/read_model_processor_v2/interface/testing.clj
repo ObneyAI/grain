@@ -1,7 +1,7 @@
 (ns ai.obney.grain.read-model-processor-v2.interface.testing
   "Cache inspection and eviction for deterministic integration scenarios."
   (:require [ai.obney.grain.read-model-processor-v2.core :as core]
-            [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]))
+            [ai.obney.grain.read-model-processor-v2.core.l1-cache :as l1]))
 
 (defn format-scoped-key
   "Return the cache key bytes for a model name, version, and cache scope."

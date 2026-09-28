@@ -1,10 +1,10 @@
-(ns ai.obney.grain.read-model-processor-v2.text-search
+(ns ai.obney.grain.read-model-processor-v2.core.text-search
   "Transactional positional trigrams. Exact phrase alignment follows the same
    offset rule as Lucene ExactPhraseMatcher; disjoint grams plus the last gram
    cover the query as in NGramPhraseQuery. No Lucene storage or copied source."
-  (:require [ai.obney.grain.read-model-processor-v2.fold-key :as key]
-            [ai.obney.grain.read-model-processor-v2.sort-data :as data]
-            [ai.obney.grain.read-model-processor-v2.instance-ids :as ids]
+  (:require [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.sort-data :as data]
+            [ai.obney.grain.read-model-processor-v2.core.instance-ids :as ids]
             [ai.obney.grain.fressian-util.interface :as codec])
   (:import [java.nio ByteBuffer]
            [java.util Locale Arrays]))

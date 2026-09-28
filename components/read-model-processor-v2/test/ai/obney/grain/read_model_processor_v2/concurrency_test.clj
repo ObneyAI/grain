@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
          [ai.obney.grain.read-model-processor-v2.interface :as rmp]
          [ai.obney.grain.read-model-processor-v2.core :as core]
-         [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]
+         [ai.obney.grain.read-model-processor-v2.core.l1-cache :as l1]
          [ai.obney.grain.event-store-v3.interface :as es]
          [ai.obney.grain.kv-store.interface :as kv]
          [ai.obney.grain.kv-store-lmdb.interface :as lmdb]

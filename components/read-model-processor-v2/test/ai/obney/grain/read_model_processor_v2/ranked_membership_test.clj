@@ -2,9 +2,9 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.read-model-processor-v2.keyed-test :as fixture]
-            [ai.obney.grain.read-model-processor-v2.ranked-set :as ranked]
-            [ai.obney.grain.read-model-processor-v2.span-membership :as membership]
-            [ai.obney.grain.read-model-processor-v2.instance-ids :as ids]
+            [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
+            [ai.obney.grain.read-model-processor-v2.core.span-membership :as membership]
+            [ai.obney.grain.read-model-processor-v2.core.instance-ids :as ids]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb])
   (:import [java.util Random Arrays]

@@ -8,15 +8,15 @@
 ;; Grain extension: optional span membership summaries and filtered navigation.
 ;; Level-zero members hold opaque payloads with implicit count 1. Sentinels and
 ;; upper levels retain little-endian span counts. See resources/META-INF/licenses.
-(ns ai.obney.grain.read-model-processor-v2.ranked-set
+(ns ai.obney.grain.read-model-processor-v2.core.ranked-set
   "Internal counted ordered index, adapted from FoundationDB RankedSet.
    All operations run inside the caller's KV transaction. Promotion is random;
    physical layout may differ on replay, but membership and order do not.
    Optional :membership? requires one unique ordinal per logical instance."
   (:refer-clojure :exclude [contains?])
-  (:require [ai.obney.grain.read-model-processor-v2.fold-key :as key]
-            [ai.obney.grain.read-model-processor-v2.instance-ids :as ids]
-            [ai.obney.grain.read-model-processor-v2.span-membership :as membership])
+  (:require [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.instance-ids :as ids]
+            [ai.obney.grain.read-model-processor-v2.core.span-membership :as membership])
   (:import [java.nio ByteBuffer ByteOrder]
            [java.util Arrays HashMap]
            [org.roaringbitmap RoaringBitmap]

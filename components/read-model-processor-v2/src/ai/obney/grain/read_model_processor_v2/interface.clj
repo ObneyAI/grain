@@ -5,7 +5,7 @@
    Optional :initial defaults to {}, and :result (state -> value) defaults to
    identity. Grain atomically persists affected state, results, indexes and
    progress. Read with value, state, values or page; compose in read-session.
-   Keyed context requires :event-source, :tenant-id, :event-store and :cache.
+   Keyed context requires :tenant-id, :event-store and :cache.
    Tenant identity always comes from context; declarations have no tenant key.
 
    Optional :include? (result -> truthy) controls result membership. Excluded
@@ -137,8 +137,10 @@
    Context fields `:read-model/name` and `:read-model/cache-tier` are attached
    to every metric event for observability."
   (:require [ai.obney.grain.read-model-processor-v2.core :as core]
-            [ai.obney.grain.read-model-processor-v2.keyed :as keyed]
-            [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]
+            [ai.obney.grain.read-model-processor-v2.core.fold-key :as fold-key]
+            [ai.obney.grain.read-model-processor-v2.core.keyed :as keyed]
+            [ai.obney.grain.read-model-processor-v2.core.read-query :as read-query]
+            [ai.obney.grain.read-model-processor-v2.core.l1-cache :as l1]
             [malli.core :as m]))
 
 (defn p
@@ -413,13 +415,64 @@
 (defn read-session
   "Catch up the named keyed folds once, then invoke f with a scoped context.
    All reads through it share a snapshot and must finish during f. The two-argument
-   form accepts explicit [[context model-names] ...] requests sharing one store;
+   form accepts explicit [[context model-names] ...] requests sharing one cache
+   and event store;
    f receives their prepared contexts in order. This is an application integration
    boundary, not tenant routing in model declarations."
   ([context model-names f]
    (read-session [[context model-names]] (fn [[prepared]] (f prepared))))
   ([requests f]
    (keyed/read-session requests @read-model-registry* f)))
+
+;; ---------------------------------------------------------------------------
+;; Declarative queries over keyed results
+;; ---------------------------------------------------------------------------
+
+(defn order-key
+  "Pure index extractor for query-visible fields. Text is case folded, nil is
+   empty text, keywords use their name. One field yields a scalar; several a tuple.
+   The function carries structural field metadata; no arbitrary code is inspected."
+  [fields] (read-query/order-key fields))
+
+(defn search-text
+  "Pure searchable-text extractor with explicit field provenance. Fields are
+   separated by spaces. Optional :suffix supports composed search boundaries."
+  ([fields] (read-query/search-text fields))
+  ([fields options] (read-query/search-text fields options)))
+
+(defn query-models
+  "Validate a four-key read-query definition and return its model/version map,
+   suitable for an endpoint's existing :grain/read-models subscription."
+  [definition]
+  (read-query/subscriptions (read-query/compile-definition definition @read-model-registry*)))
+
+(defn query
+  "Execute {:from {alias model} :related {...} :search [...] :orders {...}}.
+   Request: required :order, optional :search, :direction, :page, :limit, :params.
+   Rows contain :key (root identity) and detached results under declared aliases.
+   Returns exact pagination and :work describing the selected execution path.
+   Opaque computed ordering may evaluate every candidate. Indexed text composition
+   currently supports root text plus one related group; unsupported forms fail.
+   Does not define or maintain an additional joined read model."
+  [context definition request]
+  (let [registry @read-model-registry*
+        plan (read-query/compile-definition definition registry)
+        api {:value #'value :values #'values :page #'page
+             :index-groups #'index-groups :index-keys #'index-keys :index-rank #'index-rank
+             :search-keys #'search-keys :key-page #'key-page
+             :ranked-key-page #'ranked-key-page :joined-page #'joined-page
+             :read-session (fn [ctx names f]
+                             (keyed/read-session [[ctx names]] registry (fn [[prepared]] (f prepared))))
+             :same-members? (fn [ctx a b]
+                              (or (= a b) (keyed/same-members? ctx a (get registry a) b (get registry b))))
+             :unindexed-session
+             (fn [ctx models f]
+               (let [definitions (into {} (map (fn [[name d]]
+                                                 [name (assoc d :indexes {} :searches {} :ranked-indexes #{})])) models)
+                     unindexed (assoc ctx ::fold-key/unindexed true)]
+                 (keyed/read-session [[unindexed (keys definitions)]] definitions
+                                     (fn [[prepared]] (f prepared)))))}]
+    (read-query/execute api context plan request)))
 
 ;; ---------------------------------------------------------------------------
 ;; Legacy L1 cache

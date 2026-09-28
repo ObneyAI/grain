@@ -52,9 +52,9 @@
    :ui-test/one-shot-page {:handler-fn identity
                            :authorized? (constantly true)
                            :datastar/path "/one-shot"}
-   :ui-test/student-detail-page {:handler-fn identity
+   :ui-test/customer-detail-page {:handler-fn identity
                                  :authorized? (constantly true)
-                                 :datastar/path "/admin/students/:student-id"}})
+                                 :datastar/path "/admin/customers/:customer-id"}})
 
 (defn- hiccup
   [source]
@@ -699,7 +699,7 @@
                             {:filters {:search search
                                        :page page
                                        :empty nil}
-                             :include ["students" "documents" nil]})}}
+                             :include ["customers" "documents" nil]})}}
                 "Refresh"]))
         click (:data-on:click (attrs out))]
     (is (string/includes? click "@post(\"/admin/graduation-pending/__stream\", {payload:"))
@@ -707,7 +707,7 @@
     (is (re-find #"\.\.\(\(\$search__[a-z0-9]+\) == null \? \{\} : \{\"search\": \$search__[a-z0-9]+\}\)" click))
     (is (re-find #"\.\.\(\(\$page__[a-z0-9]+\) == null \? \{\} : \{\"page\": \$page__[a-z0-9]+\}\)" click))
     (is (not (string/includes? click "empty")))
-    (is (string/includes? click "\"include\": [\"students\", \"documents\", null]"))
+    (is (string/includes? click "\"include\": [\"customers\", \"documents\", null]"))
     (is (string/includes? click "\"dsNonce\": $dsNonce"))))
 
 (deftest indexed-collection-signals-bind-express-and-post
@@ -776,24 +776,24 @@
 (deftest checked-route-refs-resolve-from-query-metadata
   (let [out (hiccup
              [:div
-              [:a {:href (ui/href :ui-test/student-detail-page
-                         {:path-params {:student-id #uuid "00000000-0000-0000-0000-000000000099"}
+              [:a {:href (ui/href :ui-test/customer-detail-page
+                         {:path-params {:customer-id #uuid "00000000-0000-0000-0000-000000000099"}
                           :query-params {:tab :finance :page 2}})}
-               "Student"]
+               "Customer"]
               [:button {:on/click
-                        {:effect (ui/refresh :ui-test/student-detail-page
+                        {:effect (ui/refresh :ui-test/customer-detail-page
                                    {:tab :finance}
-                                   {:path-params {:student-id #uuid "00000000-0000-0000-0000-000000000099"}
+                                   {:path-params {:customer-id #uuid "00000000-0000-0000-0000-000000000099"}
                                     :query-params {:tab :finance :page 2}})}}
                "Refresh"]])
         link (nth out 2)
         button (nth out 3)
         click (:data-on:click (attrs button))]
-    (is (= "/admin/students/00000000-0000-0000-0000-000000000099?page=2&tab=finance"
+    (is (= "/admin/customers/00000000-0000-0000-0000-000000000099?page=2&tab=finance"
            (:href (attrs link))))
     (is (string/includes?
          click
-         "@post(\"/admin/students/00000000-0000-0000-0000-000000000099/__stream?page=2&tab=finance\""))
+         "@post(\"/admin/customers/00000000-0000-0000-0000-000000000099/__stream?page=2&tab=finance\""))
     (is (string/includes? click "\"tab\": \"finance\""))))
 
 (deftest checked-route-refs-reject-literal-and-missing-routes

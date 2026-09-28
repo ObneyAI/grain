@@ -1,4 +1,4 @@
-(ns ai.obney.grain.read-model-processor-v2.l1-cache
+(ns ai.obney.grain.read-model-processor-v2.core.l1-cache
   "L1 in-process cache for deserialized read model state.
 
    Holds Clojure maps in JVM heap, keyed by cache-key string.

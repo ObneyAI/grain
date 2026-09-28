@@ -1,7 +1,7 @@
-(ns ai.obney.grain.read-model-processor-v2.sort-data
+(ns ai.obney.grain.read-model-processor-v2.core.sort-data
   "Compact forward index values. Compare slices without decoding result maps."
   (:refer-clojure :exclude [comparator])
-  (:require [ai.obney.grain.read-model-processor-v2.fold-key :as key])
+  (:require [ai.obney.grain.read-model-processor-v2.core.fold-key :as key])
   (:import [java.nio ByteBuffer]
            [java.util Arrays]))
 
