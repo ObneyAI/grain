@@ -280,6 +280,7 @@ config {
 contract KeyedFoldDefinition {
     initial: () -> Any
     key: (event: Any) -> Any
+    route: (event: Any) -> Any
     step: (state: Any, event: Any) -> Any
     result: (state: Any) -> Any
     include: (result: Any) -> Boolean
@@ -287,19 +288,32 @@ contract KeyedFoldDefinition {
     @invariant IndependentPureFunctions
         -- Each model is independently defined. Initial state, routing, reduction,
         -- result calculation, and result-index extraction are deterministic.
-        -- Reducers receive ordinary immutable detached state and the original
-        -- event; result functions receive only that model instance's state.
+        -- Reducers receive ordinary immutable detached state and their routed
+        -- input (the original event for key-based definitions); result functions
+        -- receive only that model instance's state.
         -- No callback requires transaction handles, storage mutations, another
         -- projection, request context, a clock, or external effects. The caller
         -- supplies functions honouring this obligation; runtime enforcement of
         -- arbitrary program purity is not promised.
 
     @invariant StableOwnership
-        -- Each subscribed event has exactly one supported non-null stable key
-        -- obtained from that event. A model is admissible only when each key's
-        -- reduction has all the state it needs inside that instance. Missing or
-        -- ambiguous ownership is an error, never silent omission. The processor
-        -- does not infer ownership by probing a reducer with empty state.
+        -- A keyed definition supplies exactly one of key or route. Key supplies
+        -- one supported non-null stable owner and passes the original event.
+        -- Route supplies a finite ordered sequence of two-element vectors
+        -- [owner, input], determined solely from the original event. An empty
+        -- sequence deliberately selects no state; nil, malformed pairs and null
+        -- owners are errors. Several inputs for the same owner apply in their
+        -- returned order, after all inputs from earlier stored events.
+        -- Each owner's reduction must have all the state it needs inside that
+        -- instance. The processor never infers ownership by probing a reducer
+        -- with empty state, consulting another projection, or using live context.
+
+    @invariant OriginalEventProgress
+        -- Routed inputs are transient reducer arguments, never appended events.
+        -- Event selection, ordering and progress use the original stored event.
+        -- All inputs from one event are processed within one batch transaction;
+        -- their states, results, indexes and progress commit together or not at
+        -- all. Even an event with no inputs advances progress on success.
 
     @invariant LocalCompletion
         -- The result is a pure function of accumulated state, not an independently
@@ -330,8 +344,8 @@ contract KeyedFoldMaterialization {
 
     @invariant FoldEquivalence
         -- At committed progress H, each instance state equals reduction from the
-        -- declared initial state over exactly the subscribed tenant events routed
-        -- to its key through H, preserving their store order. Its result equals
+        -- declared initial state over exactly the inputs routed from subscribed
+        -- tenant events through H, preserving event and input order. Its result equals
         -- result(state). Batch boundaries, prior read choices, restart, and
         -- interleaving other keys cannot change that answer.
 

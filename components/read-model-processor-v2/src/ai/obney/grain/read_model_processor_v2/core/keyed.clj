@@ -14,7 +14,8 @@
            [java.util Arrays ArrayList HashSet]
            [ai.obney.grain.read_model_processor_v2.core.ranked_set VirtualMember]))
 
-(defn keyed? [definition] (contains? definition :key))
+(defn keyed? [definition]
+  (or (contains? definition :key) (contains? definition :route)))
 
 (defn validate! [name opts]
   (when (and (contains? opts :ranked-indexes) (not (keyed? opts)))
@@ -25,7 +26,9 @@
     (when-not (and (qualified-keyword? name) (pos-int? (:version opts 1))
                    (set? (:events opts)) (seq (:events opts))
                    (every? qualified-keyword? (:events opts))
-                   (ifn? (:key opts)) (ifn? (:result opts identity))
+                   (not= (contains? opts :key) (contains? opts :route))
+                   (ifn? (if (contains? opts :route) (:route opts) (:key opts)))
+                   (ifn? (:result opts identity))
                    (ifn? (:include? opts (constantly true)))
                    (map? (:indexes opts {}))
                    (map? (:searches opts {}))
@@ -114,21 +117,33 @@
             before-progress (read-meta tx (progress-key b))
             events (filterv #(or (nil? (:watermark before-progress))
                                 (pos? (compare (:event/id %) (:watermark before-progress)))) events)
+            apply-input (fn [states id input]
+                          (when (nil? id)
+                            (throw (ex-info "Keyed-fold event has no owner"
+                                            {:model name :event-id (:event/id input)
+                                             :event-type (:event/type input)})))
+                          (let [k (address b 1 id)
+                                state (if (contains? states id) (get states id)
+                                        (if-let [raw ((:get tx) k)]
+                                          (decode ctx :state-decoded raw) (:initial d {})))
+                                next ((:reducer-fn d) state input)]
+                            (validate-state! next)
+                            (observe! ctx :event-applied 0)
+                            (assoc states id next)))
             states (reduce
                     (fn [states event]
-                      (let [id ((:key d) event)]
-                        (when (nil? id)
-                          (throw (ex-info "Keyed-fold event has no owner"
-                                          {:model name :event-id (:event/id event)
-                                           :event-type (:event/type event)})))
-                        (let [k (address b 1 id)
-                              state (if (contains? states id) (get states id)
-                                      (if-let [raw ((:get tx) k)]
-                                        (decode ctx :state-decoded raw) (:initial d {})))
-                              next ((:reducer-fn d) state event)]
-                          (validate-state! next)
-                          (observe! ctx :event-applied 0)
-                          (assoc states id next)))) {} events)
+                      (if-let [route (:route d)]
+                        (let [inputs (route event)]
+                          (when-not (sequential? inputs)
+                            (throw (ex-info "Route must return an ordered sequence of [owner input] pairs"
+                                            {:model name :event-id (:event/id event)})))
+                          (reduce (fn [states entry]
+                                    (when-not (and (vector? entry) (= 2 (count entry)))
+                                      (throw (ex-info "Invalid routed [owner input] pair"
+                                                      {:model name :event-id (:event/id event)})))
+                                    (apply-input states (nth entry 0) (nth entry 1)))
+                                  states inputs))
+                        (apply-input states ((:key d) event) event))) {} events)
             count-before (or (read-meta tx (count-key b)) 0)
             added (volatile! 0)]
         (doseq [[id state] states]

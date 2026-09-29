@@ -2,6 +2,12 @@
   "Pure event folds with legacy projections and opt-in keyed materialization.
 
    Add :key (event -> instance-id) to a declaration for independent keyed folds.
+   Alternatively, :route (event -> ordered sequence of [instance-id input])
+   supplies zero or more reducer inputs. Supply exactly one of :key or :route.
+   Empty routes intentionally skip an event; nil routes and nil owners fail.
+   Repeated owners apply inputs in order. Progress tracks the original stored
+   event, with all its effects committed together; routed inputs are not stored
+   as events. Routing must be pure and finite, with no state or context lookup.
    Optional :initial defaults to {}, and :result (state -> value) defaults to
    identity. Grain atomically persists affected state, results, indexes and
    progress. Read with value, state, values or page; compose in read-session.
@@ -255,7 +261,7 @@
                       :definition/value
                       {:description docstring
                        :options (select-keys opts #{:events :version :schema
-                                                    :l1-ttl-ms :key :initial :result :include?
+                                                    :l1-ttl-ms :key :route :initial :result :include?
                                                     :indexes :searches :ranked-indexes :state-schema :result-schema})}})]
     `(do
        (defn ~var-name

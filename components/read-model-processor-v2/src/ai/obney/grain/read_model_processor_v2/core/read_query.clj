@@ -83,7 +83,7 @@
       (let [bindings (assoc related root {:model model})
             models (into {} (map (fn [[alias {:keys [model]}]]
                                    (let [d (get registry model)]
-                                     (when-not (:key d) (fail "Expected registered keyed model" {:alias alias :model model}))
+                                    (when-not (or (:key d) (:route d)) (fail "Expected registered keyed model" {:alias alias :model model}))
                                      [model d]))) bindings)
             sorted (loop [done [root] remaining related]
                      (if (empty? remaining) done
