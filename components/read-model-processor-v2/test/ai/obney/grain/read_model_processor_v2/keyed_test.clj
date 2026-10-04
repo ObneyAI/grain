@@ -68,6 +68,11 @@
     (rmp/read-session ctx [name]
       (fn [ctx]
         (is (= [{:value nil :total 1} {:value "same" :total 2}] (rmp/index-groups ctx name :group)))
+        (reset! observed [])
+        (is (= [{:value "same" :total 2} {:value nil :total 1}]
+               (rmp/index-groups ctx name :group ["same" nil "absent" "same"])))
+        (is (= 3 (count (filter #(= :index-group (:operation %)) @observed))))
+        (is (= [] (rmp/index-groups ctx name :group [])))
         (doseq [direction [:asc :desc]]
           (let [selection {:index :group :equals "same" :direction direction}]
             (reset! observed [])
@@ -83,6 +88,42 @@
     (is (thrown? clojure.lang.ExceptionInfo (rmp/index-keys ctx name {:index :group})))
     (is (thrown? clojure.lang.ExceptionInfo (rmp/index-keys ctx name {:equals nil :offset -1})))
     (is (thrown? clojure.lang.ExceptionInfo (rmp/index-groups ctx name :unknown)))))
+
+(deftest forward-index-values-are-metadata-only
+  (let [name (register! (fn [_ e] (select-keys e [:group :included?]))
+                        {:include? :included? :indexes {:group :group}})
+        observed (atom []) ctx (assoc *ctx* :read-model/observer #(swap! observed conj %))]
+    (append! [{:owner "a" :group nil :included? true}
+              {:owner "b" :group "same" :included? true}
+              {:owner "excluded" :group "other" :included? false}])
+    (rmp/read-session ctx [name]
+      (fn [prepared]
+        (reset! observed [])
+        (is (= {"a" {:group nil} "b" {:group "same"}}
+               (into {} (map (juxt :key :value)) (rmp/index-values prepared name [:group]))))
+        (is (= [{:key "b" :value {:group "same" :identity "b"}}]
+               (into [] (rmp/index-values prepared name [:group :identity] ["b" "absent" "b" "excluded"]))))
+        (is (empty? (filter #(#{:result-decoded :state-decoded :event-applied} (:operation %)) @observed)))
+        (reset! observed [])
+        (is (= 1 (count (into [] (take 1) (rmp/index-values prepared name [:group])))))
+        (is (= 1 (count (filter #(= :sort-key-read (:operation %)) @observed))))
+        (reset! observed [])
+        (let [calls (atom [])
+              options {:indexes [:group] :sort-value (fn [id values]
+                                                       (swap! calls conj id)
+                                                       (or (:group values) "zero")) :limit 1}]
+          (is (= ["b"] (:keys (rmp/key-page prepared name options))))
+          (is (= #{"a" "b"} (set @calls)))
+          (is (= 2 (count @calls)))
+          (is (= 2 (count (filter #(= :sort-key-read (:operation %)) @observed))))
+          (is (= ["b"] (:keys (rmp/key-page prepared name ["a" "b" "b"] options)))))))
+    (append! [{:owner "a" :group "changed" :included? true}
+              {:owner "b" :group "same" :included? false}])
+    (is (= [{:key "a" :value {:group "changed"}}] (into [] (rmp/index-values ctx name [:group]))))
+    (is (= [] (into [] (rmp/index-values ctx name [:group] []))))
+    (is (= [] (into [] (rmp/index-values (assoc ctx :tenant-id (random-uuid)) name [:group]))))
+    (is (thrown? Exception (rmp/index-values ctx name [:absent])))
+    (is (thrown? Exception (rmp/index-values ctx name [:group] nil)))))
 
 (deftest incompatible-storage-is-ignored-by-normal-materialization
   (let [name (register! (fn [_ e] (:group e)) {:indexes {:group identity}})

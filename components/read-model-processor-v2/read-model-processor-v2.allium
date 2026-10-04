@@ -535,8 +535,20 @@ contract KeyedFoldReads {
 
     @invariant ReadOnlyIndexComposition
         -- Queries may enumerate distinct sort values and their exact counts,
+        -- or read counts for specified values without enumerating other groups,
         -- seek a bounded slice of instance identities within an equality group,
         -- and obtain a key's insertion rank and presence within that group.
+        -- Queries may also read selected forward index values for specified
+        -- identities, or reduce them across the model. Each entry contains its
+        -- identity and only the requested named index values. Absent identities
+        -- are omitted; a stored nil remains a present index value. Enumeration
+        -- is reducible and honours early termination. This reads compact index
+        -- metadata, never result or reducer-state payloads, and does not claim
+        -- page-sized work when a calculation examines every candidate.
+        -- Computed ordering may consume several named forward index values
+        -- in one pass over candidate identities or all included identities.
+        -- Each candidate's sort expression is evaluated once; selection and
+        -- stable identity ties do not require decoding full model results.
         -- Identity slices and rank probes do not load result or state payloads.
         -- Group enumeration reads one maintained count per distinct value,
         -- without loading representative results. Counts change in the

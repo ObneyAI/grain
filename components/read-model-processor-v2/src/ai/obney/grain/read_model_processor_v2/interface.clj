@@ -352,9 +352,13 @@
 (defn index-groups
   "Return distinct index values in ascending order as {:value v :total n}.
    Reads maintained group counts without loading any member results.
-   Use a read-session when composing these counts with other index reads."
-  [context name index]
-  (keyed/index-groups context name (keyed-definition context name) index))
+   With values supplied, look up only those groups in supplied order, omitting
+   duplicates and missing groups. Use a read-session when composing reads."
+  ([context name index]
+   (keyed/index-groups context name (keyed-definition context name) index))
+  ([context name index values]
+   (when (nil? values) (throw (ex-info "Expected group values, not nil" {:model name})))
+   (keyed/index-groups context name (keyed-definition context name) index values)))
 
 (defn search-keys
   "Exact case-insensitive literal matching over a declared text index. Options:
@@ -369,11 +373,15 @@
   "Order distinct candidate keys belonging to this model's included results.
    Options: :index (:identity), :direction (:asc), :page (1), :limit (25), and
    optional :sort-value (fn [id stored-index-value] computed-order-value).
+   With :indexes [names...], the callback receives a map of those stored values.
+   The three-argument form considers every included identity in a single pass.
    Returns :keys, exact counts/clamped page and :sort-keys-read. Reads compact
    forward metadata for candidates; never decodes their full result/state.
    Work scales with candidates, not page size. Ties stay ascending by string ID."
-  [context name keys options]
-  (keyed/key-page context name (keyed-definition context name) keys options))
+  ([context name options]
+   (keyed/key-page context name (keyed-definition context name) ::keyed/all options))
+  ([context name keys options]
+   (keyed/key-page context name (keyed-definition context name) keys options)))
 
 (defn ranked-key-page
   "Experimental matching-key pagination through stored rank-span membership.
@@ -405,6 +413,17 @@
    :limit (25). Beyond-end offsets return []. Ties remain ascending by ID."
   [context name options]
   (keyed/index-keys context name (keyed-definition context name) options))
+
+(defn index-values
+  "Reduce {:key id :value {index stored-value}} entries without loading results.
+   Supply a vector of index names. The four-argument form reads only the supplied
+   instance IDs (duplicates and absent IDs are omitted); the three-argument form
+   scans compact forward metadata. Consume session-bound reductions in-session."
+  ([context name indexes]
+   (keyed/index-values context name (keyed-definition context name) indexes nil))
+  ([context name indexes ids]
+   (when (nil? ids) (throw (ex-info "Expected instance IDs, not nil" {:model name})))
+   (keyed/index-values context name (keyed-definition context name) indexes ids)))
 
 (defn index-rank
   "Return {:rank insertion-position :present? boolean} for an instance identity

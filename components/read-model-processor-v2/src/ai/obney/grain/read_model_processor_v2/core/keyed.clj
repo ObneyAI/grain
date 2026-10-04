@@ -325,23 +325,54 @@
     (fn [tx b _ _read]
       (search/search-keys tx b (:searches d) options #(observe! ctx %1 %2)))))
 
+(defn index-values [ctx name d indexes ids]
+  (when-not (and (vector? indexes) (every? #(or (= :identity %) (contains? (:indexes d) %)) indexes))
+    (throw (ex-info "Expected a vector of declared index names" {:model name :indexes indexes})))
+  (let [fields (mapv #(sort-data/field (:indexes d) %) indexes)]
+    (reify clojure.lang.IReduceInit
+      (reduce [_ rf initial]
+        (with-reader ctx name d
+          (fn [tx b _ read]
+            (let [step (fn [acc raw]
+                         (observe! ctx :sort-key-read (alength ^bytes raw))
+                         (rf acc {:key (sort-data/value raw 1)
+                                  :value (zipmap indexes (map #(sort-data/value raw %) fields))}))]
+              (if (some? ids)
+                (reduce (fn [acc id] (if-let [raw (read 11 id)] (step acc raw) acc)) initial (distinct ids))
+                ((:reduce tx) {:prefix (key/join b (byte-array [11]))}
+                 (fn [acc {:keys [v]}] (step acc v)) initial)))))))))
+
 (defn key-page [ctx name d keys options]
-  (let [{:keys [index direction page limit sort-value]
+  (let [{:keys [index indexes direction page limit sort-value]
          :or {index :identity direction :asc page 1 limit 25}} options]
-    (when-not (and (map? options) (every? #{:index :direction :page :limit :sort-value} (clojure.core/keys options))
+    (when-not (and (map? options) (every? #{:index :indexes :direction :page :limit :sort-value} (clojure.core/keys options))
                    (or (= index :identity) (contains? (:indexes d) index))
+                   (or (not (contains? options :indexes))
+                       (and sort-value (vector? indexes)
+                            (every? #(or (= :identity %) (contains? (:indexes d) %)) indexes)))
                    (#{:asc :desc} direction) (pos-int? page) (pos-int? limit)
                    (or (nil? sort-value) (ifn? sort-value)))
       (throw (ex-info "Invalid matching-key page" {:model name :options options})))
     (with-reader ctx name d
-      (fn [_tx _b _d read]
+      (fn [tx b _d read]
         (let [field (sort-data/field (:indexes d) index)
-              seen (java.util.HashSet.) entries (java.util.ArrayList.)]
-          (doseq [id keys :when (.add seen id)]
-            (when-let [raw (read 11 id)]
-              (observe! ctx :sort-key-read (alength ^bytes raw))
-              (.add entries (ai.obney.grain.read_model_processor_v2.core.sort_data.Entry.
-                              id raw (when sort-value (key/encode (sort-value id (sort-data/value raw field))))))))
+              fields (mapv #(sort-data/field (:indexes d) %) indexes)
+              entries (java.util.ArrayList.)
+              collect! (fn [id raw]
+                         (observe! ctx :sort-key-read (alength ^bytes raw))
+                         (let [computed (when sort-value
+                                          (key/encode
+                                            (sort-value id (if (some? indexes)
+                                                             (zipmap indexes (map #(sort-data/value raw %) fields))
+                                                             (sort-data/value raw field)))))]
+                           (.add entries (ai.obney.grain.read_model_processor_v2.core.sort_data.Entry.
+                                          id raw computed))))]
+          (if (= ::all keys)
+            ((:reduce tx) {:prefix (key/join b (byte-array [11]))}
+             (fn [_ {:keys [v]}] (collect! (sort-data/value v 1) v)) nil)
+            (let [seen (java.util.HashSet.)]
+              (doseq [id keys :when (.add seen id)]
+                (when-let [raw (read 11 id)] (collect! id raw)))))
           (.sort entries (sort-data/comparator field (= direction :desc) (some? sort-value)))
           (let [total (.size entries) pages (max 1 (quot (+ total (dec limit)) limit))
                 page (min page pages) offset (* (dec page) limit)]
@@ -517,14 +548,21 @@
               (ranked/rank tx cfg end false) (ranked/size tx cfg))]
     [first end]))
 
-(defn index-groups [ctx name d index]
-  (validate-selection! name d {:index index})
-  (with-reader ctx name d
-    (fn [tx b _ _read]
-      ((:reduce tx) {:prefix (ranked/prefix (index-config b index :asc) 6)}
-       (fn [groups {:keys [v]}]
-         (observe! ctx :index-group 0)
-         (conj groups (codec/decode v))) []))))
+(defn index-groups
+  ([ctx name d index] (index-groups ctx name d index nil))
+  ([ctx name d index values]
+   (validate-selection! name d {:index index})
+   (with-reader ctx name d
+     (fn [tx b _ _read]
+       (let [prefix (ranked/prefix (index-config b index :asc) 6)]
+         (if (some? values)
+           (into [] (keep (fn [value]
+                            (observe! ctx :index-group 0)
+                            (read-meta tx (key/checked (key/join prefix (key/encode value)))))) (distinct values))
+           ((:reduce tx) {:prefix prefix}
+            (fn [groups {:keys [v]}]
+              (observe! ctx :index-group 0)
+              (conj groups (codec/decode v))) [])))))))
 
 (defn- validate-group! [name d selection]
   (validate-selection! name d selection)
