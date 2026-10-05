@@ -2,6 +2,7 @@
   (:require [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
+            [ai.obney.grain.read-model-processor-v2.core.cache-key :as cache-key]
             [ai.obney.grain.read-model-processor-v2.core.l1-cache :as l1]
             [com.brunobonacci.mulog :as u]))
 
@@ -15,7 +16,7 @@
 
 (defn format-scoped-key [n v scope]
   (if scope
-    (.getBytes (format "%s-%s-%s" n v (Integer/toHexString (hash scope))))
+    (.getBytes (format "%s-%s-s1-%s" n v (cache-key/fingerprint scope)))
     (format-key n v)))
 
 (defn suffix-key
@@ -33,9 +34,9 @@
   (suffix-key base-key (format ":s%d" idx)))
 
 (defn partition-cache-key
-  "Cache key for a single partition: base-key:p<hash(pk)>"
+  "Cache key for a single partition, isolated by its full value fingerprint."
   ^bytes [^bytes base-key partition-key]
-  (suffix-key base-key (format ":p%s" (Integer/toHexString (hash partition-key)))))
+  (suffix-key base-key (str ":p1-" (cache-key/fingerprint partition-key))))
 
 (defn- entity-index-cache-key
   "Cache key for the entity-to-partition index: base-key:eidx"
@@ -471,7 +472,7 @@
   [{:keys [event-store cache] :as context}
    {:keys [f query partition-fn entity-id-fn partition-key name] :as args}
    cache-key manifest]
-  (let [l1-key (str (String. ^bytes cache-key) ":pk" (hash partition-key))
+  (let [l1-key (String. ^bytes (partition-cache-key cache-key partition-key))
         ttl-ms (or (:l1-ttl-ms args) default-l1-ttl-ms)
         max-entries (or (:l1-max-entries args) default-l1-max-entries)]
     (if-let [l1 (l1/get-entry l1-key)]

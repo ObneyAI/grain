@@ -521,6 +521,13 @@ surface EventRead {
         -- Transaction markers are part of the stream and are returned by reads
         -- like any other event; consumers that want only domain facts
         -- distinguish them by kind. Reads do not silently hide them.
+
+    @guarantee CommittedHeadWithoutPayload
+        -- Reading only the current committed event identity uses this tenant's
+        -- durable watermark. It returns null for an empty tenant and does not
+        -- read event bodies or other tenants. Failed and uncommitted appends
+        -- cannot advance the observed head. This is a current freshness bound;
+        -- it does not define downstream checkpoint or notification policy.
 }
 
 -- The administrative boundary: a client reads back the durable per-tenant

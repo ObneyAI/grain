@@ -130,7 +130,18 @@
             (aset-byte out i (unchecked-byte (inc (bit-and 255 (aget prefix i)))))
             out))))))
 
-(defn- scan [^Dbi db ^Txn txn ^ByteBuffer k-buf {:keys [prefix from to reverse?] :as options} rf initial check!]
+(defn- with-scan-cursor [^Dbi db ^Txn txn spare f]
+  (let [^Cursor cursor (if-let [cursor (when spare @spare)]
+                        (do (vreset! spare nil) cursor)
+                        (.openCursor db txn))]
+    (try
+      (f cursor)
+      (finally
+        (if (and spare (nil? @spare))
+          (vreset! spare cursor)
+          (.close cursor))))))
+
+(defn- scan [^Dbi db ^Txn txn ^ByteBuffer k-buf spare {:keys [prefix from to reverse?] :as options} rf initial check!]
   (when-not (every? #{:prefix :from :to :reverse?} (keys options))
     (throw (ex-info "Unknown transaction range option" {:options options})))
   (let [prefix (when (seq prefix) prefix)
@@ -143,24 +154,25 @@
     (if (or (and upper (zero? (alength ^bytes upper)))
             (and lower upper (not (neg? (byte-compare lower upper)))))
       initial
-      (with-open [^Cursor cursor (.openCursor db txn)]
-      (let [found (if reverse?
-                    (if upper
-                      (if (.get cursor (fill-buffer k-buf upper) org.lmdbjava.GetOp/MDB_SET_RANGE)
-                        (.prev cursor) (.last cursor))
-                      (.last cursor))
-                    (if lower (.get cursor (fill-buffer k-buf lower) org.lmdbjava.GetOp/MDB_SET_RANGE)
-                        (.first cursor)))]
-        (loop [found found acc initial]
-          (check! false)
-          (if-not found acc
-            (let [k (copy-buffer (.key cursor))]
-              (if (or (and lower (neg? (byte-compare k lower)))
-                      (and upper (not (neg? (byte-compare k upper)))))
-                acc
-                (let [next (rf acc {:k k :v (copy-buffer (.val cursor))})]
-                  (if (reduced? next) @next
-                      (recur (if reverse? (.prev cursor) (.next cursor)) next))))))))))))
+      (with-scan-cursor db txn spare
+        (fn [^Cursor cursor]
+          (let [found (if reverse?
+                        (if upper
+                          (if (.get cursor (fill-buffer k-buf upper) org.lmdbjava.GetOp/MDB_SET_RANGE)
+                            (.prev cursor) (.last cursor))
+                          (.last cursor))
+                        (if lower (.get cursor (fill-buffer k-buf lower) org.lmdbjava.GetOp/MDB_SET_RANGE)
+                            (.first cursor)))]
+            (loop [found found acc initial]
+              (check! false)
+              (if-not found acc
+                (let [k (copy-buffer (.key cursor))]
+                  (if (or (and lower (neg? (byte-compare k lower)))
+                          (and upper (not (neg? (byte-compare k upper)))))
+                    acc
+                    (let [next (rf acc {:k k :v (copy-buffer (.val cursor))})]
+                      (if (reduced? next) @next
+                          (recur (if reverse? (.prev cursor) (.next cursor)) next)))))))))))))
 
 (def ^:private ^ThreadLocal transactions (ThreadLocal.))
 
@@ -182,20 +194,23 @@
                      (try (check! write?) (operation)
                           (catch Throwable e (compare-and-set! failure nil e) (throw e))))]
         (with-open [^Txn txn (if (= mode :write) (.txnWrite env) (open-read-transaction env))]
-          (try
-            (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
-                  value-buffer (when (= mode :write) (value-buffer-writer))
-                  result (f {:get (fn [k] (invoke false #(read-value db txn k-buf k)))
-                             :put (fn [k v]
-                                    (invoke true #(.put db txn (fill-buffer k-buf k) (value-buffer v) no-put-flags)))
-                             :delete (fn [k] (invoke true #(.delete db txn (fill-buffer k-buf k))))
-                             :reduce (fn [options rf initial]
-                                       (invoke false #(scan db txn k-buf options rf initial check!)))})]
-              (when-let [cause @failure]
-                (throw (ex-info "Transaction aborted after an operation failed" {} cause)))
-              (when (= mode :write) (.commit txn))
-              result)
-            (finally (vreset! active false)))))
+          (let [spare (when (= mode :read) (volatile! nil))]
+            (try
+              (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
+                    value-buffer (when (= mode :write) (value-buffer-writer))
+                    result (f {:get (fn [k] (invoke false #(read-value db txn k-buf k)))
+                               :put (fn [k v]
+                                      (invoke true #(.put db txn (fill-buffer k-buf k) (value-buffer v) no-put-flags)))
+                               :delete (fn [k] (invoke true #(.delete db txn (fill-buffer k-buf k))))
+                               :reduce (fn [options rf initial]
+                                         (invoke false #(scan db txn k-buf spare options rf initial check!)))})]
+                (when-let [cause @failure]
+                  (throw (ex-info "Transaction aborted after an operation failed" {} cause)))
+                (when (= mode :write) (.commit txn))
+                result)
+              (finally
+                (vreset! active false)
+                (when-let [^Cursor cursor (when spare @spare)] (.close cursor)))))))
       (finally
         (if previous (.set transactions previous) (.remove transactions))))))
 

@@ -381,6 +381,10 @@ contract KeyedFoldMaterialization {
         -- that head before serving fresh data. Newer committed state may be
         -- observed; later events cannot cause an unbounded chase. A failed
         -- catch-up is an error rather than a successful stale fallback.
+        -- Capturing the head from a built-in store reads its committed identity
+        -- directly, without decoding the latest transaction marker or payload.
+        -- A large source batch therefore does not inflate every later freshness
+        -- check. Stores without direct-head support retain bounded reverse reads.
 
     @invariant EqualResultsPreserveState
         -- If new state has an equal result, changed state and progress still
@@ -470,6 +474,11 @@ contract KeyedFoldReads {
         -- stored sort value, without loading complete results or changing them.
         -- Matching-key sorting may visit all candidates; this is not filtered
         -- rank seeking. Only the application-selected rows need full hydration.
+        -- Page selection retains sort records only for the requested prefix
+        -- (page number times page size), or fewer when fewer candidates qualify.
+        -- It still examines every candidate needed for exact membership and
+        -- totals. Beyond-end requests clamp to the real last page, including
+        -- requests whose nominal offset exceeds machine integer bounds.
 
     @invariant StateAndValueAreDistinct
         -- State reads return accumulated state; value, result traversal, and
@@ -526,29 +535,73 @@ contract KeyedFoldReads {
 
     @invariant RankedSourcePages
         -- A direct index page uses maintained ranks to seek its offset and to
-        -- count an equality selection, rather than enumerating all preceding or
+        -- count an equality or tuple-prefix selection, rather than enumerating all preceding or
         -- matching members. Only returned result payloads are decoded. Counts,
         -- clamping, ascending key ties and read-session isolation are unchanged.
         -- Rank metadata commits with index membership in the fold transaction.
         -- Navigation has probabilistic bounds; this promises neither constant
         -- time nor page-sized work for arbitrary cross-model composition.
 
+    @invariant TuplePrefixSelection
+        -- Result traversal and direct pages may select vector-valued index
+        -- entries by their complete leading components. A prefix [true] selects
+        -- vectors beginning with true; it does not select scalar true. Components
+        -- retain their ordinary types and exact boundaries: a string component
+        -- is an equality match, not a text-prefix search, and a nested vector
+        -- component must match in full. The empty prefix selects all vectors.
+        -- Matching entries retain the index's ordinary ascending or descending
+        -- order and ascending identity ties. Exact totals, empty pages, clamping,
+        -- updates and read-session isolation follow ordinary indexed pages.
+        -- Prefixes must be vectors and cannot be combined with equality selection.
+        -- Selection reuses existing ordered index membership and ranks, without
+        -- scanning candidate sort metadata or introducing a second materialization.
+
+    @invariant TuplePrefixUnionPages
+        -- A page may select a union of complete-component tuple prefixes from
+        -- one stored index. Results use that index's global order, independent
+        -- of supplied prefix order. Duplicate and overlapping prefixes include
+        -- each instance only once; an empty collection selects no instances.
+        -- Exact total, page clamping, both directions and ascending identity
+        -- ties have the same semantics as single-prefix paging. A page can cross
+        -- several selected ranges without loading the intervening results.
+        -- Stored rank bounds count and skip whole ranges. Work scales with
+        -- requested ranges and page size, not with the selected population or
+        -- skipped pages. Only returned results are decoded. The selection uses
+        -- one tenant-scoped prepared snapshot and reflects canonical updates.
+        -- Each prefix must be a vector; union selection cannot be combined with
+        -- single-prefix or equality selection. No additional index or persisted
+        -- union state is required.
+
     @invariant ReadOnlyIndexComposition
         -- Queries may enumerate distinct sort values and their exact counts,
         -- or read counts for specified values without enumerating other groups,
         -- seek a bounded slice of instance identities within an equality group,
         -- and obtain a key's insertion rank and presence within that group.
+        -- A slice starting at offset zero seeks the group's stored key prefix
+        -- directly, without rank navigation or reading other groups. Nonzero
+        -- offsets retain rank navigation so skipped members are not scanned.
         -- Queries may also read selected forward index values for specified
         -- identities, or reduce them across the model. Each entry contains its
         -- identity and only the requested named index values. Absent identities
         -- are omitted; a stored nil remains a present index value. Enumeration
-        -- is reducible and honours early termination. This reads compact index
-        -- metadata, never result or reducer-state payloads, and does not claim
+        -- is reducible and honours early termination.
+        -- Temporary duplicate tracking and field assembly are local to each
+        -- reduction; they need not rebuild immutable intermediates per item.
+        -- Returned metadata maps remain detached immutable values, and repeating
+        -- a reduction starts with fresh duplicate tracking.
+        -- This reads compact index metadata, never result or reducer-state
+        -- payloads, and does not claim
         -- page-sized work when a calculation examines every candidate.
         -- Computed ordering may consume several named forward index values
         -- in one pass over candidate identities or all included identities.
         -- Each candidate's sort expression is evaluated once; selection and
         -- stable identity ties do not require decoding full model results.
+        -- A query may filter candidates using the same named index values
+        -- before ordering. The predicate runs once per distinct present
+        -- candidate; only accepted candidates are ordered and counted.
+        -- Filtering and ordering share one metadata read per candidate.
+        -- Reported metadata reads include rejected candidates. Empty matches
+        -- retain the ordinary empty-page and clamping semantics.
         -- Identity slices and rank probes do not load result or state payloads.
         -- Group enumeration reads one maintained count per distinct value,
         -- without loading representative results. Counts change in the
@@ -889,6 +942,8 @@ rule TenantFirstSeen {
 -- RM7: a cache entry belongs to exactly one tenant. No two tenants ever share an
 -- entry, so one tenant's events can never leak into another's projection — even
 -- when the same read model, scope and partition are read for both.
+-- Distinct identities remain isolated when their ordinary value hashes collide,
+-- in both resident and persisted caches.
 invariant CachePerTenant {
     for a in Caches:
         for b in Caches:
@@ -902,6 +957,9 @@ invariant CachePerTenant {
 -- RM8: distinct scopes of the same read model and tenant are distinct cache
 -- entries. A scoped projection and the unscoped one (or two differently scoped
 -- ones) never share accumulated state.
+-- Collection iteration order is not scope identity: equal maps and sets retain
+-- the same cache identity regardless of their construction order. Partition
+-- identities follow the same rules.
 invariant CachePerScope {
     for a in Caches:
         for b in Caches:

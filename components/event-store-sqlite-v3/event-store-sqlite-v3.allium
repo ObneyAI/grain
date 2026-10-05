@@ -581,6 +581,12 @@ surface EventRead {
         -- stream. This is the read shape a processor checkpoint lookup
         -- depends on, and it stays cheap as the stream grows.
 
+    @guarantee CommittedHeadWithoutPayload
+        -- Reading only the current committed event identity uses this tenant's
+        -- durable watermark. It returns null for an empty tenant and does not
+        -- read event bodies or other tenants. Failed and uncommitted appends
+        -- cannot advance the observed head.
+
     @guarantee TagReadsStayFlat
         -- A tag-scoped read costs in proportion to the events bearing the
         -- requested tags, never to the tenant's whole stream — including on a

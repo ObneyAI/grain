@@ -105,7 +105,11 @@ contract Store {
     @invariant OrderedRanges
         -- A reducible range visits the intersection of its byte-prefix and
         -- half-open lower/upper bounds in unsigned byte order or its reverse.
-        -- It honours early termination and closes its cursor on any exit.
+        -- It honours early termination and releases its active scan on any
+        -- exit. A read transaction may reuse one idle cursor across sequential
+        -- scans; nested scans have independent positions. All cursors close
+        -- before the transaction exits, including after callback failure.
+        -- Write-transaction scans close their cursors when each scan exits.
 
     @invariant WriteThenReadConsistency
         -- A value written under a key is read back unchanged by a subsequent

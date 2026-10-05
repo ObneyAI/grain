@@ -87,6 +87,49 @@
     (is (= 9 (.get ^java.nio.ByteBuffer grown)))
     (is (= 0 (.remaining ^java.nio.ByteBuffer (write-buffer (byte-array 0)))))))
 
+(deftest sequential-scans-reuse-only-read-transaction-cursors
+  (kv/put-batch! *cache* {:entries (mapv #(hash-map :k (.getBytes %) :v (.getBytes %)) ["a0" "a1" "b0"])})
+  (doseq [mode [:read :write]]
+    (let [cursors (atom #{}) with-cursor @#'core/with-scan-cursor
+          scan (fn [tx options]
+                 ((:reduce tx) options #(conj %1 (String. ^bytes (:k %2))) []))]
+      (with-redefs-fn {#'core/with-scan-cursor
+                      (fn [db txn spare f]
+                        (with-cursor db txn spare #(do (swap! cursors conj %) (f %))))}
+        #(kv/transact *cache* mode
+           (fn [tx]
+             (dotimes [_ 10]
+               (is (= ["a0" "a1"] (scan tx {:prefix (.getBytes "a")})))
+               (is (= ["a1" "a0"] (scan tx {:prefix (.getBytes "a") :reverse? true})))
+               (is (= [] (scan tx {:prefix (.getBytes "missing")})))
+               (is (= "b0" ((:reduce tx) {:prefix (.getBytes "b")}
+                            (fn [_ row] (reduced (String. ^bytes (:k row)))) nil)))))))
+      (is (= (if (= mode :read) 1 40) (count @cursors)))
+      (doseq [^org.lmdbjava.Cursor cursor @cursors]
+        (is (thrown? org.lmdbjava.Cursor$ClosedException (.first cursor)))))))
+
+(deftest reused-cursors-close-on-callback-and-reducer-failure
+  (kv/put! *cache* {:k (.getBytes "a") :v (.getBytes "value")})
+  (doseq [failure [:callback :reducer :caught-reducer]]
+    (let [cursors (atom #{}) with-cursor @#'core/with-scan-cursor
+          fail (fn [& _] (throw (ex-info "Expected scan failure" {})))]
+      (with-redefs-fn {#'core/with-scan-cursor
+                      (fn [db txn spare f]
+                        (with-cursor db txn spare #(do (swap! cursors conj %) (f %))))}
+        #(is (thrown? clojure.lang.ExceptionInfo
+               (kv/transact *cache* :read
+                 (fn [tx]
+                   ((:reduce tx) {} conj [])
+                   (case failure
+                     :callback (fail)
+                     :reducer ((:reduce tx) {} fail nil)
+                     :caught-reducer (try ((:reduce tx) {} fail nil)
+                                          (catch clojure.lang.ExceptionInfo _ nil))))))))
+      (is (= 1 (count @cursors)))
+      (doseq [^org.lmdbjava.Cursor cursor @cursors]
+        (is (thrown? org.lmdbjava.Cursor$ClosedException (.first cursor))))
+      (is (= 1 (kv/transact *cache* :read #((:reduce %) {} (fn [n _] (inc n)) 0)))))))
+
 (deftest shared-scratch-rejects-escaped-and-cross-thread-operations
   (let [k (.getBytes "key") escaped (atom nil)]
     (kv/put! *cache* {:k k :v (.getBytes "value")})

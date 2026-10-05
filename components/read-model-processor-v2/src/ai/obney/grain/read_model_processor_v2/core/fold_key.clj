@@ -1,13 +1,17 @@
 (ns ai.obney.grain.read-model-processor-v2.core.fold-key
   "Self-delimiting ordered keys for local keyed-fold storage."
-  (:import [java.io ByteArrayOutputStream DataOutputStream ByteArrayInputStream DataInputStream]
+  (:import [java.io ByteArrayOutputStream DataOutputStream EOFException]
+           [java.nio ByteBuffer BufferUnderflowException]
            [java.security MessageDigest]
            [java.util UUID]))
 
 (defn join ^bytes [& arrays]
-  (let [out (ByteArrayOutputStream.)]
-    (doseq [^bytes a arrays] (.write out a 0 (alength a)))
-    (.toByteArray out)))
+  (let [out (byte-array (reduce (fn [size ^bytes a] (+ size (alength a))) 0 arrays))]
+    (reduce (fn [offset ^bytes a]
+              (System/arraycopy a 0 out offset (alength a))
+              (+ offset (alength a)))
+            0 arrays)
+    out))
 
 (defn- write-key! [^DataOutputStream out value]
   (cond
@@ -39,13 +43,21 @@
     (write-key! (DataOutputStream. out) value)
     (.toByteArray out)))
 
-(defn- read-key! [^DataInputStream in]
-  (case (.readUnsignedByte in)
+(defn tuple-prefix
+  "Encode complete leading vector components, omitting only the outer terminator."
+  ^bytes [components]
+  (when-not (vector? components)
+    (throw (ex-info "Tuple prefix must be a vector" {:prefix components})))
+  (let [encoded (encode components)]
+    (java.util.Arrays/copyOf encoded (dec (alength encoded)))))
+
+(defn- read-key! [^ByteBuffer in]
+  (case (bit-and 255 (.get in))
     1 nil 2 false 3 true
     16 (let [out (StringBuilder.)
-             read-unit (fn [] (let [b (.readUnsignedByte in)]
+             read-unit (fn [] (let [b (bit-and 255 (.get in))]
                                (if (zero? b)
-                                 (case (.readUnsignedByte in) 0 -1 255 0
+                                 (case (bit-and 255 (.get in)) 0 -1 255 0
                                    (throw (ex-info "Invalid ordered string escape" {}))) b)))]
          (loop []
            (let [hi (read-unit)]
@@ -53,20 +65,22 @@
                (let [lo (read-unit)]
                  (when (= -1 lo) (throw (ex-info "Truncated ordered character" {})))
                  (.append out (char (+ (bit-shift-left hi 8) lo))) (recur))))))
-    32 (bit-xor (.readLong in) Long/MIN_VALUE)
-    48 (UUID. (.readLong in) (.readLong in))
+    32 (bit-xor (.getLong in) Long/MIN_VALUE)
+    48 (UUID. (.getLong in) (.getLong in))
     56 (keyword (subs (read-key! in) 1))
     64 (loop [out []]
-         (.mark in 1)
-         (if (zero? (.readUnsignedByte in)) out
+         (.mark in)
+         (if (zero? (.get in)) out
            (do (.reset in) (recur (conj out (read-key! in))))))
     (throw (ex-info "Invalid ordered key type" {}))))
 
 (defn decode
   "Decode one ordered value, optionally within a compact metadata field."
   ([^bytes value] (decode value 0 (alength value)))
-  ([^bytes value offset length]
-   (read-key! (DataInputStream. (ByteArrayInputStream. value offset length)))))
+  ([^bytes value ^long offset ^long length]
+   (try
+     (read-key! (ByteBuffer/wrap value offset length))
+     (catch BufferUnderflowException _ (throw (EOFException.))))))
 
 (defn descending ^bytes [^bytes key]
   (byte-array (map #(unchecked-byte (bit-xor 255 (bit-and 255 %))) key)))

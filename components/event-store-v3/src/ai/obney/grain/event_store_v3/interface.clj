@@ -32,6 +32,12 @@
   [event-store]
   (core/tenants event-store))
 
+(defn head
+  "Return the tenant's latest committed event ID (including transaction markers),
+   or nil for an empty tenant. Built-in stores read only durable metadata."
+  [event-store tenant-id]
+  (core/head event-store tenant-id))
+
 (defn append
   [event-store args]
   (core/append event-store args))

@@ -26,9 +26,16 @@
     (doseq [^bytes value fields] (.put out value))
     (.array out)))
 
-(defn value [^bytes data field]
+(defn value [^bytes data ^long field]
   (let [start (int-at data (* 4 field)) end (int-at data (* 4 (inc field)))]
     (key/decode data start (- end start))))
+
+(defn values
+  "Decode requested fields directly into a detached immutable map."
+  [data indexes fields]
+  (persistent!
+   (reduce-kv (fn [out i index] (assoc! out index (value data (nth fields i))))
+              (transient {}) indexes)))
 
 (defn compare-field ^long [^bytes a ^bytes b ^long field]
   (Arrays/compareUnsigned a (int-at a (* 4 field)) (int-at a (* 4 (inc field)))

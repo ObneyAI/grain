@@ -333,7 +333,8 @@
 
 (defn values
   "Return a reducible of {:key instance-id :value result}. Selection accepts
-   :index (default :identity), :direction and :equals. A standalone reduction
+   :index (default :identity), :direction, and either :equals or a vector :prefix
+   matching complete leading components of vector index values. A standalone reduction
    catches up once and owns a snapshot; inside a read-session consume it there."
   ([context name] (values context name {}))
   ([context name selection]
@@ -342,7 +343,12 @@
 (defn page
   "Read an indexed result page with exact counts and clamping. Returns :entries,
    :total, :total-pages, :page, :page-size, and progress/work counters. Options:
-   :index, :direction, :equals, :page (1 by default), :limit (25 by default).
+   :index, :direction, :equals, vector :prefix or vector of vectors :prefixes,
+   :page (1 by default), :limit (25 by default). Selection forms are mutually
+   exclusive. Prefixes match complete leading vector components; :prefix []
+   selects all vectors. :prefixes pages their union in global index order,
+   deduplicating overlaps; :prefixes [] selects nothing. Counts/navigation scale
+   with the number of ranges, without scanning their members or skipped pages.
    :rows-examined counts selected index rows; :rank-entries-examined separately
    counts navigation entries visited, including repeated visits. Only returned
    result payloads are decoded. Rank navigation has probabilistic bounds."
@@ -372,8 +378,11 @@
 (defn key-page
   "Order distinct candidate keys belonging to this model's included results.
    Options: :index (:identity), :direction (:asc), :page (1), :limit (25), and
-   optional :sort-value (fn [id stored-index-value] computed-order-value).
-   With :indexes [names...], the callback receives a map of those stored values.
+   optional :sort-value (fn [id stored-index-value] computed-order-value) and
+   :include? (fn [id stored-index-value] accepted?). With :indexes [names...],
+   callbacks receive a map of those stored values, decoded once per candidate.
+   Only accepted candidates are sorted and counted; :sort-keys-read includes
+   rejected candidates. Predicates run once per distinct present candidate.
    The three-argument form considers every included identity in a single pass.
    Returns :keys, exact counts/clamped page and :sort-keys-read. Reads compact
    forward metadata for candidates; never decodes their full result/state.

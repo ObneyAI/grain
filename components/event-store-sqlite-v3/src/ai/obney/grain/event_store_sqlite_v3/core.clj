@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
-            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
+            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append single-tag-union]]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.event-store-sqlite-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
@@ -207,65 +207,66 @@
                   ORDER BY e.id
 
    Returns {:sql \"...\" :params [...]}."
-  [{:keys [tenant-id tags types after as-of reverse? limit]}]
-  (let [tenant-str (str tenant-id)
-        order-dir  (if reverse? " DESC" "")]
-    (if (seq tags)
-      (let [tag-strs (mapv tag->str tags)
-            type-strs (when types (mapv #(str ":" (key-fn %)) types))
-            where-parts (cond-> ["e.tenant_id = ?"
-                                 (str "t.tag IN (" (placeholders (count tag-strs)) ")")]
-                          types  (conj (str "e.type IN (" (placeholders (count type-strs)) ")"))
-                          after  (conj "e.id > ?")
-                          as-of  (conj "e.id <= ?"))
-            ;; :limit must be the LAST positional param — after the HAVING count.
-            params (cond-> (into [tenant-str] tag-strs)
-                     types  (into type-strs)
-                     after  (conj (str after))
-                     as-of  (conj (str as-of))
-                     true   (conj (count tag-strs))
-                     limit  (conj limit))
-            ;; CROSS JOIN is a SQLite planner directive: it pins the join order
-            ;; so the query drives from the event_tags PK (tenant_id, tag,
-            ;; event_id) and probes events per matching tag row. A plain JOIN
-            ;; lets the planner drive from events on a database with no
-            ;; statistics, which scans the tenant's entire stream per read.
-            sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
-                     "FROM event_tags t CROSS JOIN events e "
-                     "ON e.tenant_id = t.tenant_id AND e.id = t.event_id "
-                     "WHERE " (string/join " AND " where-parts) " "
-                     "GROUP BY e.id "
-                     "HAVING COUNT(DISTINCT t.tag) = ? "
-                     "ORDER BY e.id" order-dir
-                     (when limit " LIMIT ?"))]
-        {:sql sql :params params})
-      (let [type-strs (when types (vec (distinct (map #(str ":" (key-fn %)) types))))
-            ;; Each equality branch can stream an id range from the composite
-            ;; index; SQLite merges these streams without sorting dense results.
-            ;; Keep the IN form for empty/unfiltered queries and above SQLite's
-            ;; default 500-term compound-select limit, preserving large filters.
-            union? (<= 2 (count type-strs) 500)
-            where-parts (cond-> ["tenant_id = ?"]
-                          types (conj (if union? "type = ?"
-                                          (str "type IN (" (placeholders (count type-strs)) ")")))
-                          after (conj "id > ?")
-                          as-of (conj "id <= ?"))
-            branch-params (fn [selected-types]
-                            (cond-> (into [tenant-str] selected-types)
-                              after (conj (str after))
-                              as-of (conj (str as-of))))
-            params (cond-> (if union?
-                             (into [] (mapcat #(branch-params [%])) type-strs)
-                             (branch-params type-strs))
-                     limit (conj limit))
-            branch (str "SELECT id, time, type, data FROM events "
-                        "WHERE " (string/join " AND " where-parts))
-            sql (str (if union?
-                       (string/join " UNION ALL " (repeat (count type-strs) branch))
-                       branch) " "
-                     "ORDER BY id" order-dir
-                     (when limit " LIMIT ?"))]
-        {:sql sql :params params}))))
+  ([query] (build-single-query query false))
+  ([{:keys [tenant-id tags types after as-of reverse? limit]} any-tag?]
+   (let [tenant-str (str tenant-id)
+         order-dir  (if reverse? " DESC" "")]
+     (if (seq tags)
+       (let [tag-strs (mapv tag->str tags)
+             type-strs (when types (mapv #(str ":" (key-fn %)) types))
+             where-parts (cond-> ["e.tenant_id = ?"
+                                  (str "t.tag IN (" (placeholders (count tag-strs)) ")")]
+                           types  (conj (str "e.type IN (" (placeholders (count type-strs)) ")"))
+                           after  (conj "e.id > ?")
+                           as-of  (conj "e.id <= ?"))
+             ;; :limit must be the LAST positional param — after the HAVING count.
+             params (cond-> (into [tenant-str] tag-strs)
+                      types  (into type-strs)
+                      after  (conj (str after))
+                      as-of  (conj (str as-of))
+                      (not any-tag?) (conj (count tag-strs))
+                      limit  (conj limit))
+             ;; CROSS JOIN is a SQLite planner directive: it pins the join order
+             ;; so the query drives from the event_tags PK (tenant_id, tag,
+             ;; event_id) and probes events per matching tag row. A plain JOIN
+             ;; lets the planner drive from events on a database with no
+             ;; statistics, which scans the tenant's entire stream per read.
+             sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
+                      "FROM event_tags t CROSS JOIN events e "
+                      "ON e.tenant_id = t.tenant_id AND e.id = t.event_id "
+                      "WHERE " (string/join " AND " where-parts) " "
+                      "GROUP BY e.id "
+                      (when-not any-tag? "HAVING COUNT(DISTINCT t.tag) = ? ")
+                      "ORDER BY e.id" order-dir
+                      (when limit " LIMIT ?"))]
+         {:sql sql :params params})
+       (let [type-strs (when types (vec (distinct (map #(str ":" (key-fn %)) types))))
+             ;; Each equality branch can stream an id range from the composite
+             ;; index; SQLite merges these streams without sorting dense results.
+             ;; Keep the IN form for empty/unfiltered queries and above SQLite's
+             ;; default 500-term compound-select limit, preserving large filters.
+             union? (<= 2 (count type-strs) 500)
+             where-parts (cond-> ["tenant_id = ?"]
+                           types (conj (if union? "type = ?"
+                                           (str "type IN (" (placeholders (count type-strs)) ")")))
+                           after (conj "id > ?")
+                           as-of (conj "id <= ?"))
+             branch-params (fn [selected-types]
+                             (cond-> (into [tenant-str] selected-types)
+                               after (conj (str after))
+                               as-of (conj (str as-of))))
+             params (cond-> (if union?
+                              (into [] (mapcat #(branch-params [%])) type-strs)
+                              (branch-params type-strs))
+                      limit (conj limit))
+             branch (str "SELECT id, time, type, data FROM events "
+                         "WHERE " (string/join " AND " where-parts))
+             sql (str (if union?
+                        (string/join " UNION ALL " (repeat (count type-strs) branch))
+                        branch) " "
+                      "ORDER BY id" order-dir
+                      (when limit " LIMIT ?"))]
+         {:sql sql :params params})))))
 
 (defn- make-reducible
   "Create a reducible that opens a read-only transaction, runs `sql` with `params`,
@@ -299,21 +300,26 @@
     (make-reducible pool sql params)))
 
 (defn- read-batch
-  "Build a UNION ALL of sub-queries and dedupe by id. Each sub-query produces
+  "Combine compatible singleton-tag filters; otherwise union and dedupe by id.
+   Each sub-query produces
    rows with byte-identical (id, time, type, data) columns for the same event,
    so picking any representative per id (via GROUP BY id) is correct."
   [event-store queries]
-  (let [sub (mapv build-single-query queries)
-        union-sql (str "SELECT id, time, type, data FROM ("
-                       (string/join " UNION ALL "
-                                    (map #(str "SELECT id, time, type, data FROM ("
-                                               (:sql %)
-                                               ")")
-                                         sub))
-                       ") GROUP BY id ORDER BY id")
-        all-params (into [] (mapcat :params) sub)
-        pool (get-in event-store [:state ::connection-pool])]
-    (make-reducible pool union-sql all-params)))
+  (if-let [combined (single-tag-union queries)]
+    ;; Internal batch union; ordinary single-query tags remain conjunctive.
+    (let [{:keys [sql params]} (build-single-query combined true)]
+      (make-reducible (get-in event-store [:state ::connection-pool]) sql params))
+    (let [sub (mapv build-single-query queries)
+          union-sql (str "SELECT id, time, type, data FROM ("
+                         (string/join " UNION ALL "
+                                      (map #(str "SELECT id, time, type, data FROM ("
+                                                 (:sql %)
+                                                 ")")
+                                           sub))
+                         ") GROUP BY id ORDER BY id")
+          all-params (into [] (mapcat :params) sub)
+          pool (get-in event-store [:state ::connection-pool])]
+      (make-reducible pool union-sql all-params))))
 
 (defn read
   [event-store args]
@@ -709,6 +715,11 @@
   compaction/EventCompaction
   (estimate [this request] (estimate-compaction this request))
   (compact! [this request] (compact-events! this request)))
+
+(extend-type SqliteEventStore
+  p/EventStoreHead
+  (head [this tenant-id]
+    (committed-last-event-id (get-in this [:state ::connection-pool]) tenant-id)))
 
 (defmethod start-event-store :sqlite
   [config]

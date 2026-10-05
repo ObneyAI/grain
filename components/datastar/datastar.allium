@@ -587,6 +587,13 @@ surface CheckedUiAuthoring {
         -- unregistered target is rejected at authoring time, so UI code cannot
         -- drift from the commands and queries that actually exist.
 
+    @guarantee RemovedIndexedRowsStayRemoved
+        -- A value binding into a nested collection may outlive its parent row
+        -- briefly while a server patch is in flight. If that parent no longer
+        -- exists, reading the binding must neither recreate it nor throw; the
+        -- control displays an empty value and ignores writes until its parent
+        -- exists again. Present rows retain ordinary two-way value binding.
+
     @guarantee ExplicitPayloadsOnly
         -- An action sends only the values the author names in its payload;
         -- ambient page state is never posted implicitly. This keeps what a

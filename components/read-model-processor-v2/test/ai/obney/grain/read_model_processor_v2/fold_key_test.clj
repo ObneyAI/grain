@@ -5,6 +5,18 @@
 (defn encoded-order [xs encode]
   (sort #(java.util.Arrays/compareUnsigned ^bytes (encode %1) ^bytes (encode %2)) xs))
 
+(deftest joined-storage-keys-preserve-bytes-and-own-their-buffer
+  (let [a (byte-array (map unchecked-byte (range 256)))
+        b (key/encode ["a\u0000b" :catalog/id 42])
+        expected (into (vec a) b)
+        joined (key/join a (byte-array 0) b)]
+    (is (= expected (vec joined)))
+    (is (= [] (vec (key/join))))
+    (is (= (vec a) (vec (key/join a))))
+    (aset-byte a 0 (byte 99))
+    (aset-byte b 0 (byte 99))
+    (is (= expected (vec joined)))))
+
 (deftest prefix-upper-bounds
   (doseq [[prefix end] [[[0] [1]] [[1 -1] [2]] [[1 2 -1] [1 3]]
                         [[-2 -1] [-1]] [[-1] nil] [[-1 -1] nil] [[] nil]]]
@@ -27,6 +39,27 @@
       (is (not= a (take (count a) b)))))
   (doseq [unsupported [1.1 1/2 (inc (bigint Long/MAX_VALUE)) {} #{} '(1)]]
     (is (thrown? clojure.lang.ExceptionInfo (key/encode unsupported)))))
+
+(deftest ordered-decoding-preserves-values-and-field-boundaries
+  (doseq [value [nil false true Long/MIN_VALUE -1 0 1 Long/MAX_VALUE
+                 #uuid "00000000-0000-0000-0000-000000000000"
+                 #uuid "ffffffff-ffff-ffff-ffff-ffffffffffff"
+                 :catalog/course :plain "" "a\u0000b" "\ud83d\ude00" "\ud800"
+                 [] [nil false ["nested" 42 [:catalog/course true]]]
+                 (String. (char-array (map char (range 65536))))]]
+    (let [encoded (key/encode value)
+          data (key/join (byte-array [99 98 97]) encoded (key/encode "following field"))]
+      (is (= value (key/decode encoded)))
+      (is (= value (key/decode data 3 (alength encoded))))
+      (is (thrown? java.io.EOFException (key/decode data 3 (dec (alength encoded))))
+          "A truncated field must not consume its following field")
+      (let [decoded (key/decode data 3 (alength encoded))]
+        (java.util.Arrays/fill data (byte 0))
+        (is (= value decoded) "Results do not retain the mutable input view"))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid ordered string escape"
+                       (key/decode (byte-array [16 0 1]))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Truncated ordered character"
+                       (key/decode (byte-array [16 1 0 0])))))
 
 (deftest string-encoding-preserves-stored-bytes
   ;; These are the existing wire bytes, expressed as unsigned decimal values.

@@ -964,11 +964,26 @@
   [node]
   (ir* node [] (java.util.IdentityHashMap.)))
 
+(defn- indexed-parent-present
+  [value]
+  (let [collection (:collection value)]
+    (when (indexed? collection)
+      (let [parent (expr-value (:collection collection))
+            index (expr-value (:index collection))]
+        (string/join " && "
+                     (remove nil? [(indexed-parent-present collection)
+                                   (str parent " != null")
+                                   (str "Object.hasOwn(" parent ", " index ")")
+                                   (str (expr-value collection) " != null")]))))))
+
 (defn- indexed-value-binding-attrs
   [value]
   (let [target (target-ref value)
-        sync (str target " = el.value;")]
-    {:data-effect (str "el.value = " target ";")
+        present (indexed-parent-present value)
+        read (str "el.value = " target ";")
+        sync (str target " = el.value;")
+        sync (if present (str "if (" present ") { " sync " }") sync)]
+    {:data-effect (if present (str "if (" present ") { " read " } else { el.value = ''; }") read)
      :data-on:input sync
      :data-on:change sync}))
 

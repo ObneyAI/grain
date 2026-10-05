@@ -73,9 +73,16 @@
                (rmp/index-groups ctx name :group ["same" nil "absent" "same"])))
         (is (= 3 (count (filter #(= :index-group (:operation %)) @observed))))
         (is (= [] (rmp/index-groups ctx name :group [])))
+        (is (= [{:value "same" :total 2}] (rmp/index-groups ctx name :group #{"same" "absent"})))
         (doseq [direction [:asc :desc]]
           (let [selection {:index :group :equals "same" :direction direction}]
             (reset! observed [])
+            (is (= ["b"] (rmp/index-keys ctx name (assoc selection :limit 1))))
+            (is (= ["b" "d"] (rmp/index-keys ctx name (assoc selection :offset 0 :limit 10))))
+            (is (= [] (rmp/index-keys ctx name (assoc selection :equals "missing"))))
+            (is (= 3 (count (filter #(= :index-entry (:operation %)) @observed))))
+            (is (empty? (filter #(= :rank-entry (:operation %)) @observed))
+                "A group's first slice needs no rank navigation")
             (is (= ["d"] (rmp/index-keys ctx name (assoc selection :offset 1 :limit 1))))
             (is (= [] (rmp/index-keys ctx name (assoc selection :offset 2))))
             (is (= {:rank 1 :present? true} (rmp/index-rank ctx name selection "d")))
@@ -103,6 +110,8 @@
                (into {} (map (juxt :key :value)) (rmp/index-values prepared name [:group]))))
         (is (= [{:key "b" :value {:group "same" :identity "b"}}]
                (into [] (rmp/index-values prepared name [:group :identity] ["b" "absent" "b" "excluded"]))))
+        (is (= [{:key "b" :value {:group "same"}}]
+               (into [] (rmp/index-values prepared name [:group] #{"b" "absent" "excluded"}))))
         (is (empty? (filter #(#{:result-decoded :state-decoded :event-applied} (:operation %)) @observed)))
         (reset! observed [])
         (is (= 1 (count (into [] (take 1) (rmp/index-values prepared name [:group])))))
@@ -124,6 +133,59 @@
     (is (= [] (into [] (rmp/index-values (assoc ctx :tenant-id (random-uuid)) name [:group]))))
     (is (thrown? Exception (rmp/index-values ctx name [:absent])))
     (is (thrown? Exception (rmp/index-values ctx name [:group] nil)))))
+
+(deftest forward-metadata-reductions-are-detached-and-reusable
+  (let [fields (mapv #(keyword (str "field-" %)) (range 12))
+        first-values (zipmap fields (range 12))
+        second-values (zipmap fields (repeat nil))
+        name (register! (fn [_ event] (select-keys event fields))
+                        {:indexes (zipmap fields fields)})]
+    (append! [(assoc first-values :owner 1) (assoc second-values :owner 2)])
+    (rmp/read-session *ctx* [name]
+      (fn [ctx]
+        (let [rows (rmp/index-values ctx name fields [1N 1 2N 2])
+              expected [{:key 1 :value first-values} {:key 2 :value second-values}]
+              retained (into [] rows)]
+          (is (= expected retained))
+          (is (= expected (into [] rows)) "Each reduction has fresh duplicate tracking")
+          (is (= expected retained) "Later decoding cannot mutate retained metadata")
+          (is (= [{:key 1 :value {}}] (into [] (rmp/index-values ctx name [] [1]))))
+        (is (= [{:key 1 :value first-values}]
+               (into [] (take 1)
+                     (rmp/index-values ctx name fields
+                                       (concat [1] (lazy-seq (throw (ex-info "Unused identities were consumed" {})))))))))))))
+
+(deftest candidate-filtering-shares-metadata-with-ordering
+  (let [name (register! (fn [_ e] (select-keys e [:score :included?]))
+                        {:include? :included? :indexes {:score :score}})
+        observed (atom []) ctx (assoc *ctx* :read-model/observer #(swap! observed conj %))
+        predicates (atom []) orders (atom [])
+        options {:indexes [:score] :index :score :page 99 :limit 1
+                 :include? (fn [id values] (swap! predicates conj [id values]) (some? (:score values)))
+                 :sort-value (fn [id values] (swap! orders conj id) (:score values))}]
+    (append! [{:owner "a" :score 2 :included? true}
+              {:owner "b" :score nil :included? true}
+              {:owner "c" :score 1 :included? true}
+              {:owner "excluded" :score 0 :included? false}])
+    (rmp/read-session ctx [name]
+      (fn [prepared]
+        (reset! observed [])
+        (let [page (rmp/key-page prepared name ["a" "b" "a" "absent" "excluded" "c"] options)]
+          (is (= ["a"] (:keys page)))
+          (is (= [2 2 2 3] (mapv page [:total :total-pages :page :sort-keys-read])))
+          (is (= [["a" {:score 2}] ["b" {:score nil}] ["c" {:score 1}]] @predicates))
+          (is (= ["a" "c"] @orders))
+          (is (= 3 (count (filter #(= :sort-key-read (:operation %)) @observed))))
+          (is (empty? (filter #(#{:result-decoded :state-decoded} (:operation %)) @observed))))
+        (is (= ["c"] (:keys (rmp/key-page prepared name (assoc options :direction :desc)))))
+        (is (= ["c"] (:keys (rmp/key-page prepared name (dissoc (assoc options :page 1) :sort-value)))))
+        (is (= {:keys [] :total 0 :total-pages 1 :page 1 :page-size 1 :sort-keys-read 3}
+               (rmp/key-page prepared name (assoc options :include? (constantly false)))))
+        (is (= ["a"] (:keys (rmp/key-page prepared name {:index :score :include? (fn [_ score] (= 2 score))}))))))
+    (is (empty? (:keys (rmp/key-page (assoc ctx :tenant-id (random-uuid)) name options))))
+    (is (thrown? Exception (rmp/key-page ctx name {:include? 42})))
+    (append! [{:owner "c" :score nil :included? true}])
+    (is (= ["a"] (:keys (rmp/key-page ctx name options))))))
 
 (deftest incompatible-storage-is-ignored-by-normal-materialization
   (let [name (register! (fn [_ e] (:group e)) {:indexes {:group identity}})
@@ -147,7 +209,9 @@
   (let [name (register! (fn [_ e] (select-keys e [:score :included?]))
                         {:include? :included? :indexes {:score :score}})
         scores [nil false true "" "a" "a\u0000" "aa" "\uffff" -10 0 10
-                :a :b #uuid "00000000-0000-0000-0000-000000000001" [] [nil] ["a" 1]]
+                :a :b #uuid "00000000-0000-0000-0000-000000000001"
+                [] [nil] [nil "a"] ["a" 1] ["a\u0000" 2] ["aa" 3]
+                [true "a"] [true "b"] [false "a"] [["a"] 1] [["a" 1] 2]]
         ids (vec (concat [1 "1" :a] (map #(str "id-" %) (range 80)) (repeatedly 5 random-uuid)))
         expected (atom {}) random (java.util.Random. 33)
         compare-rows (fn [direction [id-a a] [id-b b]]
@@ -165,11 +229,19 @@
         (doseq [{:keys [owner] :as event} events]
           (swap! expected assoc owner (select-keys event [:score :included?]))))
       (doseq [direction [:asc :desc]
-              selection (cons {} (map #(hash-map :equals %) (conj scores "absent")))]
+              selection (concat [{}] (map #(hash-map :equals %) (conj scores "absent"))
+                                (map #(hash-map :prefix %)
+                                     [[] [nil] [true] [false] ["a"] ["a\u0000"] ["aa"]
+                                      [["a"]] [["a" 1]] ["a" 1] ["absent"]]))]
         (let [rows (->> @expected
                         (filter (fn [[_ v]] (and (:included? v)
                                                 (or (not (contains? selection :equals))
-                                                    (= (:score v) (:equals selection))))))
+                                                    (= (:score v) (:equals selection)))
+                                                (or (not (contains? selection :prefix))
+                                                    (and (vector? (:score v))
+                                                         (<= (count (:prefix selection)) (count (:score v)))
+                                                         (= (:prefix selection)
+                                                            (subvec (:score v) 0 (count (:prefix selection)))))))))
                         (sort (partial compare-rows direction)))
               expected-keys (mapv first rows)
               options (merge {:index :score :direction direction} selection)]
@@ -182,6 +254,106 @@
               (is (= (vec (take 7 (drop (* 7 (dec page-number)) expected-keys)))
                      (mapv :key (:entries page)))))))))
     (is (= @expected (into {} (map (fn [id] [id (rmp/state *ctx* name id)])) ids)))))
+
+(deftest tuple-prefix-pages-seek-and-count-without-scanning-matches
+  (let [name (register! (fn [_ e] (select-keys e [:score])) {:indexes {:score :score}})
+        random (java.util.Random. 72)
+        seen (atom []) ctx (assoc *ctx* :read-model/observer #(swap! seen conj %))]
+    (with-redefs [ranked/random-hash (fn [_] (.nextInt random))]
+      (append! (mapv #(hash-map :owner (format "%05d" %)
+                                :score [(< % 3000) (quot % 2)]) (range 4096)))
+      (rmp/page ctx name {}))
+    (doseq [direction [:asc :desc]]
+      (reset! seen [])
+      (let [page (rmp/page ctx name {:index :score :prefix [true] :direction direction :page 120})]
+        (is (= 3000 (:total page)))
+        (is (= 120 (:page page) (:total-pages page)))
+        (is (= (if (= direction :asc) "02975" "00025") (:key (first (:entries page)))))
+        (is (= 25 (:rows-examined page) (:results-decoded page)))
+        (is (< (:rank-entries-examined page) 1000))
+        (is (= 25 (count (filter #(= :result-decoded (:operation %)) @seen))))
+        (is (empty? (filter #(#{:state-decoded :event-applied :sort-key-read} (:operation %)) @seen)))))
+    (let [other (assoc ctx :tenant-id (random-uuid))]
+      (append! other [{:owner "only-other" :score [true 0]}])
+      (is (= ["only-other"] (page-keys other name {:index :score :prefix [true]})))
+      (is (= 3000 (:total (rmp/page ctx name {:index :score :prefix [true]})))))
+    (doseq [options [{:prefix true} {:prefix nil} {:prefix '(true)}
+                     {:prefix [true] :equals [true 0]}]]
+      (is (thrown? clojure.lang.ExceptionInfo (rmp/page ctx name (assoc options :index :score))))
+      (is (thrown? clojure.lang.ExceptionInfo (rmp/values ctx name (assoc options :index :score)))))))
+
+(deftest tuple-prefix-union-pages-match-canonical-membership
+  (let [name (register! (fn [_ e] (select-keys e [:score :included?]))
+                        {:indexes {:score :score} :include? :included?})
+        scores [nil true "a" [] [nil] [true 0] [false 1] ["a" 1] ["a" 2]
+                ["a\u0000" 1] ["ab" 0] ["b" 0] [["nested"] 1] ["" 0]]
+        ids (mapv #(if (even? %) (str %) (java.util.UUID. 12 %)) (range 120))
+        random (java.util.Random. 713)
+        matches? (fn [prefix value]
+                   (and (vector? value) (<= (count prefix) (count value))
+                        (= prefix (subvec value 0 (count prefix)))))]
+    (dotimes [_ 3]
+      (append! (mapv (fn [id] {:owner id :score (nth scores (.nextInt random (count scores)))
+                               :included? (.nextBoolean random)}) ids))
+      (doseq [direction [:asc :desc]]
+        (let [ordered (into [] (rmp/values *ctx* name {:index :score :direction direction}))]
+          (doseq [prefixes [[] [[]] [[true] [false]] [["b"] ["a"] ["a"]]
+                            [["a" 1] ["a"] ["absent"]] [[["nested"]] [""]]
+                            [[nil] [true]] [["a\u0000"] ["ab"]] [["missing"]]
+                            [["a"] [] ["b"]]]]
+            (let [expected (into [] (comp (filter #(some (fn [prefix] (matches? prefix (get-in % [:value :score]))) prefixes))
+                                         (map :key)) ordered)
+                  pages (max 1 (quot (+ (count expected) 6) 7))]
+              (doseq [requested (conj (vec (range 1 (inc pages))) 999)]
+                (let [page (rmp/page *ctx* name {:index :score :direction direction :prefixes prefixes
+                                                :page requested :limit 7})
+                      page-number (min requested pages)]
+                  (is (= (count expected) (:total page)))
+                  (is (= pages (:total-pages page)))
+                  (is (= page-number (:page page)))
+                  (is (= (vec (take 7 (drop (* 7 (dec page-number)) expected)))
+                         (mapv :key (:entries page)))))))))))
+    (doseq [options [{:prefixes nil} {:prefixes '([true])} {:prefixes [true]}
+                     {:prefixes [[] nil]} {:prefixes [[]] :equals nil}
+                     {:prefixes [] :prefix []}]]
+      (is (thrown? clojure.lang.ExceptionInfo (rmp/page *ctx* name (assoc options :index :score)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (rmp/values *ctx* name {:index :score :prefixes [[]]}))
+        "Union selection is a page capability, not an implicit traversal API")))
+
+(deftest tuple-prefix-union-pages-skip-gaps-and-remain-snapshot-bound
+  (let [name (register! (fn [_ e] (select-keys e [:score :included?]))
+                        {:indexes {:score :score} :include? :included?})
+        random (java.util.Random. 321)
+        work (atom []) ctx (assoc *ctx* :read-model/observer #(swap! work conj %))
+        selection {:index :score :prefixes [["right"] ["left"] ["left" 0]] :limit 25}]
+    (with-redefs [ranked/random-hash (fn [_] (.nextInt random))]
+      (append! (mapv #(hash-map :owner (format "%05d" %) :included? true
+                                :score [(cond (< % 1500) "left" (< % 3500) "middle" :else "right")
+                                        (quot % 2)]) (range 5000)))
+      (rmp/page ctx name selection))
+    (doseq [direction [:asc :desc]]
+      (reset! work [])
+      (let [page (rmp/page ctx name (assoc selection :page 119 :direction direction))]
+        (is (= 3000 (:total page)))
+        (is (= 120 (:total-pages page)))
+        (is (= (if (= direction :asc) "04950" "00048") (:key (first (:entries page)))))
+        (is (= 25 (:rows-examined page) (:results-decoded page)))
+        (is (= 25 (count (filter #(= :result-decoded (:operation %)) @work))))
+        (is (< (:rank-entries-examined page) 1500))
+        (is (not-any? #(#{:state-decoded :sort-key-read :event-applied} (:operation %)) @work))))
+    (rmp/read-session ctx [name]
+      (fn [snapshot]
+        (let [before (rmp/page snapshot name selection)]
+          (append! [{:owner "00000" :score ["middle" 0] :included? true}
+                    {:owner "00001" :score ["left" 0] :included? false}])
+          (is (= (select-keys before [:entries :total])
+                 (select-keys (rmp/page snapshot name selection) [:entries :total]))))))
+    (is (= 2998 (:total (rmp/page ctx name selection))))
+    (let [other (assoc ctx :tenant-id (random-uuid))]
+      (append! other [{:owner "other" :score ["left" 0] :included? true}])
+      (is (= ["other"] (page-keys other name selection)))
+      (is (= 2998 (:total (rmp/page ctx name selection)))))))
 
 (deftest deep-pages-and-equality-counts-skip-members
   (let [name (register! (fn [_ e] (select-keys e [:score])) {:indexes {:score :score}})
@@ -598,3 +770,44 @@
                               :result (fn [s] {:total (* 2 (:total (total s)))})})
     (is (= {:total 16} (rmp/value ctx name "a")))
     (is (= {:total 18} (rmp/value other name "a")))))
+
+
+(deftest warm-keyed-reads-use-the-committed-head-without-reading-events
+  (let [name (register! history-step {:result total})]
+    (append! (repeat 300 {:owner "a" :delta 1}))
+    (is (= {:total 300} (rmp/value *ctx* name "a")))
+    (with-redefs [es/read (fn [& _] (throw (ex-info "Unexpected event payload read" {})))]
+      (is (= {:total 300} (rmp/value *ctx* name "a")))
+      (is (= {:total 300} (:value (first (:entries (rmp/page *ctx* name {})))))))
+    (with-redefs [es/head (fn [& _] {:cognitect.anomalies/category :cognitect.anomalies/unavailable})]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"committed event-store head"
+                           (rmp/value *ctx* name "a"))))))
+
+(deftest candidate-page-prefix-selection-preserves-global-order-and-clamping
+  (let [rows (mapv (fn [i] {:owner (str i) :score (mod i 7)}) (range 203))
+        name (register! (fn [_ e] {:score (:score e)}) {:indexes {:score :score}})
+        candidate-ids (concat (map :owner (reverse rows)) ["absent" "0" "3"])]
+    (append! rows)
+    (rmp/read-session *ctx* [name]
+      (fn [ctx]
+        (doseq [direction [:asc :desc] computed? [false true] explicit? [false true]]
+          (let [order-value (if computed? (comp - :score) :score)
+                ordered (->> rows (filter #(odd? (:score %)))
+                             (sort-by (fn [row] [(cond-> (order-value row) (= direction :desc) -)
+                                                 (:owner row)]))
+                             (mapv :owner))
+                options (cond-> {:index :score :indexes [:score] :direction direction :limit 7
+                                 :include? (fn [_ value] (odd? (:score value)))}
+                          computed? (assoc :sort-value (fn [_ value] (order-value value))))
+                request (fn [options]
+                          (if explicit? (rmp/key-page ctx name candidate-ids options)
+                              (rmp/key-page ctx name options)))]
+            (doseq [page [1 3 13 99 Long/MAX_VALUE]]
+              (let [result (request (assoc options :page page))
+                    clamped (min page 13)
+                    offset (* 7 (dec clamped))]
+                (is (= (subvec ordered offset (min (count ordered) (+ offset 7))) (:keys result)))
+                (is (= [87 13 clamped 203] (mapv result [:total :total-pages :page :sort-keys-read])))))
+            (let [result (request (assoc options :page Long/MAX_VALUE :limit Long/MAX_VALUE))]
+              (is (= ordered (:keys result)))
+              (is (= [87 1 1] (mapv result [:total :total-pages :page]))))))))))

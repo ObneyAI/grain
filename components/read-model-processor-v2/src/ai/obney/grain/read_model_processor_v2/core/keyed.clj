@@ -188,8 +188,10 @@
           (write! tx (progress-key b) (assoc before-progress :watermark (:event/id (peek events)))))))))
 
 (defn- head [ctx]
-  (reduce (fn [_ event] (reduced (:event/id event))) nil
-          (es/read (:event-store ctx) {:tenant-id (:tenant-id ctx) :reverse? true :limit 1})))
+  (let [result (es/head (:event-store ctx) (:tenant-id ctx))]
+    (when (:cognitect.anomalies/category result)
+      (throw (ex-info "Cannot read the committed event-store head" result)))
+    result))
 
 (defn- catch-up! [ctx name d b through]
   (let [progress (kv/transact (:cache ctx) :read #(read-meta % (progress-key b)))
@@ -325,6 +327,14 @@
     (fn [tx b _ _read]
       (search/search-keys tx b (:searches d) options #(observe! ctx %1 %2)))))
 
+(defn- reduce-distinct [rf initial items]
+  (let [seen (volatile! (transient #{}))]
+    (reduce (fn [acc item]
+              (if (contains? @seen item) acc
+                (do (vreset! seen (conj! @seen item))
+                    (rf acc item))))
+            initial items)))
+
 (defn index-values [ctx name d indexes ids]
   (when-not (and (vector? indexes) (every? #(or (= :identity %) (contains? (:indexes d) %)) indexes))
     (throw (ex-info "Expected a vector of declared index names" {:model name :indexes indexes})))
@@ -336,50 +346,66 @@
             (let [step (fn [acc raw]
                          (observe! ctx :sort-key-read (alength ^bytes raw))
                          (rf acc {:key (sort-data/value raw 1)
-                                  :value (zipmap indexes (map #(sort-data/value raw %) fields))}))]
+                                  :value (sort-data/values raw indexes fields)}))]
               (if (some? ids)
-                (reduce (fn [acc id] (if-let [raw (read 11 id)] (step acc raw) acc)) initial (distinct ids))
+                (reduce-distinct (fn [acc id] (if-let [raw (read 11 id)] (step acc raw) acc)) initial ids)
                 ((:reduce tx) {:prefix (key/join b (byte-array [11]))}
                  (fn [acc {:keys [v]}] (step acc v)) initial)))))))))
 
 (defn key-page [ctx name d keys options]
-  (let [{:keys [index indexes direction page limit sort-value]
+  (let [{:keys [index indexes direction page limit sort-value include?]
          :or {index :identity direction :asc page 1 limit 25}} options]
-    (when-not (and (map? options) (every? #{:index :indexes :direction :page :limit :sort-value} (clojure.core/keys options))
+    (when-not (and (map? options) (every? #{:index :indexes :direction :page :limit :sort-value :include?} (clojure.core/keys options))
                    (or (= index :identity) (contains? (:indexes d) index))
                    (or (not (contains? options :indexes))
-                       (and sort-value (vector? indexes)
+                       (and (or sort-value include?) (vector? indexes)
                             (every? #(or (= :identity %) (contains? (:indexes d) %)) indexes)))
                    (#{:asc :desc} direction) (pos-int? page) (pos-int? limit)
-                   (or (nil? sort-value) (ifn? sort-value)))
+                   (or (nil? sort-value) (ifn? sort-value))
+                   (or (nil? include?) (ifn? include?)))
       (throw (ex-info "Invalid matching-key page" {:model name :options options})))
     (with-reader ctx name d
       (fn [tx b _d read]
         (let [field (sort-data/field (:indexes d) index)
               fields (mapv #(sort-data/field (:indexes d) %) indexes)
-              entries (java.util.ArrayList.)
+              comparator (sort-data/comparator field (= direction :desc) (some? sort-value))
+              ;; Keep the worst retained entry at the front, so later candidates
+              ;; outside the requested prefix can be discarded immediately.
+              entries (java.util.PriorityQueue. 11 (.reversed ^java.util.Comparator comparator))
+              wanted (long (min Long/MAX_VALUE (*' page limit)))
+              ;; Inline aset keeps these counters primitive; aset-long boxes
+              ;; its value argument on each candidate.
+              ^longs counts (long-array 2)
               collect! (fn [id raw]
                          (observe! ctx :sort-key-read (alength ^bytes raw))
-                         (let [computed (when sort-value
-                                          (key/encode
-                                            (sort-value id (if (some? indexes)
-                                                             (zipmap indexes (map #(sort-data/value raw %) fields))
-                                                             (sort-data/value raw field)))))]
-                           (.add entries (ai.obney.grain.read_model_processor_v2.core.sort_data.Entry.
-                                          id raw computed))))]
+                         (aset counts 0 (inc (aget counts 0)))
+                         (let [values (when (or include? sort-value)
+                                        (if (some? indexes)
+                                          (sort-data/values raw indexes fields)
+                                          (sort-data/value raw field)))]
+                           (when (or (nil? include?) (include? id values))
+                             (aset counts 1 (inc (aget counts 1)))
+                             (let [entry (ai.obney.grain.read_model_processor_v2.core.sort_data.Entry.
+                                          id raw (when sort-value (key/encode (sort-value id values))))]
+                               (if (< (.size entries) wanted)
+                                 (.add entries entry)
+                                 (when (neg? (.compare ^java.util.Comparator comparator entry (.peek entries)))
+                                   (.poll entries)
+                                   (.add entries entry)))))))]
           (if (= ::all keys)
             ((:reduce tx) {:prefix (key/join b (byte-array [11]))}
              (fn [_ {:keys [v]}] (collect! (sort-data/value v 1) v)) nil)
             (let [seen (java.util.HashSet.)]
               (doseq [id keys :when (.add seen id)]
                 (when-let [raw (read 11 id)] (collect! id raw)))))
-          (.sort entries (sort-data/comparator field (= direction :desc) (some? sort-value)))
-          (let [total (.size entries) pages (max 1 (quot (+ total (dec limit)) limit))
+          (let [^objects ordered (.toArray entries)
+                _ (Arrays/sort ordered ^java.util.Comparator comparator)
+                total (aget counts 1) pages (max 1 (quot (+' total (dec limit)) limit))
                 page (min page pages) offset (* (dec page) limit)]
-            {:keys (mapv #(.-id ^ai.obney.grain.read_model_processor_v2.core.sort_data.Entry (.get entries %))
+            {:keys (mapv #(.-id ^ai.obney.grain.read_model_processor_v2.core.sort_data.Entry (aget ordered %))
                          (range offset (min total (+ offset limit))))
              :total total :total-pages pages :page page :page-size limit
-             :sort-keys-read total}))))))
+             :sort-keys-read (aget counts 0)}))))))
 
 (defn ranked-key-page [ctx name d keys options]
   (let [{:keys [index direction page limit]
@@ -459,19 +485,28 @@
 
 (defn- validate-selection! [name d options]
   (when-not (and (map? options)
-                 (every? #{:index :direction :equals} (keys options)))
-    (throw (ex-info "Result selection accepts :index, :direction and :equals" {:options options})))
+                 (every? #{:index :direction :equals :prefix} (keys options))
+                 (or (not (contains? options :prefix))
+                     (and (vector? (:prefix options)) (not (contains? options :equals)))))
+    (throw (ex-info "Result selection accepts :index, :direction and either :equals or a vector :prefix"
+                    {:options options})))
   (let [index (:index options :identity) direction (:direction options :asc)]
     (when-not (and (#{:asc :desc} direction)
                    (or (= :identity index) (contains? (:indexes d) index)))
       (throw (ex-info "Unknown result index or direction" {:model name :options options})))
     nil))
 
+(defn- selection-prefix [options]
+  (let [encoded (cond
+                  (contains? options :equals) (key/encode (:equals options))
+                  (contains? options :prefix) (key/tuple-prefix (:prefix options)))]
+    (cond-> encoded (and encoded (= :desc (:direction options))) key/descending)))
+
 (defn- selection [b name d options]
   (validate-selection! name d options)
-  (let [direction (:direction options :asc)]
-    (cond-> (index-prefix b (:index options :identity) direction)
-      (contains? options :equals) (key/join (sort-bytes (:equals options) direction)))))
+  (let [prefix (selection-prefix options)]
+    (cond-> (index-prefix b (:index options :identity) (:direction options :asc))
+      prefix (key/join prefix))))
 
 (defn- reduce-results [ctx name d tx b read options rf initial]
   (let [prefix (selection b name d options)]
@@ -491,49 +526,85 @@
       (with-reader ctx name d
         (fn [tx b d read] (reduce-results ctx name d tx b read options rf initial))))))
 
+(defn- page-prefixes [name d options]
+  (let [selection-options (select-keys options [:index :direction :equals :prefix])]
+    (validate-selection! name d selection-options)
+    (if (contains? options :prefixes)
+      (do
+        (when-not (and (vector? (:prefixes options))
+                       (every? vector? (:prefixes options))
+                       (not-any? #(contains? options %) [:equals :prefix]))
+          (throw (ex-info "Page prefixes must be vectors and cannot be combined with :equals or :prefix"
+                          {:options options})))
+        (mapv #(selection-prefix (assoc selection-options :prefix %)) (distinct (:prefixes options))))
+      [(selection-prefix selection-options)])))
+
+(defn- page-ranges [tx cfg prefixes total]
+  ;; Rank intervals are already in index order, including descending indexes.
+  ;; Merging overlapping intervals makes duplicate/nested prefixes a true union.
+  (reduce (fn [ranges [start end :as interval]]
+            (if-let [[previous-start previous-end] (peek ranges)]
+              (if (<= start previous-end)
+                (conj (pop ranges) [previous-start (max end previous-end)])
+                (conj ranges interval))
+              [interval]))
+          []
+          (sort-by first
+                   (keep (fn [prefix]
+                           (let [start (if prefix (ranked/rank tx cfg prefix false) 0)
+                                 end (if prefix
+                                       (if-let [end (key/prefix-end prefix)]
+                                         (ranked/rank tx cfg end false)
+                                         (ranked/size tx cfg))
+                                       total)]
+                             (when (< start end) [start end]))) prefixes))))
+
+(defn- read-page-ranges [ctx tx navigation-tx cfg read ranges offset limit]
+  (loop [ranges (seq ranges) offset offset entries []]
+    (if-let [[start end] (first ranges)]
+      (let [size (- end start)]
+        (if (>= offset size)
+          (recur (next ranges) (- offset size) entries)
+          (let [stop (+ (count entries) (min (- size offset) (- limit (count entries))))
+                member (ranked/get-nth navigation-tx cfg (+ start offset))
+                entries ((:reduce tx) {:prefix (ranked/prefix cfg 0) :from (ranked/pack cfg 0 member)}
+                         (fn [entries {:keys [v]}]
+                           (observe! ctx :index-entry 0)
+                           (let [id (codec/decode v)
+                                 entry (decode ctx :result-decoded (read 2 id))
+                                 entries (conj entries (select-keys entry [:key :value]))]
+                             (if (= stop (count entries)) (reduced entries) entries))) entries)]
+            (if (= limit (count entries)) entries
+              (recur (next ranges) 0 entries)))))
+      entries)))
+
 (defn page [ctx name d options]
   (when-not (and (map? options)
-                 (every? #{:index :direction :equals :page :limit} (keys options))
+                 (every? #{:index :direction :equals :prefix :prefixes :page :limit} (keys options))
                  (pos-int? (:page options 1)) (pos-int? (:limit options 25)))
     (throw (ex-info "Invalid keyed-fold page" {:options options})))
-  (with-reader ctx name d
-    (fn [tx b d read]
-      (let [selection-options (select-keys options [:index :direction :equals])
-            prefix (selection b name d selection-options)
-            cfg (index-config b (:index options :identity) (:direction options :asc))
-            rank-examined (volatile! 0)
-            navigation-tx (assoc tx :reduce
-                                 (fn [bounds rf initial]
-                                   ((:reduce tx) bounds
-                                    (fn [acc entry]
-                                      (observe! ctx :rank-entry 0)
-                                      (vswap! rank-examined inc)
-                                      (rf acc entry)) initial)))
-            equals? (contains? options :equals)
-            member-prefix (when equals? (sort-bytes (:equals options) (:direction options :asc)))
-            first-rank (if equals? (ranked/rank navigation-tx cfg member-prefix false) 0)
-            total (if equals?
-                    (- (if-let [end (key/prefix-end member-prefix)]
-                         (ranked/rank navigation-tx cfg end false)
-                         (ranked/size navigation-tx cfg)) first-rank)
-                    (or (read-meta tx (count-key b)) 0))
-            limit (:limit options 25)
-            pages (max 1 (quot (+ total (dec limit)) limit))
-            page (min (:page options 1) pages)
-            offset (* (dec page) limit)
-            start (when (pos? total) (ranked/get-nth navigation-tx cfg (+ first-rank offset)))
-            entries (if-not start []
-                      ((:reduce tx) {:prefix prefix :from (ranked/pack cfg 0 start)}
-                       (fn [entries {:keys [v]}]
-                         (observe! ctx :index-entry 0)
-                         (let [id (codec/decode v)
-                               entry (decode ctx :result-decoded (read 2 id))
-                               entries (conj entries (select-keys entry [:key :value]))]
-                           (if (= limit (count entries)) (reduced entries) entries))) []))]
-        {:entries entries :total total :total-pages pages :page page :page-size limit
-         :rows-examined (count entries) :rank-entries-examined @rank-examined
-         :results-decoded (count entries)
-         :progress (read-meta tx (progress-key b))}))))
+  (let [prefixes (page-prefixes name d options)]
+    (with-reader ctx name d
+      (fn [tx b d read]
+        (let [cfg (index-config b (:index options :identity) (:direction options :asc))
+              rank-examined (volatile! 0)
+              navigation-tx (assoc tx :reduce
+                                   (fn [bounds rf initial]
+                                     ((:reduce tx) bounds
+                                      (fn [acc entry]
+                                        (observe! ctx :rank-entry 0)
+                                        (vswap! rank-examined inc)
+                                        (rf acc entry)) initial)))
+              ranges (page-ranges navigation-tx cfg prefixes (or (read-meta tx (count-key b)) 0))
+              total (reduce (fn [total [start end]] (+ total (- end start))) 0 ranges)
+              limit (:limit options 25)
+              pages (max 1 (quot (+ total (dec limit)) limit))
+              page (min (:page options 1) pages)
+              entries (read-page-ranges ctx tx navigation-tx cfg read ranges (* (dec page) limit) limit)]
+          {:entries entries :total total :total-pages pages :page page :page-size limit
+           :rows-examined (count entries) :rank-entries-examined @rank-examined
+           :results-decoded (count entries)
+           :progress (read-meta tx (progress-key b))})))))
 
 (defn- navigation-reader [ctx tx]
   (assoc tx :reduce
@@ -556,9 +627,10 @@
      (fn [tx b _ _read]
        (let [prefix (ranked/prefix (index-config b index :asc) 6)]
          (if (some? values)
-           (into [] (keep (fn [value]
-                            (observe! ctx :index-group 0)
-                            (read-meta tx (key/checked (key/join prefix (key/encode value)))))) (distinct values))
+           (reduce-distinct (fn [groups value]
+                              (observe! ctx :index-group 0)
+                              (if-let [group (read-meta tx (key/checked (key/join prefix (key/encode value))))]
+                                (conj groups group) groups)) [] values)
            ((:reduce tx) {:prefix prefix}
             (fn [groups {:keys [v]}]
               (observe! ctx :index-group 0)
@@ -578,19 +650,22 @@
     (validate-group! name d selection)
     (with-reader ctx name d
       (fn [tx b _ _read]
-        (let [tx (navigation-reader ctx tx)
-              cfg (index-config b (:index options :identity) (:direction options :asc))
-              [first end] (group-bounds tx cfg (:direction options :asc) (:equals options))
-              offset (:offset options 0) limit (:limit options 25)]
-          (if (>= offset (- end first)) []
-            (let [start (ranked/get-nth tx cfg (+ first offset))]
-              ((:reduce tx) {:prefix (key/join (ranked/prefix cfg 0)
-                                             (sort-bytes (:equals options) (:direction options :asc)))
-                             :from (ranked/pack cfg 0 start)}
+        (let [cfg (index-config b (:index options :identity) (:direction options :asc))
+              offset (:offset options 0) limit (:limit options 25)
+              prefix (key/join (ranked/prefix cfg 0)
+                               (sort-bytes (:equals options) (:direction options :asc)))
+              start (if (zero? offset)
+                      prefix
+                      (let [navigation (navigation-reader ctx tx)
+                            [first end] (group-bounds navigation cfg (:direction options :asc) (:equals options))]
+                        (when (< offset (- end first))
+                          (ranked/pack cfg 0 (ranked/get-nth navigation cfg (+ first offset))))))]
+          (if-not start []
+              ((:reduce tx) {:prefix prefix :from start}
                (fn [ids {:keys [v]}]
                  (observe! ctx :index-entry 0)
                  (let [ids (conj ids (codec/decode v))]
-                   (if (= limit (count ids)) (reduced ids) ids))) []))))))))
+                   (if (= limit (count ids)) (reduced ids) ids))) [])))))))
 
 (defn index-rank [ctx name d selection id]
   (validate-group! name d selection)

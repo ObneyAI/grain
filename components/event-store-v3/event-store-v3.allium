@@ -445,6 +445,14 @@ surface EventRead {
         -- ascending by default or descending when the read is reversed. A
         -- limit is applied only after that ordering is established.
 
+    @guarantee CommittedHead
+        -- A caller can read its tenant's current committed event identity,
+        -- including the transaction marker, or null for an empty tenant.
+        -- Invalid tenant identities are rejected. Failed appends do not advance
+        -- the head. Built-in stores read the existing durable watermark without
+        -- decoding events or enumerating other tenants; the cost does not grow
+        -- with the size of the most recently committed batch.
+
     @guarantee NoApplicationDeletion
         -- The ordinary append/read boundary exposes no deletion operation.
         -- Possession of this event-store surface alone cannot compact history.

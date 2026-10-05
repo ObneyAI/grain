@@ -97,6 +97,30 @@
                  [] [nil "A" :x 42] [["nested"]]]]
     (is (= value (key/decode (key/encode value))))))
 
+(deftest repeated-and-concurrent-searches-match-literal-oracle
+  (let [model (fixture/register! step opts)
+        texts ["abcdefghi" "abc---def" "def---ghi" "ghi---abc"
+               "abcabcabc" "aaaaaa" "😀abcdefghi😀" "ABCdef" "xyz"]
+        rows (mapv (fn [i]
+                     {:owner (case (mod i 4) 0 (str i) 1 (java.util.UUID. 0 i)
+                                   2 [:row i] (keyword (str "row-" i)))
+                      :text (nth texts (mod i (count texts))) :score i :included? true})
+                   (range 300))
+        cases (vec (for [mode [:contains :prefix :suffix]
+                         query ["abcdefghi" "abcabc" "aaaaaa" "😀abc" "abc" "ghi" "missing"]]
+                     [mode query]))
+        expected (mapv (fn [[mode query]]
+                         (let [matches (case mode :prefix str/starts-with? :suffix str/ends-with? str/includes?)]
+                           (into #{} (comp (filter #(matches (search/normalize (:text %)) query))
+                                           (map :owner)) rows))) cases)
+        run #(mapv (fn [[mode query]] (find-keys fixture/*ctx* model query mode)) cases)]
+    (fixture/append! rows)
+    (let [first-result (run)
+          readers (mapv (fn [_] (future (run))) (range 8))]
+      (is (= expected first-result))
+      (doseq [reader readers] (is (= expected (deref reader 10000 ::timeout))))
+      (is (= expected first-result) "Later reads cannot mutate detached identities"))))
+
 (deftest search-and-ordering-share-the-read-session-snapshot
   (let [model (fixture/register! step opts)
         entered (promise) advanced (promise)]

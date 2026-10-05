@@ -2,6 +2,7 @@
   (:require [clojure.test :refer :all]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.read-model-processor-v2.core :as core]
+            [ai.obney.grain.read-model-processor-v2.core.cache-key :as cache-key]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
@@ -1385,3 +1386,69 @@
       (let [result (rmp/p (make-context) (make-order-partitioned-args))]
         (is (= 1 (count result)))
         (is (= 7500 (:total (get result order-id))))))))
+
+(deftest colliding-tenant-hashes-do-not-share-resident-or-persisted-state
+  (let [a (java.util.UUID. 0 0) b (java.util.UUID. 1 1)
+        args (make-args {:l1-ttl-ms 60000})]
+    (is (not= a b))
+    (is (= (hash a) (hash b)))
+    (doseq [[tenant n] [[a 1] [b 3]]]
+      (is (nil? (:cognitect.anomalies/category
+                 (es/append *event-store*
+                   {:tenant-id tenant
+                    :events (vec (repeatedly n #(es/->event {:type :test/counter-incremented})))})))))
+    (doseq [round (range 2)]
+      (when (pos? round) (rmp/l1-clear!))
+      (is (= {:count 1} (rmp/p (assoc (make-context) :tenant-id a) args)))
+      (is (= {:count 3} (rmp/p (assoc (make-context) :tenant-id b) args))))))
+
+(deftest colliding-query-scopes-do-not-share-resident-or-persisted-state
+  (let [a (java.util.UUID. 0 0) b (java.util.UUID. 1 1)
+        scope #(hash-map :tags #{[:bucket %]})
+        args #(make-args {:scope (scope %)
+                          :query {:types #{:test/counter-incremented} :tags #{[:bucket %]}}
+                          :l1-ttl-ms 60000})]
+    (is (= (hash (scope a)) (hash (scope b))))
+    (append-tagged-events! 1 :test/counter-incremented #{[:bucket a]})
+    (append-tagged-events! 3 :test/counter-incremented #{[:bucket b]})
+    (doseq [round (range 2)]
+      (when (pos? round) (rmp/l1-clear!))
+      (is (= {:count 1} (rmp/p (make-context) (args a))))
+      (is (= {:count 3} (rmp/p (make-context) (args b)))))))
+
+(deftest colliding-partition-hashes-preserve-slices-and-full-merge
+  (let [a (java.util.UUID. 0 0) b (java.util.UUID. 1 1)
+        ids-a (set (append-item-events! 4 "a"))
+        ids-b (set (append-item-events! 7 "b"))
+        args (make-partitioned-args {:partition-fn #(get {"a" a "b" b} (:bucket %))
+                                    :l1-ttl-ms 60000})]
+    (is (= (hash a) (hash b)))
+    (is (= (set/union ids-a ids-b) (set (keys (rmp/p (make-context) args)))))
+    (doseq [round (range 2)]
+      (when (pos? round) (rmp/l1-clear!))
+      (is (= ids-a (set (keys (rmp/p (make-context) (assoc args :partition-key a))))))
+      (is (= ids-b (set (keys (rmp/p (make-context) (assoc args :partition-key b)))))))
+    (rmp/l1-clear!)
+    (is (= (set/union ids-a ids-b) (set (keys (rmp/p (make-context) args)))))))
+
+(deftest cache-identities-ignore-unordered-construction-and-print-settings
+  (let [a (java.util.UUID. 0 0) b (java.util.UUID. 1 1)
+        left (array-map :tags (conj #{} [:bucket a] [:bucket b]) :types #{:test/counter-incremented})
+        right (array-map :types #{:test/counter-incremented} :tags (conj #{} [:bucket b] [:bucket a]))]
+    (is (= left right))
+    (is (= (cache-key/fingerprint left) (cache-key/fingerprint right)))
+    (is (= (cache-key/fingerprint left)
+           (binding [*print-length* 0 *print-level* 0] (cache-key/fingerprint left))))
+    (is (not= (cache-key/fingerprint a) (cache-key/fingerprint b)))
+    (doseq [[x y] [[1 1N] [1 1M] [[1 2] '(1 2)] [0.0 -0.0] [1M 1.0M]
+                   [#{} []] [{} []] [[:map []] {}]]]
+      (is (= (= x y) (= (cache-key/fingerprint x) (cache-key/fingerprint y)))))))
+
+(deftest ambiguous-old-cache-addresses-are-not-reused
+  (let [old-key (.getBytes (format "%s-%s-%s" :test/counter 1
+                                  (Integer/toHexString (hash test-tenant-id))))]
+    (kv/put! *cache* {:k old-key :v (fressian-util/encode {:data {:count 999} :watermark nil})})
+    (append-test-events! 1)
+    (is (= {:count 1} (rmp/p (make-context) (make-args))))
+    (rmp/l1-clear!)
+    (is (= {:count 1} (rmp/p (make-context) (make-args))))))

@@ -710,6 +710,27 @@
     (is (string/includes? click "\"include\": [\"customers\", \"documents\", null]"))
     (is (string/includes? click "\"dsNonce\": $dsNonce"))))
 
+(deftest nested-indexed-bindings-guard-removed-parent-rows
+  (let [out (hiccup
+             (ui/with-signals [rows {:name "rows" :stable? true :init [{"amount" "12"}]}
+                               idx {:name "idx" :stable? true :init 0}]
+               [:div
+                [:input {:bind/value (ui/indexed (ui/indexed rows idx) "amount")}]
+                [:input {:bind/value (ui/indexed (ui/indexed (ui/indexed rows idx) "details") "name")}]]))
+        row-input (attrs (nth out 2))
+        nested-input (attrs (nth out 3))
+        row-guard "if ($rows != null && Object.hasOwn($rows, $idx) && $rows[$idx] != null)"
+        nested-guard (str "if ($rows != null && Object.hasOwn($rows, $idx) && $rows[$idx] != null"
+                          " && $rows[$idx] != null && Object.hasOwn($rows[$idx], \"details\")"
+                          " && $rows[$idx][\"details\"] != null)")]
+    (is (= (str row-guard " { el.value = $rows[$idx][\"amount\"]; } else { el.value = ''; }")
+           (:data-effect row-input)))
+    (is (= (str row-guard " { $rows[$idx][\"amount\"] = el.value; }")
+           (:data-on:input row-input)
+           (:data-on:change row-input)))
+    (is (string/starts-with? (:data-effect nested-input) nested-guard))
+    (is (string/starts-with? (:data-on:change nested-input) nested-guard))))
+
 (deftest indexed-collection-signals-bind-express-and-post
   (let [out (hiccup
              (ui/with-signals [custom-amounts {:init [80000 80000 80000]}

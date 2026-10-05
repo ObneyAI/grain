@@ -67,15 +67,32 @@
         (cond (= found position) true (< found position) (recur (inc mid) hi)
               :else (recur lo mid))))))
 
-(defn- aligned? [^bytes pivot pivot-offset postings query-length mode]
+(defn- aligned? [^bytes pivot pivot-offset ^objects postings ^ints offsets query-length mode]
   (let [length (data/int-at pivot 0)]
     (loop [at 4]
       (when (< at (alength pivot))
         (let [start (- (data/int-at pivot at) pivot-offset)]
           (if (and (<= 0 start (- length query-length))
                    (case mode :prefix (zero? start) :suffix (= start (- length query-length)) true)
-                   (every? (fn [[^bytes posting offset]] (has-position? posting (+ start offset))) postings))
+                   (loop [i 0]
+                     (or (= i (alength postings))
+                         (and (has-position? (aget postings i) (+ start (aget offsets i)))
+                              (recur (inc i))))))
             true (recur (+ at 4))))))))
+
+(defn- copy-ordinal! [^bytes source ^bytes target]
+  (System/arraycopy source (- (alength source) 4) target (- (alength target) 4) 4))
+
+(defn- read-postings! [tx ^bytes k v ^objects lookups ^objects postings]
+  (loop [i 0]
+    (if (= i (alength lookups)) true
+      (let [lookup (aget lookups i)
+            raw (if lookup
+                  (do (copy-ordinal! k lookup) ((:get tx) lookup))
+                  v)]
+        (when raw
+          (aset postings i raw)
+          (recur (inc i)))))))
 
 (defn search-keys [tx b searches {:keys [index query mode] :or {mode :contains} :as options} observe]
   (when-not (and (every? #{:index :query :mode} (keys options))
@@ -92,18 +109,22 @@
           candidates (mapv (fn [[term offset]]
                              {:term term :offset offset :prefix (term-key cfg 0 term)
                               :count (if-let [raw ((:get tx) (term-key cfg 1 term))] (data/int-at raw 0) 0)}) query-terms)
-          pivot (apply min-key :count candidates)]
+          pivot (apply min-key :count candidates)
+          ;; Private scratch space for this search's synchronous point reads.
+          ;; Only decoded, detached identities leave this operation.
+          lookups (object-array (map #(when (not= (:term %) (:term pivot))
+                                        (posting-key (:prefix %) 0)) candidates))
+          offsets (int-array (map :offset candidates))
+          postings (object-array (count candidates))
+          identity-key (slot b 8 (number-bytes 0))]
       (if (zero? (:count pivot)) []
         (persistent!
           ((:reduce tx) {:prefix (:prefix pivot)}
            (fn [out {:keys [^bytes k ^bytes v]}]
              (observe :search-candidate (alength v))
-             (let [ordinal (data/int-at k (- (alength k) 4))
-                   postings (reduce (fn [out {:keys [term prefix offset]}]
-                                      (if-let [raw (if (= term (:term pivot)) v
-                                                      ((:get tx) (posting-key prefix ordinal)))]
-                                        (conj out [raw offset]) (reduced nil))) [] candidates)]
-               (if (and postings (aligned? v (:offset pivot) postings n mode))
-                 (do (observe :search-match 0)
-                     (conj! out (codec/decode ((:get tx) (slot b 8 (number-bytes ordinal)))))) out)))
+             (if (and (read-postings! tx k v lookups postings)
+                      (aligned? v (:offset pivot) postings offsets n mode))
+               (do (observe :search-match 0)
+                   (copy-ordinal! k identity-key)
+                   (conj! out (codec/decode ((:get tx) identity-key)))) out))
            (transient [])))))))
