@@ -1382,3 +1382,72 @@
     (is (not (clojure.string/includes? sql "UNION")))
     (is (some #(re-find #"SEARCH t USING" %) details) (pr-str details))
     (is (not-any? #(re-find #"SCAN [te](?: |$)" %) details) (pr-str details))))
+
+(deftest singleton-tag-reads-preserve-filter-order-and-bound-semantics
+  (let [processor (uuid/v4)
+        other-tag (uuid/v4)
+        other-tenant (uuid/v4)
+        absent-tenant (uuid/v4)
+        rows (mapv (fn [[type tags]] (append-event! type tags {}))
+                   [[:test/alpha #{[:processor processor]}]
+                    [:test/beta #{[:processor processor] [:other other-tag]}]
+                    [:test/alpha #{[:other other-tag]}]
+                    [:test/alpha #{[:processor processor]}]
+                    [:test/gamma #{[:processor processor]}]
+                    [:test/beta #{[:processor processor]}]])
+        foreign (first (es/append *event-store*
+                                 {:tenant-id other-tenant
+                                  :events [(es/->event {:type :test/alpha
+                                                       :tags #{[:processor processor]}})]}))
+        ids (mapv :event/id rows)]
+    (doseq [tenant [*tenant-id* other-tenant absent-tenant]
+            types [nil #{} #{:test/alpha} #{:test/beta} #{:test/alpha :test/beta}]
+            after [nil (ids 0) (ids 2) (ids 5)]
+            as-of [nil (ids 0) (ids 3) (ids 5)]
+            reverse? [false true]
+            limit [nil 1 3]]
+      (let [query (cond-> {:tenant-id tenant :tags #{[:processor processor]} :reverse? reverse?}
+                    (some? types) (assoc :types types)
+                    after (assoc :after after)
+                    as-of (assoc :as-of as-of)
+                    limit (assoc :limit limit))
+            source (cond (= tenant *tenant-id*) rows (= tenant other-tenant) [foreign] :else [])
+            eligible (filter (fn [event]
+                               (and (contains? (:event/tags event) [:processor processor])
+                                    (or (nil? types) (contains? types (:event/type event)))
+                                    (or (nil? after) (uuid/< after (:event/id event)))
+                                    (or (nil? as-of) (not (uuid/< as-of (:event/id event)))))) source)
+            ordered (if reverse? (reverse eligible) eligible)
+            expected (mapv :event/id (if limit (take limit ordered) ordered))]
+        (let [actual (es/read *event-store* query)]
+          (if (and after as-of)
+            (is (= ::anom/incorrect (::anom/category actual)) (str query))
+            (is (= expected (mapv :event/id (into [] actual))) (str query))))))))
+
+(deftest singleton-tag-checkpoint-cas-streams-newest-without-aggregation
+  (let [processor (uuid/v4)
+        tag [:processor processor]
+        rows (mapv #(append-event! :test/alpha #{tag} {:n %}) (range 50))
+        _other-type (append-event! :test/beta #{tag} {})
+        query {:tenant-id *tenant-id* :types #{:test/alpha}
+               :tags #{tag} :reverse? true :limit 1}
+        observed (atom nil)]
+    (doseq [any-tag? [false true]]
+      (let [{:keys [sql params]} (#'sqlite-core/build-single-query query any-tag?)
+            details (mapv :detail (jdbc/execute! (pool)
+                                                (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                                {:builder-fn rs/as-unqualified-maps}))]
+        (is (re-find #"(?i)SEARCH t.*tenant_id=\? AND tag=\?" (first details)) (str details))
+        (is (not-any? #(re-find #"(?i)TEMP B-TREE|SCAN " %) details) (str details))
+        (is (= [(str (:event/id (peek rows)))]
+               (mapv :id (jdbc/execute! (pool) (into [sql] params)
+                                       {:builder-fn rs/as-unqualified-maps}))))))
+    (let [result (es/append *event-store*
+                            {:tenant-id *tenant-id*
+                             :events [(es/->event {:type :test/alpha :tags #{tag}})]
+                             :cas (assoc (dissoc query :tenant-id)
+                                         :predicate-fn (fn [events]
+                                                         (reset! observed (mapv :event/id (into [] events)))
+                                                         false))})]
+      (is (= ::anom/conflict (::anom/category result)))
+      (is (= [(:event/id (peek rows))] @observed)))))

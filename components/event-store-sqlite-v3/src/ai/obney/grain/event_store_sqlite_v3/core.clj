@@ -211,7 +211,27 @@
   ([{:keys [tenant-id tags types after as-of reverse? limit]} any-tag?]
    (let [tenant-str (str tenant-id)
          order-dir  (if reverse? " DESC" "")]
-     (if (seq tags)
+     (cond
+       (= 1 (count tags))
+       (let [type-strs (when types (mapv #(str ":" (key-fn %)) types))
+             where-parts (cond-> ["t.tenant_id = ?" "t.tag = ?"]
+                           types (conj (str "e.type IN (" (placeholders (count type-strs)) ")"))
+                           after (conj "t.event_id > ?")
+                           as-of (conj "t.event_id <= ?"))
+             params (cond-> [tenant-str (tag->str (first tags))]
+                      types (into type-strs)
+                      after (conj (str after))
+                      as-of (conj (str as-of))
+                      limit (conj limit))
+             sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
+                      "FROM event_tags t CROSS JOIN events e "
+                      "ON e.tenant_id = t.tenant_id AND e.id = t.event_id "
+                      "WHERE " (string/join " AND " where-parts) " "
+                      "ORDER BY t.event_id" order-dir
+                      (when limit " LIMIT ?"))]
+         {:sql sql :params params})
+
+       (seq tags)
        (let [tag-strs (mapv tag->str tags)
              type-strs (when types (mapv #(str ":" (key-fn %)) types))
              where-parts (cond-> ["e.tenant_id = ?"
@@ -240,6 +260,7 @@
                       "ORDER BY e.id" order-dir
                       (when limit " LIMIT ?"))]
          {:sql sql :params params})
+       :else
        (let [type-strs (when types (vec (distinct (map #(str ":" (key-fn %)) types))))
              ;; Each equality branch can stream an id range from the composite
              ;; index; SQLite merges these streams without sorting dense results.
