@@ -4,6 +4,7 @@
             [ai.obney.grain.read-model-processor-v2.keyed-test :as fixture]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.fold-key-test :as key-test]
             [ai.obney.grain.read-model-processor-v2.core.text-search :as search]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]))
@@ -95,7 +96,7 @@
   (doseq [value [nil false true "" "a" "a\u0000b" "😀𐐀" (str (char 0xD800))
                  Long/MIN_VALUE -1 0 Long/MAX_VALUE :name :namespaced/name (random-uuid)
                  [] [nil "A" :x 42] [["nested"]]]]
-    (is (= value (key/decode (key/encode value))))))
+    (is (= value (key-test/decode-physical (key/encode value))))))
 
 (deftest repeated-and-concurrent-searches-match-literal-oracle
   (let [model (fixture/register! step opts)

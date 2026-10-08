@@ -4,7 +4,6 @@
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.fressian-util.interface :as codec]
             [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
-            [ai.obney.grain.read-model-processor-v2.core.compact-key :as compact]
             [ai.obney.grain.read-model-processor-v2.core.namespace-registry :as namespaces]
             [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
             [ai.obney.grain.read-model-processor-v2.core.text-search :as search]
@@ -22,7 +21,7 @@
   (when-not (map? opts)
     (throw (ex-info "Read model options must be a map" {:model name})))
   (let [keyed-options #{:events :version :key :route :initial :result :include? :indexes
-                        :searches :filtered-indexes :schema :state-schema :result-schema}
+                        :searches :filtered-indexes :state-schema :result-schema}
         ordinary-options #{:events :version :schema :partition-fn :entity-id-fn :l1-ttl-ms}
         keyed? (boolean (keyed? opts))
         supported (if keyed? keyed-options ordinary-options)
@@ -58,7 +57,7 @@
                    (every? (fn [[k f]] (and (keyword? k) (not= :identity k) (ifn? f)))
                            (:indexes opts)))
       (throw (ex-info "Invalid keyed-fold declaration" {:model name})))
-    (doseq [schema (keep opts [:schema :state-schema :result-schema])] (m/schema schema))))
+    (doseq [schema (keep opts [:state-schema :result-schema])] (m/schema schema))))
 
 (defn- observe! [context operation size]
   (when-let [f (:read-model/observer context)] (f {:operation operation :bytes size})))
@@ -86,14 +85,17 @@
   (and (= :identity index) (not (contains? (:filtered-indexes d) :identity))))
 (defn- index-sort-bytes [d index value direction]
   (if (compact-identity? d index)
-    (cond-> (compact/encode value) (= direction :desc) key/descending)
+    (cond-> (key/encode-compact value) (= direction :desc) key/descending)
     (sort-bytes value direction)))
 (defn- index-member [d index direction value id]
   (if (compact-identity? d index)
     (key/join (index-sort-bytes d index value direction) (key/encode id))
     (key/join (sort-bytes value direction) (key/encode (str id)) (key/encode id))))
-(defn- fits-prefix? [cfg prefix]
-  (< (+ (alength ^bytes (ranked/prefix cfg 0)) (alength ^bytes prefix)) 511))
+(defn- fits-prefix?
+  "A selection prefix must leave space for a member suffix within LMDB's key limit."
+  ([^bytes prefix] (< (alength prefix) 511))
+  ([cfg ^bytes prefix]
+   (< (+ (alength ^bytes (ranked/prefix cfg 0)) (alength prefix)) 511)))
 
 (defn- update-group! [tx b index value delta]
   ;; Levels 0..5 are the RankedSet. Level 6 stores one count per sort value,
@@ -139,7 +141,7 @@
   (kv/transact (:cache ctx) :write
     (fn [tx]
       (let [tx (membership/transaction tx)
-            identity-base (force (::shared-identity-prefix ctx))
+            identity-base (::shared-identity-prefix ctx)
             before-progress (read-meta tx (progress-key b))
             events (filterv #(or (nil? (:watermark before-progress))
                                 (pos? (compare (:event/id %) (:watermark before-progress)))) events)
@@ -226,7 +228,7 @@
     (when-not (pos-int? batch-size)
       (throw (ex-info "Keyed-fold batch size must be positive" {:batch-size batch-size})))
     (when (and through (or (nil? after) (pos? (compare through after))))
-      (let [validate-state! (prepare-validation (or (:state-schema d) (:schema d)) name :state)
+      (let [validate-state! (prepare-validation (:state-schema d) name :state)
             validate-result! (prepare-validation (:result-schema d) name :result)
             remaining (reduce
                        (fn [batch event]
@@ -292,7 +294,7 @@
                              (fn [[ctx names]]
                                (let [identity-prefix (get prefixes [(:tenant-id ctx) :grain.read-query/shared-identities 1])]
                                  (doseq [name (distinct names)]
-                                   (catch-up! (assoc ctx ::shared-identity-prefix (delay identity-prefix))
+                                   (catch-up! (assoc ctx ::shared-identity-prefix identity-prefix)
                                               name (get registry name)
                                               (get prefixes (namespace-identity ctx name (get registry name)))
                                               (get heads (identity-of ctx))))
@@ -406,7 +408,7 @@
                            (when (or (nil? include?) (include? id values))
                              (aset counts 1 (inc (aget counts 1)))
                              (let [entry (ai.obney.grain.read_model_processor_v2.core.sort_data.Entry.
-                                          id raw (when sort-value (compact/encode (sort-value id values))))]
+                                          id raw (when sort-value (key/encode-compact (sort-value id values))))]
                                (if (< (.size entries) wanted)
                                  (.add entries entry)
                                  (when (neg? (.compare ^java.util.Comparator comparator entry (.peek entries)))
@@ -519,8 +521,8 @@
 (defn- selection-prefix [d options]
   (let [compact? (compact-identity? d (:index options :identity))
         encoded (cond
-                  (contains? options :equals) ((if compact? compact/encode key/encode) (:equals options))
-                  (contains? options :prefix) ((if compact? compact/tuple-prefix key/tuple-prefix) (:prefix options)))]
+                  (contains? options :equals) ((if compact? key/encode-compact key/encode) (:equals options))
+                  (contains? options :prefix) ((if compact? key/compact-tuple-prefix key/tuple-prefix) (:prefix options)))]
     (cond-> encoded (and encoded (= :desc (:direction options))) key/descending)))
 
 (defn- selection [b name d options]
@@ -531,7 +533,7 @@
 
 (defn- reduce-results [ctx name d tx b read options rf initial]
   (let [prefix (selection b name d options)]
-    (if (>= (alength ^bytes prefix) 511) initial
+    (if-not (fits-prefix? prefix) initial
       ((:reduce tx) {:prefix prefix :from (ranked/after prefix)}
      (fn [acc {:keys [v]}]
        (observe! ctx :index-entry 0)
@@ -677,7 +679,7 @@
               offset (:offset options 0) limit (:limit options 25)
               prefix (key/join (ranked/prefix cfg 0)
                                (index-sort-bytes d (:index options :identity) (:equals options) (:direction options :asc)))
-              start (when (< (alength ^bytes prefix) 511)
+              start (when (fits-prefix? prefix)
                       (if (zero? offset)
                       prefix
                       (let [navigation (navigation-reader ctx tx)

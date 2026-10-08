@@ -344,6 +344,10 @@ contract KeyedFoldDefinition {
         -- Diagnostics name the model, distinguish unknown from inapplicable
         -- options, list supported options and explain how to correct the declaration.
         -- A typo cannot silently discard inclusion, result or index behavior.
+        -- Keyed state validation is declared with state-schema, and result
+        -- validation with result-schema. The schema option belongs only to
+        -- ordinary projections and is rejected on keyed definitions, even when
+        -- state-schema is also present. Ordinary schema behavior is unchanged.
         -- Filtered paging support is named filtered-indexes. No alternate
         -- declaration spelling is accepted. Updating application declarations
         -- to this name preserves materialization identity without replay.
@@ -766,8 +770,9 @@ contract ComposedReadQuery {
         -- exact equality index on the root or a same-key related model. Text
         -- extractors must match the fields. Grain handles the separator between
         -- segments. One text index serves both root-only and related searches;
-        -- applications need not declare a separator suffix. Existing empty or
-        -- space-suffixed extractors remain usable without a version change.
+        -- search-text accepts only a nonempty vector of result-field keywords,
+        -- with no options argument or caller-supplied separator suffix. Its
+        -- extracted text joins those fields with spaces and adds no suffix.
         -- A non-nil related default cannot serve as indexed search text: it is
         -- not present in the related model's index. Reject that search shape.
         -- Unsupported search shapes and missing field-order index support fail

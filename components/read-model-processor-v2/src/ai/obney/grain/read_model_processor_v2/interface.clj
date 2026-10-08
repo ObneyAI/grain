@@ -241,8 +241,8 @@
    Read with value, state, values, page, or a composed query; project rejects
    keyed models. Keyed-only options are :initial (a value, default {}),
    :result, :include?, :indexes, :searches, :filtered-indexes, :state-schema
-   and :result-schema. Keyed :schema is an alias for :state-schema. State is
-   validated after each input, and results before publication.
+   and :result-schema. State is validated after each input, and results before
+   publication. :schema applies only to ordinary models.
 
        (defreadmodel :example customers
          {:events #{:example/customer-changed} :version 1
@@ -483,10 +483,8 @@
 (defn search-text
   "Pure searchable-text extractor with explicit field provenance. Fields are
    separated by spaces. The same extractor serves root-only and related searches;
-   Grain handles the joining boundary. The optional :suffix arity remains for
-   compatibility with existing stored indexes; new declarations need no suffix."
-  ([fields] (read-query/search-text fields))
-  ([fields options] (read-query/search-text fields options)))
+   Grain handles the joining boundary."
+  [fields] (read-query/search-text fields))
 
 (defn query-models
   "Validate a four-key read-query definition, including static search and order

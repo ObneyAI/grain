@@ -77,7 +77,8 @@ The optional filtered capability adds membership storage and update work.
 Ordinary and keyed declarations have different option sets. Unknown options,
 including keyed-only options on ordinary models, fail during registration.
 Keyed `:initial` supplies a state value; its default is `{}`. Keyed state and
-result schemas validate processing. Ordinary `:schema` validates schema syntax only.
+result schemas validate processing. Ordinary `:schema` validates schema syntax only;
+keyed models use `:state-schema` and reject `:schema`.
 
 Declaration errors identify the model and offending options, order, or search
 fields. Messages include a correction. Structured `ex-data` supplies `:hint`,
@@ -124,7 +125,6 @@ Indexed search supports a root text segment, optionally followed by one related
 text segment. The latter must be reached through an exact keyword equality index
 on the root or a same-key related model. Grain handles the joining space; one
 extractor serves both root-only and combined search, including boundary matches.
-Existing empty or space-suffixed extractors remain supported without rebuilding.
 Other search shapes, including non-nil defaults for related search text, fail
 during definition validation, including `query-models`. Nonempty searches shorter than three Unicode code
 points return a validation message without reading the population.

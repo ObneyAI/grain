@@ -25,14 +25,11 @@
                  (if (= 1 (count values)) (first values) values)))
     {::order fields}))
 
-(defn search-text
-  ([fields] (search-text fields {}))
-  ([fields {:keys [suffix] :or {suffix ""} :as options}]
-   (when-not (and (vector? fields) (seq fields) (every? keyword? fields)
-                  (string? suffix) (every? #{:suffix} (keys options)))
-     (fail "Search text requires fields and an optional suffix" {:fields fields :options options}))
-   (with-meta (fn [result] (str (str/join " " (map #(get result %) fields)) suffix))
-     {::text {:fields fields :suffix suffix}})))
+(defn search-text [fields]
+  (when-not (and (vector? fields) (seq fields) (every? keyword? fields))
+    (fail "Search text requires a nonempty keyword vector" {:fields fields}))
+  (with-meta (fn [result] (str/join " " (map #(get result %) fields)))
+    {::text {:fields fields}}))
 
 (defn field-ref [expression]
   (when (qualified-keyword? expression)
@@ -229,11 +226,8 @@
         names (mapv (comp second field-ref) fields)
         model (get-in plan [:bindings alias :model])
         segment (some (fn [[index extract]]
-                        (let [{:keys [fields suffix]} (::text (meta extract))]
-                          ;; Existing space-suffixed indexes remain usable. New
-                          ;; declarations need no knowledge of query boundaries.
-                          (when (and (= names fields) (#{"" " "} suffix))
-                            {:alias alias :model model :index index :suffix suffix})))
+                        (when (= {:fields names} (::text (meta extract)))
+                          {:alias alias :model model :index index}))
                       (get-in plan [:models model :searches]))]
     (when-not segment
       (let [extractor (list 'rmp/search-text names)]
@@ -348,7 +342,7 @@
         (.addAll found ^java.util.Collection (join (search related text :contains)))
         (let [^ints points (.toArray (.codePoints ^String text))]
           (doseq [split (range 1 (alength points)) :when (= 32 (aget points (dec split)))
-                  :let [left (str (String. points 0 (int (dec split))) (:suffix root))
+                  :let [left (String. points 0 (int (dec split)))
                         right (String. points (int split) (int (- (alength points) split)))
                         related-hits (join (search related right :prefix))]
                   :when (seq related-hits)

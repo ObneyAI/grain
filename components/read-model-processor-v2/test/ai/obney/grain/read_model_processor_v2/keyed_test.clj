@@ -96,6 +96,9 @@
                           [{:result identity} #{:result}]
                           [{:state-schema :map} #{:state-schema}]
                           [{:key :owner :ranked-indexes #{:identity}} #{:ranked-indexes}]
+                          [{:key :owner :schema :map} #{:schema}]
+                          [{:route (constantly []) :schema :map} #{:schema}]
+                          [{:key :owner :state-schema :map :schema :map} #{:schema}]
                           [{:filtered-indexes #{:identity}} #{:filtered-indexes}]]]
     (let [name (keyword "invalid" (str (random-uuid)))
           error (try (rmp/register-read-model! name identity (merge {:events #{:keyed/change}} opts))
@@ -700,7 +703,7 @@
       (is (empty? @checked)))))
 
 (deftest later-catch-ups-resolve-current-schemas-and-preserve-failure-details
-  (doseq [option [:schema :state-schema :result-schema]]
+  (doseq [option [:state-schema :result-schema]]
     (let [schema-name (keyword "keyed-test" (str (random-uuid)))
           ctx (assoc *ctx* :tenant-id (random-uuid))
           kind (if (= option :result-schema) :result :state)]
@@ -883,3 +886,9 @@
             (let [result (request (assoc options :page Long/MAX_VALUE :limit Long/MAX_VALUE))]
               (is (= ordered (:keys result)))
               (is (= [87 1 1] (mapv result [:total :total-pages :page]))))))))))
+
+(deftest ordinary-schema-remains-supported
+  (rmp/register-read-model! :test/ordinary-schema (fn [state _] state)
+                            {:events #{:keyed/change} :schema [:map]})
+  (is (= [:map] (:schema (get (rmp/global-read-model-registry) :test/ordinary-schema))))
+  (is (= {} (rmp/project *ctx* :test/ordinary-schema))))

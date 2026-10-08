@@ -1,7 +1,7 @@
 (ns ai.obney.grain.read-model-processor-v2.core.sort-data
   "Compact forward index values. Compare slices without decoding result maps."
   (:refer-clojure :exclude [comparator])
-  (:require [ai.obney.grain.read-model-processor-v2.core.compact-key :as key])
+  (:require [ai.obney.grain.read-model-processor-v2.core.fold-key :as key])
   (:import [java.nio ByteBuffer]
            [java.util Arrays]))
 
@@ -16,7 +16,7 @@
     (+ 2 (.indexOf ^java.util.List (vec (sort (keys indexes))) index))))
 
 (defn encode ^bytes [id indexes]
-  (let [fields (mapv key/encode (concat [(str id) id] (map val (sort-by key indexes))))
+  (let [fields (mapv key/encode-compact (concat [(str id) id] (map val (sort-by key indexes))))
         header (* 4 (inc (count fields)))
         size (+ header (reduce + (map #(alength ^bytes %) fields)))
         out (ByteBuffer/allocate size)]
@@ -28,7 +28,7 @@
 
 (defn value [^bytes data ^long field]
   (let [start (int-at data (* 4 field)) end (int-at data (* 4 (inc field)))]
-    (key/decode data start (- end start))))
+    (key/decode-compact data start (- end start))))
 
 (defn values
   "Decode requested fields directly into a detached immutable map."

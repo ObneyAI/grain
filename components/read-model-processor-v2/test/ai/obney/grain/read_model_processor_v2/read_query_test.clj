@@ -9,7 +9,7 @@
 (defn setup []
   (let [customer (fixture/register! (fn [_ e] (:customer e))
                                    {:include? some? :indexes {:name (rmp/order-key [:name]) :company :company}
-                                    :searches {:text (rmp/search-text [:name :email] {:suffix " "})}})
+                                    :searches {:text (rmp/search-text [:name :email])}})
         company (fixture/register! (fn [_ e] (:company e))
                                   {:key :company-id :include? some? :searches {:text (rmp/search-text [:name])}})
         ledger (fixture/register! (fn [_ e] (:ledger e))
@@ -279,29 +279,33 @@
                 (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
     (is (= 1 @reductions))))
 
-(deftest search-boundaries-match-literal-composition-with-either-index-spelling
-  (doseq [suffix ["" " "]]
-    (let [customer (fixture/register! (fn [_ e] (:customer e))
-                                      {:indexes {:name (rmp/order-key [:name]) :company :company}
-                                       :searches {:text (rmp/search-text [:name :email] {:suffix suffix})}})
-          company (fixture/register! (fn [_ e] (:company e))
-                                     {:key :company-id :searches {:text (rmp/search-text [:name])}})
-          root-only {:from {:customer customer} :search [:customer/name :customer/email]
-                     :orders {:name [:customer/name]}}
-          related (assoc root-only :related {:company {:model company :key :customer/company}}
-                                   :search [:customer/name :customer/email :company/name])
-          examples [["Anna" "mail.test" "Acme"] ["BOB" "  tail " " Beta"]
-                    ["😀𐐀" "end😀" "𐐀Co"] ["Empty" "" "Company"]]
-          texts (mapv (fn [[name email company]] [(str name " " email) (str name " " email " " company)]) examples)
-          queries ["anna" "test acm" "tail   be" "tail  be" "😀 𐐀" "end😀 𐐀" "empty  com" "bob" "missing"]]
-      (fixture/append! (mapv (fn [i [name email company]]
-                              {:owner (str i) :company-id (str "c" i) :company {:name company}
-                               :customer {:name name :email email :company (str "c" i)}})
-                            (range) examples))
-      (doseq [[definition column] [[root-only 0] [related 1]] query queries]
-        (let [expected (into #{} (keep-indexed (fn [i fields]
-                                                (when (str/includes? (str/lower-case (nth fields column))
-                                                                     (str/lower-case query)) (str i)))) texts)]
-          (is (= expected (set (map :key (:rows (rmp/query fixture/*ctx* definition
-                                                          {:order :name :search query})))))
-              (pr-str {:suffix suffix :related? (= column 1) :query query})))))))
+(deftest search-boundaries-match-literal-composition
+  (let [customer (fixture/register! (fn [_ e] (:customer e))
+                                    {:indexes {:name (rmp/order-key [:name]) :company :company}
+                                     :searches {:text (rmp/search-text [:name :email])}})
+        company (fixture/register! (fn [_ e] (:company e))
+                                   {:key :company-id :searches {:text (rmp/search-text [:name])}})
+        root-only {:from {:customer customer} :search [:customer/name :customer/email]
+                   :orders {:name [:customer/name]}}
+        related (assoc root-only :related {:company {:model company :key :customer/company}}
+                                 :search [:customer/name :customer/email :company/name])
+        examples [["Anna" "mail.test" "Acme"] ["BOB" "  tail " " Beta"]
+                  ["😀𐐀" "end😀" "𐐀Co"] ["Empty" "" "Company"]]
+        texts (mapv (fn [[name email company]] [(str name " " email) (str name " " email " " company)]) examples)
+        queries ["anna" "test acm" "tail   be" "tail  be" "😀 𐐀" "end😀 𐐀" "empty  com" "bob" "missing"]]
+    (fixture/append! (mapv (fn [i [name email company]]
+                            {:owner (str i) :company-id (str "c" i) :company {:name company}
+                             :customer {:name name :email email :company (str "c" i)}})
+                          (range) examples))
+    (doseq [[definition column] [[root-only 0] [related 1]] query queries]
+      (let [expected (into #{} (keep-indexed (fn [i fields]
+                                              (when (str/includes? (str/lower-case (nth fields column))
+                                                                   (str/lower-case query)) (str i)))) texts)]
+        (is (= expected (set (map :key (:rows (rmp/query fixture/*ctx* definition
+                                                        {:order :name :search query})))))
+            (pr-str {:related? (= column 1) :query query}))))))
+
+(deftest search-text-accepts-only-fields
+  (is (= "Anna mail.test" ((rmp/search-text [:name :email]) {:name "Anna" :email "mail.test"})))
+  (doseq [options [{} {:suffix " "} nil]]
+    (is (thrown? clojure.lang.ArityException (rmp/search-text [:name] options)))))

@@ -1,6 +1,40 @@
 (ns ai.obney.grain.read-model-processor-v2.fold-key-test
   (:require [clojure.test :refer [deftest is]]
-            [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]))
+            [ai.obney.grain.read-model-processor-v2.core.fold-key :as key])
+  (:import [java.io EOFException]
+           [java.nio ByteBuffer BufferUnderflowException]
+           [java.util UUID]))
+
+(defn- read-physical-key! [^ByteBuffer in]
+  (case (bit-and 255 (.get in))
+    1 nil 2 false 3 true
+    16 (let [out (StringBuilder.)
+             read-unit (fn [] (let [b (bit-and 255 (.get in))]
+                               (if (zero? b)
+                                 (case (bit-and 255 (.get in)) 0 -1 255 0
+                                   (throw (ex-info "Invalid ordered string escape" {}))) b)))]
+         (loop []
+           (let [hi (read-unit)]
+             (if (= -1 hi) (.toString out)
+               (let [lo (read-unit)]
+                 (when (= -1 lo) (throw (ex-info "Truncated ordered character" {})))
+                 (.append out (char (+ (bit-shift-left hi 8) lo))) (recur))))))
+    32 (bit-xor (.getLong in) Long/MIN_VALUE)
+    48 (UUID. (.getLong in) (.getLong in))
+    56 (keyword (subs (read-physical-key! in) 1))
+    64 (loop [out []]
+         (.mark in)
+         (if (zero? (.get in)) out
+           (do (.reset in) (recur (conj out (read-physical-key! in))))))
+    (throw (ex-info "Invalid ordered key type" {}))))
+
+(defn decode-physical
+  "Test oracle for physical key round-trips; production only decodes metadata."
+  ([^bytes value] (decode-physical value 0 (alength value)))
+  ([^bytes value ^long offset ^long length]
+   (try
+     (read-physical-key! (ByteBuffer/wrap value offset length))
+     (catch BufferUnderflowException _ (throw (EOFException.))))))
 
 (defn encoded-order [xs encode]
   (sort #(java.util.Arrays/compareUnsigned ^bytes (encode %1) ^bytes (encode %2)) xs))
@@ -49,17 +83,17 @@
                  (String. (char-array (map char (range 65536))))]]
     (let [encoded (key/encode value)
           data (key/join (byte-array [99 98 97]) encoded (key/encode "following field"))]
-      (is (= value (key/decode encoded)))
-      (is (= value (key/decode data 3 (alength encoded))))
-      (is (thrown? java.io.EOFException (key/decode data 3 (dec (alength encoded))))
+      (is (= value (decode-physical encoded)))
+      (is (= value (decode-physical data 3 (alength encoded))))
+      (is (thrown? java.io.EOFException (decode-physical data 3 (dec (alength encoded))))
           "A truncated field must not consume its following field")
-      (let [decoded (key/decode data 3 (alength encoded))]
+      (let [decoded (decode-physical data 3 (alength encoded))]
         (java.util.Arrays/fill data (byte 0))
         (is (= value decoded) "Results do not retain the mutable input view"))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid ordered string escape"
-                       (key/decode (byte-array [16 0 1]))))
+                       (decode-physical (byte-array [16 0 1]))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Truncated ordered character"
-                       (key/decode (byte-array [16 1 0 0])))))
+                       (decode-physical (byte-array [16 1 0 0])))))
 
 (deftest string-encoding-preserves-stored-bytes
   ;; These are the existing wire bytes, expressed as unsigned decimal values.
