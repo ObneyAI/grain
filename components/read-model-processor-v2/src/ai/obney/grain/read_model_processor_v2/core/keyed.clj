@@ -9,7 +9,6 @@
             [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
             [ai.obney.grain.read-model-processor-v2.core.text-search :as search]
             [ai.obney.grain.read-model-processor-v2.core.sort-data :as sort-data]
-            [ai.obney.grain.read-model-processor-v2.core.instance-ids :as ids]
             [ai.obney.grain.read-model-processor-v2.core.span-membership :as membership]
             [malli.core :as m])
   (:import [org.roaringbitmap RoaringBitmap]
@@ -116,7 +115,7 @@
         payload (codec/encode id)]
     (ranked/ensure-init! tx cfg)
     (when (ranked/add! tx cfg member payload
-                       (when (:membership? cfg) (ids/ensure-ordinal! tx b id)))
+                       (when (:membership? cfg) (membership/ensure-ordinal! tx b id)))
       (when (= direction :asc) (update-group! tx b index position 1)))
     (observe! ctx :index-written (alength ^bytes payload))))
 
@@ -187,7 +186,7 @@
             (write-observed! ctx tx :state-written (address b 1 id) state)
             (vswap! added + (- (if included? 1 0) (if old 1 0)))
             (when (not= (boolean included?) (boolean old))
-              (let [ordinal (ids/ensure-ordinal! tx identity-base id)
+              (let [ordinal (membership/ensure-ordinal! tx identity-base id)
                     bits (membership/bitmap tx (included-key b))]
                 (if included? (.add ^RoaringBitmap bits (int ordinal))
                     (.remove ^RoaringBitmap bits (int ordinal)))
@@ -440,7 +439,7 @@
         (let [candidates (RoaringBitmap.) examined (volatile! 0)]
           (doseq [id keys]
             (vswap! examined inc)
-            (let [ordinal (ids/ordinal tx b id)]
+            (let [ordinal (membership/ordinal tx b id)]
               (observe! ctx :candidate-ordinal-read (if (some? ordinal) 4 0))
               (when (some? ordinal) (.add candidates (int ordinal)))))
           (let [result (ranked/filtered-page tx (membership-config b d index direction)
@@ -474,7 +473,7 @@
                       examined (volatile! 0)
                       collect! (fn [id]
                                  (vswap! examined inc)
-                                 (let [ordinal (ids/ordinal tx b id)]
+                                 (let [ordinal (membership/ordinal tx b id)]
                                    (observe :candidate-ordinal-read (if (some? ordinal) 4 0))
                                    (if (and (some? ordinal) (.contains live (int ordinal)))
                                      (.add candidates (int ordinal))

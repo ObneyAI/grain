@@ -258,9 +258,10 @@
 
 (deftest incompatible-storage-is-ignored-by-normal-materialization
   (let [name (register! (fn [_ e] (:group e)) {:indexes {:group identity}})
-        current-prefix (key/prefix *ctx* name 1)
-        old-prefix (aclone current-prefix)]
-    (aset-byte old-prefix 2 (byte 50))
+        ;; Historical KF2 addressed each tenant/model/version by a SHA-256 hash.
+        old-prefix (key/join (byte-array [75 70 50])
+                             (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                                      (key/encode [(:tenant-id *ctx*) name 1])))]
     (append! [{:owner "a" :group "same"} {:owner "b" :group "same"}])
     (let [head (:event/id (first (into [] (es/read (:event-store *ctx*)
                                                  {:tenant-id (:tenant-id *ctx*) :reverse? true :limit 1}))))

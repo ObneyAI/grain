@@ -4,7 +4,6 @@
             [ai.obney.grain.read-model-processor-v2.keyed-test :as fixture]
             [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
             [ai.obney.grain.read-model-processor-v2.core.span-membership :as membership]
-            [ai.obney.grain.read-model-processor-v2.core.instance-ids :as ids]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb])
   (:import [java.util Random Arrays]
@@ -90,7 +89,7 @@
                                       (fn [out {:keys [k]}] (conj out (ranked/unpack cfg k))) [])]
                          (doseq [[begin end] (map vector entries (concat (rest entries) [nil]))]
                            (let [expected (set (filter (fn [i]
-                                                        (let [k (ids/number-bytes i)]
+                                                        (let [k (membership/number-bytes i)]
                                                           (and (not (neg? (Arrays/compareUnsigned k begin)))
                                                                (or (nil? end) (neg? (Arrays/compareUnsigned k end)))))) @present))
                                  bits (membership/bitmap tx (ranked/membership-key cfg level begin))]
@@ -101,14 +100,14 @@
                              offset (* (dec (:page result)) 7)]
                          (is (= (count ordered) (:total result)))
                          (is (= (subvec ordered offset (min (count ordered) (+ offset 7)))
-                                (mapv ids/number-value (:payloads result)))))))))]
+                                (mapv membership/number-value (:payloads result)))))))))]
     (kv/transact store :write #(ranked/init! % cfg))
     (dotimes [_ 16]
       (kv/transact store :write
         (fn [tx]
           (let [tx (membership/transaction tx)]
             (dotimes [_ 40]
-              (let [id (.nextInt rng 160) key (ids/number-bytes id)]
+              (let [id (.nextInt rng 160) key (membership/number-bytes id)]
                 (if (.nextBoolean rng)
                   (do (ranked/add! tx cfg key key id) (swap! present conj id))
                   (do (ranked/remove! tx cfg key) (swap! present disj id)))))
@@ -118,7 +117,7 @@
           (kv/transact store :write
             (fn [tx]
               (let [tx (membership/transaction tx)]
-                (doseq [id @present] (ranked/remove! tx cfg (ids/number-bytes id)))
+                (doseq [id @present] (ranked/remove! tx cfg (membership/number-bytes id)))
                 (membership/flush! tx (fn [& _]))
                 (throw (ex-info "rollback" {})))))))
     (check!)))

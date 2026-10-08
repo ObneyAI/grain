@@ -3,7 +3,7 @@
    Run with component tests on the classpath. Arguments: population report.edn."
   (:refer-clojure :exclude [bean run!])
   (:require [ai.obney.grain.read-model-processor-v2.interface :as rmp]
-            [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.namespace-registry :as namespaces]
             [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
             [ai.obney.grain.read-model-processor-v2.ranked-set-test :as rank-test]
             [ai.obney.grain.event-store-v3.interface :as es]
@@ -30,8 +30,12 @@
 (defn samples [f]
   (dotimes [_ 10] (f))
   (stats (repeatedly 30 #(dissoc (measure f) :result))))
-(defn storage [ctx model]
-  (let [prefix (key/prefix ctx model 1)]
+(defn storage
+  "Stored key/value bytes in the model's current KF9 namespace, excluding
+   namespace registry records and the shared identity namespace."
+  [ctx model]
+  (let [identity [(:tenant-id ctx) model 1]
+        prefix (get (namespaces/resolve! (:cache ctx) [identity]) identity)]
     (kv/transact (:cache ctx) :read
       #((:reduce %) {:prefix prefix}
          (fn [out {:keys [k v]}]
@@ -66,6 +70,8 @@
               _ (assert (= (count (remove #(zero? (mod % 997)) (range n)))
                            (:total (rmp/page ctx plain {:index :name}))) "Fixture population missing")
               sizes (into {} (for [model [plain indexed]] [model (storage ctx model)]))
+              _ (assert (every? #(and (pos? (:entries %)) (pos? (:bytes %))) (vals sizes))
+                        "Materialized model namespace storage missing")
               candidates [[:absent []] [:sparse (vec (take-nth 100 ids))]
                           [:half (vec (take-nth 2 ids))] [:broad ids]]
               cases

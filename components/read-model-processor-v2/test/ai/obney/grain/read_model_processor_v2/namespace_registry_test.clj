@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [ai.obney.grain.read-model-processor-v2.compact-cache-test :as fixture]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
+            [ai.obney.grain.read-model-processor-v2.core.namespace-registry :as namespaces]
             [ai.obney.grain.fressian-util.interface :as codec]
             [ai.obney.grain.kv-store.interface :as kv])
   (:import [java.util UUID]))
@@ -9,8 +10,7 @@
 (use-fixtures :each fixture/fixture)
 
 (defn resolver []
-  (try (requiring-resolve 'ai.obney.grain.read-model-processor-v2.core.namespace-registry/resolve!)
-       (catch java.io.FileNotFoundException _ nil)))
+  namespaces/resolve!)
 
 (def identities
   [[(UUID. 1 1) :registry-test/a 1]

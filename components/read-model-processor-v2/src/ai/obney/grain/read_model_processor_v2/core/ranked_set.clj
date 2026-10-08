@@ -15,7 +15,6 @@
    Optional :membership? requires one unique ordinal per logical instance."
   (:refer-clojure :exclude [contains?])
   (:require [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
-            [ai.obney.grain.read-model-processor-v2.core.instance-ids :as ids]
             [ai.obney.grain.read-model-processor-v2.core.span-membership :as membership])
   (:import [java.nio ByteBuffer ByteOrder]
            [java.util Arrays HashMap]
@@ -90,7 +89,7 @@
      (let [member (unpack cfg k) address (membership-key cfg level member)]
        (if (zero? level)
          (when (pos? (alength ^bytes member))
-           (.add out (int (ids/number-value ((:get tx) address)))))
+           (.add out (int (membership/number-value ((:get tx) address)))))
          (.or out (membership/bitmap tx address)))) out)
    (RoaringBitmap.)))
 
@@ -112,7 +111,7 @@
               (zero? level)
               (do ((:put tx) (pack cfg 0 key) value)
                   (when (:membership? cfg)
-                    ((:put tx) (membership-key cfg 0 key) (ids/number-bytes ordinal))))
+                    ((:put tx) (membership-key cfg 0 key) (membership/number-bytes ordinal))))
               (not (zero? (bit-and hash (dec (bit-shift-left 1 (* 4 level))))))
               (let [prev (previous-key tx cfg level key false)]
                 (increment! tx cfg level prev 1)
@@ -143,7 +142,7 @@
   (check-key! key)
   (if-not (contains? tx cfg key) false
     (let [ordinal (when (:membership? cfg)
-                    (ids/number-value ((:get tx) (membership-key cfg 0 key))))]
+                    (membership/number-value ((:get tx) (membership-key cfg 0 key))))]
       (dotimes [level (:levels cfg)]
         (if (zero? level)
           (do ((:delete tx) (pack cfg 0 key))
@@ -208,7 +207,7 @@
                             _ (when raw (observe :membership-read (alength ^bytes raw)))
                             n (if (zero? level)
                                 (do (vswap! leaves inc)
-                                    (if (and raw (.contains candidates (int (ids/number-value raw)))) 1 0))
+                                    (if (and raw (.contains candidates (int (membership/number-value raw)))) 1 0))
                                 (if raw (RoaringBitmap/andCardinality candidates (membership/decode raw)) 0))]
                         (.put counts lookup n) n)))))
             (visit [level {:keys [k v]} end]

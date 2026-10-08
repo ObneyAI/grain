@@ -4,7 +4,7 @@
    cover the query as in NGramPhraseQuery. No Lucene storage or copied source."
   (:require [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
             [ai.obney.grain.read-model-processor-v2.core.sort-data :as data]
-            [ai.obney.grain.read-model-processor-v2.core.instance-ids :as ids]
+            [ai.obney.grain.read-model-processor-v2.core.span-membership :as membership]
             [ai.obney.grain.fressian-util.interface :as codec])
   (:import [java.nio ByteBuffer]
            [java.util Locale Arrays]))
@@ -46,7 +46,7 @@
    result entries or nil. Removed identities retain their ordinal for re-entry."
   [tx b searches id before after]
   (when (seq searches)
-    (let [ordinal (ids/ensure-ordinal! tx b id)]
+    (let [ordinal (membership/ensure-ordinal! tx b id)]
       (doseq [[index extract] searches
               :let [old (when before (normalize (extract (:value before))))
                     next (when after (normalize (extract (:value after))))]

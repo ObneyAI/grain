@@ -2,16 +2,7 @@
   "Ordered UTF16 metadata and identity sort values, separate from physical key admission."
   (:import [java.io ByteArrayOutputStream DataOutputStream EOFException]
            [java.nio ByteBuffer BufferUnderflowException]
-           [java.security MessageDigest]
            [java.util UUID]))
-
-(defn join ^bytes [& arrays]
-  (let [out (byte-array (reduce (fn [size ^bytes a] (+ size (alength a))) 0 arrays))]
-    (reduce (fn [offset ^bytes a]
-              (System/arraycopy a 0 out offset (alength a))
-              (+ offset (alength a)))
-            0 arrays)
-    out))
 
 (defn- write-key! [^DataOutputStream out value]
   (cond
@@ -84,16 +75,3 @@
    (try
      (read-key! (ByteBuffer/wrap value offset length))
      (catch BufferUnderflowException _ (throw (EOFException.))))))
-
-(defn descending ^bytes [^bytes key]
-  (byte-array (map #(unchecked-byte (bit-xor 255 (bit-and 255 %))) key)))
-
-(defn prefix-end
-  "Exclusive upper bound of a byte prefix, or nil when it has no upper bound."
-  ^bytes [^bytes prefix]
-  (loop [i (dec (alength prefix))]
-    (when (>= i 0)
-      (if (= 255 (bit-and 255 (aget prefix i))) (recur (dec i))
-        (let [end (java.util.Arrays/copyOf prefix (inc i))]
-          (aset-byte end i (unchecked-byte (inc (bit-and 255 (aget prefix i)))))
-          end)))))

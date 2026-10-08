@@ -2,13 +2,53 @@
   (:require [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
-            [ai.obney.grain.read-model-processor-v2.core.cache-key :as cache-key]
             [ai.obney.grain.read-model-processor-v2.core.l1-cache :as l1]
-            [com.brunobonacci.mulog :as u]))
+            [com.brunobonacci.mulog :as u])
+  (:import [java.security MessageDigest]
+           [java.util Arrays HexFormat IdentityHashMap]))
 
 ;; ---------------------------------------------------------------------------
 ;; Cache key helpers
 ;; ---------------------------------------------------------------------------
+
+(defn- ordered-cache-values [encode key-fn values]
+  ;; Encode each comparison key once. Maps and sets have no iteration order.
+  (let [values (vec values)]
+    (if (< (count values) 2) values
+      (->> values
+           (mapv #(vector (encode (key-fn %)) %))
+           (sort (fn [[a] [b]] (Arrays/compareUnsigned ^bytes a ^bytes b)))
+           (mapv second)))))
+
+(defn- canonical-cache-value [value]
+  ;; Query unions commonly share the same event-type set. Reuse its normalized
+  ;; form within this call, without introducing a long-lived identity cache.
+  (let [seen (IdentityHashMap.)
+        encoded (IdentityHashMap.)]
+    (letfn [(comparison-key [x]
+              (or (.get encoded x)
+                  (let [bytes (fressian-util/encode x)]
+                    (.put encoded x bytes)
+                    bytes)))
+            (form [x]
+              (or (.get seen x)
+                  (let [v (cond
+                            (record? x) [:record (.getName (class x)) (ordered-cache-values comparison-key first (map (fn [[k v]] [(form k) (form v)]) x))]
+                            (instance? java.util.Map x) [:map (ordered-cache-values comparison-key first (map (fn [[k v]] [(form k) (form v)]) x))]
+                            (instance? java.util.Set x) [:set (ordered-cache-values comparison-key identity (map form x))]
+                            (or (sequential? x) (instance? java.util.List x)) [:sequence (mapv form x)]
+                            (integer? x) (if (<= Long/MIN_VALUE x Long/MAX_VALUE) (long x) (bigint x))
+                            (instance? java.math.BigDecimal x) (.stripTrailingZeros ^java.math.BigDecimal x)
+                            (instance? Float x) (double x)
+                            :else x)]
+                    (.put seen x v)
+                    v)))]
+      (form value))))
+
+(defn- cache-fingerprint [value]
+  (.formatHex (HexFormat/of)
+              (.digest (MessageDigest/getInstance "SHA-256")
+                       (fressian-util/encode (canonical-cache-value value)))))
 
 (defn format-key
   [n v]
@@ -16,7 +56,7 @@
 
 (defn format-scoped-key [n v scope]
   (if scope
-    (.getBytes (format "%s-%s-s1-%s" n v (cache-key/fingerprint scope)))
+    (.getBytes (format "%s-%s-s1-%s" n v (cache-fingerprint scope)))
     (format-key n v)))
 
 (defn suffix-key
@@ -36,7 +76,7 @@
 (defn partition-cache-key
   "Cache key for a single partition, isolated by its full value fingerprint."
   ^bytes [^bytes base-key partition-key]
-  (suffix-key base-key (str ":p1-" (cache-key/fingerprint partition-key))))
+  (suffix-key base-key (str ":p1-" (cache-fingerprint partition-key))))
 
 (defn- entity-index-cache-key
   "Cache key for the entity-to-partition index: base-key:eidx"

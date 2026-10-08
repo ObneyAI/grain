@@ -2,7 +2,6 @@
   "Self-delimiting ordered keys for local keyed-fold storage."
   (:import [java.io ByteArrayOutputStream DataOutputStream EOFException]
            [java.nio ByteBuffer BufferUnderflowException]
-           [java.security MessageDigest]
            [java.util UUID]))
 
 (defn join ^bytes [& arrays]
@@ -94,15 +93,6 @@
         (let [end (java.util.Arrays/copyOf prefix (inc i))]
           (aset-byte end i (unchecked-byte (inc (bit-and 255 (aget prefix i)))))
           end)))))
-
-(defn prefix ^bytes [context name version]
-  (when-not (uuid? (:tenant-id context))
-    (throw (ex-info "Keyed folds require a UUID :tenant-id"
-                    {:model name})))
-  ;; KF5 addresses models by tenant and version within the configured cache.
-  (join (byte-array [75 70 53])
-        (.digest (MessageDigest/getInstance "SHA-256")
-                 (encode [(:tenant-id context) name version]))))
 
 (defn checked ^bytes [^bytes key]
   (when (> (alength key) 511)

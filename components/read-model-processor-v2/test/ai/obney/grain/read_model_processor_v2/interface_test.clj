@@ -2,7 +2,6 @@
   (:require [clojure.test :refer :all]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.read-model-processor-v2.core :as core]
-            [ai.obney.grain.read-model-processor-v2.core.cache-key :as cache-key]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [ai.obney.grain.kv-store.interface :as kv]
@@ -1434,15 +1433,16 @@
 (deftest cache-identities-ignore-unordered-construction-and-print-settings
   (let [a (java.util.UUID. 0 0) b (java.util.UUID. 1 1)
         left (array-map :tags (conj #{} [:bucket a] [:bucket b]) :types #{:test/counter-incremented})
-        right (array-map :types #{:test/counter-incremented} :tags (conj #{} [:bucket b] [:bucket a]))]
+        right (array-map :types #{:test/counter-incremented} :tags (conj #{} [:bucket b] [:bucket a]))
+        cache-key #(vec (core/partition-cache-key (byte-array 0) %))]
     (is (= left right))
-    (is (= (cache-key/fingerprint left) (cache-key/fingerprint right)))
-    (is (= (cache-key/fingerprint left)
-           (binding [*print-length* 0 *print-level* 0] (cache-key/fingerprint left))))
-    (is (not= (cache-key/fingerprint a) (cache-key/fingerprint b)))
+    (is (= (cache-key left) (cache-key right)))
+    (is (= (cache-key left)
+           (binding [*print-length* 0 *print-level* 0] (cache-key left))))
+    (is (not= (cache-key a) (cache-key b)))
     (doseq [[x y] [[1 1N] [1 1M] [[1 2] '(1 2)] [0.0 -0.0] [1M 1.0M]
                    [#{} []] [{} []] [[:map []] {}]]]
-      (is (= (= x y) (= (cache-key/fingerprint x) (cache-key/fingerprint y)))))))
+      (is (= (= x y) (= (cache-key x) (cache-key y)))))))
 
 (deftest ambiguous-old-cache-addresses-are-not-reused
   (let [old-key (.getBytes (format "%s-%s-%s" :test/counter 1

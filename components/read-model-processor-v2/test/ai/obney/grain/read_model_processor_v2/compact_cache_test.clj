@@ -8,6 +8,9 @@
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.compact-key :as compact]
+            [ai.obney.grain.read-model-processor-v2.core.keyed :as keyed]
+            [ai.obney.grain.read-model-processor-v2.core.namespace-registry :as namespaces]
             [ai.obney.grain.schema-util.interface :as schema])
   (:import [java.util UUID Arrays]))
 
@@ -99,40 +102,30 @@
     (is (= (set owners) (set (rmp/search-keys (ctx) model {:index :text :query "alpha"}))))))
 
 (deftest compact-codec-preserves-utf16-order-and-doubled-legacy-size-bound
-  (let [encode (try (requiring-resolve 'ai.obney.grain.read-model-processor-v2.core.compact-key/encode)
-                    (catch java.io.FileNotFoundException _ nil))]
-    (is (some? encode))
-    (when encode
-      (let [decode (requiring-resolve 'ai.obney.grain.read-model-processor-v2.core.compact-key/decode)
-            units (mapv #(str (char %)) (range 65536))
-            encoded (mapv encode units)]
-        (is (every? true? (map #(= %1 (decode %2)) units encoded)))
-        (is (every? neg? (map #(Arrays/compareUnsigned ^bytes %1 ^bytes %2) encoded (rest encoded))))
-        (is (every? true? (map #(<= (alength ^bytes %2) (* 2 (alength ^bytes (key/encode %1)))) units encoded)))
-        (doseq [value ["" "a\u0000b" "\ud800" "\udc00" "\ud800\udc00"
-                       ["a" ["\u0101" :x] 1] [false 9 (UUID. 1 2)]]]
-          (is (= value (decode (encode value)))))))))
+  (let [units (mapv #(str (char %)) (range 65536))
+        encoded (mapv compact/encode units)]
+    (is (every? true? (map #(= %1 (compact/decode %2)) units encoded)))
+    (is (every? neg? (map #(Arrays/compareUnsigned ^bytes %1 ^bytes %2) encoded (rest encoded))))
+    (is (every? true? (map #(<= (alength ^bytes %2) (* 2 (alength ^bytes (key/encode %1)))) units encoded)))
+    (doseq [value ["" "a\u0000b" "\ud800" "\udc00" "\ud800\udc00"
+                   ["a" ["\u0101" :x] 1] [false 9 (UUID. 1 2)]]]
+      (is (= value (compact/decode (compact/encode value)))))))
 
 (deftest absent-identity-selection-at-physical-key-boundary-is-empty
-  (let [encode (try (requiring-resolve 'ai.obney.grain.read-model-processor-v2.core.compact-key/encode)
-                    (catch java.io.FileNotFoundException _ nil))]
-    (is (some? encode))
-    (when encode
-      (let [model (register! :compact-test/empty-boundary {})
-            index-prefix (requiring-resolve 'ai.obney.grain.read-model-processor-v2.core.keyed/index-prefix)
-            overhead (alength ^bytes (index-prefix (byte-array 7) :identity :asc))
-            exact (apply str (repeat (- 511 overhead 3) "x"))
-            probes [exact (str exact "x") (apply str (repeat 200 "\u0101"))]]
-        (is (= 511 (+ overhead (alength ^bytes (encode exact)))))
-        (append! (ctx) [{:owner "a" :score 1 :group ["a" 1] :text "alpha" :included? true}])
-        (rmp/read-session (ctx) [model]
-          (fn [prepared]
-            (doseq [direction [:asc :desc] probe probes]
-              (let [options {:index :identity :equals probe :direction direction}]
-                (is (= [] (page-ids prepared model (assoc options :limit 10))))
-                (is (= [] (rmp/index-keys prepared model (assoc options :limit 10))))
-                (is (= [] (into [] (rmp/values prepared model options))))
-                (is (= {:rank 0 :present? false} (rmp/index-rank prepared model options "a")))))))))))
+  (let [model (register! :compact-test/empty-boundary {})
+        overhead (alength ^bytes (#'keyed/index-prefix (byte-array 7) :identity :asc))
+        exact (apply str (repeat (- 511 overhead 3) "x"))
+        probes [exact (str exact "x") (apply str (repeat 200 "\u0101"))]]
+    (is (= 511 (+ overhead (alength ^bytes (compact/encode exact)))))
+    (append! (ctx) [{:owner "a" :score 1 :group ["a" 1] :text "alpha" :included? true}])
+    (rmp/read-session (ctx) [model]
+      (fn [prepared]
+        (doseq [direction [:asc :desc] probe probes]
+          (let [options {:index :identity :equals probe :direction direction}]
+            (is (= [] (page-ids prepared model (assoc options :limit 10))))
+            (is (= [] (rmp/index-keys prepared model (assoc options :limit 10))))
+            (is (= [] (into [] (rmp/values prepared model options))))
+            (is (= {:rank 0 :present? false} (rmp/index-rank prepared model options "a")))))))))
 
 (deftest absent-unicode-probes-retain-one-read-session-and-snapshot
   (let [model (register! :compact-test/probes {:filtered-indexes #{:identity}})
@@ -170,20 +163,16 @@
     (let [broken (register! :compact-test/abort {:result (fn [_] (throw (ex-info "expected failure" {})))})]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expected failure" (rmp/value (ctx) broken "same")))
       (let [identity [(:tenant-id (ctx)) broken 1]
-            resolver (try (requiring-resolve 'ai.obney.grain.read-model-processor-v2.core.namespace-registry/resolve!)
-                          (catch java.io.FileNotFoundException _ nil))
-            base (vec (if resolver (get (resolver @*cache* [identity]) identity)
-                          (key/prefix (ctx) broken 1)))
+            base (vec (get (namespaces/resolve! @*cache* [identity]) identity))
             after (snapshot)]
         (is (empty? (filter (fn [[k _]] (= base (vec (take (count base) k)))) after)))
         (reopen!)
         (is (= after (snapshot)))
         (register! broken {})
         (is (= row (rmp/value (ctx) broken "same")))
-        (when resolver
-          (is (= base (vec (get (resolver @*cache* [identity]) identity))))
-          (let [registry-records #(into {} (filter (fn [[k _]] (= [75 82 57] (vec (take 3 k))))) %)]
-            (is (= (registry-records after) (registry-records (snapshot))))))))))
+        (is (= base (vec (get (namespaces/resolve! @*cache* [identity]) identity))))
+        (let [registry-records #(into {} (filter (fn [[k _]] (= [75 82 57] (vec (take 3 k))))) %)]
+          (is (= (registry-records after) (registry-records (snapshot)))))))))
 
 (def owners [false "false" 1 "1" 2 "2" 10 "10" :a ":a" [1] "[1]"
              #uuid "00000000-0000-0000-0000-000000000003" "00000000-0000-0000-0000-000000000003"
