@@ -3,6 +3,7 @@
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
             [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
+            [ai.obney.grain.read-model-processor-v2.core.namespace-registry :as namespaces]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.kv-store-lmdb.interface :as lmdb]
@@ -53,6 +54,35 @@
 (defn stored-bytes []
   (kv/transact (:cache *ctx*) :read
     #((:reduce %) {} (fn [out {:keys [k v]}] (assoc out (vec k) (vec v))) {})))
+
+(defn materialized-bytes []
+  (let [stored (stored-bytes)
+        registry? (fn [[k _]] (= [75 82 57] (vec (take 3 k))))
+        registry (into {} (filter registry?) stored)]
+    (when (seq registry)
+      (let [decode #(codec/decode (byte-array %))
+            counter (decode (get registry [75 82 57 0]))
+            records (fn [kind]
+                      (mapv (fn [[_ v]] (decode v)) (filter (fn [[k _]] (= kind (nth k 3))) registry)))
+            forward (records 1) reverse (records 2) n (:next-id counter)
+            identities (mapv :identity forward)]
+        (is (= #{:next-id} (set (keys counter))))
+        (is (= (+ 1 (* 2 n)) (count registry)))
+        (is (= n (count (set identities))))
+        (is (= (set (range n)) (set (map :ordinal forward))))
+        (is (= (frequencies forward) (frequencies reverse)))
+        (is (every? #(and (= #{:identity :ordinal} (set (keys %)))
+                          (= 3 (count (:identity %)))
+                          (uuid? (nth (:identity %) 0))
+                          (qualified-keyword? (nth (:identity %) 1))
+                          (pos-int? (nth (:identity %) 2))) forward))
+        (let [addresses (namespaces/resolve! (:cache *ctx*) identities)]
+          (doseq [{:keys [identity ordinal]} forward]
+            (is (= (into [75 70 57]
+                         (.array (doto (java.nio.ByteBuffer/allocate 4) (.putInt (int ordinal)))))
+                   (vec (get addresses identity)))))
+          (is (= stored (stored-bytes))))))
+    (into {} (remove registry?) stored)))
 
 (defn page-keys [ctx name options]
   (mapv :key (:entries (rmp/page ctx name options))))
@@ -564,12 +594,12 @@
   (let [name (register! history-step {:result total})]
     (append! [{:owner "a" :delta 1} {:delta 2}])
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no owner" (rmp/value *ctx* name "a")))
-    (is (empty? (stored-bytes))))
+    (is (empty? (materialized-bytes))))
   (let [ctx (assoc *ctx* :tenant-id (random-uuid))
         name (register! (fn [_ e] (:label e)) {:indexes {:label identity}})]
     (append! ctx [{:owner "a" :label "ok"} {:owner "b" :label (apply str (repeat 600 "x"))}])
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"511" (rmp/page ctx name {})))
-    (is (empty? (stored-bytes)))))
+    (is (empty? (materialized-bytes)))))
 
 (deftest isolation-and-scoped-read-lifetime
   (let [name (register! history-step {:result total})
@@ -635,7 +665,7 @@
                           :result {:result-schema [:map [:total [:int {:max 10}]]]}
                           :codec {})))]
       (append! ctx [{:owner "a" :delta 1} {:owner "b" :delta 99}])
-      (let [before (stored-bytes) original codec/encode]
+      (let [before (materialized-bytes) original codec/encode]
         (if (= phase :codec)
           (with-redefs [codec/encode (fn [v]
                                       (when (= [99] (:history v))
@@ -643,7 +673,7 @@
                                       (original v))]
             (is (thrown? clojure.lang.ExceptionInfo (rmp/value ctx name "a"))))
           (is (thrown? clojure.lang.ExceptionInfo (rmp/value ctx name "a"))))
-        (is (= before (stored-bytes)) "Includes indexes, counts and progress")
+        (is (= before (materialized-bytes)) "Includes indexes, counts and progress")
         (when (= phase :codec)
           (is (= {"a" {:total 1} "b" {:total 99}} (results ctx name))))))))
 
@@ -764,13 +794,14 @@
         second-model (register! history-step {:result total})
         ctx (assoc *ctx* :read-model/batch-size 1)
         other (assoc ctx :tenant-id (random-uuid))
-        calls (atom []) original key/prefix]
+        calls (atom []) resolutions (atom 0) original namespaces/resolve!]
     (append! [{:owner "a" :delta 1} {:owner "a" :delta 2} {:owner "b" :delta 4}])
     (append! other [{:owner "a" :delta 9}])
     (let [escaped
-          (with-redefs [key/prefix (fn [ctx name version]
-                                    (swap! calls conj [(:tenant-id ctx) name version])
-                                    (original ctx name version))]
+          (with-redefs [namespaces/resolve! (fn [cache identities]
+                                             (swap! resolutions inc)
+                                             (swap! calls into identities)
+                                             (original cache identities))]
             (rmp/read-session [[ctx [name name second-model]] [other [name]] [ctx [name]]]
               (fn [[a b duplicate]]
                 (is (= (repeat 10 [{:total 3} {:history [1 2]} {:total 9} {:total 3}])
@@ -788,13 +819,14 @@
                   (is (thrown? clojure.lang.ExceptionInfo (rmp/value changed name "a"))))
                 (is (thrown? clojure.lang.ExceptionInfo (rmp/value b second-model "a")))
                 a)))]
-      (is (= {[(:tenant-id ctx) name 1] 1
-              [(:tenant-id ctx) second-model 1] 1
-              [(:tenant-id other) name 1] 1
-              [(:tenant-id ctx) :grain.read-query/shared-identities 1] 1
-              [(:tenant-id other) :grain.read-query/shared-identities 1] 1}
-             (frequencies @calls))
+      (is (= #{[(:tenant-id ctx) name 1]
+               [(:tenant-id ctx) second-model 1]
+               [(:tenant-id other) name 1]
+               [(:tenant-id ctx) :grain.read-query/shared-identities 1]
+               [(:tenant-id other) :grain.read-query/shared-identities 1]}
+             (set @calls))
           "Address preparation is bounded by distinct tenant/model identities, including cold batches")
+      (is (= 1 @resolutions))
       (is (thrown? clojure.lang.ExceptionInfo (rmp/value escaped name "a"))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Transaction aborted"
           (rmp/read-session ctx [name]

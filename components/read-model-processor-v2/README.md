@@ -94,10 +94,31 @@ joined pages. Grouped ordering reports its group count as `:related-groups` in
 Direct use of a related ordering requires exact equal membership;
 per-model bitmaps over shared tenant identity ordinals prove this without
 reading every result. Membership changes commit with state, indexes and progress.
-The derived key format is now KF5: older derived data is ignored and normal replay
+The derived key format is now KF9: older derived data is ignored and normal replay
 builds the current format. Storage is addressed by tenant, model and version
 within the configured cache, which belongs to its event store. There is no
 application-supplied history identifier or backfill command.
+
+KF9 uses durable short namespace addresses and compact strings in non-filtered
+implicit identity ordering. Explicit indexes, filtered identity indexes and
+typed identity suffixes retain their existing encoding. This preserves accepted
+key sizes and ordering for Unicode strings and mixed identity types; it does not
+require an ASCII-only schema. Sort metadata values use the compact representation
+without changing the ordering exposed by queries.
+
+Namespace reservation is atomic and distinct from fold publication. A failed
+first fold can leave a complete empty reservation, but cannot publish its states,
+results, indexes, counts or progress. Retrying reuses that reservation. Invalid
+durable namespace mappings fail explicitly rather than being reassigned. A read
+session retains its captured namespace resolution and does not rerun the user's
+callback to change an encoding.
+
+For rollout, build and validate the new derived cache from the existing event
+history with enough disk and LMDB map capacity for replay. Keep event history and
+durable processor checkpoints unchanged. An old cache retained for rollback may
+be behind events written during KF9 operation: rebuild the old format from the
+current history or verify its normal catch-up before serving reads. Merely
+swapping in an older cache directory does not establish freshness.
 
 Indexed search supports a root text segment, optionally followed by one related
 text segment. The latter must be reached through an exact keyword equality index

@@ -368,6 +368,17 @@ contract KeyedFoldMaterialization {
         -- by key. Definitions contain no tenant-routing or cross-tenant selector.
         -- A single-tenant deployment uses the same definitions and contracts.
 
+    @invariant StableMaterializationIdentity
+        -- Internal addressing choices are invisible to callers. Concurrent first
+        -- use, later reads, and reopening the configured cache resolve the same
+        -- tenant, model, and version consistently; distinct scopes never alias.
+        -- A read session keeps one consistent resolution for its lifetime.
+        -- Failed or uncertain identity initialization cannot expose another
+        -- scope's materialization or make partially published results readable.
+        -- Inconsistent durable identity information encountered while resolving
+        -- an address fails explicitly before serving or replacing data through
+        -- that address; it is not guessed or reassigned.
+
     @invariant CoordinatedPublication
         -- A successful batch publishes all its affected accumulated states,
         -- results, index changes, counts, and model progress together. Every
@@ -405,6 +416,10 @@ contract KeyedFoldMaterialization {
         -- Incompatible stored formats are not migrated. A new storage-format
         -- identity materializes through normal event folding; old derived data
         -- is unused and may be discarded independently of the event history.
+        -- Changing or restoring a derived representation never rewrites source
+        -- events or rewinds durable processor checkpoints. Before serving a
+        -- fresh read, a rebuilt or restored representation satisfies the same
+        -- captured-head freshness contract as an ordinary materialization.
 
     @invariant TimeDoesNotMutateMaterialization
         -- Advancing the query date alone does not change accumulated state,
@@ -523,6 +538,20 @@ contract KeyedFoldReads {
         -- as the final tie-breaker in both sort directions.
         -- Oversized storage keys fail with an identifiable key-too-large error
         -- before committing the affected batch; values are never truncated.
+
+    @invariant RepresentationPreservesAdmissionAndOrder
+        -- A storage representation change does not newly reject a previously
+        -- accepted valid input as an oversized key merely because its encoding
+        -- differs. It does not narrow an existing accepted string domain.
+        -- String ordering retains UTF-16 code-unit comparison, including NUL,
+        -- supplementary pairs, and unpaired surrogates. Tuple components keep
+        -- their ordinary types and boundaries in either direction.
+        -- Distinct supported identities with the same string form remain
+        -- distinct and retain their deterministic typed ordering. Descending
+        -- sort values do not reverse ascending identity ties.
+        -- Exact counts, presence, and insertion ranks remain unchanged for
+        -- absent identities, including a requested identity group different
+        -- from the absent key's string form and an empty or non-string group.
 
     @invariant TraversalAndLifetime
         -- Traversal can be consumed without materializing the full result set,

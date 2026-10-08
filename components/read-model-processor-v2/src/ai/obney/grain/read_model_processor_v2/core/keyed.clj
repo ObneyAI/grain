@@ -4,6 +4,8 @@
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.fressian-util.interface :as codec]
             [ai.obney.grain.read-model-processor-v2.core.fold-key :as key]
+            [ai.obney.grain.read-model-processor-v2.core.compact-key :as compact]
+            [ai.obney.grain.read-model-processor-v2.core.namespace-registry :as namespaces]
             [ai.obney.grain.read-model-processor-v2.core.ranked-set :as ranked]
             [ai.obney.grain.read-model-processor-v2.core.text-search :as search]
             [ai.obney.grain.read-model-processor-v2.core.sort-data :as sort-data]
@@ -67,7 +69,7 @@
     (observe! ctx operation (alength ^bytes bytes))
     (codec/decode bytes)))
 
-(defn- base [ctx name d] (key/prefix ctx name (:version d 1)))
+(defn- namespace-identity [ctx name d] [(:tenant-id ctx) name (:version d 1)])
 (defn- address [b kind id] (key/checked (key/join b (byte-array [kind]) (key/encode id))))
 (defn- progress-key [b] (key/join b (byte-array [0])))
 (defn- count-key [b] (key/join b (byte-array [4])))
@@ -81,8 +83,18 @@
   (assoc (index-config b index direction) :membership? (contains? (:filtered-indexes d) index)))
 (defn- sort-bytes [value direction]
   (cond-> (key/encode value) (= direction :desc) key/descending))
-(defn- index-member [direction value id]
-  (key/join (sort-bytes value direction) (key/encode (str id)) (key/encode id)))
+(defn- compact-identity? [d index]
+  (and (= :identity index) (not (contains? (:filtered-indexes d) :identity))))
+(defn- index-sort-bytes [d index value direction]
+  (if (compact-identity? d index)
+    (cond-> (compact/encode value) (= direction :desc) key/descending)
+    (sort-bytes value direction)))
+(defn- index-member [d index direction value id]
+  (if (compact-identity? d index)
+    (key/join (index-sort-bytes d index value direction) (key/encode id))
+    (key/join (sort-bytes value direction) (key/encode (str id)) (key/encode id))))
+(defn- fits-prefix? [cfg prefix]
+  (< (+ (alength ^bytes (ranked/prefix cfg 0)) (alength ^bytes prefix)) 511))
 
 (defn- update-group! [tx b index value delta]
   ;; Levels 0..5 are the RankedSet. Level 6 stores one count per sort value,
@@ -95,12 +107,12 @@
       ((:put tx) k (codec/encode {:value value :total total})))))
 
 (defn- remove-index! [tx b d index direction position id]
-  (when (ranked/remove! tx (membership-config b d index direction) (index-member direction position id))
+  (when (ranked/remove! tx (membership-config b d index direction) (index-member d index direction position id))
     (when (= direction :asc) (update-group! tx b index position -1))))
 
 (defn- add-index! [ctx tx b d index direction position id]
   (let [cfg (membership-config b d index direction)
-        member (index-member direction position id)
+        member (index-member d index direction position id)
         payload (codec/encode id)]
     (ranked/ensure-init! tx cfg)
     (when (ranked/add! tx cfg member payload
@@ -251,48 +263,42 @@
     (fn [f] (f tx b d read))))
 
 (defn read-session
-  "Prepare explicit [context model-names] requests, then pass their contexts to f.
-   All requests must share a cache and event store. Callers supply trusted tenant
-   context; definitions never select tenants. No transaction escapes to callbacks."
+  "Prepare explicit model namespaces and catch up before one finite read snapshot."
   [requests registry f]
   (when-not (seq requests) (throw (ex-info "Read session requires at least one request" {})))
   (let [cache (:cache (ffirst requests))
         event-store (:event-store (ffirst requests))]
     (when-not cache (throw (ex-info "Read session requires :cache" {})))
-    (let [prefixes
-          (reduce (fn [prefixes [ctx names]]
-                    (when (::session ctx)
-                      (throw (ex-info "Cannot open a nested keyed-fold read session" {})))
-                    (when-not (identical? cache (:cache ctx))
-                      (throw (ex-info "Read-session contexts must share one store" {})))
-                    (when-not (identical? event-store (:event-store ctx))
-                      (throw (ex-info "Read-session contexts must share one event store" {})))
-                    (reduce (fn [prefixes name]
-                              (let [id [(identity-of ctx) name]
-                                    d (get registry name)]
-                                (when-not (keyed? d)
-                                  (throw (ex-info "Expected a registered keyed fold" {:model name})))
-                                (if (contains? prefixes id) prefixes
-                                  (assoc prefixes id (base ctx name d)))))
-                            prefixes names)) {} requests)
-          identity-prefixes (into {} (map (fn [[ctx _]]
-                                            [(identity-of ctx)
-                                             (delay (key/prefix ctx :grain.read-query/shared-identities 1))])) requests)
-          prepared
+    (doseq [[ctx names] requests]
+      (when (::session ctx)
+        (throw (ex-info "Cannot open a nested keyed-fold read session" {})))
+      (when-not (identical? cache (:cache ctx))
+        (throw (ex-info "Read-session contexts must share one store" {})))
+      (when-not (identical? event-store (:event-store ctx))
+        (throw (ex-info "Read-session contexts must share one event store" {})))
+      (doseq [name names]
+        (when-not (keyed? (get registry name))
+          (throw (ex-info "Expected a registered keyed fold" {:model name})))))
+    (let [{:keys [prefixes prepared]}
           (locking cache
-            (let [heads (reduce (fn [heads [ctx _]]
-                                 (let [id (identity-of ctx)]
-                                   (if (contains? heads id) heads (assoc heads id (head ctx))))) {} requests)]
-              (mapv (fn [[ctx names]]
-                      (doseq [name (distinct names)]
-                        (catch-up! (assoc ctx ::shared-identity-prefix (get identity-prefixes (identity-of ctx)))
-                                   name (get registry name)
-                                   (get prefixes [(identity-of ctx) name])
-                                   (get heads (identity-of ctx))))
-                      [ctx (select-keys registry names)]) requests)))]
-      ;; Catch-up is serialized; detached result composition can run concurrently.
-      ;; A writer may advance before this snapshot opens, which the finite-head
-      ;; contract permits. The snapshot still includes all captured-head effects.
+            (let [identities (mapcat
+                              (fn [[ctx names]]
+                                (cons [(:tenant-id ctx) :grain.read-query/shared-identities 1]
+                                      (map #(namespace-identity ctx % (get registry %)) names))) requests)
+                  prefixes (namespaces/resolve! cache (vec identities))
+                  heads (reduce (fn [heads [ctx _]]
+                                  (let [id (identity-of ctx)]
+                                    (if (contains? heads id) heads (assoc heads id (head ctx))))) {} requests)
+                  prepared (mapv
+                             (fn [[ctx names]]
+                               (let [identity-prefix (get prefixes [(:tenant-id ctx) :grain.read-query/shared-identities 1])]
+                                 (doseq [name (distinct names)]
+                                   (catch-up! (assoc ctx ::shared-identity-prefix (delay identity-prefix))
+                                              name (get registry name)
+                                              (get prefixes (namespace-identity ctx name (get registry name)))
+                                              (get heads (identity-of ctx))))
+                               [ctx (select-keys registry names)])) requests)]
+              {:prefixes prefixes :prepared prepared}))]
       (kv/transact cache :read
         (fn [tx]
           (f (mapv (fn [[ctx definitions]]
@@ -301,7 +307,7 @@
                              :definitions definitions
                              :readers (into {} (map (fn [[name d]]
                                                       [name (prepare-reader tx
-                                                              (get prefixes [(identity-of ctx) name]) d)]))
+                                                              (get prefixes (namespace-identity ctx name d)) d)]))
                                             definitions)})) prepared)))))))
 
 (defn- with-reader [ctx name d f]
@@ -401,7 +407,7 @@
                            (when (or (nil? include?) (include? id values))
                              (aset counts 1 (inc (aget counts 1)))
                              (let [entry (ai.obney.grain.read_model_processor_v2.core.sort_data.Entry.
-                                          id raw (when sort-value (key/encode (sort-value id values))))]
+                                          id raw (when sort-value (compact/encode (sort-value id values))))]
                                (if (< (.size entries) wanted)
                                  (.add entries entry)
                                  (when (neg? (.compare ^java.util.Comparator comparator entry (.peek entries)))
@@ -511,26 +517,28 @@
       (throw (ex-info "Unknown result index or direction" {:model name :options options})))
     nil))
 
-(defn- selection-prefix [options]
-  (let [encoded (cond
-                  (contains? options :equals) (key/encode (:equals options))
-                  (contains? options :prefix) (key/tuple-prefix (:prefix options)))]
+(defn- selection-prefix [d options]
+  (let [compact? (compact-identity? d (:index options :identity))
+        encoded (cond
+                  (contains? options :equals) ((if compact? compact/encode key/encode) (:equals options))
+                  (contains? options :prefix) ((if compact? compact/tuple-prefix key/tuple-prefix) (:prefix options)))]
     (cond-> encoded (and encoded (= :desc (:direction options))) key/descending)))
 
 (defn- selection [b name d options]
   (validate-selection! name d options)
-  (let [prefix (selection-prefix options)]
+  (let [prefix (selection-prefix d options)]
     (cond-> (index-prefix b (:index options :identity) (:direction options :asc))
       prefix (key/join prefix))))
 
 (defn- reduce-results [ctx name d tx b read options rf initial]
   (let [prefix (selection b name d options)]
-    ((:reduce tx) {:prefix prefix :from (ranked/after prefix)}
+    (if (>= (alength ^bytes prefix) 511) initial
+      ((:reduce tx) {:prefix prefix :from (ranked/after prefix)}
      (fn [acc {:keys [v]}]
        (observe! ctx :index-entry 0)
        (let [id (codec/decode v)
              entry (decode ctx :result-decoded (read 2 id))]
-         (rf acc (select-keys entry [:key :value])))) initial)))
+         (rf acc (select-keys entry [:key :value])))) initial))))
 
 (defn values [ctx name d options]
   ;; No resource is opened until reduction. A session-bound reducible must be
@@ -551,8 +559,8 @@
                        (not-any? #(contains? options %) [:equals :prefix]))
           (throw (ex-info "Page prefixes must be vectors and cannot be combined with :equals or :prefix"
                           {:options options})))
-        (mapv #(selection-prefix (assoc selection-options :prefix %)) (distinct (:prefixes options))))
-      [(selection-prefix selection-options)])))
+        (mapv #(selection-prefix d (assoc selection-options :prefix %)) (distinct (:prefixes options))))
+      [(selection-prefix d selection-options)])))
 
 (defn- page-ranges [tx cfg prefixes total]
   ;; Rank intervals are already in index order, including descending indexes.
@@ -566,13 +574,14 @@
           []
           (sort-by first
                    (keep (fn [prefix]
-                           (let [start (if prefix (ranked/rank tx cfg prefix false) 0)
+                           (when (or (nil? prefix) (fits-prefix? cfg prefix))
+                             (let [start (if prefix (ranked/rank tx cfg prefix false) 0)
                                  end (if prefix
                                        (if-let [end (key/prefix-end prefix)]
                                          (ranked/rank tx cfg end false)
                                          (ranked/size tx cfg))
                                        total)]
-                             (when (< start end) [start end]))) prefixes))))
+                             (when (< start end) [start end])))) prefixes))))
 
 (defn- read-page-ranges [ctx tx navigation-tx cfg read ranges offset limit]
   (loop [ranges (seq ranges) offset offset entries []]
@@ -627,8 +636,8 @@
            ((:reduce tx) bounds
             (fn [acc entry] (observe! ctx :rank-entry 0) (rf acc entry)) initial))))
 
-(defn- group-bounds [tx cfg direction value]
-  (let [prefix (sort-bytes value direction)
+(defn- group-bounds [tx cfg d index direction value]
+  (let [prefix (index-sort-bytes d index value direction)
         first (ranked/rank tx cfg prefix false)
         end (if-let [end (key/prefix-end prefix)]
               (ranked/rank tx cfg end false) (ranked/size tx cfg))]
@@ -668,13 +677,14 @@
         (let [cfg (index-config b (:index options :identity) (:direction options :asc))
               offset (:offset options 0) limit (:limit options 25)
               prefix (key/join (ranked/prefix cfg 0)
-                               (sort-bytes (:equals options) (:direction options :asc)))
-              start (if (zero? offset)
+                               (index-sort-bytes d (:index options :identity) (:equals options) (:direction options :asc)))
+              start (when (< (alength ^bytes prefix) 511)
+                      (if (zero? offset)
                       prefix
                       (let [navigation (navigation-reader ctx tx)
-                            [first end] (group-bounds navigation cfg (:direction options :asc) (:equals options))]
+                            [first end] (group-bounds navigation cfg d (:index options :identity) (:direction options :asc) (:equals options))]
                         (when (< offset (- end first))
-                          (ranked/pack cfg 0 (ranked/get-nth navigation cfg (+ first offset))))))]
+                          (ranked/pack cfg 0 (ranked/get-nth navigation cfg (+ first offset)))))))]
           (if-not start []
               ((:reduce tx) {:prefix prefix :from start}
                (fn [ids {:keys [v]}]
@@ -688,8 +698,14 @@
   (with-reader ctx name d
     (fn [tx b _ _read]
       (let [tx (navigation-reader ctx tx) direction (:direction selection :asc)
-            cfg (index-config b (:index selection :identity) direction)
-            member (index-member direction (:equals selection) id)
-            first (ranked/rank tx cfg (sort-bytes (:equals selection) direction) false)]
-        {:rank (- (ranked/rank tx cfg member false) first)
-         :present? (ranked/contains? tx cfg member)}))))
+            index (:index selection :identity) value (:equals selection)
+            cfg (index-config b index direction)]
+        (if (and (compact-identity? d index) (not= value (str id)))
+          (let [group-key (key/join (ranked/prefix (index-config b index :asc) 6) (key/encode value))
+                group (when (<= (alength ^bytes group-key) 511) (read-meta tx group-key))]
+            {:rank (if (and group (string? value) (pos? (compare (str id) value))) (:total group) 0)
+             :present? false})
+          (let [member (index-member d index direction value id)
+                first (ranked/rank tx cfg (index-sort-bytes d index value direction) false)]
+            {:rank (- (ranked/rank tx cfg member false) first)
+             :present? (ranked/contains? tx cfg member)}))))))

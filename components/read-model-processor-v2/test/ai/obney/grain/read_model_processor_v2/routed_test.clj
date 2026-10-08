@@ -44,9 +44,9 @@
   (f/append! [{:owner nil}])
   (doseq [bad [nil {} #{["a" {}]} [["a"]] [["a" {} :extra]] [[nil {}]]]]
     (let [model (register! f/history-step {:route (constantly bad)})
-          before (f/stored-bytes)]
+          before (f/materialized-bytes)]
       (is (thrown? clojure.lang.ExceptionInfo (rmp/value f/*ctx* model "a")) (pr-str bad))
-      (is (true? (= before (f/stored-bytes))))))
+      (is (true? (= before (f/materialized-bytes))))))
   (is (thrown? clojure.lang.ExceptionInfo
                (rmp/value f/*ctx* (f/register! f/history-step {}) "a")))
   (doseq [opts [{:key :owner} {:route nil} {:route 123}]]
