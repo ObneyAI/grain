@@ -57,6 +57,45 @@
 (defn page-keys [ctx name options]
   (mapv :key (:entries (rmp/page ctx name options))))
 
+(deftest declaration-options-must-have-an-effect
+  (doseq [[opts invalid] [[{:key :owner :include some?} #{:include}]
+                          [{:key :owner :index {:name :name}} #{:index}]
+                          [{:key :owner :l1-ttl-ms 1000} #{:l1-ttl-ms}]
+                          [{:indexes {:name :name}} #{:indexes}]
+                          [{:initial []} #{:initial}]
+                          [{:result identity} #{:result}]
+                          [{:state-schema :map} #{:state-schema}]
+                          [{:key :owner :ranked-indexes #{:identity}} #{:ranked-indexes}]
+                          [{:filtered-indexes #{:identity}} #{:filtered-indexes}]]]
+    (let [name (keyword "invalid" (str (random-uuid)))
+          error (try (rmp/register-read-model! name identity (merge {:events #{:keyed/change}} opts))
+                     (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= invalid (:options error)))
+      (is (not (contains? (rmp/global-read-model-registry) name))))))
+
+(deftest filtered-indexes-use-the-declared-stored-order
+  (let [name (register! (fn [_ e] (select-keys e [:name]))
+                        {:indexes {:name :name} :filtered-indexes #{:name}})]
+    (append! [{:owner "a" :name "Alice"} {:owner "b" :name "Bob"} {:owner "c" :name "Chris"}])
+    (is (= ["c"] (:keys (rmp/filtered-key-page *ctx* name ["a" "c"] {:index :name :page 2 :limit 1}))))
+    (is (= ["a" "c"] (:keys (rmp/filtered-key-page *ctx* name ["a" "c"] {:index :name}))))))
+
+(deftest option-errors-explain-the-model-contract
+  (doseq [[opts unknown inapplicable correction]
+          [[{:key :owner :index {}} #{:index} #{} #"Supported options"]
+           [{:indexes {}} #{} #{:indexes} #"exactly one of :key or :route"]
+           [{:key :owner :l1-ttl-ms 1} #{} #{:l1-ttl-ms} #"ordinary models read with project"]]]
+    (let [error (try (rmp/register-read-model! :test/customer identity
+                                              (assoc opts :events #{:keyed/change}))
+                     (catch clojure.lang.ExceptionInfo e e))
+          data (ex-data error)]
+      (is (= :test/customer (:model data)))
+      (is (= unknown (:unknown-options data)))
+      (is (= inapplicable (:inapplicable-options data)))
+      (is (some #{:events} (:supported-options data)))
+      (is (re-find correction (or (:hint data) "")))
+      (is (re-find #":test/customer" (or (ex-message error) ""))))))
+
 (deftest read-only-index-composition
   (let [name (register! (fn [_ e] (select-keys e [:group :included?]))
                         {:include? :included? :indexes {:group :group}})

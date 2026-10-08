@@ -4,9 +4,13 @@
 The application supplies meaning; Grain selects and loads the page.
 
 ```clojure
-;; In ordinary keyed model declarations:
+;; In the customer model declaration:
 :indexes {:name (rmp/order-key [:last-name :first-name])}
 :searches {:text (rmp/search-text [:first-name :last-name :email])}
+
+;; In the ledger model declaration:
+:indexes {:balance (rmp/order-key [:balance-cents])}
+:filtered-indexes #{:balance}
 
 (def customers
   {:from {:customer :crm/customer-directory}
@@ -46,6 +50,7 @@ Relationships are required by default. `:missing [:default value]` handles an
 absent result, including optional nil; a stored nil stays nil. An optional pure
 `:validate` function receives the lookup key and resolved value and may throw a
 domain error. Its return value is ignored. Aliases cannot use the reserved `:key`.
+Reusing a result fetched during page selection still runs its relationship validator.
 
 `order-key` and `search-text` remain pure functions. Their metadata lets Grain
 match declared fields to indexes without interpreting arbitrary functions.
@@ -54,6 +59,32 @@ ordering uses `name`. Other values retain their ordering. Root-ID ties always
 use ascending string order, even for descending pages. Changing an extractor
 requires the usual model version change. Opaque extractors still work through
 the existing low-level APIs.
+
+## Choosing the application API
+
+| Need | API |
+|---|---|
+| One ordinary model's accumulated state | `defreadmodel` without routing, then `project` |
+| Individually stored results | `defreadmodel` with `:key` or `:route`, then `value`, `state`, `values`, or `page` |
+| Search and page across related keyed models | A four-key declaration, then `query` |
+
+Candidate-ID pages, index metadata functions, and `read-session` are advanced
+composition tools. A declarative query coordinates those operations for the application.
+`filtered-key-page` selects matching IDs in stored order using indexes listed in
+`:filtered-indexes`. Ordinary indexes already support rank-based page navigation.
+The optional filtered capability adds membership storage and update work.
+
+Ordinary and keyed declarations have different option sets. Unknown options,
+including keyed-only options on ordinary models, fail during registration.
+Keyed `:initial` supplies a state value; its default is `{}`. Keyed state and
+result schemas validate processing. Ordinary `:schema` validates schema syntax only.
+
+Declaration errors identify the model and offending options, order, or search
+fields. Messages include a correction. Structured `ex-data` supplies `:hint`,
+query `:path`, and, when an index is missing, `:suggested-extractor`.
+For example, an unsupported `:name` order over `:customer/name` suggests
+`(rmp/order-key [:name])` on the customer model. Option errors list
+`:supported-options` and distinguish unknown options from inapplicable ones.
 
 ## Execution and current limits
 
@@ -70,18 +101,24 @@ application-supplied history identifier or backfill command.
 
 Indexed search supports a root text segment, optionally followed by one related
 text segment. The latter must be reached through an exact keyword equality index
-on the root or a same-key related model. For combined search, the root extractor
-uses `{:suffix " "}`; the related extractor has no suffix. This preserves matches
-across the boundary. Other search shapes, including non-nil defaults for related
-search text, fail explicitly. Nonempty searches shorter than three Unicode code
+on the root or a same-key related model. Grain handles the joining space; one
+extractor serves both root-only and combined search, including boundary matches.
+Existing empty or space-suffixed extractors remain supported without rebuilding.
+Other search shapes, including non-nil defaults for related search text, fail
+during definition validation, including `query-models`. Nonempty searches shorter than three Unicode code
 points return a validation message without reading the population.
 
-An arbitrary computed order still evaluates its candidates and is reported as
+Plain field orders require matching index support. Unsupported declarations fail
+before reads begin. If current membership prevents indexed ordering, the query
+reports an error instead of scanning root results. Use an explicit `:call` for
+an order that requires calculation across candidates.
+
+An explicit computed order still evaluates its candidates and is reported as
 `:computed` in `:work`; it is not made indexable by declaring dependencies.
 Eager argument resolution can read values the business function ultimately does
 not need, increasing allocation for computed sorts.
-A typed oversized-storage-key failure uses a separate unindexed replay and
-reports `:oversized-key-scan`; unrelated errors are propagated.
+A typed oversized-storage-key failure propagates to the caller. It does not
+trigger an unindexed replay or a population scan.
 
 Every selected row contains all declared bindings. Results are detached from the
 read session. Snapshot/freshness semantics are those of the existing keyed

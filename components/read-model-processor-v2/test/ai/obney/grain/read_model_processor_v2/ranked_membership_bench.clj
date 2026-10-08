@@ -56,7 +56,7 @@
         step (fn [_ e] (select-keys e [:name :text :included?]))]
     (try
       (rmp/register-read-model! plain step opts)
-      (rmp/register-read-model! indexed step (assoc opts :ranked-indexes #{:name}))
+      (rmp/register-read-model! indexed step (assoc opts :filtered-indexes #{:name}))
       (es/append store {:tenant-id (:tenant-id ctx) :events events})
       ;; Same promotion decisions for both indexes: isolate membership overhead.
       (with-redefs [ranked/random-hash rank-test/crc-hash]
@@ -75,12 +75,12 @@
                     (for [[label keys] candidates page [1 999999] direction [:asc :desc]]
                       (let [options {:index :name :page page :limit 25 :direction direction}
                             baseline #(rmp/key-page prepared plain keys options)
-                            experiment #(rmp/ranked-key-page prepared indexed keys options)
+                            experiment #(rmp/filtered-key-page prepared indexed keys options)
                             before (baseline) after (experiment)
                             _ (assert (= (comparable before) (comparable after)) "Pagination mismatch")
                             a (samples baseline) b (samples experiment)
                             observed (volatile! {})
-                            counters (rmp/ranked-key-page
+                            counters (rmp/filtered-key-page
                                        (assoc prepared :read-model/observer
                                               (fn [{:keys [operation bytes]}]
                                                 (vswap! observed update operation
@@ -99,7 +99,7 @@
                          (let [options {:index :name :page 999999 :limit 25}
                                baseline #(rmp/key-page prepared plain
                                                        (rmp/search-keys prepared plain {:index :text :query query}) options)
-                               experiment #(rmp/ranked-key-page prepared indexed
+                               experiment #(rmp/filtered-key-page prepared indexed
                                                                (rmp/search-keys prepared indexed {:index :text :query query}) options)
                                _ (assert (= (comparable (baseline)) (comparable (experiment))))]
                            {:query query :baseline (samples baseline) :ranked (samples experiment)})))))

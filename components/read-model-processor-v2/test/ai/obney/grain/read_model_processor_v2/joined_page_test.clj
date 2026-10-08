@@ -8,7 +8,7 @@
 (defn models []
   [(fixture/register! merge {:include? :member?})
    (fixture/register! merge {:include? :ledger? :indexes {:balance :balance}
-                             :ranked-indexes #{:balance}})])
+                             :filtered-indexes #{:balance}})])
 (defn expected [rows {:keys [direction page limit missing-value] :as options}]
   (let [candidates (when (contains? options :keys) (set (:keys options)))
         value #(if (:ledger? %) (:balance %) missing-value)
@@ -52,7 +52,7 @@
 (deftest completely-absent-ledgers-and-empty-populations
   (let [members (fixture/register! merge {:include? :member?})
         ledger (fixture/register! merge {:events #{:keyed/other} :indexes {:balance :balance}
-                                        :ranked-indexes #{:balance}})
+                                        :filtered-indexes #{:balance}})
         rows (mapv #(hash-map :owner (str %) :member? true) (range 53))]
     (is (= 0 (:total (rmp/joined-page fixture/*ctx* members ledger {:index :balance :missing-value 0}))))
     (fixture/append! rows)

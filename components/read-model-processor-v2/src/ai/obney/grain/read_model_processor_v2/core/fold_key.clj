@@ -100,11 +100,9 @@
     (throw (ex-info "Keyed folds require a UUID :tenant-id"
                     {:model name})))
   ;; KF5 addresses models by tenant and version within the configured cache.
-  ;; The unindexed partition is private to the oversized-key query fallback.
   (join (byte-array [75 70 53])
         (.digest (MessageDigest/getInstance "SHA-256")
-                 (encode (cond-> [(:tenant-id context) name version]
-                           (::unindexed context) (conj :unindexed))))))
+                 (encode [(:tenant-id context) name version]))))
 
 (defn checked ^bytes [^bytes key]
   (when (> (alength key) 511)

@@ -14,7 +14,7 @@
 (def shape [:keys :total :total-pages :page :page-size])
 (defn step [_ e] (select-keys e [:name :score :included?]))
 (def options {:include? :included? :indexes {:name :name :score :score}
-              :searches {:text :name} :ranked-indexes #{:name :score :identity}})
+              :searches {:text :name} :filtered-indexes #{:name :score :identity}})
 
 (defn assert-pages [ctx model keys]
   (rmp/read-session ctx [model]
@@ -22,7 +22,7 @@
       (doseq [index [:identity :name :score] direction [:asc :desc] page [1 2 7 999]]
         (let [opts {:index index :direction direction :page page :limit 7}]
           (is (= (select-keys (rmp/key-page ctx model keys opts) shape)
-                 (select-keys (rmp/ranked-key-page ctx model keys opts) shape))))))))
+                 (select-keys (rmp/filtered-key-page ctx model keys opts) shape))))))))
 
 (deftest composed-candidates-mutations-restart-and-isolation
   (let [model (fixture/register! step options)
@@ -42,37 +42,37 @@
     (fixture/append! (take 60 events))
     (assert-pages fixture/*ctx* model keys)
     (let [observed (atom []) ctx (assoc fixture/*ctx* :read-model/observer #(swap! observed conj %))]
-      (rmp/ranked-key-page ctx model keys {:index :name :page 10})
+      (rmp/filtered-key-page ctx model keys {:index :name :page 10})
       (is (not-any? #(#{:result-decoded :state-decoded :sort-key-read} (:operation %)) @observed)))
     (kv/stop (:cache fixture/*ctx*))
     (let [cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir fixture/*directory* :db-name "folds"
                                                :map-size (* 64 1024 1024)}))]
       (reset! fixture/*cache-handle* cache)
       (assert-pages (assoc fixture/*ctx* :cache cache) model keys)
-      (is (= 0 (:total (rmp/ranked-key-page (assoc fixture/*ctx* :cache cache :tenant-id (random-uuid))
+      (is (= 0 (:total (rmp/filtered-key-page (assoc fixture/*ctx* :cache cache :tenant-id (random-uuid))
                                             model keys {:index :name})))))))
 
 (deftest validation-and-atomic-rollback
-  (is (thrown? Exception (fixture/register! step (assoc options :ranked-indexes #{:missing}))))
-  (let [plain (fixture/register! step (dissoc options :ranked-indexes))
+  (is (thrown? Exception (fixture/register! step (assoc options :filtered-indexes #{:missing}))))
+  (let [plain (fixture/register! step (dissoc options :filtered-indexes))
         model (fixture/register! step (assoc options :result #(if (= "fail" (:name %))
                                                                (throw (ex-info "fail" {})) %)))]
-    (is (thrown? Exception (rmp/ranked-key-page fixture/*ctx* plain [] {:index :name})))
-    (is (thrown? Exception (rmp/ranked-key-page fixture/*ctx* model [] {:index :name :sort-value identity})))
+    (is (thrown? Exception (rmp/filtered-key-page fixture/*ctx* plain [] {:index :name})))
+    (is (thrown? Exception (rmp/filtered-key-page fixture/*ctx* model [] {:index :name :sort-value identity})))
     (fixture/append! [{:owner "a" :name "before" :score 1 :included? true}])
-    (rmp/ranked-key-page fixture/*ctx* model ["a"] {:index :name})
+    (rmp/filtered-key-page fixture/*ctx* model ["a"] {:index :name})
     (let [before (fixture/stored-bytes)]
       (fixture/append! [{:owner "b" :name "good" :score 2 :included? true}
                        {:owner "c" :name "fail" :score 3 :included? true}])
-      (is (thrown? Exception (rmp/ranked-key-page fixture/*ctx* model ["a" "b" "c"] {:index :name})))
+      (is (thrown? Exception (rmp/filtered-key-page fixture/*ctx* model ["a" "b" "c"] {:index :name})))
       (is (= before (fixture/stored-bytes))))))
 
 (deftest membership-without-text-index-and-with-nil-results
-  (let [model (fixture/register! (fn [_ _] nil) {:ranked-indexes #{:identity}})]
+  (let [model (fixture/register! (fn [_ _] nil) {:filtered-indexes #{:identity}})]
     (fixture/append! [{:owner :b} {:owner :a}])
     (is (nil? (rmp/value fixture/*ctx* model :a ::missing)))
     (is (= {:keys [:b] :total 2 :total-pages 2 :page 2 :page-size 1}
-           (select-keys (rmp/ranked-key-page fixture/*ctx* model [:b :missing :a :a]
+           (select-keys (rmp/filtered-key-page fixture/*ctx* model [:b :missing :a :a]
                                              {:page 2 :limit 1}) shape)))))
 
 (deftest span-splits-merges-and-random-mutations
@@ -131,14 +131,14 @@
     (fixture/append! events)
     (rmp/read-session ctx [model]
       (fn [prepared]
-        (let [before (rmp/ranked-key-page prepared model keys page-options)
+        (let [before (rmp/filtered-key-page prepared model keys page-options)
               writer (future
                        (fixture/append! ctx (mapv #(assoc % :included? false) (take 30 events)))
                        (rmp/progress ctx model))]
           (is (not= ::timeout (deref writer 20000 ::timeout)))
-          (is (= before (rmp/ranked-key-page prepared model keys page-options))))))
-    (let [current (rmp/ranked-key-page ctx model keys page-options)
+          (is (= before (rmp/filtered-key-page prepared model keys page-options))))))
+    (let [current (rmp/filtered-key-page ctx model keys page-options)
           replay (fixture/register! step options)]
       (is (= 10 (:total current)))
       (is (= (select-keys current shape)
-             (select-keys (rmp/ranked-key-page (assoc ctx :read-model/batch-size 1) replay keys page-options) shape))))))
+             (select-keys (rmp/filtered-key-page (assoc ctx :read-model/batch-size 1) replay keys page-options) shape))))))

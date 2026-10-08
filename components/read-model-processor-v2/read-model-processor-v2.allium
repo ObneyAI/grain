@@ -337,6 +337,16 @@ contract KeyedFoldDefinition {
         -- Existing declarations without keyed execution retain their previous
         -- projection behaviour and return shapes. Keyed and legacy identities
         -- cannot accidentally read one another's materializations.
+
+    @invariant EffectiveDeclarationOptions
+        -- Unknown options and options belonging only to the other execution
+        -- model are rejected at registration, with the offending keys reported.
+        -- Diagnostics name the model, distinguish unknown from inapplicable
+        -- options, list supported options and explain how to correct the declaration.
+        -- A typo cannot silently discard inclusion, result or index behavior.
+        -- Filtered paging support is named filtered-indexes. No alternate
+        -- declaration spelling is accepted. Updating application declarations
+        -- to this name preserves materialization identity without replay.
 }
 
 contract KeyedFoldMaterialization {
@@ -413,7 +423,7 @@ contract KeyedFoldReads {
     index_rank: (context: Any, model: Any, selection: Any, key: Any) -> Any
     search_keys: (context: Any, model: Any, selection: Any) -> Any
     key_page: (context: Any, model: Any, keys: Any, selection: Any) -> Any
-    ranked_key_page: (context: Any, model: Any, keys: Any, selection: Any) -> Any
+    filtered_key_page: (context: Any, model: Any, keys: Any, selection: Any) -> Any
     joined_page: (context: Any, membership_model: Any, ordering_model: Any, selection: Any) -> Any
 
     @invariant RankedJoinWithMissingValues
@@ -435,6 +445,9 @@ contract KeyedFoldReads {
         -- A model may opt selected stored indexes into experimental membership
         -- summaries. Enabling or changing this selection requires a new model
         -- version. Summaries publish atomically with ordinary index changes.
+        -- Filtered-key paging is the public operation for this capability.
+        -- Ordinary indexes already support rank navigation;
+        -- the optional capability adds efficient selection within a subset.
         -- Ranked matching-key pages have the same membership, order, counts,
         -- clamping and ties as matching-key pages with a stored sort order.
         -- Duplicate, excluded and absent keys do not inflate counts. Candidate
@@ -693,6 +706,9 @@ contract ComposedReadQuery {
         -- query error. It must not silently drop a row or substitute history.
         -- Validators run on accessed results, including related results read
         -- to resolve ordering groups. They do not audit unaccessed results.
+        -- Reusing a result obtained during page selection does not bypass its
+        -- relationship validator. Selected results satisfy validation regardless
+        -- of which index or ordering supplied them.
 
     @invariant QuerySemantics
         -- Search and ordering apply before page selection. Counts are exact,
@@ -719,16 +735,28 @@ contract ComposedReadQuery {
         -- Indexed text composition supports one contiguous root text segment,
         -- optionally followed by one related text segment reached through an
         -- exact equality index on the root or a same-key related model. Text
-        -- extractors must match the fields and separator suffix exactly.
+        -- extractors must match the fields. Grain handles the separator between
+        -- segments. One text index serves both root-only and related searches;
+        -- applications need not declare a separator suffix. Existing empty or
+        -- space-suffixed extractors remain usable without a version change.
         -- A non-nil related default cannot serve as indexed search text: it is
         -- not present in the related model's index. Reject that search shape.
-        -- Unsupported search shapes raise an explicit unsupported error rather
-        -- than silently scanning or returning incomplete matches.
+        -- Unsupported search shapes and missing field-order index support fail
+        -- during definition validation, before event catch-up or query reads.
+        -- This validation also applies when obtaining subscription dependencies.
+        -- Definition errors identify the offending order or search relationship,
+        -- model and field references. Missing-index errors show the required
+        -- extractor or explain why the relationship shape is unsupported.
+        -- Corrections are available in both the message and structured error
+        -- data; calculation suggestions disclose candidate-dependent work.
+        -- Plain field orders never fall back to population-result scanning.
+        -- If current membership prevents the supported indexed execution, fail
+        -- explicitly instead. An explicit call expression opts into calculation.
         -- Calculation arguments are resolved eagerly; all declared arguments
         -- may be read for every candidate, even if the function could ignore an
         -- argument for some inputs. This cost is measured, not assumed away.
-        -- A typed oversized-storage-key failure uses a separately namespaced,
-        -- unindexed replay and explicitly reports oversized-key-scan work.
+        -- A typed oversized-storage-key failure propagates to the caller. It
+        -- does not trigger another unindexed replay or a population scan.
 
     @invariant IsolationAndFreshness
         -- Every relationship uses the trusted context's event store, cache and

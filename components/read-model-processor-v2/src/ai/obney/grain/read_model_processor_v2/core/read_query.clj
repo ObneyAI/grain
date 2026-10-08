@@ -7,6 +7,10 @@
 (defn fail [message data]
   (throw (ex-info message (assoc data :type :grain.read-query/invalid))))
 
+(defn- unsupported! [message data hint]
+  (throw (ex-info (str message ". " hint)
+                  (assoc data :type :grain.read-query/unsupported :hint hint))))
+
 (defn normalize [value]
   (cond (nil? value) ""
         (string? value) (.toLowerCase ^String value Locale/ROOT)
@@ -34,7 +38,7 @@
   (when (qualified-keyword? expression)
     [(keyword (namespace expression)) (keyword (name expression))]))
 
-(defn compile-definition [definition registry]
+(defn- parse-definition [definition registry]
   (when-not (and (map? definition) (every? #{:from :related :search :orders} (keys definition))
                  (map? (:from definition)) (= 1 (count (:from definition))))
     (fail "Read query requires one root and only from/related/search/orders" {:definition definition}))
@@ -113,15 +117,22 @@
           value))))
 
 (defn row-reader [api ctx plan params ^HashMap shared id & [seed]]
-  (let [local (HashMap. ^java.util.Map (or seed {})) root (:root plan)]
+  (let [local (HashMap.) root (:root plan)]
     (letfn [(binding-key [alias]
               (if (= root alias) id (evaluate (get-in plan [:bindings alias :key]))))
             (result [alias]
               (if (.containsKey local alias) (.get local alias)
                   (let [relation (get-in plan [:bindings alias])
-                      ;; Share only non-identity relationships (catalog etc.).
-                        cache (if (or (= alias root) (and (vector? (:key relation)) (= :id (first (:key relation))))) (HashMap.) shared)
-                        value (resolve-value api ctx plan alias (binding-key alias) cache)]
+                        value (if (contains? seed alias)
+                                (let [value (get seed alias)]
+                                  (when-let [validate (:validate relation)]
+                                    (validate (binding-key alias) value))
+                                  value)
+                                ;; Share only non-identity relationships (catalog etc.).
+                                (let [cache (if (or (= alias root)
+                                                    (and (vector? (:key relation)) (= :id (first (:key relation)))))
+                                              (HashMap.) shared)]
+                                  (resolve-value api ctx plan alias (binding-key alias) cache)))]
                     (.put local alias value) value)))
             (evaluate [expr]
               (if-let [[alias field] (field-ref expr)] (get (result alias) field)
@@ -213,38 +224,116 @@
                                      (into out (union-page (mapv make-group members) offset n))))))))]
         (assoc info :keys ids :strategy :related-groups :related-groups (count entries))))))
 
-(defn- text-segment [plan fields suffix]
+(defn- text-segment [plan fields]
   (let [alias (first (field-ref (first fields)))
         names (mapv (comp second field-ref) fields)
         model (get-in plan [:bindings alias :model])
-        index (some (fn [[index extract]]
-                      (when (= {:fields names :suffix suffix} (::text (meta extract))) index))
-                    (get-in plan [:models model :searches]))]
-    (when-not index
-      (throw (ex-info "Search fields need a matching search-text extractor"
-                      {:type :grain.read-query/unsupported :fields fields :suffix suffix})))
-    {:alias alias :model model :index index}))
+        segment (some (fn [[index extract]]
+                        (let [{:keys [fields suffix]} (::text (meta extract))]
+                          ;; Existing space-suffixed indexes remain usable. New
+                          ;; declarations need no knowledge of query boundaries.
+                          (when (and (= names fields) (#{"" " "} suffix))
+                            {:alias alias :model model :index index :suffix suffix})))
+                      (get-in plan [:models model :searches]))]
+    (when-not segment
+      (let [extractor (list 'rmp/search-text names)]
+        (unsupported! (str "Search fields " (pr-str fields) " on model " model
+                           " need a matching search-text extractor")
+                      {:path [:search] :alias alias :model model :fields fields
+                       :suggested-extractor extractor}
+                      (str "Declare an entry under :searches using " (pr-str extractor)
+                           ". The fields and their order must match. Bump :version when changing stored extraction."))))
+    segment))
+
+(defn- equality-guidance [plan alias]
+  (let [expression (get-in plan [:bindings alias :key])
+        [parent field] (field-ref expression)
+        model (get-in plan [:bindings parent :model])]
+    (if (and parent (same-key? plan parent))
+      {:index-model model :suggested-extractor field
+       :hint (str "Declare an exact equality index on " model ", for example "
+                  (pr-str {:indexes {:relation field}})
+                  ". Use the raw keyword extractor to preserve IDs. Bump :version when adding the index.")}
+      {:hint (str "Relationship " alias " uses " (pr-str expression)
+                  ". Indexed related search and field ordering require a field lookup from the root "
+                  (:root plan) " or a binding with the same instance ID. Change that relationship or exclude its fields.")})))
+
+(defn- search-segments [plan]
+  (let [parts (mapv vec (partition-by (comp first field-ref) (:search plan)))
+        aliases (mapv (comp first field-ref first) parts)]
+    (when-not (<= 1 (count parts) 2)
+      (unsupported! (str "Search has unsupported alias segments " (pr-str aliases))
+                    {:path [:search] :model (:model plan) :fields (:search plan)
+                     :aliases aliases :segments (count parts)}
+                    (str "Keep fields for root " (:root plan)
+                         " together and first, optionally followed by fields from one related binding.")))
+    (when-not (= (:root plan) (first aliases))
+      (unsupported! (str "Indexed search must start with root text from " (:root plan)
+                         ", but starts with " (first aliases))
+                    {:path [:search] :model (:model plan) :fields (:search plan)
+                     :root (:root plan) :aliases aliases}
+                    "Place the root's search fields first; related-only search is not supported."))
+    (let [segments (mapv #(text-segment plan %) parts)
+          related (second segments)
+          alias (:alias related)
+          missing (get-in plan [:bindings alias :missing])]
+      (when (and related (vector? missing) (some? (second missing)))
+        (unsupported! (str "Search relationship " alias " on model " (:model related)
+                           " has a non-nil missing default " (pr-str missing))
+                      {:path [:related alias :missing] :alias alias :model (:model related)
+                       :fields (second parts) :missing missing}
+                      "Default text is absent from the stored search index. Remove these related fields from :search, or use :error or [:default nil] if the domain permits."))
+      (when (and related (nil? (group-source plan alias)))
+        (let [{:keys [hint] :as guidance} (equality-guidance plan alias)]
+          (unsupported! (str "Search relationship " alias " on model " (:model related)
+                             " requires indexed equality membership")
+                        (merge guidance {:path [:related alias :key] :alias alias :model (:model related)
+                                         :fields (second parts) :expression (get-in plan [:bindings alias :key])})
+                        hint)))
+      segments)))
+
+(defn- computed-order? [expressions]
+  (boolean (some #(and (vector? %) (= :call (first %))) expressions)))
+
+(defn- unsupported-order [plan order expressions reason]
+  (let [refs (mapv field-ref expressions)
+        alias (when (and (every? some? refs) (apply = (map first refs))) (ffirst refs))
+        model (get-in plan [:bindings alias :model])
+        fields (mapv second refs)
+        guidance (cond
+                   (= reason :different-membership)
+                   {:hint "The index source must contain exactly the root's included IDs. Restore membership agreement, or use an explicit :call calculation, which can evaluate every candidate."}
+                   (and alias (same-key? plan alias))
+                   (let [extractor (list 'rmp/order-key fields)]
+                     {:index-model model :suggested-extractor extractor
+                      :hint (str "Declare an entry under :indexes on " model " using " (pr-str extractor)
+                                 ". A raw keyword or arbitrary function does not supply order-field metadata. Bump :version when changing stored extraction.")})
+                   (and alias (= 1 (count fields))) (equality-guidance plan alias)
+                   :else {:hint "Use fields from one supported indexed binding, or an explicit :call calculation. A calculation can evaluate every candidate."})]
+    (unsupported! (str "Unsupported field ordering " order " for " (pr-str expressions)
+                       (when model (str " on model " model)))
+                  (merge guidance {:path [:orders order] :order order :alias alias :model model
+                                   :fields expressions :expressions expressions :reason reason})
+                  (:hint guidance))))
+
+(defn compile-definition [definition registry]
+  (let [plan (parse-definition definition registry)
+        segments (when (seq (:search plan)) (search-segments plan))]
+    (doseq [[order expressions] (:orders plan) :when (not (computed-order? expressions))]
+      (let [refs (mapv field-ref expressions)
+            alias (ffirst refs)
+            fields (mapv second refs)]
+        (when-not (and (every? some? refs) (every? #(= alias (first %)) refs)
+                       (or (and (same-key? plan alias) (order-index plan alias fields))
+                           (and (= 1 (count fields)) (group-source plan alias))))
+          (unsupported-order plan order expressions :missing-index-support))))
+    (assoc plan :search-segments segments)))
 
 (defn- matching-keys [api ctx plan text shared]
-  (let [parts (mapv vec (partition-by (comp first field-ref) (:search plan)))]
-    (when-not (<= 1 (count parts) 2)
-      (throw (ex-info "Indexed search currently supports a root segment and one related segment"
-                      {:type :grain.read-query/unsupported :segments (count parts)})))
-    (let [segments (mapv (fn [i fields] (text-segment plan fields (if (< i (dec (count parts))) " " "")))
-                         (range) parts)
-          root (first segments)
-          related (second segments)
-          missing (get-in plan [:bindings (:alias related) :missing])
-          _ (when (and related (vector? missing) (some? (second missing)))
-              (throw (ex-info "Indexed related search cannot include a non-nil missing default"
-                              {:type :grain.read-query/unsupported :alias (:alias related)})))
-          _ (when-not (= (:root plan) (:alias root))
-              (throw (ex-info "Indexed search must start with root text"
-                              {:type :grain.read-query/unsupported})))
-          source (when related (groups api ctx plan (:alias related) shared))
-          _ (when (and related (nil? source))
-              (throw (ex-info "Related text requires indexed equality membership"
-                              {:type :grain.read-query/unsupported :alias (:alias related)})))
+  (let [[root related] (:search-segments plan)]
+    (when-not root
+      (throw (ex-info "This read query does not declare search fields" {:type :grain.read-query/unsupported})))
+    (let [source (when related (groups api ctx plan (:alias related) shared))
           totals (into {} (map (juxt :value :total)) (:entries source))
           members (memoize (fn [group]
                              (if-let [total (get totals group)]
@@ -259,7 +348,7 @@
         (.addAll found ^java.util.Collection (join (search related text :contains)))
         (let [^ints points (.toArray (.codePoints ^String text))]
           (doseq [split (range 1 (alength points)) :when (= 32 (aget points (dec split)))
-                  :let [left (String. points 0 (int split))
+                  :let [left (str (String. points 0 (int (dec split))) (:suffix root))
                         right (String. points (int split) (int (- (alength points) split)))
                         related-hits (join (search related right :prefix))]
                   :when (seq related-hits)
@@ -289,7 +378,7 @@
         fields (mapv second refs)
         model (get-in plan [:bindings alias :model])
         index (when alias (order-index plan alias fields))
-        ranked? (contains? (get-in plan [:models model :ranked-indexes]) index)
+        ranked? (contains? (get-in plan [:models model :filtered-indexes]) index)
         selection (assoc (select-keys options [:page :limit :direction]) :index index)
         root? (= alias (:root plan))
         same? (and index (same-key? plan alias)
@@ -297,7 +386,7 @@
     (cond
       (and index same?)
       (if keys
-        (assoc ((if ranked? (:ranked-key-page api) (:key-page api)) ctx model keys selection)
+        (assoc ((if ranked? (:filtered-key-page api) (:key-page api)) ctx model keys selection)
                :strategy (if ranked? :ranked-matches :indexed-matches))
         (let [page ((:page api) ctx model selection)]
           (assoc (dissoc page :entries) :keys (mapv :key (:entries page)) :strategy :indexed
@@ -305,7 +394,7 @@
 
       (and (nil? keys) alias (= 1 (count fields)) (group-source plan alias))
       (or (grouped-page api ctx plan alias (first fields) shared options)
-          (computed-page api ctx plan expressions keys shared options))
+          (unsupported-order plan (:order options) expressions :different-membership))
 
       (and keys alias (= 1 (count fields)) (group-source plan alias))
       (let [{:keys [model index]} (group-source plan alias)]
@@ -316,7 +405,7 @@
                                                        (normalize (get (resolve-value api ctx plan alias related-id shared)
                                                                        (first fields))))))
                  :strategy :related-matches)
-          (computed-page api ctx plan expressions keys shared options)))
+          (unsupported-order plan (:order options) expressions :different-membership)))
 
       (and index ranked? (same-key? plan alias)
            (vector? (get-in plan [:bindings alias :missing]))
@@ -327,29 +416,9 @@
                                    (cond-> (assoc selection :missing-value (extract default)) keys (assoc :keys keys)))
                :strategy :joined))
 
-      :else (computed-page api ctx plan expressions keys shared options))))
+      (computed-order? expressions) (computed-page api ctx plan expressions keys shared options)
 
-(defn- scan-page [api ctx plan shared options]
-  ;; Oversized ordered keys cannot use stored ordering. This explicitly reported
-  ;; exceptional path operates on a separate unindexed materialization.
-  (let [text (:search options)
-        expressions (get (:orders plan) (:order options))
-        rows (into []
-                   (keep (fn [{id :key}]
-                           (let [reader (row-reader api ctx plan (:params options) shared id)
-                                 evaluate (:evaluate reader)
-                                 searchable (str/join " " (map evaluate (:search plan)))]
-                             (when (or (empty? text) (str/includes? (normalize searchable) text))
-                               {:id id :order (mapv #(normalize (evaluate %)) expressions)}))))
-                   ((:values api) ctx (:model plan)))
-        direction (:direction options)
-        ordered (sort (fn [a b]
-                        (let [c (compare (:order a) (:order b))]
-                          (if (zero? c) (compare (str (:id a)) (str (:id b)))
-                              (if (= :desc direction) (- c) c)))) rows)
-        info (page-info (count rows) options)]
-    (assoc info :keys (mapv :id (take (:limit options) (drop (* (dec (:page info)) (:limit options)) ordered)))
-           :strategy :oversized-key-scan :candidates-examined (count rows))))
+      :else (unsupported-order plan (:order options) expressions :different-membership))))
 
 (defn execute [api ctx plan request]
   (when-not (and (map? request) (every? #{:params :search :order :direction :page :limit} (keys request)))
@@ -361,11 +430,10 @@
             (fail "Invalid read-query page, ordering or parameters" {:request request}))
         text (normalize (str/trim (:search options)))
         options (assoc options :search text)
-        run (fn [prepared scan?]
+        run (fn [prepared]
               (let [shared (HashMap.)
-                    keys (when (and (not scan?) (seq text)) (matching-keys api prepared plan text shared))
-                    selected (if scan? (scan-page api prepared plan shared options)
-                                 (ordered-page api prepared plan keys shared options))
+                    keys (when (seq text) (matching-keys api prepared plan text shared))
+                    selected (ordered-page api prepared plan keys shared options)
                     rows (mapv (fn [id] ((:row (row-reader api prepared plan (:params options) shared id
                                                            (get-in selected [:seeds id]))))) (:keys selected))]
                 (observe prepared {:operation :read-query-plan :strategy (:strategy selected)
@@ -375,10 +443,4 @@
     (if (and (seq text) (< (.codePointCount ^String text 0 (count text)) 3))
       {:rows [] :total 0 :total-pages 1 :page 1 :page-size (:limit options)
        :search-error "Enter at least 3 characters to search." :work {:strategy :unsupported-short-search}}
-      (try
-        ((:read-session api) ctx (keys (:models plan)) #(run % false))
-        (catch clojure.lang.ExceptionInfo e
-          (if (= :grain.read-model/key-too-large (:type (ex-data e)))
-            (do (observe ctx {:operation :directory-index-unavailable :reason :key-too-large})
-                ((:unindexed-session api) ctx (:models plan) #(run % true)))
-            (throw e)))))))
+      ((:read-session api) ctx (keys (:models plan)) run))))

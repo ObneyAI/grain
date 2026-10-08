@@ -30,9 +30,15 @@
    key-page orders candidate IDs using compact index values, without full rows.
    Search extraction changes require a model version change, like other indexes.
 
-   Experimental :ranked-indexes is a set of stored index names (including optional
-   :identity) to maintain span membership for ranked-key-page. Enable it with a
-   new model version. Ordinary models incur no membership storage/write overhead.
+   Experimental :filtered-indexes is a set of stored index names (including optional
+   :identity) that support efficient paging within a matching subset. Enable it with
+   a new model version. This adds membership storage and update work. Ordinary
+   indexes already support rank navigation for unfiltered pages.
+
+   Normal application reads use value, state, values, page, or a four-key query.
+   query chooses the execution path and coordinates related reads. Index metadata,
+   candidate-ID paging, and read-session are advanced composition tools. They do
+   not need to appear in an application's declarative list query.
 
    Direct index pages use stored ranks for offsets and equality counts. Grain
    maintains those ranks in the fold transaction. Incompatible derived storage
@@ -143,7 +149,6 @@
    Context fields `:read-model/name` and `:read-model/cache-tier` are attached
    to every metric event for observability."
   (:require [ai.obney.grain.read-model-processor-v2.core :as core]
-            [ai.obney.grain.read-model-processor-v2.core.fold-key :as fold-key]
             [ai.obney.grain.read-model-processor-v2.core.keyed :as keyed]
             [ai.obney.grain.read-model-processor-v2.core.read-query :as read-query]
             [ai.obney.grain.read-model-processor-v2.core.l1-cache :as l1]
@@ -224,26 +229,30 @@
   @read-model-registry*)
 
 (defmacro defreadmodel
-  "Define and register a read model reducer.
+  "Define and register a pure event reducer under :<ns-kw>/<name>.
 
-   Follows the same pattern as `defcommand` and `defquery`:
+   Without :key or :route, the model accumulates one state starting from {}.
+   Read it with project. Its options are :events, :version, :schema,
+   :partition-fn, :entity-id-fn and :l1-ttl-ms. Legacy :schema checks schema
+   syntax at registration; it does not validate each reduced state.
 
-       (defreadmodel :ns-kw name
-         {:events  #{:ns/event-a :ns/event-b}  ; event types to subscribe to
-          :version 1                            ; bump to invalidate cache
-          :schema [:map [:count :int]]          ; optional projected-state schema
-          ;; Optional — for partitioned read models:
-          :partition-fn  (fn [entity] ...)      ; entity -> partition key
-          :entity-id-fn  (fn [event] ...)       ; event -> entity id
-          ;; Optional — L1 cache TTL:
-          :l1-ttl-ms 1000}                      ; ms before revalidating (default 0)
+   With exactly one of :key or :route, each instance accumulates separate state.
+   :key maps an event to an instance ID. :route returns [ID input] pairs.
+   Read with value, state, values, page, or a composed query; project rejects
+   keyed models. Keyed-only options are :initial (a value, default {}),
+   :result, :include?, :indexes, :searches, :filtered-indexes, :state-schema
+   and :result-schema. Keyed :schema is an alias for :state-schema. State is
+   validated after each input, and results before publication.
+
+       (defreadmodel :example customers
+         {:events #{:example/customer-changed} :version 1
+          :key :customer-id :indexes {:name (order-key [:name])}}
          \"Optional docstring.\"
          [state event]
-         ... reducer body ...)
+         (customer-step state event))
 
-   The reducer receives accumulated state (a map, initially `{}`) and a single event.
-   It must return the new state. The function is registered under the qualified keyword
-   `:<ns-kw>/<name>` and can be projected via `(project context :<ns-kw>/<name>)`."
+   Unknown or inapplicable options are errors. Change :version when changing
+   materialized behavior. The macro also defines the reducer Var ns-kw-name."
   {:arglists '([ns-kw name opts? docstring? [state event] & body])}
   [ns-kw fn-name & args]
   (let [[opts args] (if (map? (first args))
@@ -262,7 +271,7 @@
                       {:description docstring
                        :options (select-keys opts #{:events :version :schema
                                                     :l1-ttl-ms :key :route :initial :result :include?
-                                                    :indexes :searches :ranked-indexes :state-schema :result-schema})}})]
+                                                    :indexes :searches :filtered-indexes :state-schema :result-schema})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
@@ -355,6 +364,9 @@
   [context name options]
   (keyed/page context name (keyed-definition context name) options))
 
+;; Advanced composition: index metadata and candidate-ID pages.
+;; Prefer query for declarative list pages; it coordinates these operations.
+
 (defn index-groups
   "Return distinct index values in ascending order as {:value v :total n}.
    Reads maintained group counts without loading any member results.
@@ -392,21 +404,21 @@
   ([context name keys options]
    (keyed/key-page context name (keyed-definition context name) keys options)))
 
-(defn ranked-key-page
-  "Experimental matching-key pagination through stored rank-span membership.
-   The model must opt the chosen index into :ranked-indexes and use a new version.
+(defn filtered-key-page
+  "Advanced, experimental pagination of matching IDs in stored order.
+   The model must opt the chosen index into :filtered-indexes and use a new version.
    Accepts :index (:identity), :direction (:asc), :page (1), :limit (25).
    Matches key-page's stored-order semantics; no query-time sort callback.
    Resolves candidate IDs into target-model ordinals, counts span intersections,
    and skips spans to select the page without decoding or sorting full results.
    Candidate resolution and bitmap work are not bounded by page size."
   [context name keys options]
-  (keyed/ranked-key-page context name (keyed-definition context name) keys options))
+  (keyed/filtered-key-page context name (keyed-definition context name) keys options))
 
 (defn joined-page
   "Experimental identity join: membership from one model, ordering from another.
    Options: :index, :direction, :page, :limit, required :missing-value, optional
-   :keys restricting candidates. The ordering index must opt into :ranked-indexes.
+   :keys restricting candidates. The ordering index must opt into :filtered-indexes.
    Missing/excluded ordering results use the supplied value and share ascending
    string-ID ties with real equal values. Both models use one prepared snapshot.
    Reads membership/ordinal metadata, not full results; unsearched selection visits
@@ -470,12 +482,15 @@
 
 (defn search-text
   "Pure searchable-text extractor with explicit field provenance. Fields are
-   separated by spaces. Optional :suffix supports composed search boundaries."
+   separated by spaces. The same extractor serves root-only and related searches;
+   Grain handles the joining boundary. The optional :suffix arity remains for
+   compatibility with existing stored indexes; new declarations need no suffix."
   ([fields] (read-query/search-text fields))
   ([fields options] (read-query/search-text fields options)))
 
 (defn query-models
-  "Validate a four-key read-query definition and return its model/version map,
+  "Validate a four-key read-query definition, including static search and order
+   index requirements, and return its model/version map,
    suitable for an endpoint's existing :grain/read-models subscription."
   [definition]
   (read-query/subscriptions (read-query/compile-definition definition @read-model-registry*)))
@@ -485,7 +500,9 @@
    Request: required :order, optional :search, :direction, :page, :limit, :params.
    Rows contain :key (root identity) and detached results under declared aliases.
    Returns exact pagination and :work describing the selected execution path.
-   Opaque computed ordering may evaluate every candidate. Indexed text composition
+   Explicit :call ordering may evaluate every candidate. Unsupported plain field
+   orders fail rather than scanning results. Storage-key size errors propagate.
+   Indexed text composition
    currently supports root text plus one related group; unsupported forms fail.
    Does not define or maintain an additional joined read model."
   [context definition request]
@@ -494,18 +511,11 @@
         api {:value #'value :values #'values :page #'page
              :index-groups #'index-groups :index-keys #'index-keys :index-rank #'index-rank
              :search-keys #'search-keys :key-page #'key-page
-             :ranked-key-page #'ranked-key-page :joined-page #'joined-page
+             :filtered-key-page #'filtered-key-page :joined-page #'joined-page
              :read-session (fn [ctx names f]
                              (keyed/read-session [[ctx names]] registry (fn [[prepared]] (f prepared))))
              :same-members? (fn [ctx a b]
-                              (or (= a b) (keyed/same-members? ctx a (get registry a) b (get registry b))))
-             :unindexed-session
-             (fn [ctx models f]
-               (let [definitions (into {} (map (fn [[name d]]
-                                                 [name (assoc d :indexes {} :searches {} :ranked-indexes #{})])) models)
-                     unindexed (assoc ctx ::fold-key/unindexed true)]
-                 (keyed/read-session [[unindexed (keys definitions)]] definitions
-                                     (fn [[prepared]] (f prepared)))))}]
+                              (or (= a b) (keyed/same-members? ctx a (get registry a) b (get registry b))))}]
     (read-query/execute api context plan request)))
 
 ;; ---------------------------------------------------------------------------

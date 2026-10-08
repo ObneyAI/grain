@@ -18,10 +18,29 @@
   (or (contains? definition :key) (contains? definition :route)))
 
 (defn validate! [name opts]
-  (when (and (contains? opts :ranked-indexes) (not (keyed? opts)))
-    (throw (ex-info "Rank membership requires a keyed fold" {:model name})))
-  (when (and (contains? opts :searches) (not (keyed? opts)))
-    (throw (ex-info "Text search requires a keyed fold" {:model name})))
+  (when-not (map? opts)
+    (throw (ex-info "Read model options must be a map" {:model name})))
+  (let [keyed-options #{:events :version :key :route :initial :result :include? :indexes
+                        :searches :filtered-indexes :schema :state-schema :result-schema}
+        ordinary-options #{:events :version :schema :partition-fn :entity-id-fn :l1-ttl-ms}
+        keyed? (boolean (keyed? opts))
+        supported (if keyed? keyed-options ordinary-options)
+        invalid (into #{} (remove supported) (keys opts))]
+    (when (seq invalid)
+      (let [unknown (into #{} (remove (into keyed-options ordinary-options)) invalid)
+            inapplicable (into #{} (remove unknown) invalid)
+            supported (vec (sort supported))
+            hint (str (when (seq inapplicable)
+                        (str (pr-str (vec (sort inapplicable)))
+                             (if keyed?
+                               " apply only to ordinary models read with project; remove them from this keyed model. "
+                               " require a keyed model; remove them or supply exactly one of :key or :route. ")))
+                      "Supported options: " (pr-str supported) ".")]
+        (throw (ex-info (str "Read model " name " has unknown or inapplicable options "
+                             (pr-str (vec (sort-by pr-str invalid))) ". " hint)
+                        {:type :grain.read-model/invalid :model name :options invalid :keyed? keyed?
+                         :unknown-options unknown :inapplicable-options inapplicable
+                         :supported-options supported :hint hint})))))
   (when (keyed? opts)
     (when-not (and (qualified-keyword? name) (pos-int? (:version opts 1))
                    (set? (:events opts)) (seq (:events opts))
@@ -32,15 +51,11 @@
                    (ifn? (:include? opts (constantly true)))
                    (map? (:indexes opts {}))
                    (map? (:searches opts {}))
-                   (set? (:ranked-indexes opts #{}))
-                   (every? #(or (= :identity %) (contains? (:indexes opts) %)) (:ranked-indexes opts))
+                   (set? (:filtered-indexes opts #{}))
+                   (every? #(or (= :identity %) (contains? (:indexes opts) %)) (:filtered-indexes opts))
                    (every? (fn [[k f]] (and (keyword? k) (ifn? f))) (:searches opts))
                    (every? (fn [[k f]] (and (keyword? k) (not= :identity k) (ifn? f)))
-                           (:indexes opts))
-                   (not-any? #(contains? opts %)
-                             [:partition-fn :entity-id-fn :l1-ttl-ms :l1-max-entries
-                              :record-scope :entity-key :entity-source :depends-on :derived?
-                              :tenant-key :tenant-id :scope :query :queries]))
+                           (:indexes opts)))
       (throw (ex-info "Invalid keyed-fold declaration" {:model name})))
     (doseq [schema (keep opts [:schema :state-schema :result-schema])] (m/schema schema))))
 
@@ -63,7 +78,7 @@
 (defn- index-prefix [b index direction]
   (ranked/prefix (index-config b index direction) 0))
 (defn- membership-config [b d index direction]
-  (assoc (index-config b index direction) :membership? (contains? (:ranked-indexes d) index)))
+  (assoc (index-config b index direction) :membership? (contains? (:filtered-indexes d) index)))
 (defn- sort-bytes [value direction]
   (cond-> (key/encode value) (= direction :desc) key/descending))
 (defn- index-member [direction value id]
@@ -218,7 +233,7 @@
             (when (or (nil? old) (pos? (compare through old)))
               (write! tx (progress-key b) (assoc p :checked-through through)))))))))
 
-(defn- identity-of [ctx] [(:tenant-id ctx) (boolean (::key/unindexed ctx))])
+(defn- identity-of [ctx] (:tenant-id ctx))
 
 (defn session-definition [ctx name]
   (when-let [s (::session ctx)]
@@ -407,11 +422,11 @@
              :total total :total-pages pages :page page :page-size limit
              :sort-keys-read (aget counts 0)}))))))
 
-(defn ranked-key-page [ctx name d keys options]
+(defn filtered-key-page [ctx name d keys options]
   (let [{:keys [index direction page limit]
          :or {index :identity direction :asc page 1 limit 25}} options]
     (when-not (and (map? options) (every? #{:index :direction :page :limit} (clojure.core/keys options))
-                   (contains? (:ranked-indexes d) index)
+                   (contains? (:filtered-indexes d) index)
                    (#{:asc :desc} direction) (pos-int? page) (pos-int? limit))
       (throw (ex-info "Ranked key page requires an opted-in stored index" {:model name :options options})))
     (with-reader ctx name d
@@ -434,7 +449,7 @@
          :or {index :identity direction :asc page 1 limit 25}} options]
     (when-not (and (map? options)
                    (every? #{:index :direction :page :limit :missing-value :keys} (clojure.core/keys options))
-                   (contains? options :missing-value) (contains? (:ranked-indexes d) index)
+                   (contains? options :missing-value) (contains? (:filtered-indexes d) index)
                    (#{:asc :desc} direction) (pos-int? page) (pos-int? limit))
       (throw (ex-info "Joined page requires a ranked index and an explicit missing value"
                       {:model name :options options})))
