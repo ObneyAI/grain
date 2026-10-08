@@ -146,3 +146,13 @@ read session. Snapshot/freshness semantics are those of the existing keyed
 read-session API, not a stronger cross-fold event-log transaction.
 
 Contract: [keyed folds and composed read queries](read-model-processor-v2.allium).
+
+Implementation lives in `core.clj`; tests and the ranked-membership benchmark
+live in `interface_test.clj`. Run the benchmark from `projects/grain-core-v2`:
+
+```sh
+clojure -J--add-opens=java.base/java.nio=ALL-UNNAMED \
+  -J--add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+  -Sdeps '{:paths ["resources" "../../components/read-model-processor-v2/test"] :deps {bench/sqlite {:local/root "../../components/event-store-sqlite-v3"}}}' \
+  -M -m ai.obney.grain.read-model-processor-v2.interface-test 10000 /tmp/ranked-membership.edn
+```
