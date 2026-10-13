@@ -962,17 +962,22 @@
 ;; Durable namespace reservations
 ;; ---------------------------------------------------------------------------
 
-(def ^:private namespace-registry-prefix (byte-array [75 82 57]))
-(def ^:private namespace-counter-key (key-join namespace-registry-prefix (byte-array [0])))
+(def ^:dynamic ^:private namespace-registry-prefix (byte-array [75 82 57]))
+(def ^:dynamic ^:private namespace-counter-key (key-join namespace-registry-prefix (byte-array [0])))
+(def ^:dynamic ^:private namespace-data-prefix (byte-array [75 70 57]))
 (def ^:private namespace-max-ordinal Integer/MAX_VALUE)
 
 (defn- namespace-failure [message data]
   (throw (ex-info message (assoc data :type :grain.read-model/invalid-registry))))
 
 (defn- namespace-valid-identity? [identity]
-  (and (vector? identity) (= 3 (count identity))
+  (and (vector? identity) (contains? #{3 4} (count identity))
        (uuid? (nth identity 0)) (qualified-keyword? (nth identity 1))
-       (pos-int? (nth identity 2))))
+       (pos-int? (nth identity 2))
+       (or (= 3 (count identity))
+           (let [scope (nth identity 3)]
+             (and (vector? scope) (= 2 (count scope)) (= :event-scope (first scope))
+                  (string? (second scope)) (boolean (re-matches #"[0-9a-f]+" (second scope))))))))
 
 (defn- namespace-digest [identity]
   (.digest (MessageDigest/getInstance "SHA-256") (key-encode identity)))
@@ -987,7 +992,7 @@
   (key-join namespace-registry-prefix (byte-array [2]) (namespace-ordinal-bytes ordinal)))
 
 (defn- namespace-address [ordinal]
-  (key-join (byte-array [75 70 57]) (namespace-ordinal-bytes ordinal)))
+  (key-join namespace-data-prefix (namespace-ordinal-bytes ordinal)))
 
 (defn- namespace-read-value [tx k]
   (when-let [raw ((:get tx) k)]
@@ -1009,7 +1014,8 @@
   (when-let [entry (namespace-read-value tx (namespace-forward-key identity))]
     (let [{stored :identity ordinal :ordinal :as value} (:value entry)]
       (when-not (and (map? value) (= #{:identity :ordinal} (set (keys value)))
-                     (namespace-valid-identity? stored) (integer? ordinal)
+                     (namespace-valid-identity? stored)
+                     (= (count stored) (alength ^bytes namespace-registry-prefix)) (integer? ordinal)
                      (some? next-id) (<= 0 ordinal) (< ordinal next-id))
         (namespace-failure "Invalid namespace registry forward entry" {:identity identity}))
       (when-not (= identity stored)
@@ -1030,16 +1036,18 @@
   (let [counts
         ((:reduce tx) {:prefix namespace-registry-prefix}
          (fn [counts {:keys [k]}]
-           (when (< (alength ^bytes k) 4)
+           (when (<= (alength ^bytes k) (alength ^bytes namespace-registry-prefix))
              (namespace-failure "Invalid namespace registry address" {}))
-           (let [kind (bit-and 255 (aget ^bytes k 3))]
+           (let [kind (bit-and 255 (aget ^bytes k (alength ^bytes namespace-registry-prefix)))]
              (case kind
                0 (when-not (Arrays/equals ^bytes k ^bytes namespace-counter-key)
                    (namespace-failure "Invalid namespace counter address" {}))
                (1 2)
                (let [{stored :identity ordinal :ordinal :as value} (:value (namespace-read-value tx k))]
                  (when-not (and (map? value) (= #{:identity :ordinal} (set (keys value)))
-                                (namespace-valid-identity? stored) (integer? ordinal) (<= 0 ordinal) (< ordinal next-id))
+                                (namespace-valid-identity? stored)
+                                (= (count stored) (alength ^bytes namespace-registry-prefix))
+                                (integer? ordinal) (<= 0 ordinal) (< ordinal next-id))
                    (namespace-failure "Invalid namespace registry record" {}))
                  (when-not (Arrays/equals ^bytes k ^bytes (if (= kind 1) (namespace-forward-key stored) (namespace-reverse-key ordinal)))
                    (namespace-failure "Namespace registry address does not match its record" {}))
@@ -1054,7 +1062,7 @@
   (let [initial (namespace-counter tx)
         _ (when (some? initial) (namespace-validate-registry! tx initial))
         _ (when (and (nil? initial)
-                     ((:reduce tx) {:prefix (byte-array [75 70 57])}
+                     ((:reduce tx) {:prefix namespace-data-prefix}
                       (fn [_ _] (reduced true)) false))
             (namespace-failure "Namespace registry is missing while materialized data remains" {}))
         _ (when (and (nil? initial)
@@ -1082,12 +1090,23 @@
 
 (defn namespace-resolve! [cache identities]
   (when-not (and cache (sequential? identities) (every? namespace-valid-identity? identities))
-    (throw (ex-info "Expected cache and tenant/model/version namespace identities"
+    (throw (ex-info "Expected cache and tenant/model/version namespace identities with optional event scope"
                     {:type :grain.read-model/invalid-namespace})))
-  (let [identities (vec (distinct identities))]
-    (if (empty? identities) {}
-      (or (kv/transact cache :read #(namespace-resolve-known % identities))
-          (kv/transact cache :write #(namespace-allocate! % identities))))))
+  (let [groups (group-by count (distinct identities))
+        resolve! (fn [identities]
+                   (if (empty? identities) {}
+                     (or (kv/transact cache :read #(namespace-resolve-known % identities))
+                         (kv/transact cache :write #(namespace-allocate! % identities)))))
+        ordinary (resolve! (get groups 3))
+        ;; Scoped namespaces have their own address and registry prefixes. An
+        ;; older reader can still reserve ordinary KF9 namespaces in this cache.
+        scoped (when (seq (get groups 4))
+                 (let [prefix (byte-array [75 82 83 57])]
+                   (binding [namespace-registry-prefix prefix
+                             namespace-counter-key (key-join prefix (byte-array [0]))
+                             namespace-data-prefix (byte-array [75 70 83 57])]
+                     (resolve! (get groups 4)))))]
+    (merge ordinary scoped)))
 
 ;; ---------------------------------------------------------------------------
 ;; Shared identities and membership bitmaps
@@ -1656,7 +1675,53 @@
     (keyed-observe! ctx operation (alength ^bytes bytes))
     (codec/decode bytes)))
 
-(defn- keyed-namespace-identity [ctx name d] [(:tenant-id ctx) name (:version d 1)])
+(defn- keyed-validate-scope! [scope]
+  (let [query? (fn [q]
+                 (and (map? q) (every? #{:tags :types} (keys q))
+                      (or (not (contains? q :types))
+                          (and (set? (:types q)) (every? keyword? (:types q))))
+                      (or (not (contains? q :tags))
+                          (and (set? (:tags q))
+                               (every? #(and (vector? %) (= 2 (count %))
+                                             (keyword? (first %)) (uuid? (second %))) (:tags q))))))]
+    (when-not (or (nil? scope)
+                  (and (map? scope)
+                       (or (and (= #{:tags} (set (keys scope))) (query? scope))
+                           (and (= #{:queries} (set (keys scope)))
+                                (or (query? (:queries scope))
+                                    (and (vector? (:queries scope)) (every? query? (:queries scope))))))))
+      (throw (ex-info "Keyed event scope requires {:tags #{[tag UUID] ...}} or {:queries [{:tags ... :types ...} ...]}"
+                      {:type :grain.read-model/invalid-scope :scope scope
+                       :hint "Scope selects events before folding. Tenant, progress, ordering and limits belong to the read operation, not its event scope."}))))
+  scope)
+
+(defn keyed-scoped-context [ctx scope]
+  (keyed-validate-scope! scope)
+  (if scope (assoc ctx :read-model/scope scope) (dissoc ctx :read-model/scope)))
+
+(defn- keyed-namespace-identity [ctx name d]
+  (cond-> [(:tenant-id ctx) name (:version d 1)]
+    (:read-model/scope ctx)
+    (conj [:event-scope (.formatHex (HexFormat/of)
+                         (codec/encode (canonical-cache-value (:read-model/scope ctx))))])))
+
+(defn- keyed-event-query [ctx d after]
+  (let [scope (:read-model/scope ctx)
+        queries (cond
+                  (nil? scope) [{}]
+                  (contains? scope :tags) [scope]
+                  (map? (:queries scope)) [(:queries scope)]
+                  :else (:queries scope))
+        queries (into []
+                  (keep (fn [q]
+                          (let [types (if (contains? q :types)
+                                        (into #{} (filter (:events d)) (:types q)) (:events d))]
+                            ;; Empty selectors must never turn into an unfiltered store read.
+                            (when (and (seq types) (or (not (contains? q :tags)) (seq (:tags q))))
+                              (cond-> (assoc q :tenant-id (:tenant-id ctx) :types types)
+                                after (assoc :after after)))))) queries)]
+    (if (= 1 (count queries)) (first queries) queries)))
+
 (defn- keyed-address [b kind id] (key-checked (key-join b (byte-array [kind]) (key-encode id))))
 (defn- keyed-progress-key [b] (key-join b (byte-array [0])))
 (defn- keyed-count-key [b] (key-join b (byte-array [4])))
@@ -1819,15 +1884,14 @@
     (when (and through (or (nil? after) (pos? (compare through after))))
       (let [validate-state! (keyed-prepare-validation (:state-schema d) name :state)
             validate-result! (keyed-prepare-validation (:result-schema d) name :result)
+            query (keyed-event-query ctx d after)
             remaining (reduce
                        (fn [batch event]
                          (if (pos? (compare (:event/id event) through)) (reduced batch)
                            (let [batch (conj batch event)]
                              (if (= batch-size (count batch))
                                (do (keyed-apply-batch! ctx name d b validate-state! validate-result! batch) []) batch))))
-                       [] (es/read (:event-store ctx)
-                                   (cond-> {:tenant-id (:tenant-id ctx) :types (:events d)}
-                                     after (assoc :after after))))]
+                       [] (if (seq query) (es/read (:event-store ctx) query) []))]
         (when (seq remaining) (keyed-apply-batch! ctx name d b validate-state! validate-result! remaining)))
       (kv/transact (:cache ctx) :write
         (fn [tx]
@@ -1835,7 +1899,7 @@
             (when (or (nil? old) (pos? (compare through old)))
               (keyed-write! tx (keyed-progress-key b) (assoc p :checked-through through)))))))))
 
-(defn- keyed-identity-of [ctx] (:tenant-id ctx))
+(defn- keyed-identity-of [ctx] [(:tenant-id ctx) (:read-model/scope ctx)])
 
 (defn keyed-session-definition [ctx name]
   (when-let [s (:ai.obney.grain.read-model-processor-v2.core.keyed/session ctx)]
@@ -1860,6 +1924,7 @@
         event-store (:event-store (ffirst requests))]
     (when-not cache (throw (ex-info "Read session requires :cache" {})))
     (doseq [[ctx names] requests]
+      (keyed-validate-scope! (:read-model/scope ctx))
       (when (:ai.obney.grain.read-model-processor-v2.core.keyed/session ctx)
         (throw (ex-info "Cannot open a nested keyed-fold read session" {})))
       (when-not (identical? cache (:cache ctx))
@@ -1873,20 +1938,20 @@
           (locking cache
             (let [identities (mapcat
                               (fn [[ctx names]]
-                                (cons [(:tenant-id ctx) :grain.read-query/shared-identities 1]
+                                (cons (keyed-namespace-identity ctx :grain.read-query/shared-identities {:version 1})
                                       (map #(keyed-namespace-identity ctx % (get registry %)) names))) requests)
                   prefixes (namespace-resolve! cache (vec identities))
                   heads (reduce (fn [heads [ctx _]]
-                                  (let [id (keyed-identity-of ctx)]
+                                  (let [id (:tenant-id ctx)]
                                     (if (contains? heads id) heads (assoc heads id (keyed-head ctx))))) {} requests)
                   prepared (mapv
                              (fn [[ctx names]]
-                               (let [identity-prefix (get prefixes [(:tenant-id ctx) :grain.read-query/shared-identities 1])]
+                               (let [identity-prefix (get prefixes (keyed-namespace-identity ctx :grain.read-query/shared-identities {:version 1}))]
                                  (doseq [name (distinct names)]
                                    (keyed-catch-up! (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix identity-prefix)
                                               name (get registry name)
                                               (get prefixes (keyed-namespace-identity ctx name (get registry name)))
-                                              (get heads (keyed-identity-of ctx))))
+                                              (get heads (:tenant-id ctx))))
                                [ctx (select-keys registry names)])) requests)]
               {:prefixes prefixes :prepared prepared}))]
       (kv/transact cache :read

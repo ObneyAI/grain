@@ -80,6 +80,54 @@ Keyed `:initial` supplies a state value; its default is `{}`. Keyed state and
 result schemas validate processing. Ordinary `:schema` validates schema syntax only;
 keyed models use `:state-schema` and reject `:schema`.
 
+## Materializing a requested event scope
+
+Keyed reads accept an explicit event scope through `scoped-context`. Scope limits
+event replay before folding; index filters select results afterward. Application
+context keys such as a student ID do not implicitly scope Grain's event reads.
+
+```clojure
+(let [scoped (rmp/scoped-context context {:tags #{[:User user-id]}})]
+  (into [] (rmp/values scoped :enrollment/applications
+                      {:index :user :equals user-id})))
+
+;; Reuse existing tag/type query scopes, including related record tags:
+(rmp/scoped-context context
+                    {:queries [{:tags #{[:User user-id]}}
+                               {:tags #{[:Application application-id]}}]})
+```
+
+Use the returned context with `value`, `state`, `values`, `page`, `query`, and
+`read-session`. Each event scope has independent state, results, indexes, exact
+counts, and durable progress. Reading one scope does not catch up another scope
+or the unscoped model. Cold reads build only the requested scope; later reads
+resume its progress. Overlapping scopes are independent materializations, so
+their histories cannot overwrite one another. Equal maps and tag sets reuse the
+same durable scope identity, including after restart.
+
+Lists and counts include every matching instance within the requested scope,
+even when none was cached before the request. Events outside that scope do not
+run its reducer. Without an event scope, reads request the whole model for that
+tenant. A point key or an index equality/prefix filter alone still requests
+unscoped replay: Grain cannot infer event tags from an arbitrary routing or index
+function.
+
+Scope accepts `{:tags #{[tag UUID] ...}}` or `{:queries query-or-vector}`. Query
+maps accept only `:tags` and `:types`; query types are intersected with each
+model's declared events, and union reads deduplicate matching events. Empty tag
+sets, empty type sets, and an empty query vector select nothing. Tenant, replay
+cursors, limits, and direction remain controlled by Grain. An active read
+session's event scope cannot change. Pass nil to `scoped-context` to remove a
+scope before opening a session. This context helper applies to keyed APIs;
+ordinary `project` continues to take its scope argument directly.
+
+Within one query, an event must bear all supplied tags. Use separate query maps
+to union the User stream with related Application, Enrollment, and financial
+record streams, as in the existing `project` query-scope API.
+
+Scoped namespaces use separate registry and data prefixes alongside existing
+unscoped KF9 data, so introducing scopes does not invalidate an existing cache.
+
 Declaration errors identify the model and offending options, order, or search
 fields. Messages include a correction. Structured `ex-data` supplies `:hint`,
 query `:path`, and, when an index is missing, `:suggested-extractor`.

@@ -356,20 +356,32 @@ contract KeyedFoldDefinition {
 contract KeyedFoldMaterialization {
     catch_up: (context: Any, model: Any) -> Any
 
+    @invariant RequestedScopeBeforeMaterialization
+        -- A caller's requested event scope constrains source selection before
+        -- folding or index maintenance. A scoped read materializes only that
+        -- scope's model instance; it never first catches up the model over the
+        -- tenant's whole subscribed history and then filters the results.
+        -- Reading additional scopes builds their materializations on demand.
+        -- Events outside the requested scope do not cause state, result, index,
+        -- or count updates and cannot fail that scope's reduction.
+        -- An absent scope requests the whole subscribed tenant stream.
+
     @invariant FoldEquivalence
-        -- At committed progress H, each instance state equals reduction from the
-        -- declared initial state over exactly the inputs routed from subscribed
-        -- tenant events through H, preserving event and input order. Its result equals
-        -- result(state). Batch boundaries, prior read choices, restart, and
-        -- interleaving other keys cannot change that answer.
+        -- At a requested scope's committed progress H, each instance state equals
+        -- reduction from the declared initial state over exactly the inputs routed
+        -- from subscribed tenant events matching that scope through H, preserving
+        -- event and input order. Its result equals result(state). Batch boundaries,
+        -- prior read choices, restart, and
+        -- interleaving other keys or scopes cannot change that answer.
 
     @invariant ContextSuppliesTenancy
         -- Tenant identity comes from trusted caller context. The configured
         -- cache belongs to its event store; no additional history identifier
         -- is supplied by the application.
         -- State, results, indexes, progress, and read positions are isolated by
-        -- tenant, model, and version within that cache; instances are distinguished
-        -- by key. Definitions contain no tenant-routing or cross-tenant selector.
+        -- tenant, model, version, and requested event scope within that cache;
+        -- instances are distinguished by key. Definitions contain no tenant-routing
+        -- or cross-tenant selector.
         -- A single-tenant deployment uses the same definitions and contracts.
 
     @invariant StableMaterializationIdentity
@@ -385,9 +397,15 @@ contract KeyedFoldMaterialization {
 
     @invariant CoordinatedPublication
         -- A successful batch publishes all its affected accumulated states,
-        -- results, index changes, counts, and model progress together. Every
-        -- event covered by advanced progress has its complete effects committed.
+        -- results, index changes, counts, and requested scope's progress together.
+        -- Every event covered by advanced progress has its complete effects committed.
         -- Result calculation and indexing have no independent refresh checkpoint.
+
+    @invariant IndependentScopeProgress
+        -- Completing one scope cannot mark an unread scope, a broader scope,
+        -- or the unscoped model as caught up. Each requested scope resumes from
+        -- its own durable progress. Overlapping scopes preserve their own fold
+        -- equivalence without skipping or double-applying matching inputs.
 
     @invariant FailureAndRestart
         -- Failure in routing, reduction, completion, validation, encoding, or
@@ -402,8 +420,8 @@ contract KeyedFoldMaterialization {
         -- Application reducers do not coordinate writers themselves.
 
     @invariant FiniteFreshness
-        -- A read captures a finite source head and catches its model up through
-        -- that head before serving fresh data. Newer committed state may be
+        -- A read captures a finite source head and catches its requested scope up
+        -- through that head before serving fresh data. Newer committed state may be
         -- observed; later events cannot cause an unbounded chase. A failed
         -- catch-up is an error rather than a successful stale fallback.
         -- Capturing the head from a built-in store reads its committed identity
@@ -543,6 +561,15 @@ contract KeyedFoldReads {
         -- Oversized storage keys fail with an identifiable key-too-large error
         -- before committing the affected batch; values are never truncated.
 
+    @invariant CompleteWithinRequestedScope
+        -- Traversal, search, pages, and counts cover the complete requested
+        -- event scope through captured progress, including matching instances
+        -- that were not cached before the request. An incomplete cache is never
+        -- reported as a complete answer. Scope constrains materialization;
+        -- result membership and index selection then apply before pagination.
+        -- Completeness within one scope does not require materializing another
+        -- scope or the entire tenant population.
+
     @invariant RepresentationPreservesAdmissionAndOrder
         -- A storage representation change does not newly reject a previously
         -- accepted valid input as an oversized key merely because its encoding
@@ -565,7 +592,8 @@ contract KeyedFoldReads {
 
     @invariant CompositionRemainsAQuery
         -- Queries can combine independent models' results in a scoped read
-        -- session sharing one cache and event store. Catch-up runs once before
+        -- session sharing one cache and event store. Each prepared model retains
+        -- its requested event scope. Catch-up runs once per model and scope before
         -- the session's reads, without each addressed read starting
         -- another replay. This creates no shared model definition, version, or
         -- checkpoint and no persisted cross-model dependency graph. No historical

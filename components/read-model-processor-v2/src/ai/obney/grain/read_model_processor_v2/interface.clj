@@ -45,7 +45,8 @@
    uses a fresh format identity and materializes through normal event replay.
 
    The caching and partitioning options below describe legacy project calls.
-   Keyed folds do not use L1/TTL caching or legacy scopes.
+   Keyed folds do not use L1/TTL caching. Use scoped-context for event-tag or
+   event-query scopes; index selection alone does not constrain event replay.
 
    Read models are pure reducer functions `(state, event) -> state` that project
    event streams into queryable state. This processor handles caching, incremental
@@ -314,6 +315,21 @@
 ;; ---------------------------------------------------------------------------
 ;; Keyed folds
 ;; ---------------------------------------------------------------------------
+
+(defn scoped-context
+  "Return a context whose keyed reads replay only the requested event scope.
+   Accepts {:tags #{[tag UUID] ...}} or {:queries [{:tags ... :types ...} ...]}.
+   Query types are intersected with each model's subscriptions; queries form a
+   deduplicated event union. Empty selectors select nothing. Tenant and replay
+   cursors come from Grain. State, results, indexes, counts and progress are
+   cached independently per scope. Index selections apply after scoped replay.
+   Use this context with value, state, values, page, query or read-session.
+   Passing nil removes the scope. An active session's scope cannot be changed.
+
+     (values (scoped-context context {:tags #{[:User user-id]}})
+             :enrollment/applications {:index :user :equals user-id})"
+  [context scope]
+  (core/keyed-scoped-context context scope))
 
 (defn- keyed-definition [context name]
   (let [definition (or (core/keyed-session-definition context name)
