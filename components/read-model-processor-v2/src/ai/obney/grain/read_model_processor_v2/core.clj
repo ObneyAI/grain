@@ -6,7 +6,8 @@
             [clojure.string :as str]
             [com.brunobonacci.mulog :as u]
             [malli.core :as m])
-  (:import [java.io ByteArrayOutputStream DataOutputStream EOFException]
+  (:import [java.lang.ref WeakReference]
+           [java.io ByteArrayOutputStream DataOutputStream EOFException]
            [java.nio ByteBuffer ByteOrder BufferUnderflowException]
            [java.security MessageDigest]
            [java.util Arrays ArrayList Comparator HashMap HashSet HexFormat
@@ -1896,29 +1897,120 @@
       (throw (ex-info "Cannot read the committed event-store head" result)))
     result))
 
-(defn- keyed-catch-up! [ctx name d b through]
+;; This is event-source absence evidence, not projection freshness. Owners are
+;; weak, descriptors contain only validated immutable identity values, and a
+;; full working set retains ordinary durable checkpointing for overflow scopes.
+(def ^:private empty-proof-max-entries 256)
+(def ^:private empty-proof-max-bytes (* 16 1024 1024))
+(def ^:private empty-proof-max-entry-bytes (* 256 1024))
+(def ^:private empty-proof-prune-every 256)
+(def ^:private empty-proofs* (atom {:entries {} :bytes 0}))
+
+(defn- empty-proof-key [source identity d]
+  [(System/identityHashCode source) identity (:events d)])
+
+(defn- empty-proof-size [[_ identity types]]
+  ;; Two bytes per character conservatively accounts for UTF-16 strings;
+  ;; fixed object/collection overhead is charged per entry and event type.
+  (+ 1024 (* 2 (count (str (nth identity 1))))
+     (if-let [scope (nth identity 3 nil)] (* 2 (count (second scope))) 0)
+     (* 128 (count types))
+     (reduce + 0 (map #(* 2 (count (str %))) types))))
+
+(defn- empty-proof-forget! [key]
+  (locking empty-proofs*
+    (when-let [proof (get-in @empty-proofs* [:entries key])]
+      (swap! empty-proofs* #(-> % (update :entries dissoc key)
+                               (update :bytes - (:bytes proof)))))))
+
+(defn- empty-proof-covers? [source key after through]
+  (locking empty-proofs*
+    (when-let [proof (get-in @empty-proofs* [:entries key])]
+      (if-not (identical? source (.get ^WeakReference (:source proof)))
+        (do (empty-proof-forget! key) false)
+        (and (or (nil? (:after proof))
+                 (and after (not (neg? (compare after (:after proof))))))
+             (not (pos? (compare through (:through proof)))))))))
+
+(defn- prune-empty-proofs [state]
+  (reduce-kv (fn [out key proof]
+               (if (.get ^WeakReference (:source proof)) out
+                 (-> out (update :entries dissoc key) (update :bytes - (:bytes proof)))))
+             state (:entries state)))
+
+(defn- empty-proof-remember! [source key after through]
+  (let [size (empty-proof-size key)]
+    (when (<= size empty-proof-max-entry-bytes)
+      (locking empty-proofs*
+        (let [state @empty-proofs*
+              old (get-in state [:entries key])
+              state (if (and (nil? old)
+                             (or (>= (count (:entries state)) empty-proof-max-entries)
+                                 (> (+ (:bytes state) size) empty-proof-max-bytes)))
+                      ;; Cleanup is amortized across capacity misses, never
+                      ;; repeated for every overflow student or reset by hits.
+                      (if (pos? (:prune-countdown state 0))
+                        (update state :prune-countdown dec)
+                        (assoc (prune-empty-proofs state) :prune-countdown (dec empty-proof-prune-every)))
+                      state)
+              old (get-in state [:entries key])
+              bytes (+ (- (:bytes state) (:bytes old 0)) size)]
+          (if (and (or old (< (count (:entries state)) empty-proof-max-entries))
+                   (<= bytes empty-proof-max-bytes))
+            (let [through (if (and old (identical? source (.get ^WeakReference (:source old)))
+                                   (= after (:after old))
+                                   (pos? (compare (:through old) through)))
+                            (:through old) through)]
+              (reset! empty-proofs*
+                      (assoc state
+                             :entries (assoc (:entries state) key
+                                             {:source (WeakReference. source) :after after
+                                              :through through :bytes size})
+                             :bytes bytes))
+              true)
+            (do (reset! empty-proofs* state) false)))))))
+
+(defn- keyed-checkpoint! [ctx b through]
+  (kv/transact (:cache ctx) :write
+    (fn [tx]
+      (let [p (keyed-read-meta tx (keyed-progress-key b)) old (:checked-through p)]
+        (when (or (nil? old) (pos? (compare through old)))
+          (keyed-write! tx (keyed-progress-key b) (assoc p :checked-through through)))))))
+
+(defn- keyed-catch-up! [ctx name d b through identity]
   (let [progress (kv/transact (:cache ctx) :read #(keyed-read-meta % (keyed-progress-key b)))
         after (last (sort (keep #(get progress %) [:checked-through :watermark])))
         batch-size (:read-model/batch-size ctx 128)]
     (when-not (pos-int? batch-size)
       (throw (ex-info "Keyed-fold batch size must be positive" {:batch-size batch-size})))
     (when (and through (or (nil? after) (pos? (compare through after))))
-      (let [validate-state! (keyed-prepare-validation (:state-schema d) name :state)
-            validate-result! (keyed-prepare-validation (:result-schema d) name :result)
-            query (keyed-event-query ctx d after)
-            remaining (reduce
-                       (fn [batch event]
-                         (if (pos? (compare (:event/id event) through)) (reduced batch)
-                           (let [batch (conj batch event)]
-                             (if (= batch-size (count batch))
-                               (do (keyed-apply-batch! ctx name d b validate-state! validate-result! batch) []) batch))))
-                       [] (if (seq query) (es/read (:event-store ctx) query) []))]
-        (when (seq remaining) (keyed-apply-batch! ctx name d b validate-state! validate-result! remaining)))
-      (kv/transact (:cache ctx) :write
-        (fn [tx]
-          (let [p (keyed-read-meta tx (keyed-progress-key b)) old (:checked-through p)]
-            (when (or (nil? old) (pos? (compare through old)))
-              (keyed-write! tx (keyed-progress-key b) (assoc p :checked-through through)))))))))
+      (let [source (:event-store ctx)
+            stable? (es/stable-empty-intervals? source)
+            proof-key (when stable? (empty-proof-key source identity d))]
+        (when-not (and stable? (empty-proof-covers? source proof-key after through))
+          (let [validate-state! (keyed-prepare-validation (:state-schema d) name :state)
+                validate-result! (keyed-prepare-validation (:result-schema d) name :result)
+                query (keyed-event-query ctx d after)
+                accepted? (volatile! false)
+                remaining (reduce
+                            (fn [batch event]
+                              (if (pos? (compare (:event/id event) through)) (reduced batch)
+                                (do
+                                  (when (and stable? (not @accepted?))
+                                    (empty-proof-forget! proof-key))
+                                  (vreset! accepted? true)
+                                  (let [batch (conj batch event)]
+                                    (if (= batch-size (count batch))
+                                      (do (keyed-apply-batch! ctx name d b validate-state! validate-result! batch) [])
+                                      batch)))))
+                            [] (if (seq query) (es/read source query) []))]
+            (when (seq remaining)
+              (keyed-apply-batch! ctx name d b validate-state! validate-result! remaining))
+            ;; Only a completed, ordered read with no accepted source events
+            ;; can suppress a checkpoint. Route-empty events are not absence.
+            (when-not (and stable? (not @accepted?)
+                           (empty-proof-remember! source proof-key after through))
+              (keyed-checkpoint! ctx b through))))))))
 
 (defn- keyed-identity-of [ctx] [(:tenant-id ctx) (:read-model/scope ctx)])
 
@@ -1993,7 +2085,7 @@
                                          :when (not (contains? @caught-up identity))]
                                    (keyed-catch-up! (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix identity-prefix)
                                               name (get registry name) (get prefixes identity)
-                                              (get heads (:tenant-id ctx)))
+                                              (get heads (:tenant-id ctx)) identity)
                                    (vswap! caught-up conj identity))
                                [ctx (select-keys registry (keys model-identities)) model-identities])) requests)]
               {:prefixes prefixes :prepared prepared}))]

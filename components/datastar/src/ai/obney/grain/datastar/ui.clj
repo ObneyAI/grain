@@ -1090,7 +1090,40 @@
         (assoc attrs :data-signals encoded)))
     attrs))
 
-(declare lower-ir)
+(defn- lower-ir*
+  [ir-node opts]
+  (case (:op ir-node)
+    :literal (lower-attr-value (:value ir-node))
+    :fragment (doall (map #(lower-ir* % opts) (:children ir-node)))
+    :element
+    (let [attrs0 (lower-attrs (:attrs ir-node))
+          attrs0b (reduce-kv merge-lowered-attr attrs0 (lower-morph-attrs (:morph ir-node)))
+          attrs1 (merge-data-signals attrs0b (:signals ir-node))
+          attrs2 (reduce-kv (fn [m k v]
+                              (if (= k :attr)
+                                (reduce-kv (fn [m2 attr-k attr-v]
+                                             (merge-lowered-attr
+                                              m2
+                                              (keyword (str "data-attr:" (name attr-k)))
+                                              (expr-value attr-v)))
+                                           m
+                                           v)
+                                (reduce-kv merge-lowered-attr
+                                           m
+                                           (lower-binding-attrs k v))))
+                            attrs1
+                            (:bindings ir-node))
+          attrs2b (if-let [effect (:effect ir-node)]
+                    (merge-lowered-attr attrs2 :data-effect (lower-effect* effect {}))
+                    attrs2)
+          attrs3 (reduce-kv (fn [m k v]
+                              (let [ctx {:bound-value-signal (get-in ir-node [:bindings :value])}
+                                    [attr-k attr-v] (lower-event-attr k v ctx)]
+                                (merge-lowered-attr m attr-k attr-v)))
+                            attrs2b
+                            (:events ir-node))
+          children (map #(lower-ir* % opts) (:children ir-node))]
+      (into [(:tag ir-node) attrs3] children))))
 
 (defn lower-ir
   "Lowers Datastar UI IR to plain Datastar hiccup.
@@ -1100,39 +1133,10 @@
    - `:query-registry` explicit registry used to resolve checked route refs."
   ([ir-node] (lower-ir ir-node {:target :datastar}))
   ([ir-node opts]
+   ;; All fragment and element children are realized inside this boundary.
+   ;; Nested public calls retain their own binding and restore this one.
    (binding [*lower-opts* opts]
-     (case (:op ir-node)
-     :literal (lower-attr-value (:value ir-node))
-     :fragment (doall (map #(lower-ir % opts) (:children ir-node)))
-     :element
-     (let [attrs0 (lower-attrs (:attrs ir-node))
-           attrs0b (reduce-kv merge-lowered-attr attrs0 (lower-morph-attrs (:morph ir-node)))
-           attrs1 (merge-data-signals attrs0b (:signals ir-node))
-           attrs2 (reduce-kv (fn [m k v]
-                               (if (= k :attr)
-                                 (reduce-kv (fn [m2 attr-k attr-v]
-                                              (merge-lowered-attr
-                                               m2
-                                               (keyword (str "data-attr:" (name attr-k)))
-                                               (expr-value attr-v)))
-                                            m
-                                            v)
-                                 (reduce-kv merge-lowered-attr
-                                            m
-                                            (lower-binding-attrs k v))))
-                             attrs1
-                             (:bindings ir-node))
-           attrs2b (if-let [effect (:effect ir-node)]
-                     (merge-lowered-attr attrs2 :data-effect (lower-effect* effect {}))
-                     attrs2)
-           attrs3 (reduce-kv (fn [m k v]
-                               (let [ctx {:bound-value-signal (get-in ir-node [:bindings :value])}
-                                     [attr-k attr-v] (lower-event-attr k v ctx)]
-                                 (merge-lowered-attr m attr-k attr-v)))
-                             attrs2b
-                             (:events ir-node))
-           children (map #(lower-ir % opts) (:children ir-node))]
-       (into [(:tag ir-node) attrs3] children))))))
+     (lower-ir* ir-node opts))))
 
 (defn hiccup
   "Compiles Datastar UI source to ordinary Datastar hiccup.

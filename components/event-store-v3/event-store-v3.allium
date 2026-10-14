@@ -445,6 +445,15 @@ surface EventRead {
         -- ascending by default or descending when the read is reversed. A
         -- limit is applied only after that ordering is established.
 
+    @guarantee StableEmptyIntervals
+        -- A store may explicitly promise that a completed read proving no
+        -- matching events in a finite committed interval stays true for this
+        -- open store. Later appends mint ids strictly beyond the committed
+        -- head, and old event types and tags cannot be rewritten to introduce
+        -- new matches. Authorized deletion preserves empty intervals.
+        -- Unsupported or mutable stores do not supply this optional promise;
+        -- readers keep ordinary catch-up rather than reuse negative evidence.
+
     @guarantee CommittedHead
         -- A caller can read its tenant's current committed event identity,
         -- including the transaction marker, or null for an empty tenant.

@@ -430,6 +430,20 @@ contract KeyedFoldMaterialization {
         -- catch-up is an error rather than a successful stale fallback.
         -- Capturing the head from a built-in store reads its committed identity
         -- directly, without decoding the latest transaction marker or payload.
+        -- Every session still reads current durable progress and captures its
+        -- source head. An explicitly stable source permits bounded reuse of a
+        -- completed scoped read proving no matching events in an interval. A
+        -- proof is specific to the live source identity, tenant, model version,
+        -- exact event scope and subscribed types; it applies only when current
+        -- progress and the captured head lie within that proven empty interval.
+        -- Such reads need neither another event query nor a progress rewrite.
+        -- An advanced head, progress outside the proof, source reopen or changed selector
+        -- returns to ordinary reading. Failed reads and reductions never create
+        -- evidence; a routed event with no inputs still advances normal progress.
+        -- Evidence retains no source or cache owner strongly and has fixed entry
+        -- and identity-size bounds. When admission has no room, ordinary durable
+        -- checkpointing is preserved so a broad working set cannot thrash into
+        -- repeated idle event queries. Unsupported sources keep ordinary catch-up.
         -- A large source batch therefore does not inflate every later freshness
         -- check. Stores without direct-head support retain bounded reverse reads.
 

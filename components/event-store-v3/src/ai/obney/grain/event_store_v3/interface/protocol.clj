@@ -8,6 +8,12 @@
     "Return the tenant's committed event ID, or nil for an empty tenant.
      Optional capability: read durable metadata without decoding event bodies."))
 
+(defprotocol EventStoreStableEmptyIntervals
+  (stable-empty-intervals? [this]
+    "Optional promise: a completed selection empty through a committed head
+     cannot acquire matches later. Appends are strictly beyond that head; old
+     tag/type identities cannot be rewritten. Deletion preserves this promise."))
+
 (defprotocol EventStore
   (start [this])
   (stop [this])

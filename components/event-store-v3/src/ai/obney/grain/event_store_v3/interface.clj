@@ -38,6 +38,12 @@
   [event-store tenant-id]
   (core/head event-store tenant-id))
 
+(defn stable-empty-intervals?
+  "Whether this open store explicitly guarantees that committed empty event
+   intervals stay empty. Unsupported or mutable stores return false."
+  [event-store]
+  (core/stable-empty-intervals? event-store))
+
 (defn append
   [event-store args]
   (core/append event-store args))

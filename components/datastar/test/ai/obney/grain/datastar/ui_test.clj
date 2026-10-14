@@ -817,6 +817,49 @@
          "@post(\"/admin/customers/00000000-0000-0000-0000-000000000099/__stream?page=2&tab=finance\""))
     (is (string/includes? click "\"tab\": \"finance\""))))
 
+(deftest lowering-keeps-explicit-options-through-literal-and-lazy-fragments
+  (let [registry {:ui-test/lowering-page {:datastar/path "/lowering"}}
+        opts {:query-registry registry}
+        link (ui/href :ui-test/lowering-page {:query-params {:id 7}})
+        source (list [:div (map (fn [_] [:a {:href link} "Details"]) (range 2))])
+        out (ui/lower-ir (ui/ir source) opts)]
+    (is (= "/lowering?id=7" (ui/lower-ir (ui/ir link) opts)))
+    ;; Fragment and child sequences have completed before the explicit
+    ;; registry's dynamic scope ends; realizing them later needs no registry.
+    (is (= ["/lowering?id=7" "/lowering?id=7"]
+           (mapv #(get (attrs %) :href) (nth (first out) 2))))))
+
+(deftest nested-public-lowering-restores-outer-options
+  (let [outer-opts {:query-registry {:ui-test/outer-lowering {:datastar/path "/outer"}}}
+        inner-opts {:query-registry {:ui-test/inner-lowering {:datastar/path "/inner"}}}
+        original ds/page-path
+        inner-result (atom nil)
+        caller-opts {:query-registry {:ui-test/caller-lowering {:datastar/path "/caller"}}}]
+    (binding [ui/*lower-opts* caller-opts]
+      (with-redefs [ds/page-path
+                    (fn [query params registry]
+                      (when (= query :ui-test/outer-lowering)
+                        (reset! inner-result
+                                (ui/lower-ir (ui/ir (ui/href :ui-test/inner-lowering)) inner-opts))
+                        (is (= outer-opts ui/*lower-opts*)))
+                      (original query params registry))]
+        (is (= "/outer"
+               (ui/lower-ir (ui/ir (ui/href :ui-test/outer-lowering)) outer-opts)))
+        (is (= "/inner" @inner-result))
+        (is (= caller-opts ui/*lower-opts*))))))
+
+(deftest failed-lowering-restores-caller-options
+  (let [caller-opts {:query-registry {:ui-test/caller-lowering {:datastar/path "/caller"}}}]
+    (binding [ui/*lower-opts* caller-opts]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"not registered"
+           (ui/lower-ir
+            (ui/ir (list [:div [:a {:href (ui/href :ui-test/missing-lowering)} "Missing"]]))
+            {:query-registry {}})))
+      (is (= caller-opts ui/*lower-opts*))
+      (is (= "/caller"
+             (ui/lower-ir (ui/ir (ui/href :ui-test/caller-lowering)) caller-opts))))))
+
 (deftest checked-route-refs-reject-literal-and-missing-routes
   (testing "refresh string paths fail"
     (is (thrown-with-msg?

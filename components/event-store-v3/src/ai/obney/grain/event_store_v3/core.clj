@@ -70,6 +70,10 @@
   [event-store]
   (p/tenants event-store))
 
+(defn stable-empty-intervals? [event-store]
+  (and (satisfies? p/EventStoreStableEmptyIntervals event-store)
+       (true? (p/stable-empty-intervals? event-store))))
+
 (defn head
   [event-store tenant-id]
   (if-not (uuid? tenant-id)

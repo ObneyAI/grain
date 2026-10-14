@@ -56,7 +56,7 @@
     (is (= 2 @calls))
     (kv/put! *cache* {:k k :v (byte-array [7])})
     (update!)
-    (is (= 3 @calls) "A legacy direct commit invalidates all proof reuse")
+    (is (= 3 @calls) "An overlapping public put invalidates the prefix proof")
     (is (nil? (kv/transact *cache* :read :with-validation)))))
 
 (deftest validated-update-proofs-obey-rollback-final-mutations-and-lifetime
@@ -112,6 +112,112 @@
     (kv/transact *cache* :write
       #((:with-validation %) (byte-array [10]) tracked (fn [] nil)))
     (is (= 2 @calls) "Evicted proof is safely revalidated")))
+
+(deftest legacy-writes-retain-only-unaffected-validation-proofs
+  (let [prefix (byte-array [10 1]) k (byte-array [10 1 2]) calls (atom 0)
+        validator (fn [tx]
+                    (swap! calls inc)
+                    (when-let [v ((:get tx) k)]
+                      (when-not (= [7] (vec v)) (throw (ex-info "Invalid value" {})))))
+        checked (fn []
+                  (kv/transact *cache* :write
+                    #((:with-validation %) prefix validator (fn [] nil))))]
+    (kv/put! *cache* {:k k :v (byte-array [7])})
+    (checked)
+    (is (true? (kv/put! *cache* {:k (byte-array [20]) :v (byte-array [8])})))
+    (is (nil? (kv/put-batch! *cache* {:entries [{:k (byte-array [10 2]) :v (byte-array [9])}
+                                             {:k (byte-array [30]) :v (byte-array [8])}]})))
+    (is (nil? (kv/put-batch! *cache* {:entries []})))
+    (checked)
+    (is (= 1 @calls) "Unrelated single, sibling-prefix and batch writes preserve proof")
+    (kv/put! *cache* {:k (byte-array [10]) :v (byte-array [9])})
+    (checked)
+    (is (= 2 @calls) "Parent-prefix writes conservatively invalidate proof")
+    (kv/put! *cache* {:k k :v (byte-array [99])})
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid value" (checked)))
+    (is (= 3 @calls))
+    (kv/put-batch! *cache* {:entries [{:k k :v (byte-array [7])}]})
+    (checked)
+    (is (= 4 @calls) "Overlapping batch writes require revalidation")))
+
+(deftest failed-legacy-batches-publish-neither-values-nor-proof-invalidations
+  (let [prefix (byte-array [10]) k (byte-array [10 1]) calls (atom 0)
+        validator (fn [_] (swap! calls inc))
+        checked (fn []
+                  (kv/transact *cache* :write
+                    #((:with-validation %) prefix validator (fn [] nil))))]
+    (kv/put! *cache* {:k k :v (byte-array [7])})
+    (checked)
+    (is (thrown? Exception
+          (kv/put-batch! *cache* {:entries [{:k k :v (byte-array [99])}
+                                          {:k (byte-array 600) :v (byte-array [8])}]})))
+    (is (= [7] (vec (kv/get! *cache* {:k k}))))
+    (checked)
+    (is (= 1 @calls) "Failed overlapping mutations do not publish invalidated proofs")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"entry realization failed"
+          (kv/put-batch! *cache*
+            {:entries (lazy-seq (cons {:k k :v (byte-array [99])}
+                                    (lazy-seq (throw (ex-info "entry realization failed" {})))))})))
+    (is (= [7] (vec (kv/get! *cache* {:k k}))))
+    (checked)
+    (is (= 1 @calls))))
+
+(deftest legacy-writes-reject-nesting-and-work-without-validation-capability
+  (doseq [mode [:read :write]
+          write! [(fn [cache] (kv/put! cache {:k (byte-array [21]) :v (byte-array [8])}))
+                  (fn [cache] (kv/put-batch! cache {:entries [{:k (byte-array [21]) :v (byte-array [8])}]}))]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Nested"
+          (kv/transact *cache* mode
+            (fn [tx]
+              (when (= mode :write) ((:put tx) (byte-array [20]) (byte-array [7])))
+              (write! *cache*)))))
+    (is (nil? (kv/get! *cache* {:k (byte-array [20])})))
+    (is (nil? (kv/get! *cache* {:k (byte-array [21])}))))
+  (let [cache (dissoc *cache* :ai.obney.grain.kv-store-lmdb.core/validation-state)]
+    (is (true? (kv/put! cache {:k (byte-array [20]) :v (byte-array [7])})))
+    (is (nil? (kv/put-batch! cache {:entries [{:k (byte-array [21]) :v (byte-array [8])}]})))
+    (is (= [7] (vec (kv/get! cache {:k (byte-array [20])}))))
+    (is (= [8] (vec (kv/get! cache {:k (byte-array [21])}))))))
+
+(deftest concurrent-legacy-writes-preserve-proofs-but-native-commits-do-not
+  (let [prefix (byte-array [10]) k (byte-array [10 1]) calls (atom 0)
+        validator (fn [tx]
+                    (swap! calls inc)
+                    (when-let [v ((:get tx) k)]
+                      (when-not (= [7] (vec v)) (throw (ex-info "Invalid value" {})))))
+        checked (fn []
+                  (kv/transact *cache* :write
+                    #((:with-validation %) prefix validator (fn [] nil))))]
+    (checked)
+    (let [writes (mapv (fn [n]
+                        (future
+                          (let [entry {:k (byte-array [20 n]) :v (byte-array [7])}]
+                            (if (even? n) (kv/put! *cache* entry)
+                                (kv/put-batch! *cache* {:entries [entry]})))))
+                      (range 32))]
+      (doseq [write writes] (is (not= ::timeout (deref write 10000 ::timeout)))))
+    (let [before @calls]
+      (checked)
+      (is (<= before @calls (inc before))
+          "Racing publication may conservatively lose proof and revalidate once")
+      (let [settled @calls]
+        (checked)
+        (is (= settled @calls) "Settled evidence is reused")))
+    (let [before @calls]
+      (let [env ^org.lmdbjava.Env (:env *cache*) db ^org.lmdbjava.Dbi (:db *cache*)
+            key (doto (java.nio.ByteBuffer/allocateDirect (.getMaxKeySize env))
+                  (.put (byte-array [30])) (.flip))
+            value (doto (java.nio.ByteBuffer/allocateDirect 1) (.put (byte-array [8])) (.flip))]
+        (.put db key value))
+      (checked)
+      (is (= (inc before) @calls) "Even unrelated unknown native commits require revalidation"))
+    (let [writes (mapv (fn [n]
+                        (future (kv/put! *cache* {:k (if (zero? n) k (byte-array [30 n]))
+                                                 :v (byte-array [99])})))
+                      (range 8))]
+      (doseq [write writes] (is (not= ::timeout (deref write 10000 ::timeout)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid value" (checked))
+        "Racing unrelated publishers cannot restore a proof invalidated by corruption")))
 
 (deftest scratch-reuse-preserves-lengths-and-detached-values
   (let [entries (mapv (fn [i key-size value-size]
@@ -171,7 +277,7 @@
     (is (= 9 (.get ^java.nio.ByteBuffer grown)))
     (is (= 0 (.remaining ^java.nio.ByteBuffer (write-buffer (byte-array 0)))))))
 
-(deftest sequential-scans-reuse-only-read-transaction-cursors
+(deftest sequential-scans-reuse-transaction-cursors
   (kv/put-batch! *cache* {:entries (mapv #(hash-map :k (.getBytes %) :v (.getBytes %)) ["a0" "a1" "b0"])})
   (doseq [mode [:read :write]]
     (let [cursors (atom #{}) with-cursor @#'core/with-scan-cursor
@@ -188,21 +294,23 @@
                (is (= [] (scan tx {:prefix (.getBytes "missing")})))
                (is (= "b0" ((:reduce tx) {:prefix (.getBytes "b")}
                             (fn [_ row] (reduced (String. ^bytes (:k row)))) nil)))))))
-      (is (= (if (= mode :read) 1 40) (count @cursors)))
+      (is (= 1 (count @cursors)))
       (doseq [^org.lmdbjava.Cursor cursor @cursors]
         (is (thrown? org.lmdbjava.Cursor$ClosedException (.first cursor)))))))
 
 (deftest reused-cursors-close-on-callback-and-reducer-failure
   (kv/put! *cache* {:k (.getBytes "a") :v (.getBytes "value")})
-  (doseq [failure [:callback :reducer :caught-reducer]]
+  (doseq [mode [:read :write] failure [:callback :reducer :caught-reducer]]
     (let [cursors (atom #{}) with-cursor @#'core/with-scan-cursor
           fail (fn [& _] (throw (ex-info "Expected scan failure" {})))]
       (with-redefs-fn {#'core/with-scan-cursor
                       (fn [db txn spare f]
                         (with-cursor db txn spare #(do (swap! cursors conj %) (f %))))}
         #(is (thrown? clojure.lang.ExceptionInfo
-               (kv/transact *cache* :read
+               (kv/transact *cache* mode
                  (fn [tx]
+                   (when (= mode :write)
+                     ((:put tx) (.getBytes "uncommitted") (.getBytes "value")))
                    ((:reduce tx) {} conj [])
                    (case failure
                      :callback (fail)
@@ -212,6 +320,7 @@
       (is (= 1 (count @cursors)))
       (doseq [^org.lmdbjava.Cursor cursor @cursors]
         (is (thrown? org.lmdbjava.Cursor$ClosedException (.first cursor))))
+      (is (nil? (kv/get! *cache* {:k (.getBytes "uncommitted")})))
       (is (= 1 (kv/transact *cache* :read #((:reduce %) {} (fn [n _] (inc n)) 0)))))))
 
 (deftest shared-scratch-rejects-escaped-and-cross-thread-operations

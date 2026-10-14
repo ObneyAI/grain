@@ -95,22 +95,20 @@
   [cache args]
   (read-snapshot cache (fn [get-value] (get-value args))))
 
+(declare transact)
+
 (defn put!
-  [{:keys [env db] :as _cache} {:keys [k v]}]
-  (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
-        _ (.. k-buf (put k) flip)
-        v-buf (ByteBuffer/allocateDirect (count v))
-        _ (.. v-buf (put v) flip)]
-    (.put db k-buf v-buf)))
+  [cache {:keys [k v]}]
+  ;; Ordinary public writes participate in the same commit provenance and
+  ;; prefix-proof invalidation as explicit transactional operations.
+  (transact cache :write #((:put %) k v)))
 
 (defn put-batch!
-  [{:keys [^Env env ^Dbi db] :as _cache} {:keys [entries]}]
-  (with-open [txn (.txnWrite env)]
-    (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
-          value-buffer (value-buffer-writer)]
+  [cache {:keys [entries]}]
+  (transact cache :write
+    (fn [tx]
       (doseq [{:keys [k v]} entries]
-        (.put db txn (fill-buffer k-buf k) (value-buffer v) no-put-flags)))
-    (.commit txn)))
+        ((:put tx) k v)))))
 
 (defn- copy-buffer [^ByteBuffer value]
   (let [view (.duplicate value) out (byte-array (.remaining view))]
@@ -140,6 +138,11 @@
         (if (and spare (nil? @spare))
           (vreset! spare cursor)
           (.close cursor))))))
+
+(defn- close-spare-cursor! [spare]
+  (when-let [^Cursor cursor @spare]
+    (vreset! spare nil)
+    (.close cursor)))
 
 (defn- scan [^Dbi db ^Txn txn ^ByteBuffer k-buf spare {:keys [prefix from to reverse?] :as options} rf initial check!]
   (when-not (every? #{:prefix :from :to :reverse?} (keys options))
@@ -209,7 +212,7 @@
                      (try (check! write?) (operation)
                           (catch Throwable e (compare-and-set! failure nil e) (throw e))))]
         (with-open [^Txn txn (if (= mode :write) (.txnWrite env) (open-read-transaction env))]
-          (let [spare (when (= mode :read) (volatile! nil))
+          (let [spare (volatile! nil)
                 validation-state (when (= mode :write) (::validation-state cache))
                 write-id (when validation-state (.getId txn))
                 base-id (when write-id (dec write-id))
@@ -260,6 +263,10 @@
                 (when-let [cause @failure]
                   (throw (ex-info "Transaction aborted after an operation failed" {} cause)))
                 (when (= mode :write)
+                  ;; Write cursors must close while their transaction is ready;
+                  ;; LMDB releases them at commit. Sequential scans reuse one
+                  ;; idle cursor, and nested scans still have separate loans.
+                  (close-spare-cursor! spare)
                   (.commit txn)
                   (when validation-state
                     ;; Use this transaction's ID, never env.info's potentially
@@ -273,7 +280,7 @@
                 result)
               (finally
                 (vreset! active false)
-                (when-let [^Cursor cursor (when spare @spare)] (.close cursor)))))))
+                (close-spare-cursor! spare))))))
       (finally
         (if previous (.set transactions previous) (.remove transactions))))))
 

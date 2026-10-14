@@ -742,6 +742,10 @@
   (head [this tenant-id]
     (committed-last-event-id (get-in this [:state ::connection-pool]) tenant-id)))
 
+(extend-type SqliteEventStore
+  p/EventStoreStableEmptyIntervals
+  (stable-empty-intervals? [_] true))
+
 (defmethod start-event-store :sqlite
   [config]
   (p/start

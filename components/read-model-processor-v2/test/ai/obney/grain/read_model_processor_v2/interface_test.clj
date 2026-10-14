@@ -3286,24 +3286,27 @@
                 (let [prefix (allocate! n)]
                   ;; Real materialization writes advance native revisions, but
                   ;; cannot change the already validated namespace registry.
-                  (kv/transact @*compact-cache* :write
-                    #((:put %) (core/key-join prefix (byte-array [20])) (byte-array [7])))))
+                  (let [entry {:k (core/key-join prefix (byte-array [20])) :v (byte-array [7])}]
+                    (case (mod n 3)
+                      0 (kv/transact @*compact-cache* :write #((:put %) (:k entry) (:v entry)))
+                      1 (kv/put! @*compact-cache* entry)
+                      2 (kv/put-batch! @*compact-cache* {:entries [entry]})))))
               (is (= 0 @scans) "Clean registry creation and checked append need no repeated whole scan")
               (compact-cache-reopen!)
               (allocate! 32)
               (is (= 1 @scans) "Reopening requires a full check of existing entries")
               (kv/put! @*compact-cache* {:k (byte-array [90]) :v (byte-array [8])})
               (allocate! 33)
-              (is (= 2 @scans) "Even an unrelated legacy commit is conservatively unknown")
+              (is (= 1 @scans) "An unrelated public put preserves registry validation")
               (let [transact kv/transact]
                 (with-redefs [kv/transact (fn [cache mode f]
                                           (transact cache mode #(f (dissoc % :with-validation))))]
                   (allocate! 34)
                   (allocate! 35)))
-              (is (= 4 @scans) "A store without the optional capability always validates")
+              (is (= 3 @scans) "A store without the optional capability always validates")
               (is (= 36 (count (set (vals (namespace-registry-bytes-map
                                            (core/namespace-resolve! @*compact-cache* (mapv identity (range 36)))))))))
-              (is (= 4 @scans) "Known identities retain point/inverse checks without allocation"))))))))
+              (is (= 3 @scans) "Known identities retain point/inverse checks without allocation"))))))))
 
 (deftest registry-addresses-are-compact-distinct-durable-and-order-independent
   (compact-cache-fixture
