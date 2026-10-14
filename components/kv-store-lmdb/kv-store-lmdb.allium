@@ -93,6 +93,26 @@ contract Store {
     -- Write a list of entries as one atomic unit.
     put_batch: (entries: List<Entry>) -> Any
     transact: (mode: String, callback: Any) -> Any
+    validated_update: (prefix: Any, validate: Any, update: Any) -> Any
+
+    @invariant MutationAwareValidation
+        -- Write callbacks may use a validated update over a nonempty byte-key
+        -- prefix. The caller supplies a stable validator function identity,
+        -- depending only on stored entries under that prefix, and an update
+        -- preserving the validated invariant. Different invariants require
+        -- different validator identities. Reuse never substitutes for the
+        -- caller's obligation to preserve the invariant during its update.
+        -- The validator runs before the update unless a prior successful check
+        -- and only known preserving updates establish its validity for this
+        -- transaction. Ordinary overlapping mutations invalidate the proof.
+        -- Writes outside the prefix need not invalidate it. Unknown commits,
+        -- including writes from older code or another store handle, invalidate
+        -- all proof reuse. Reopening a store starts without proofs.
+        -- Proofs are bounded process-local optimizations, never durable data.
+        -- They publish only with successful commit; failures, including caught
+        -- operation failures, cannot publish a proof or partial update. The
+        -- capability has the same thread and callback lifetime as other write
+        -- operations and is unavailable in read callbacks.
 
     @invariant ScopedTransactions
         -- Read callbacks observe one snapshot. Write callbacks see earlier

@@ -28,7 +28,7 @@
                 (setMaxDbs 1)
                 (open file nil))
         dbi (.openDbi env db-name (into-array DbiFlags [DbiFlags/MDB_CREATE]))]
-    (assoc kv-store :env env :db dbi)))
+    (assoc kv-store :env env :db dbi ::validation-state (atom {:revision nil :proofs []}))))
 
 (defn stop
   [{:keys [env db] :as _kv-store}]
@@ -175,8 +175,23 @@
                           (recur (if reverse? (.prev cursor) (.next cursor)) next)))))))))))))
 
 (def ^:private ^ThreadLocal transactions (ThreadLocal.))
+(def ^:private max-validation-proofs 16)
 
-(defn transact [{:keys [^Env env ^Dbi db]} mode f]
+(defn- overlapping-prefix? [prefix ^bytes key]
+  ;; Treat writes at a parent prefix conservatively as overlapping too.
+  (let [n (min (count prefix) (alength key))]
+    (loop [i 0]
+      (or (= i n)
+          (and (= (nth prefix i) (aget key i)) (recur (inc i)))))))
+
+(defn- invalidate-proofs! [proofs key]
+  (when proofs
+    (vswap! proofs #(into [] (remove (fn [[_ prefix]] (overlapping-prefix? prefix key))) %))))
+
+(defn- same-validation? [[validator prefix] other-validator other-prefix]
+  (and (identical? validator other-validator) (= prefix other-prefix)))
+
+(defn transact [{:keys [^Env env ^Dbi db] :as cache} mode f]
   (when-not (#{:read :write} mode)
     (throw (ex-info "Transaction mode must be :read or :write" {:mode mode})))
   (let [previous (.get transactions)]
@@ -194,19 +209,67 @@
                      (try (check! write?) (operation)
                           (catch Throwable e (compare-and-set! failure nil e) (throw e))))]
         (with-open [^Txn txn (if (= mode :write) (.txnWrite env) (open-read-transaction env))]
-          (let [spare (when (= mode :read) (volatile! nil))]
+          (let [spare (when (= mode :read) (volatile! nil))
+                validation-state (when (= mode :write) (::validation-state cache))
+                write-id (when validation-state (.getId txn))
+                base-id (when write-id (dec write-id))
+                before (when validation-state @validation-state)
+                proofs (when validation-state
+                         (volatile! (if (= base-id (:revision before)) (:proofs before) [])))
+                modified? (volatile! false)]
             (try
               (let [k-buf (ByteBuffer/allocateDirect (.getMaxKeySize env))
                     value-buffer (when (= mode :write) (value-buffer-writer))
-                    result (f {:get (fn [k] (invoke false #(read-value db txn k-buf k)))
-                               :put (fn [k v]
-                                      (invoke true #(.put db txn (fill-buffer k-buf k) (value-buffer v) no-put-flags)))
-                               :delete (fn [k] (invoke true #(.delete db txn (fill-buffer k-buf k))))
-                               :reduce (fn [options rf initial]
-                                         (invoke false #(scan db txn k-buf spare options rf initial check!)))})]
+                    operations {:get (fn [k] (invoke false #(read-value db txn k-buf k)))
+                                :put (fn [k v]
+                                       (invoke true #(do
+                                                       (invalidate-proofs! proofs k)
+                                                       (let [result (.put db txn (fill-buffer k-buf k) (value-buffer v) no-put-flags)]
+                                                         (vreset! modified? true)
+                                                         result))))
+                                :delete (fn [k]
+                                          (invoke true #(do
+                                                          (invalidate-proofs! proofs k)
+                                                          (let [deleted? (.delete db txn (fill-buffer k-buf k))]
+                                                            (when deleted? (vreset! modified? true))
+                                                            deleted?))))
+                                :reduce (fn [options rf initial]
+                                          (invoke false #(scan db txn k-buf spare options rf initial check!)))}
+                    operations (cond-> operations
+                                 proofs
+                                 (assoc :with-validation
+                                        (fn [prefix validator update!]
+                                          (invoke true
+                                            (fn []
+                                              (when-not (and (bytes? prefix) (pos? (alength ^bytes prefix))
+                                                             (<= (alength ^bytes prefix) (.getMaxKeySize env))
+                                                             (fn? validator) (fn? update!))
+                                                (throw (ex-info "Expected byte prefix, validator and preserving update" {})))
+                                              (let [prefix (vec prefix)]
+                                                (when-not (some #(same-validation? % validator prefix) @proofs)
+                                                  (validator operations))
+                                                (let [result (update!)]
+                                                  ;; The caller promises its update preserves the checked
+                                                  ;; invariant. Subsequent ordinary writes invalidate it.
+                                                  (vswap! proofs #(vec (take-last max-validation-proofs
+                                                                         (conj (into [] (remove
+                                                                                          (fn [proof] (same-validation? proof validator prefix))) %)
+                                                                               [validator prefix]))))
+                                                  result)))))))
+                    result (f operations)]
                 (when-let [cause @failure]
                   (throw (ex-info "Transaction aborted after an operation failed" {} cause)))
-                (when (= mode :write) (.commit txn))
+                (when (= mode :write)
+                  (.commit txn)
+                  (when validation-state
+                    ;; Use this transaction's ID, never env.info's potentially
+                    ;; newer foreign commit. Empty commits retain the base ID.
+                    ;; A racing older publisher cannot replace newer evidence.
+                    (let [revision (if @modified? write-id base-id)]
+                      (swap! validation-state
+                             (fn [current]
+                               (if (and (:revision current) (> (:revision current) revision)) current
+                                 {:revision revision :proofs @proofs}))))))
                 result)
               (finally
                 (vreset! active false)

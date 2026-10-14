@@ -1058,17 +1058,22 @@
     (when-not (= {0 1 1 next-id 2 next-id} counts)
       (namespace-failure "Namespace registry counter does not cover its entries" {}))))
 
-(defn- namespace-allocate! [tx identities]
+(defn- namespace-validate-allocation! [tx]
+  (let [initial (namespace-counter tx)]
+    (if (some? initial)
+      (namespace-validate-registry! tx initial)
+      (when ((:reduce tx) {:prefix namespace-registry-prefix}
+             (fn [_ _] (reduced true)) false)
+        (namespace-failure "Namespace registry counter is missing" {})))))
+
+(defn- namespace-allocate-checked! [tx identities]
   (let [initial (namespace-counter tx)
-        _ (when (some? initial) (namespace-validate-registry! tx initial))
+        ;; This check depends on materialized data outside the registry prefix,
+        ;; so it is deliberately not covered by the registry validation proof.
         _ (when (and (nil? initial)
                      ((:reduce tx) {:prefix namespace-data-prefix}
                       (fn [_ _] (reduced true)) false))
-            (namespace-failure "Namespace registry is missing while materialized data remains" {}))
-        _ (when (and (nil? initial)
-                     ((:reduce tx) {:prefix namespace-registry-prefix}
-                      (fn [_ _] (reduced true)) false))
-            (namespace-failure "Namespace registry counter is missing" {}))]
+            (namespace-failure "Namespace registry is missing while materialized data remains" {}))]
     (first
      (reduce (fn [[out next-id] identity]
                (if-let [prefix (namespace-lookup tx identity next-id)]
@@ -1087,6 +1092,16 @@
                      ((:put tx) namespace-counter-key (codec/encode {:next-id (inc next-id)}))
                      [(assoc out identity (namespace-address next-id)) (inc next-id)]))))
              [{} (or initial 0)] identities))))
+
+(defn- namespace-allocate! [tx identities]
+  (if-let [with-validation (:with-validation tx)]
+    ;; Checked append preserves every existing mapping and adds one complete
+    ;; forward/inverse/counter assignment atomically. Raw or unknown mutations
+    ;; invalidate the backend's proof; unsupported stores validate each time.
+    (with-validation namespace-registry-prefix namespace-validate-allocation!
+      #(namespace-allocate-checked! tx identities))
+    (do (namespace-validate-allocation! tx)
+        (namespace-allocate-checked! tx identities))))
 
 (defn namespace-resolve! [cache identities]
   (when-not (and cache (sequential? identities) (every? namespace-valid-identity? identities))

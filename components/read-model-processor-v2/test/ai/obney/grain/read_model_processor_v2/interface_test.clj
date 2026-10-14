@@ -3268,6 +3268,43 @@
 
 (defn namespace-registry-bytes-map [m] (into {} (map (fn [[k v]] [k (vec v)])) m))
 
+(deftest growing-registry-validation-is-reused-only-across-proven-preserving-commits
+  (doseq [scoped? [false true]]
+    (compact-cache-fixture
+      (fn []
+        (let [tenant (UUID. 7 1)
+              identity (fn [n] (cond-> [tenant (keyword "registry-growth" (str n)) 1]
+                                 scoped? (conj [:event-scope "abcd"])))
+              validation-var (ns-resolve 'ai.obney.grain.read-model-processor-v2.core 'namespace-validate-registry!)
+              original @validation-var scans (atom 0)
+              allocate! (fn [n]
+                          (let [id (identity n)]
+                            (get (core/namespace-resolve! @*compact-cache* [id]) id)))]
+          (with-redefs-fn {validation-var (fn [& args] (swap! scans inc) (apply original args))}
+            (fn []
+              (doseq [n (range 32)]
+                (let [prefix (allocate! n)]
+                  ;; Real materialization writes advance native revisions, but
+                  ;; cannot change the already validated namespace registry.
+                  (kv/transact @*compact-cache* :write
+                    #((:put %) (core/key-join prefix (byte-array [20])) (byte-array [7])))))
+              (is (= 0 @scans) "Clean registry creation and checked append need no repeated whole scan")
+              (compact-cache-reopen!)
+              (allocate! 32)
+              (is (= 1 @scans) "Reopening requires a full check of existing entries")
+              (kv/put! @*compact-cache* {:k (byte-array [90]) :v (byte-array [8])})
+              (allocate! 33)
+              (is (= 2 @scans) "Even an unrelated legacy commit is conservatively unknown")
+              (let [transact kv/transact]
+                (with-redefs [kv/transact (fn [cache mode f]
+                                          (transact cache mode #(f (dissoc % :with-validation))))]
+                  (allocate! 34)
+                  (allocate! 35)))
+              (is (= 4 @scans) "A store without the optional capability always validates")
+              (is (= 36 (count (set (vals (namespace-registry-bytes-map
+                                           (core/namespace-resolve! @*compact-cache* (mapv identity (range 36)))))))))
+              (is (= 4 @scans) "Known identities retain point/inverse checks without allocation"))))))))
+
 (deftest registry-addresses-are-compact-distinct-durable-and-order-independent
   (compact-cache-fixture
     (fn []

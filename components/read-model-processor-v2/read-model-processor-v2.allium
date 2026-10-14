@@ -394,6 +394,10 @@ contract KeyedFoldMaterialization {
         -- Inconsistent durable identity information encountered while resolving
         -- an address fails explicitly before serving or replacing data through
         -- that address; it is not guessed or reassigned.
+        -- A whole-registry integrity check may be reused only with evidence
+        -- that intervening writes preserved the checked invariants. An unchanged
+        -- counter or store handle alone is insufficient. Raw or unknown registry
+        -- mutations and reopening invalidate such reuse before new allocation.
 
     @invariant CoordinatedPublication
         -- A successful batch publishes all its affected accumulated states,

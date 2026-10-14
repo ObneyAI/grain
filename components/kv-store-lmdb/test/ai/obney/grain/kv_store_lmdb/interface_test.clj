@@ -29,6 +29,90 @@
 
 (use-fixtures :each test-fixture)
 
+(deftest validated-updates-reuse-only-the-same-invariant-and-known-preserving-writes
+  (let [prefix (byte-array [10]) k (byte-array [10 1]) calls (atom 0)
+        validator (fn [tx]
+                    (swap! calls inc)
+                    (when-let [v ((:get tx) k)]
+                      (when-not (= [7] (vec v)) (throw (ex-info "Invalid value" {})))))
+        update! (fn []
+                  (kv/transact *cache* :write
+                    (fn [tx]
+                      ((:with-validation tx) prefix validator #((:put tx) k (byte-array [7]))))))]
+    (update!)
+    (let [env ^org.lmdbjava.Env (:env *cache*) before (.-lastTransactionId (.info env))]
+      (update!)
+      (is (= (inc before) (.-lastTransactionId (.info env)))
+          "An equal-value put still commits this write transaction's native ID"))
+    (is (= 1 @calls))
+    (kv/transact *cache* :write #((:put %) (byte-array [20 1]) (byte-array [9])))
+    (update!)
+    (is (= 1 @calls) "Known unrelated writes preserve proof")
+    (kv/transact *cache* :write
+      (fn [tx]
+        ((:with-validation tx) prefix (fn [_] nil) #((:put tx) k (byte-array [99])))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid value" (update!))
+        "A weaker validator on the same prefix cannot satisfy the original invariant")
+    (is (= 2 @calls))
+    (kv/put! *cache* {:k k :v (byte-array [7])})
+    (update!)
+    (is (= 3 @calls) "A legacy direct commit invalidates all proof reuse")
+    (is (nil? (kv/transact *cache* :read :with-validation)))))
+
+(deftest validated-update-proofs-obey-rollback-final-mutations-and-lifetime
+  (let [prefix (byte-array [10]) k (byte-array [10 1]) calls (atom 0)
+        validator (fn [tx]
+                    (swap! calls inc)
+                    (when-let [v ((:get tx) k)]
+                      (when-not (= [7] (vec v)) (throw (ex-info "Invalid value" {})))))
+        checked (fn [tx]
+                  ((:with-validation tx) prefix validator #((:put tx) k (byte-array [7]))))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Rollback"
+          (kv/transact *cache* :write
+            (fn [tx] (checked tx) (throw (ex-info "Rollback" {}))))))
+    (is (nil? (kv/get! *cache* {:k k})))
+    (kv/transact *cache* :write checked)
+    (is (= 2 @calls) "A rolled-back validation cannot publish a proof")
+    (kv/transact *cache* :write
+      (fn [tx] (checked tx) ((:put tx) k (byte-array [99]))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Transaction aborted"
+          (kv/transact *cache* :write
+            (fn [tx]
+              (try (checked tx) (catch clojure.lang.ExceptionInfo _ nil))
+              ((:put tx) (byte-array [30]) (byte-array [1]))))))
+    (is (nil? (kv/get! *cache* {:k (byte-array [30])})))
+    (is (= 3 @calls) "Mutation after checked update invalidates its refreshed proof")
+    (kv/put! *cache* {:k k :v (byte-array [7])})
+    (let [escaped (kv/transact *cache* :write
+                    (fn [tx] (checked tx) (:with-validation tx)))]
+      (is (thrown? clojure.lang.ExceptionInfo (escaped prefix validator (fn [] nil)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Transaction aborted"
+          (kv/transact *cache* :write
+            (fn [tx]
+              (is (= :rejected
+                     @(future (try ((:with-validation tx) prefix validator (fn [] nil))
+                                   (catch clojure.lang.ExceptionInfo _ :rejected)))))))))))
+
+(deftest validated-update-proofs-copy-prefixes-and-bound-retention
+  (let [validator (fn [_] nil) prefix (byte-array [10]) calls (atom 0)
+        tracked (fn [_] (swap! calls inc))]
+    (kv/transact *cache* :write
+      (fn [tx]
+        ((:with-validation tx) prefix tracked (fn [] nil))
+        (aset-byte prefix 0 (byte 99))))
+    (kv/transact *cache* :write
+      #((:with-validation %) (byte-array [10]) tracked (fn [] nil)))
+    (is (= 1 @calls) "Stored prefixes are immutable copies, including empty commits")
+    (kv/transact *cache* :write
+      (fn [tx]
+        (doseq [n (range 40)]
+          ((:with-validation tx) (byte-array [(byte n)]) validator (fn [] nil)))))
+    (is (<= (count (:proofs @(:ai.obney.grain.kv-store-lmdb.core/validation-state *cache*)))
+            16))
+    (kv/transact *cache* :write
+      #((:with-validation %) (byte-array [10]) tracked (fn [] nil)))
+    (is (= 2 @calls) "Evicted proof is safely revalidated")))
+
 (deftest scratch-reuse-preserves-lengths-and-detached-values
   (let [entries (mapv (fn [i key-size value-size]
                         {:k (byte-array (repeat key-size (inc i)))
