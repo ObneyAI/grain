@@ -1304,6 +1304,38 @@
                     (membership-put! tx (ranked-membership-key cfg level key) right))))))
           true)))))
 
+(defn- ranked-append!
+  "Insert a captured-hash member at the maximum of an initially empty index.
+   Promoted keys split the last span: its old contents stay unchanged."
+  [tx cfg key value ordinal hash previous]
+  (if (ranked-contains? tx cfg key) false
+    (do
+      (dotimes [level (:levels cfg)]
+        (cond
+          (zero? level)
+          (do ((:put tx) (ranked-pack cfg 0 key) value)
+              (when (:membership? cfg)
+                ((:put tx) (ranked-membership-key cfg 0 key) (membership-number-bytes ordinal))))
+          (not (zero? (bit-and hash (dec (bit-shift-left 1 (* 4 level))))))
+          (let [prev (aget ^objects previous level)]
+            (ranked-increment! tx cfg level prev 1)
+            (when (:membership? cfg)
+              (let [address (ranked-membership-key cfg level prev)
+                    bits (membership-bitmap tx address)]
+                (.add bits (int ordinal))
+                (membership-put! tx address bits))))
+          :else
+          (do
+            (ranked-set-count! tx cfg level key 1)
+            (when (:membership? cfg)
+              (let [address (ranked-membership-key cfg level (aget ^objects previous level))]
+                ;; A split persists even an empty sentinel summary upstream.
+                (membership-put! tx address (membership-bitmap tx address))
+                (membership-put! tx (ranked-membership-key cfg level key)
+                                 (doto (RoaringBitmap.) (.add (int ordinal))))))
+            (aset ^objects previous level key))))
+      true)))
+
 (defn ranked-remove! [tx cfg key]
   (ranked-check-key! key)
   (if-not (ranked-contains? tx cfg key) false
@@ -1797,6 +1829,70 @@
       (when (= direction :asc) (keyed-update-group! tx b index position 1)))
     (keyed-observe! ctx :index-written (alength ^bytes payload))))
 
+(defn- keyed-empty-ranks? [tx cfg]
+  ;; Eligibility is not proof: inspect every persisted rank and span summary.
+  (let [zero-count (ranked-encode-count 0)
+        empty-level? (fn [level membership?]
+                       ((:reduce tx) {:prefix (ranked-prefix cfg level)}
+                        (fn [_ {:keys [k v]}]
+                          (if (and (= (alength ^bytes k) (alength ^bytes (ranked-prefix cfg level)))
+                                   (if membership?
+                                     (try (.isEmpty (membership-decode v))
+                                          (catch Exception _ false))
+                                     (Arrays/equals ^bytes zero-count ^bytes v)))
+                            true (reduced false))) true))]
+    (and (every? #(empty-level? % false) (range (:levels cfg)))
+         (or (not (:membership? cfg))
+             (every? #(empty-level? (+ 16 %) true) (range (:levels cfg)))))))
+
+(defn- keyed-cold-index-builders [ctx tx b d before-progress states]
+  (when (and (nil? (:watermark before-progress))
+             (nil? (:read-model/observer ctx)) (<= 32 (count states))
+             ;; Raw or uncertain persisted results cannot join a deferred build.
+             ((:reduce tx) {:prefix (key-join b (byte-array [2]))}
+              (fn [_ _] (reduced false)) true))
+    (let [builders (HashMap.)]
+      ;; Check all directions before group counts or queued additions change.
+      (doseq [index (conj (vec (keys (:indexes d))) :identity)
+              :let [groups-empty? ((:reduce tx)
+                                    {:prefix (ranked-prefix (keyed-index-config b index :asc) 6)}
+                                    (fn [_ _] (reduced false)) true)]
+              direction [:asc :desc]
+              :let [cfg (keyed-membership-config b d index direction)]
+              :when (and groups-empty? (keyed-empty-ranks? tx cfg))]
+        (.put builders [index direction] {:cfg cfg :entries (ArrayList.) :initialized? (volatile! false)}))
+      builders)))
+
+(defn- keyed-enqueue-index! [ctx tx b d builders index direction position id]
+  (if-let [{:keys [cfg entries initialized?]} (when builders (.get ^HashMap builders [index direction]))]
+    (let [member (keyed-index-member d index direction position id)
+          payload (codec/encode id)]
+      (when-not @initialized? (ranked-ensure-init! tx cfg) (vreset! initialized? true))
+      ;; Reserve ordinals and consume random hashes in original insertion order.
+      (let [ordinal (when (:membership? cfg) (membership-ensure-ordinal! tx b id))
+            _ (ranked-check-key! member)
+            _ (when (and (:membership? cfg)
+                         (not (and (integer? ordinal) (<= 0 ordinal Integer/MAX_VALUE))))
+                (throw (ex-info "Membership index requires a model-local ordinal" {})))
+            hash ((:hash-fn cfg) member)]
+        ;; Fail oversized physical keys before validating a later owner's result.
+        (ranked-pack cfg 0 member)
+        ;; Final states have one owner per key; each member includes its typed
+        ;; key, making these initially empty index additions distinct.
+        (.add ^ArrayList entries [member payload ordinal hash])
+        (when (= direction :asc) (keyed-update-group! tx b index position 1))))
+    (keyed-add-index! ctx tx b d index direction position id)))
+
+(defn- keyed-build-cold-indexes! [tx builders]
+  (when builders
+    (doseq [{:keys [cfg entries]} (.values ^HashMap builders)]
+      (.sort ^ArrayList entries
+             (reify Comparator
+               (compare [_ a b] (Arrays/compareUnsigned ^bytes (nth a 0) ^bytes (nth b 0)))))
+      (let [previous (object-array (repeat (:levels cfg) ranked-empty-key))]
+        (doseq [[member payload ordinal hash] entries]
+          (ranked-append! tx cfg member payload ordinal hash previous))))))
+
 (defn- keyed-read-meta [tx k] (some-> ((:get tx) k) codec/decode))
 (defn- keyed-write! [tx k v] ((:put tx) k (codec/encode v)))
 (defn- keyed-write-observed! [ctx tx operation k value]
@@ -1813,7 +1909,10 @@
                           {:model name :kind kind :explanation (m/explain schema value)})))))
     (constantly nil)))
 
-(defn- keyed-apply-batch! [ctx name d b validate-state! validate-result! events]
+(defn- keyed-apply-batch!
+  ([ctx name d b validate-state! validate-result! events]
+   (keyed-apply-batch! ctx name d b validate-state! validate-result! events nil))
+  ([ctx name d b validate-state! validate-result! events through]
   (kv/transact (:cache ctx) :write
     (fn [tx]
       (let [tx (membership-transaction tx)
@@ -1849,7 +1948,8 @@
                                   states inputs))
                         (apply-input states ((:key d) event) event))) {} events)
             count-before (or (keyed-read-meta tx (keyed-count-key b)) 0)
-            added (volatile! 0)]
+            added (volatile! 0)
+            builders (keyed-cold-index-builders ctx tx b d before-progress states)]
         (doseq [[id state] states]
           (let [value ((:result d identity) state)
                 _ (validate-result! value)
@@ -1883,13 +1983,24 @@
                         :when (or (nil? old) (not= position (get-in old [:indexes index])))]
                   (when old
                     (keyed-remove-index! tx b d index direction (get-in old [:indexes index]) id))
-                  (keyed-add-index! ctx tx b d index direction position id))
+                  (keyed-enqueue-index! ctx tx b d builders index direction position id))
                 ((:put tx) (keyed-address b 11 id) (sort-data-encode id (dissoc indexes :identity)))
                 (keyed-write-observed! ctx tx :result-written result-k {:key id :value value :indexes indexes})))))
+        (keyed-build-cold-indexes! tx builders)
         (membership-flush! tx #(keyed-observe! ctx %1 %2))
         (when (seq events)
-          (when-not (zero? @added) (keyed-write! tx (keyed-count-key b) (+ count-before @added)))
-          (keyed-write! tx (keyed-progress-key b) (assoc before-progress :watermark (:event/id (peek events)))))))))
+          (when-not (zero? @added) (keyed-write! tx (keyed-count-key b) (+ count-before @added))))
+        ;; Only the final partial batch receives a captured head, after its
+        ;; ordered source read completed. Preserve progress from concurrent
+        ;; writers even when they already applied every event in this tail.
+        (let [advance-through? (and through
+                                   (or (nil? (:checked-through before-progress))
+                                       (pos? (compare through (:checked-through before-progress)))))
+              progress (cond-> before-progress
+                         (seq events) (assoc :watermark (:event/id (peek events)))
+                         advance-through? (assoc :checked-through through))]
+          (when (or (seq events) advance-through?)
+            (keyed-write! tx (keyed-progress-key b) progress))))))))
 
 (defn- keyed-head [ctx]
   (let [result (es/head (:event-store ctx) (:tenant-id ctx))]
@@ -2005,11 +2116,12 @@
                                       batch)))))
                             [] (if (seq query) (es/read source query) []))]
             (when (seq remaining)
-              (keyed-apply-batch! ctx name d b validate-state! validate-result! remaining))
+              (keyed-apply-batch! ctx name d b validate-state! validate-result! remaining through))
             ;; Only a completed, ordered read with no accepted source events
             ;; can suppress a checkpoint. Route-empty events are not absence.
-            (when-not (and stable? (not @accepted?)
-                           (empty-proof-remember! source proof-key after through))
+            (when-not (or (seq remaining)
+                          (and stable? (not @accepted?)
+                               (empty-proof-remember! source proof-key after through)))
               (keyed-checkpoint! ctx b through))))))))
 
 (defn- keyed-identity-of [ctx] [(:tenant-id ctx) (:read-model/scope ctx)])

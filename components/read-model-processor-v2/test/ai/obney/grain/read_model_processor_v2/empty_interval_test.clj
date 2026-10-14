@@ -53,7 +53,7 @@
         (is (= {:heads 1 :event-queries 1 :writes 0}
                (:counts (counted #(rmp/value own model "a")))))
         (append-user! ctx a 5)
-        (is (= {:value {:total 6} :counts {:heads 1 :event-queries 1 :writes 2}}
+        (is (= {:value {:total 6} :counts {:heads 1 :event-queries 1 :writes 1}}
                (counted #(rmp/value own model "a"))))
         (is (= {:heads 1 :event-queries 0 :writes 0}
                (:counts (counted #(rmp/value own model "a")))))

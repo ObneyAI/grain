@@ -56,6 +56,8 @@
 
    See `ai.obney.grain.datastar.interface` for the public API."
   (:require [hiccup2.core :as h]
+            [hiccup.compiler :as html-compiler]
+            [hiccup.util :as html-util]
             [clojure.data.json :as json]
             [clojure.set :as set]
             [clojure.core.async :as async]
@@ -120,8 +122,65 @@
    datastar-transformer
    (mt/strip-extra-keys-transformer)))
 
+(def ^:private html-void-tags
+  #{"area" "base" "br" "col" "command" "embed" "hr" "img" "input" "keygen" "link"
+    "meta" "param" "source" "track" "wbr"})
+
+(def ^:private appendable-html-implementations
+  ;; An unknown or overridden Hiccup implementation retains upstream dispatch.
+  ;; This conservative source check can only disable the optimization on upgrade.
+  (into {}
+    (keep (fn [type]
+            (let [implementation (get-in html-compiler/HtmlRenderer [:impls type :render-html])]
+              (when (and implementation
+                         (.startsWith (.getName (class implementation)) "hiccup.compiler$eval"))
+                [type implementation]))))
+    [clojure.lang.IPersistentVector clojure.lang.ISeq]))
+
+(defn- appendable-html? [value type dispatch-cache]
+  (and (not (instance? hiccup.compiler.HtmlRenderer value))
+       (some? (get appendable-html-implementations type))
+       (let [protocol html-compiler/HtmlRenderer
+             _ (when-not (identical? protocol (:protocol @dispatch-cache))
+                 (vreset! dispatch-cache {:protocol protocol :classes {}}))
+             value-class (class value)
+             classes (:classes @dispatch-cache)
+             implementation (if (contains? classes value-class)
+                              (get classes value-class)
+                              (let [resolved (:render-html (find-protocol-impl protocol value))]
+                                (when (< (count classes) 64)
+                                  (vswap! dispatch-cache assoc-in [:classes value-class] resolved))
+                                resolved))]
+         (identical? (get appendable-html-implementations type) implementation))))
+
+(defn- append-html! [^StringBuilder out value dispatch-cache empty-falsey?]
+   (cond
+    (and (vector? value) (appendable-html? value clojure.lang.IPersistentVector dispatch-cache))
+    (let [[tag attrs content] (html-compiler/normalize-element value)
+          container? (or content
+                         (and (#{:html :xhtml} html-util/*html-mode*)
+                              (not (html-void-tags tag))))]
+      (.append out "<") (.append out ^String tag)
+      (.append out ^String (html-compiler/render-attr-map attrs))
+      (if container?
+        (do (.append out ">")
+            (append-html! out content dispatch-cache true)
+            (.append out "</") (.append out ^String tag) (.append out ">"))
+        (.append out ^String (if (#{:xml :xhtml} html-util/*html-mode*) " />" ">"))))
+
+    (and (seq? value) (appendable-html? value clojure.lang.ISeq dispatch-cache))
+    (html-compiler/iterate! #(append-html! out % dispatch-cache false) value)
+
+    :else (let [rendered (html-compiler/render-html value)]
+            (.append out ^Object (if empty-falsey? (or rendered "") rendered)))))
+
 (defn render-html [hiccup]
-  (str (h/html hiccup)))
+  ;; Append standard trees once instead of copying every rendered subtree into
+  ;; each ancestor. Attributes, leaves and custom dispatch remain Hiccup's.
+  (let [out (StringBuilder.)
+        dispatch-cache (volatile! {:protocol html-compiler/HtmlRenderer :classes {}})]
+    (append-html! out hiccup dispatch-cache true)
+    (.toString out)))
 
 (defn- url-encode
   [v]

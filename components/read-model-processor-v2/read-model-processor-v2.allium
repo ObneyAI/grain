@@ -404,6 +404,11 @@ contract KeyedFoldMaterialization {
         -- results, index changes, counts, and requested scope's progress together.
         -- Every event covered by advanced progress has its complete effects committed.
         -- Result calculation and indexing have no independent refresh checkpoint.
+        -- After an ordered source read finishes, its final partial batch may
+        -- publish the captured-head freshness checkpoint in the same atomic
+        -- unit. Failure publishes neither that batch nor its freshness checkpoint;
+        -- earlier full batches remain independently durable. Existing newer
+        -- progress is preserved even when a concurrent writer applied the tail.
 
     @invariant IndependentScopeProgress
         -- Completing one scope cannot mark an unread scope, a broader scope,
