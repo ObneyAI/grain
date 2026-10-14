@@ -1699,11 +1699,17 @@
   (keyed-validate-scope! scope)
   (if scope (assoc ctx :read-model/scope scope) (dissoc ctx :read-model/scope)))
 
-(defn- keyed-namespace-identity [ctx name d]
-  (cond-> [(:tenant-id ctx) name (:version d 1)]
-    (:read-model/scope ctx)
-    (conj [:event-scope (.formatHex (HexFormat/of)
-                         (codec/encode (canonical-cache-value (:read-model/scope ctx))))])))
+(defn- keyed-scope-identity [scope]
+  (when scope
+    [:event-scope (.formatHex (HexFormat/of)
+                    (codec/encode (canonical-cache-value scope)))]))
+
+(defn- keyed-namespace-identity
+  ([ctx name d]
+   (keyed-namespace-identity ctx name d (keyed-scope-identity (:read-model/scope ctx))))
+  ([ctx name d scope-identity]
+   (cond-> [(:tenant-id ctx) name (:version d 1)]
+     scope-identity (conj scope-identity))))
 
 (defn- keyed-event-query [ctx d after]
   (let [scope (:read-model/scope ctx)
@@ -1933,36 +1939,58 @@
         (throw (ex-info "Read-session contexts must share one event store" {})))
       (doseq [name names]
         (when-not (keyed? (get registry name))
-          (throw (ex-info "Expected a registered keyed fold" {:model name})))))
-    (let [{:keys [prefixes prepared]}
+          (throw (ex-info "Expected a registered keyed fold" {:model name}))))
+      ;; Duplicate requests still validate their own configuration even when
+      ;; their namespace's catch-up is shared with an earlier request.
+      (when (and (seq names) (not (pos-int? (:read-model/batch-size ctx 128))))
+        (throw (ex-info "Keyed-fold batch size must be positive"
+                        {:batch-size (:read-model/batch-size ctx 128)}))))
+    (let [;; Reuse only immutable address preparation within this session. Heads,
+          ;; registry validation and the snapshot are still acquired on every
+          ;; session; nothing survives into a later request or cache reopen.
+          scope-identities (into {} (map (fn [scope] [scope (keyed-scope-identity scope)]))
+                                 (distinct (map (comp :read-model/scope first) requests)))
+          identities (volatile! {})
+          identity-order (volatile! [])
+          identity-for (fn [ctx name d]
+                         (let [k [(:tenant-id ctx) name (:version d 1) (:read-model/scope ctx)]]
+                           (or (get @identities k)
+                               (let [identity (keyed-namespace-identity ctx name d
+                                                (get scope-identities (:read-model/scope ctx)))]
+                                 (vswap! identities assoc k identity)
+                                 (vswap! identity-order conj identity)
+                                 identity))))
+          requests (mapv (fn [[ctx names]]
+                           [ctx (identity-for ctx :grain.read-query/shared-identities {:version 1})
+                            (into {} (map (fn [name] [name (identity-for ctx name (get registry name))]))
+                                  (distinct names))]) requests)
+          {:keys [prefixes prepared]}
           (locking cache
-            (let [identities (mapcat
-                              (fn [[ctx names]]
-                                (cons (keyed-namespace-identity ctx :grain.read-query/shared-identities {:version 1})
-                                      (map #(keyed-namespace-identity ctx % (get registry %)) names))) requests)
-                  prefixes (namespace-resolve! cache (vec identities))
-                  heads (reduce (fn [heads [ctx _]]
+            (let [prefixes (namespace-resolve! cache @identity-order)
+                  heads (reduce (fn [heads [ctx _ _]]
                                   (let [id (:tenant-id ctx)]
                                     (if (contains? heads id) heads (assoc heads id (keyed-head ctx))))) {} requests)
+                  caught-up (volatile! #{})
                   prepared (mapv
-                             (fn [[ctx names]]
-                               (let [identity-prefix (get prefixes (keyed-namespace-identity ctx :grain.read-query/shared-identities {:version 1}))]
-                                 (doseq [name (distinct names)]
+                             (fn [[ctx shared-identity model-identities]]
+                               (let [identity-prefix (get prefixes shared-identity)]
+                                 (doseq [[name identity] model-identities
+                                         :when (not (contains? @caught-up identity))]
                                    (keyed-catch-up! (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix identity-prefix)
-                                              name (get registry name)
-                                              (get prefixes (keyed-namespace-identity ctx name (get registry name)))
-                                              (get heads (:tenant-id ctx))))
-                               [ctx (select-keys registry names)])) requests)]
+                                              name (get registry name) (get prefixes identity)
+                                              (get heads (:tenant-id ctx)))
+                                   (vswap! caught-up conj identity))
+                               [ctx (select-keys registry (keys model-identities)) model-identities])) requests)]
               {:prefixes prefixes :prepared prepared}))]
       (kv/transact cache :read
         (fn [tx]
-          (f (mapv (fn [[ctx definitions]]
+          (f (mapv (fn [[ctx definitions model-identities]]
                      (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/session
                             {:cache cache :event-store event-store :identity (keyed-identity-of ctx)
                              :definitions definitions
                              :readers (into {} (map (fn [[name d]]
                                                       [name (keyed-prepare-reader tx
-                                                              (get prefixes (keyed-namespace-identity ctx name d)) d)]))
+                                                              (get prefixes (get model-identities name)) d)]))
                                             definitions)})) prepared)))))))
 
 (defn- keyed-with-reader [ctx name d f]

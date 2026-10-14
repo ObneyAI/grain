@@ -2664,7 +2664,8 @@
 (def ^:dynamic *compact-cache* nil)
 
 (defn compact-cache-fixture [f]
-  (let [directory (str "/private/tmp/grain-compact-test-" (random-uuid))
+  (let [directory (str (io/file (System/getProperty "java.io.tmpdir")
+                                (str "grain-compact-test-" (random-uuid))))
         _ (.mkdirs (io/file directory))
         store (es/start {:conn {:type :sqlite :database-file (str directory "/events.db")}})
         options {:storage-dir (str directory "/cache") :db-name "test" :map-size (* 128 1024 1024)}

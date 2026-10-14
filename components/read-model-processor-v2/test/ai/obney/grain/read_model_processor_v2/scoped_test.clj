@@ -154,3 +154,56 @@
         (let [result (rmp/query ctx definition {:order :total})]
           (is (= 1 (:total result)))
           (is (= [{:key "a" :application {:total 1} :ledger {:total 1}}] (:rows result))))))))
+
+(deftest large-scopes-prepare-once-without-reusing-freshness-across-sessions
+  (with-stores
+    (fn [ctx]
+      (let [tags (into #{} (repeatedly 318 #(vector :PaymentPlan (random-uuid))))
+            outside [:User (random-uuid)]
+            scope {:tags tags} other-scope {:tags #{outside}}
+            a (rmp/scoped-context ctx scope)
+            equal-a (rmp/scoped-context ctx {:tags (into #{} (reverse (vec tags)))})
+            b (rmp/scoped-context ctx other-scope)
+            other (assoc a :tenant-id (random-uuid))
+            one (fixture/keyed-register! fixture/keyed-history-step {:result fixture/keyed-total})
+            two (fixture/keyed-register! fixture/keyed-history-step {:result fixture/keyed-total})
+            identity-var (ns-resolve 'ai.obney.grain.read-model-processor-v2.core 'keyed-namespace-identity)
+            canonical-var (ns-resolve 'ai.obney.grain.read-model-processor-v2.core 'canonical-cache-value)
+            catch-up-var (ns-resolve 'ai.obney.grain.read-model-processor-v2.core 'keyed-catch-up!)
+            originals (mapv deref [identity-var canonical-var catch-up-var])
+            counts (atom {})]
+        (append! ctx [{:owner "plan" :delta 7 :tags tags}
+                      {:owner "plan" :delta 20 :tags #{outside}}])
+        (append! other [{:owner "plan" :delta 90 :tags tags}])
+        (with-redefs-fn
+          {identity-var (fn [& args]
+                          (swap! counts update :identities (fnil inc 0))
+                          (apply (nth originals 0) args))
+           canonical-var (fn [value]
+                           (when (contains? #{scope other-scope} value)
+                             (swap! counts update :scope-serializations (fnil inc 0)))
+                           ((nth originals 1) value))
+           catch-up-var (fn [& args]
+                          (swap! counts update :catch-ups (fnil inc 0))
+                          (apply (nth originals 2) args))}
+          #(rmp/read-session [[a [one one two]] [(assoc equal-a :read-model/batch-size 1) [one]]
+                             [b [one]] [other [one]]]
+             (fn [[pa duplicate pb other-tenant]]
+               (dotimes [_ 14]
+                 (is (= {:total 7} (rmp/value pa one "plan")))
+                 (is (= {:total 7} (rmp/value pa two "plan")))
+                 (is (= {:total 7} (rmp/value duplicate one "plan")))
+                 (is (= {:total 20} (rmp/value pb one "plan")))
+                 (is (= {:total 90} (rmp/value other-tenant one "plan")))))))
+        (is (= {:identities 7 :scope-serializations 2 :catch-ups 4} @counts)
+            "Work depends on distinct requested identities/scopes, not duplicate models, contexts or reads")
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"batch size must be positive"
+              (rmp/read-session [[a [one]] [(assoc equal-a :read-model/batch-size 0) [one]]]
+                (constantly nil)))
+            "Sharing catch-up must not hide invalid configuration in a duplicate request")
+        (with-redefs [es/read (fn [& _] (throw (ex-info "Warm scope replayed" {})))]
+          (is (= {:total 7} (rmp/value equal-a one "plan"))))
+        (append! ctx [{:owner "plan" :delta 3 :tags tags}])
+        (is (= {:total 10} (rmp/value a one "plan")))
+        (is (= {:total 20} (rmp/value b one "plan")))
+        (is (= {:total 90} (rmp/value other one "plan")))))))
