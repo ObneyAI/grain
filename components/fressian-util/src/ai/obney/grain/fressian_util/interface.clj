@@ -2,7 +2,9 @@
   (:require [clojure.data.fressian :as fressian])
   (:import [java.io ByteArrayInputStream]
            [java.time Instant OffsetDateTime]
-           [org.fressian.handlers ReadHandler WriteHandler]))
+           [org.fressian FressianWriter]
+           [org.fressian.handlers ILookup ReadHandler WriteHandler]
+           [org.fressian.impl Codes Handlers]))
 
 (def ^:private java-time-write-handlers
   {OffsetDateTime
@@ -28,13 +30,46 @@
      (read [_ rdr _tag _component-count]
        (Instant/parse ^CharSequence (.readObject rdr))))})
 
+(def ^:private native-map-write-handler
+  (let [^WriteHandler fallback (get (.valAt Handlers/extendedWriteHandlers java.util.Map) "map")]
+    (reify WriteHandler
+      (write [_ writer value]
+        (if (instance? FressianWriter writer)
+          (let [^FressianWriter writer writer
+                n (* 2 (count value))]
+            (.writeTag writer "map" 1)
+            ;; Match Fressian's sized-list bytes without allocating an
+            ;; alternating key/value ArrayList for each nested map.
+            (if (< n 8)
+              (.writeCode writer (+ Codes/LIST_PACKED_LENGTH_START n))
+              (do (.writeCode writer Codes/LIST)
+                  (.writeCount writer n)))
+            (reduce-kv (fn [_ k v]
+                         (.writeObject writer k)
+                         (.writeObject writer v)
+                         nil)
+                       nil value))
+          ;; The published handler lookup also supports other Writer instances.
+          (.write fallback writer value))))))
+
+(def ^:private native-map-write-handlers
+  {clojure.lang.PersistentArrayMap {"map" native-map-write-handler}
+   clojure.lang.PersistentHashMap {"map" native-map-write-handler}
+   clojure.lang.PersistentTreeMap {"map" native-map-write-handler}})
+
 (def write-handlers
   "Fressian write-handler lookup extending the standard Clojure handlers with
   java.time.OffsetDateTime and java.time.Instant. Suitable to pass as the
   `:handlers` option to `clojure.data.fressian/write` in user code."
-  (-> (merge fressian/clojure-write-handlers java-time-write-handlers)
-      fressian/associative-lookup
-      fressian/inheritance-lookup))
+  (let [^ILookup standard (-> (merge fressian/clojure-write-handlers java-time-write-handlers)
+                              fressian/associative-lookup
+                              fressian/inheritance-lookup)]
+    (reify ILookup
+      (valAt [_ type]
+        ;; Exact classes only: records and custom map subclasses retain their
+        ;; existing handlers and iteration semantics.
+        (or (get native-map-write-handlers type)
+            (.valAt standard type))))))
 
 (def read-handlers
   "Fressian read-handler lookup extending the standard Clojure handlers with
