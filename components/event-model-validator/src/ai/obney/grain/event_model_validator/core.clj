@@ -362,7 +362,9 @@
            [block-key block] (:read-models area-map)
            :when (contains? read-models block-key)
            :let [spec-schema (:schema block)
-                 live-schema (get-in read-models [block-key :schema])
+                 definition (get read-models block-key)
+                 live-schema (get definition (if (or (contains? definition :key) (contains? definition :route))
+                                               :state-schema :schema))
                  sf (when spec-schema (schema-form spec-schema))
                  lf (when live-schema (schema-form live-schema))]
            :when (and (not= sf ::unparseable) (not= lf ::unparseable) (not= sf lf))]

@@ -29,7 +29,7 @@
 --   - a store is usable only between start and stop
 --
 -- Excludes (implementation, governed by each concrete store, not here):
---   - storage engine, on-disk format, transactions, map sizing, reader-slot
+--   - storage engine, on-disk format, transaction mechanics, map sizing, reader-slot
 --     pools and any retry/back-pressure on resource exhaustion (LMDB specifics)
 --   - serialization of the values themselves: keys and values are opaque byte
 --     sequences; callers encode/decode their own payloads
@@ -79,7 +79,8 @@ contract KeyValueStore {
 
     @invariant ReadYourWrite
         -- After write(k, v) succeeds, read(k) returns a value byte-for-byte
-        -- equal to v, until a later write replaces it. The store neither
+        -- equal to v, until a later write replaces it or a transactional deletion
+        -- removes it. The store neither
         -- inspects nor transforms the bytes — what is put is what is got.
 
     @invariant AbsentKeyReadsNothing
@@ -127,9 +128,38 @@ contract KeyValueStore {
         -- responsibility; the store sees only opaque keys.
 }
 
+contract TransactionalKeyValueStore {
+    transact: (mode: String, callback: Any) -> Any
+
+    @invariant AtomicReadWrite
+        -- A write callback observes its earlier writes and deletions. Its changes
+        -- commit together only when it completes successfully; failures roll
+        -- everything back. A caught operation error also prevents commit.
+
+    @invariant SnapshotReads
+        -- A read callback observes one committed snapshot. Writes and deletions
+        -- through a read callback fail. Returned bytes are detached copies.
+
+    @invariant OrderedTraversal
+        -- Traversal visits byte keys in unsigned lexicographic order, optionally
+        -- reversed, within the intersection of a prefix and half-open bounds.
+        -- Reduction honours early termination without retaining the collection.
+
+    @invariant ScopedOperations
+        -- Operations are valid only on the callback's thread during its lifetime.
+        -- Escaped or cross-thread operations fail instead of touching closed or
+        -- concurrently used storage resources. Nested transactions on the same
+        -- store and thread fail rather than deadlocking or nesting snapshots.
+}
+
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
+
+surface TransactionalKeyValueBoundary {
+    contracts:
+        fulfils TransactionalKeyValueStore
+}
 
 -- The boundary an implementing store presents to its callers. The implementing
 -- store (code, e.g. an LMDB- or in-memory-backed store) fulfils the

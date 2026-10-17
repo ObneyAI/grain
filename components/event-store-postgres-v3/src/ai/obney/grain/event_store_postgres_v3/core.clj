@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
-            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
+            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append single-tag-union]]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.event-store-postgres-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
@@ -168,25 +168,26 @@
 (defn- build-single-query-sql
   "Build WHERE clause and params for a single read query.
    Returns {:where-sql \"WHERE ...\" :params [...]}"
-  [{:keys [tenant-id tags types after as-of]}]
-  (let [tenant-clause [["tenant_id = ?" tenant-id]]
-        tag-clauses (when tags
-                      [["tags @> ?::text[]"
-                        (into-array String
-                                    (map #(str (key-fn (first %)) ":" (second %)) tags))]])
-        clauses  (->> (concat tenant-clause
-                              tag-clauses
-                              [(when types
-                                 ["type = ANY(?)"
-                                  (into-array String (mapv #(str ":" (key-fn %)) types))])
-                               (when after ["id > ?" after])
-                               (when as-of  ["id <= ?" as-of])])
-                      (remove nil?))
-        where-sql (if (seq clauses)
-                    (str "WHERE " (string/join " AND " (map first clauses)))
-                    "")]
-    {:where-sql where-sql
-     :params    (mapv second clauses)}))
+  ([query] (build-single-query-sql query false))
+  ([{:keys [tenant-id tags types after as-of]} any-tag?]
+   (let [tenant-clause [["tenant_id = ?" tenant-id]]
+         tag-clauses (when tags
+                       [[(if any-tag? "tags && ?::text[]" "tags @> ?::text[]")
+                         (into-array String
+                                     (map #(str (key-fn (first %)) ":" (second %)) tags))]])
+         clauses  (->> (concat tenant-clause
+                               tag-clauses
+                               [(when types
+                                  ["type = ANY(?)"
+                                   (into-array String (mapv #(str ":" (key-fn %)) types))])
+                                (when after ["id > ?" after])
+                                (when as-of  ["id <= ?" as-of])])
+                       (remove nil?))
+         where-sql (if (seq clauses)
+                     (str "WHERE " (string/join " AND " (map first clauses)))
+                     "")]
+     {:where-sql where-sql
+      :params    (mapv second clauses)})))
 
 (defn- order-limit-clause
   "Build the ` ORDER BY id [DESC] [LIMIT ?]` tail + its trailing param for a
@@ -240,19 +241,24 @@
 
 (defn- read-batch
   [event-store tenant-id queries]
-  (let [sub-queries (map
-                     (fn [query]
-                       (let [{:keys [where-sql params]} (build-single-query-sql query)]
-                         {:sql    (str "(SELECT id, time, type, tags, data FROM grain.events "
-                                       where-sql ")")
-                          :params params}))
-                     queries)
-        union-sql   (str "SELECT DISTINCT ON (id) id, time, type, tags, data FROM ("
-                         (string/join " UNION ALL " (map :sql sub-queries))
-                         ") AS combined ORDER BY id")
-        all-params  (into [] (mapcat :params) sub-queries)
-        conn (get-in event-store [:state ::connection-pool])]
-    (make-reducible conn tenant-id union-sql all-params)))
+  (if-let [combined (single-tag-union queries)]
+    (let [{:keys [where-sql params]} (build-single-query-sql combined true)]
+      (make-reducible (get-in event-store [:state ::connection-pool]) tenant-id
+                      (str "SELECT id, time, type, tags, data FROM grain.events "
+                           where-sql " ORDER BY id") params))
+    (let [sub-queries (map
+                       (fn [query]
+                         (let [{:keys [where-sql params]} (build-single-query-sql query)]
+                           {:sql    (str "(SELECT id, time, type, tags, data FROM grain.events "
+                                         where-sql ")")
+                            :params params}))
+                       queries)
+          union-sql   (str "SELECT DISTINCT ON (id) id, time, type, tags, data FROM ("
+                           (string/join " UNION ALL " (map :sql sub-queries))
+                           ") AS combined ORDER BY id")
+          all-params  (into [] (mapcat :params) sub-queries)
+          conn (get-in event-store [:state ::connection-pool])]
+      (make-reducible conn tenant-id union-sql all-params))))
 
 (defn read
   [event-store args]
@@ -510,6 +516,15 @@
   compaction/EventCompaction
   (estimate [this request] (estimate-compaction this request))
   (compact! [this request] (compact-events! this request)))
+
+(extend-type PostgresEventStore
+  p/EventStoreHead
+  (head [this tenant-id]
+    (committed-last-event-id (get-in this [:state ::connection-pool]) tenant-id)))
+
+(extend-type PostgresEventStore
+  p/EventStoreStableEmptyIntervals
+  (stable-empty-intervals? [_] true))
 
 (defmethod start-event-store :postgres
   [config]

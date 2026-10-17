@@ -1,5 +1,52 @@
 (ns ai.obney.grain.read-model-processor-v2.interface
-  "Read model projection engine with two-tier caching and optional partitioning.
+  "Pure event folds with legacy projections and opt-in keyed materialization.
+
+   Add :key (event -> instance-id) to a declaration for independent keyed folds.
+   Alternatively, :route (event -> ordered sequence of [instance-id input])
+   supplies zero or more reducer inputs. Supply exactly one of :key or :route.
+   Empty routes intentionally skip an event; nil routes and nil owners fail.
+   Repeated owners apply inputs in order. Progress tracks the original stored
+   event, with all its effects committed together; routed inputs are not stored
+   as events. Routing must be pure and finite, with no state or context lookup.
+   Optional :initial defaults to {}, and :result (state -> value) defaults to
+   identity. Grain atomically persists affected state, results, indexes and
+   progress. Read with value, state, values or page; compose in read-session.
+   Keyed context requires :tenant-id, :event-store and :cache.
+   Tenant identity always comes from context; declarations have no tenant key.
+
+   Optional :include? (result -> truthy) controls result membership. Excluded
+   instances retain state, but have no readable result, index entries or count.
+   Omission includes every result, including nil. Membership changes commit with
+   state and progress; no application storage mutations are needed.
+
+   :indexes maps index names to pure result -> sort-value functions. Supported
+   sort values are nil, booleans, strings, signed 64-bit integers, UUIDs, keywords,
+   and tuples (vectors) of these. Keys must fit the backend's 511-byte encoding
+   limit. Change the model version when changing routing, initial state, reducer,
+   result, inclusion, schemas or indexes. :state-schema and :result-schema are optional.
+
+   :searches maps names to pure result -> string-or-nil functions. Text postings
+   commit with the result and progress. search-keys returns exact matching IDs;
+   key-page orders candidate IDs using compact index values, without full rows.
+   Search extraction changes require a model version change, like other indexes.
+
+   Experimental :filtered-indexes is a set of stored index names (including optional
+   :identity) that support efficient paging within a matching subset. Enable it with
+   a new model version. This adds membership storage and update work. Ordinary
+   indexes already support rank navigation for unfiltered pages.
+
+   Normal application reads use value, state, values, page, or a four-key query.
+   query chooses the execution path and coordinates related reads. Index metadata,
+   candidate-ID paging, and read-session are advanced composition tools. They do
+   not need to appear in an application's declarative list query.
+
+   Direct index pages use stored ranks for offsets and equality counts. Grain
+   maintains those ranks in the fold transaction. Incompatible derived storage
+   uses a fresh format identity and materializes through normal event replay.
+
+   The caching and partitioning options below describe legacy project calls.
+   Keyed folds do not use L1/TTL caching. Use scoped-context for event-tag or
+   event-query scopes; index selection alone does not constrain event replay.
 
    Read models are pure reducer functions `(state, event) -> state` that project
    event streams into queryable state. This processor handles caching, incremental
@@ -103,7 +150,6 @@
    Context fields `:read-model/name` and `:read-model/cache-tier` are attached
    to every metric event for observability."
   (:require [ai.obney.grain.read-model-processor-v2.core :as core]
-            [ai.obney.grain.read-model-processor-v2.l1-cache :as l1]
             [malli.core :as m]))
 
 (defn p
@@ -145,6 +191,7 @@
   "Register a read model reducer and its opts under `rm-name` (qualified keyword).
    Called automatically by `defreadmodel`; use directly for programmatic registration."
   [rm-name reducer-fn opts]
+  (core/keyed-validate! rm-name opts)
   (when-let [schema (:schema opts)]
     (try
       (m/schema schema)
@@ -155,6 +202,7 @@
   (swap! read-model-registry* assoc rm-name (merge {:reducer-fn reducer-fn} opts)))
 
 (defn ^:no-doc register-declared! [rm-name reducer-fn opts definition]
+  (core/keyed-validate! rm-name opts)
   (when-let [schema (:schema opts)]
     (try
       (m/schema schema)
@@ -179,26 +227,30 @@
   @read-model-registry*)
 
 (defmacro defreadmodel
-  "Define and register a read model reducer.
+  "Define and register a pure event reducer under :<ns-kw>/<name>.
 
-   Follows the same pattern as `defcommand` and `defquery`:
+   Without :key or :route, the model accumulates one state starting from {}.
+   Read it with project. Its options are :events, :version, :schema,
+   :partition-fn, :entity-id-fn and :l1-ttl-ms. Legacy :schema checks schema
+   syntax at registration; it does not validate each reduced state.
 
-       (defreadmodel :ns-kw name
-         {:events  #{:ns/event-a :ns/event-b}  ; event types to subscribe to
-          :version 1                            ; bump to invalidate cache
-          :schema [:map [:count :int]]          ; optional projected-state schema
-          ;; Optional — for partitioned read models:
-          :partition-fn  (fn [entity] ...)      ; entity -> partition key
-          :entity-id-fn  (fn [event] ...)       ; event -> entity id
-          ;; Optional — L1 cache TTL:
-          :l1-ttl-ms 1000}                      ; ms before revalidating (default 0)
+   With exactly one of :key or :route, each instance accumulates separate state.
+   :key maps an event to an instance ID. :route returns [ID input] pairs.
+   Read with value, state, values, page, or a composed query; project rejects
+   keyed models. Keyed-only options are :initial (a value, default {}),
+   :result, :include?, :indexes, :searches, :filtered-indexes, :state-schema
+   and :result-schema. State is validated after each input, and results before
+   publication. :schema applies only to ordinary models.
+
+       (defreadmodel :example customers
+         {:events #{:example/customer-changed} :version 1
+          :key :customer-id :indexes {:name (order-key [:name])}}
          \"Optional docstring.\"
          [state event]
-         ... reducer body ...)
+         (customer-step state event))
 
-   The reducer receives accumulated state (a map, initially `{}`) and a single event.
-   It must return the new state. The function is registered under the qualified keyword
-   `:<ns-kw>/<name>` and can be projected via `(project context :<ns-kw>/<name>)`."
+   Unknown or inapplicable options are errors. Change :version when changing
+   materialized behavior. The macro also defines the reducer Var ns-kw-name."
   {:arglists '([ns-kw name opts? docstring? [state event] & body])}
   [ns-kw fn-name & args]
   (let [[opts args] (if (map? (first args))
@@ -216,7 +268,8 @@
                       :definition/value
                       {:description docstring
                        :options (select-keys opts #{:events :version :schema
-                                                    :l1-ttl-ms})}})]
+                                                    :l1-ttl-ms :key :route :initial :result :include?
+                                                    :indexes :searches :filtered-indexes :state-schema :result-schema})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
@@ -243,6 +296,8 @@
   ([context rm-name] (project context rm-name nil))
   ([context rm-name scope]
    (let [entry (get @read-model-registry* rm-name)
+         _ (when (core/keyed? entry)
+             (throw (ex-info "Use value, state, values or page for a keyed fold" {:model rm-name})))
          query (cond
                  (:queries scope) (:queries scope)
                  (:tags scope)    {:types (:events entry) :tags (:tags scope)}
@@ -258,15 +313,232 @@
                   (:l1-ttl-ms entry)    (assoc :l1-ttl-ms (:l1-ttl-ms entry)))))))
 
 ;; ---------------------------------------------------------------------------
-;; L1 In-Process Cache
+;; Keyed folds
+;; ---------------------------------------------------------------------------
+
+(defn scoped-context
+  "Return a context whose keyed reads replay only the requested event scope.
+   Accepts {:tags #{[tag UUID] ...}} or {:queries [{:tags ... :types ...} ...]}.
+   Query types are intersected with each model's subscriptions; queries form a
+   deduplicated event union. Empty selectors select nothing. Tenant and replay
+   cursors come from Grain. State, results, indexes, counts and progress are
+   cached independently per scope. Index selections apply after scoped replay.
+   Use this context with value, state, values, page, query or read-session.
+   Passing nil removes the scope. An active session's scope cannot be changed.
+
+     (values (scoped-context context {:tags #{[:User user-id]}})
+             :enrollment/applications {:index :user :equals user-id})"
+  [context scope]
+  (core/keyed-scoped-context context scope))
+
+(defn- keyed-definition [context name]
+  (let [definition (or (core/keyed-session-definition context name)
+                       (get @read-model-registry* name))]
+    (when-not (core/keyed? definition)
+      (throw (ex-info "Expected a registered keyed fold" {:model name})))
+    definition))
+
+(defn value
+  "Read a keyed fold's materialized result after catch-up. Supply not-found to
+   distinguish an absent or explicitly excluded result from a stored nil.
+   Missing defaults to nil. Optional :include? controls result publication while
+   retaining accumulated state; omitted means include every result."
+  ([context name key] (value context name key nil))
+  ([context name key not-found]
+   (core/keyed-point context name (keyed-definition context name) key :value not-found)))
+
+(defn state
+  "Read a keyed fold's detached accumulator, not its completion value."
+  ([context name key] (state context name key nil))
+  ([context name key not-found]
+   (core/keyed-point context name (keyed-definition context name) key :state not-found)))
+
+(defn values
+  "Return a reducible of {:key instance-id :value result}. Selection accepts
+   :index (default :identity), :direction, and either :equals or a vector :prefix
+   matching complete leading components of vector index values. A standalone reduction
+   catches up once and owns a snapshot; inside a read-session consume it there."
+  ([context name] (values context name {}))
+  ([context name selection]
+   (core/keyed-values context name (keyed-definition context name) selection)))
+
+(defn page
+  "Read an indexed result page with exact counts and clamping. Returns :entries,
+   :total, :total-pages, :page, :page-size, and progress/work counters. Options:
+   :index, :direction, :equals, vector :prefix or vector of vectors :prefixes,
+   :page (1 by default), :limit (25 by default). Selection forms are mutually
+   exclusive. Prefixes match complete leading vector components; :prefix []
+   selects all vectors. :prefixes pages their union in global index order,
+   deduplicating overlaps; :prefixes [] selects nothing. Counts/navigation scale
+   with the number of ranges, without scanning their members or skipped pages.
+   :rows-examined counts selected index rows; :rank-entries-examined separately
+   counts navigation entries visited, including repeated visits. Only returned
+   result payloads are decoded. Rank navigation has probabilistic bounds."
+  [context name options]
+  (core/keyed-page context name (keyed-definition context name) options))
+
+;; Advanced composition: index metadata and candidate-ID pages.
+;; Prefer query for declarative list pages; it coordinates these operations.
+
+(defn index-groups
+  "Return distinct index values in ascending order as {:value v :total n}.
+   Reads maintained group counts without loading any member results.
+   With values supplied, look up only those groups in supplied order, omitting
+   duplicates and missing groups. Use a read-session when composing reads."
+  ([context name index]
+   (core/keyed-index-groups context name (keyed-definition context name) index))
+  ([context name index values]
+   (when (nil? values) (throw (ex-info "Expected group values, not nil" {:model name})))
+   (core/keyed-index-groups context name (keyed-definition context name) index values)))
+
+(defn search-keys
+  "Exact case-insensitive literal matching over a declared text index. Options:
+   :index, :query, :mode (:contains by default; :prefix or :suffix for composed
+   boundaries). Contains requires >=3 Unicode code points, boundaries >=1.
+   Returns detached IDs, without decoding result/state payloads. Use read-session
+   when combining searches and membership reads from independent folds."
+  [context name options]
+  (core/keyed-search-keys context name (keyed-definition context name) options))
+
+(defn key-page
+  "Order distinct candidate keys belonging to this model's included results.
+   Options: :index (:identity), :direction (:asc), :page (1), :limit (25), and
+   optional :sort-value (fn [id stored-index-value] computed-order-value) and
+   :include? (fn [id stored-index-value] accepted?). With :indexes [names...],
+   callbacks receive a map of those stored values, decoded once per candidate.
+   Only accepted candidates are sorted and counted; :sort-keys-read includes
+   rejected candidates. Predicates run once per distinct present candidate.
+   The three-argument form considers every included identity in a single pass.
+   Returns :keys, exact counts/clamped page and :sort-keys-read. Reads compact
+   forward metadata for candidates; never decodes their full result/state.
+   Work scales with candidates, not page size. Ties stay ascending by string ID."
+  ([context name options]
+   (core/keyed-key-page context name (keyed-definition context name) :ai.obney.grain.read-model-processor-v2.core.keyed/all options))
+  ([context name keys options]
+   (core/keyed-key-page context name (keyed-definition context name) keys options)))
+
+(defn filtered-key-page
+  "Advanced, experimental pagination of matching IDs in stored order.
+   The model must opt the chosen index into :filtered-indexes and use a new version.
+   Accepts :index (:identity), :direction (:asc), :page (1), :limit (25).
+   Matches key-page's stored-order semantics; no query-time sort callback.
+   Resolves candidate IDs into target-model ordinals, counts span intersections,
+   and skips spans to select the page without decoding or sorting full results.
+   Candidate resolution and bitmap work are not bounded by page size."
+  [context name keys options]
+  (core/keyed-filtered-key-page context name (keyed-definition context name) keys options))
+
+(defn joined-page
+  "Experimental identity join: membership from one model, ordering from another.
+   Options: :index, :direction, :page, :limit, required :missing-value, optional
+   :keys restricting candidates. The ordering index must opt into :filtered-indexes.
+   Missing/excluded ordering results use the supplied value and share ascending
+   string-ID ties with real equal values. Both models use one prepared snapshot.
+   Reads membership/ordinal metadata, not full results; unsearched selection visits
+   all membership IDs. Supplied candidates use point membership probes instead.
+   Defaulted candidate IDs may be sorted; no result or default entry is persisted."
+  [context membership-model ordering-model options]
+  (core/keyed-joined-page context membership-model (keyed-definition context membership-model)
+                     ordering-model (keyed-definition context ordering-model) options))
+
+(defn index-keys
+  "Read instance identities from an equality group without loading results.
+   Options: :index, :equals (required), :direction, zero-based :offset (0),
+   :limit (25). Beyond-end offsets return []. Ties remain ascending by ID."
+  [context name options]
+  (core/keyed-index-keys context name (keyed-definition context name) options))
+
+(defn index-values
+  "Reduce {:key id :value {index stored-value}} entries without loading results.
+   Supply a vector of index names. The four-argument form reads only the supplied
+   instance IDs (duplicates and absent IDs are omitted); the three-argument form
+   scans compact forward metadata. Consume session-bound reductions in-session."
+  ([context name indexes]
+   (core/keyed-index-values context name (keyed-definition context name) indexes nil))
+  ([context name indexes ids]
+   (when (nil? ids) (throw (ex-info "Expected instance IDs, not nil" {:model name})))
+   (core/keyed-index-values context name (keyed-definition context name) indexes ids)))
+
+(defn index-rank
+  "Return {:rank insertion-position :present? boolean} for an instance identity
+   in an equality group. Selection: :index, :equals (required), :direction.
+   Loads index metadata only; absent identities still have an insertion rank."
+  [context name selection id]
+  (core/keyed-index-rank context name (keyed-definition context name) selection id))
+
+(defn progress
+  "Read a keyed model's committed replay progress after catch-up."
+  [context name]
+  (core/keyed-progress context name (keyed-definition context name)))
+
+(defn read-session
+  "Catch up the named keyed folds once, then invoke f with a scoped context.
+   All reads through it share a snapshot and must finish during f. The two-argument
+   form accepts explicit [[context model-names] ...] requests sharing one cache
+   and event store;
+   f receives their prepared contexts in order. This is an application integration
+   boundary, not tenant routing in model declarations."
+  ([context model-names f]
+   (read-session [[context model-names]] (fn [[prepared]] (f prepared))))
+  ([requests f]
+   (core/keyed-read-session requests @read-model-registry* f)))
+
+;; ---------------------------------------------------------------------------
+;; Declarative queries over keyed results
+;; ---------------------------------------------------------------------------
+
+(defn order-key
+  "Pure index extractor for query-visible fields. Text is case folded, nil is
+   empty text, keywords use their name. One field yields a scalar; several a tuple.
+   The function carries structural field metadata; no arbitrary code is inspected."
+  [fields] (core/query-order-key fields))
+
+(defn search-text
+  "Pure searchable-text extractor with explicit field provenance. Fields are
+   separated by spaces. The same extractor serves root-only and related searches;
+   Grain handles the joining boundary."
+  [fields] (core/query-search-text fields))
+
+(defn query-models
+  "Validate a four-key read-query definition, including static search and order
+   index requirements, and return its model/version map,
+   suitable for an endpoint's existing :grain/read-models subscription."
+  [definition]
+  (core/query-subscriptions (core/query-compile-definition definition @read-model-registry*)))
+
+(defn query
+  "Execute {:from {alias model} :related {...} :search [...] :orders {...}}.
+   Request: required :order, optional :search, :direction, :page, :limit, :params.
+   Rows contain :key (root identity) and detached results under declared aliases.
+   Returns exact pagination and :work describing the selected execution path.
+   Explicit :call ordering may evaluate every candidate. Unsupported plain field
+   orders fail rather than scanning results. Storage-key size errors propagate.
+   Indexed text composition
+   currently supports root text plus one related group; unsupported forms fail.
+   Does not define or maintain an additional joined read model."
+  [context definition request]
+  (let [registry @read-model-registry*
+        plan (core/query-compile-definition definition registry)
+        api {:value #'value :values #'values :page #'page
+             :index-groups #'index-groups :index-keys #'index-keys :index-rank #'index-rank
+             :search-keys #'search-keys :key-page #'key-page
+             :filtered-key-page #'filtered-key-page :joined-page #'joined-page
+             :read-session (fn [ctx names f]
+                             (core/keyed-read-session [[ctx names]] registry (fn [[prepared]] (f prepared))))
+             :same-members? (fn [ctx a b]
+                              (or (= a b) (core/keyed-same-members? ctx a (get registry a) b (get registry b))))}]
+    (core/query-execute api context plan request)))
+
+;; ---------------------------------------------------------------------------
+;; Legacy L1 cache
 ;; ---------------------------------------------------------------------------
 
 (defn l1-clear!
   "Clear the L1 in-process cache. Useful for testing or after deployments."
   []
-  (l1/clear!))
+  (core/l1-clear!))
 
 (defn l1-stats
   "Return L1 cache statistics: {:entries n}"
   []
-  (l1/stats))
+  (core/l1-stats))

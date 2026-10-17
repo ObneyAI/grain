@@ -291,6 +291,11 @@ config {
     -- keep-alive traffic on every view.
     heartbeat_interval: Duration = 10.seconds
 
+    -- Event-driven views sample an optional query refresh key during the existing
+    -- connection liveness check. The key can express a query date without making
+    -- time passage a business event or running the full query on every check.
+    refresh_key_sample_interval: Duration = 30.seconds
+
     -- How many recent stored-event identities a view remembers for
     -- de-duplication. Bounded on purpose: once a view has remembered this many,
     -- the oldest identity is forgotten, so a much later redelivery of a very old
@@ -513,9 +518,20 @@ surface LiveViewBoundary {
 
     @guarantee RendersOnChangeOnly
         -- An open view is re-rendered on relevant change (a subscribed domain
-        -- event in its tenant, a timer tick in polling mode, or an input
+        -- event in its tenant, a timer tick in polling mode, a changed declared
+        -- query refresh key, or an input
         -- change) and a fresh patch is pushed only when the rendered output
         -- actually differs from the last one — an unchanged view is silent.
+
+    @guarantee QueryClockRefresh
+        -- An event-driven query may declare a cheap context-to-refresh-key
+        -- function, for example its current business date. The boundary samples
+        -- it at the liveness interval and before event-driven renders. A changed
+        -- key triggers the same authorized render path as other relevant changes;
+        -- an equal key triggers no query or patch. This emits no domain event and
+        -- invalidates no read-model materialization. Queries without this option
+        -- retain their existing event-only behavior. No cross-tenant event
+        -- subscription is introduced by a refresh key.
 
     @guarantee SurvivesRenderErrors
         -- A transient render or query failure does not tear down a live view:
@@ -570,6 +586,13 @@ surface CheckedUiAuthoring {
         -- their target through the query registry. A literal route string or an
         -- unregistered target is rejected at authoring time, so UI code cannot
         -- drift from the commands and queries that actually exist.
+
+    @guarantee RemovedIndexedRowsStayRemoved
+        -- A value binding into a nested collection may outlive its parent row
+        -- briefly while a server patch is in flight. If that parent no longer
+        -- exists, reading the binding must neither recreate it nor throw; the
+        -- control displays an empty value and ignores writes until its parent
+        -- exists again. Present rows retain ordinary two-way value binding.
 
     @guarantee ExplicitPayloadsOnly
         -- An action sends only the values the author names in its payload;

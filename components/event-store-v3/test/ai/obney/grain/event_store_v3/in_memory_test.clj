@@ -1,6 +1,7 @@
 (ns ai.obney.grain.event-store-v3.in-memory-test
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.event-store-v3.interface.protocol :as protocol]
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
             [cognitect.anomalies :as anom]
@@ -748,3 +749,38 @@
       (finally
         (es/stop store)
         (pubsub/stop ps)))))
+
+
+(deftest committed-head-is-tenant-scoped-and-does-not-read-events
+  (let [other (uuid/v4)]
+    (is (nil? (es/head *event-store* *tenant-id*)))
+    (append-event! :test/alpha #{} {:value 1})
+    (let [expected (:event/id (last (read-events {})))
+          unexpected (fn [& _] (throw (ex-info "Head must not read events or enumerate tenants" {})))]
+      (with-redefs [protocol/read unexpected protocol/tenants unexpected]
+        (is (= expected (es/head *event-store* *tenant-id*)))
+        (is (nil? (es/head *event-store* other))))
+      (is (= ::anom/conflict
+             (::anom/category (es/append *event-store*
+                                {:tenant-id *tenant-id*
+                                 :events [(es/->event {:type :test/beta})]
+                                 :cas {:predicate-fn (constantly false)}}))))
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (es/append *event-store* {:tenant-id other :events [(es/->event {:type :test/beta})]})
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (is (uuid? (es/head *event-store* other)))
+      (append-event! :test/alpha #{} {:value 2})
+      (is (pos? (compare (es/head *event-store* *tenant-id*) expected))))))
+
+(deftest committed-head-supports-stores-without-the-optional-capability
+  (let [calls (atom []) id (uuid/v7)
+        store (reify protocol/EventStore
+                (read [_ query] (swap! calls conj query) [{:event/id id}]))]
+    (is (= id (es/head store *tenant-id*)))
+    (is (= [{:tenant-id *tenant-id* :reverse? true :limit 1}] @calls))
+    (doseq [tenant [nil "not-a-uuid" {}]]
+      (is (= ::anom/incorrect (::anom/category (es/head store tenant)))))
+    (is (= 1 (count @calls)))
+    (is (nil? (es/head (reify protocol/EventStore (read [_ _] [])) *tenant-id*)))
+    (let [failure {::anom/category ::anom/unavailable ::anom/message "Offline"}]
+      (is (= failure (es/head (reify protocol/EventStore (read [_ _] failure)) *tenant-id*))))))

@@ -1,6 +1,7 @@
 (ns ai.obney.grain.event-store-sqlite-v3.integration-test
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.event-store-v3.interface.backend :as backend]
             [ai.obney.grain.event-store-sqlite-v3.core :as sqlite-core]
             [ai.obney.grain.event-store-sqlite-v3.interface]
             [ai.obney.grain.event-retention.interface :as retention]
@@ -1296,3 +1297,157 @@
         ;; on tenant_id alone (which would visit the whole tenant stream).
         (is (some #(re-find #"(?i)SEARCH e\b.*\(tenant_id=\? AND id=\?\)" %) details)
             "events is probed by full (tenant_id, id) key")))))
+
+
+(deftest committed-head-does-not-decode-the-latest-batch
+  (let [other (uuid/v4)]
+    (is (nil? (es/head *event-store* *tenant-id*)))
+    (es/append *event-store*
+               {:tenant-id *tenant-id*
+                :events (mapv (fn [n] (es/->event {:type :test/alpha :body {:value n}})) (range 100))})
+    (let [expected (:event/id (first (into [] (es/read *event-store*
+                                                       {:tenant-id *tenant-id* :reverse? true :limit 1}))))
+          unexpected (fn [& _] (throw (ex-info "Head must not decode events or enumerate tenants" {})))]
+      (with-redefs [fressian/decode unexpected sqlite-core/read unexpected sqlite-core/tenants unexpected]
+        (dotimes [_ 3] (is (= expected (es/head *event-store* *tenant-id*))))
+        (is (nil? (es/head *event-store* other))))
+      (is (= ::anom/conflict
+             (::anom/category (es/append *event-store*
+                                {:tenant-id *tenant-id*
+                                 :events [(es/->event {:type :test/beta})]
+                                 :cas {:predicate-fn (constantly false)}}))))
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (es/append *event-store* {:tenant-id other :events [(es/->event {:type :test/beta})]})
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (is (uuid? (es/head *event-store* other)))
+      (append-event! :test/beta #{})
+      (is (pos? (compare (es/head *event-store* *tenant-id*) expected))))))
+
+
+(deftest committed-head-excludes-uncommitted-watermarks
+  (append-event! :test/alpha #{})
+  (let [committed (es/head *event-store* *tenant-id*)]
+    (jdbc/with-transaction [tx (pool) {:rollback-only true}]
+      (jdbc/execute! tx ["UPDATE tenants SET last_event_id = ? WHERE id = ?"
+                         (str (uuid/v7)) (str *tenant-id*)])
+      ;; This lookup uses a separate connection while the writer is uncommitted.
+      (is (= committed (es/head *event-store* *tenant-id*))))
+    (is (= committed (es/head *event-store* *tenant-id*)))))
+
+
+(deftest singleton-tag-batches-preserve-union-semantics
+  (let [a [:member (uuid/v4)] b [:member (uuid/v4)] c [:group (uuid/v4)]
+        ids (mapv :event/id
+                  [(append-event! :test/alpha #{a})
+                   (append-event! :test/beta #{b})
+                   (append-event! :test/alpha #{a b})
+                   (append-event! :test/beta #{a c})
+                   (append-event! :test/gamma #{c})])
+        other-tenant (uuid/v4)
+        _ (es/append *event-store* {:tenant-id other-tenant
+                                    :events [(es/->event {:type :test/alpha :tags #{a b}})]})
+        cases (concat
+                (for [filter [{} {:types #{:test/alpha}} {:types #{:test/alpha :test/beta}}
+                              {:types #{}} {:after (ids 1)} {:as-of (ids 2)}
+                              {:types #{:test/alpha} :after (ids 2)}]]
+                  (mapv #(assoc filter :tags #{%}) [a b a]))
+                [[{:tags #{a b}} {:tags #{c}}]
+                 [{:tags #{a} :types #{:test/alpha}} {:tags #{b} :types #{:test/beta}}]
+                 [{:tags #{a} :after (ids 2)} {:tags #{b}}]
+                 [{:tags #{}} {:tags #{a}}]])]
+    (doseq [queries cases]
+      (let [expected (with-redefs [backend/single-tag-union (constantly nil)]
+                       (read-events queries))]
+        (is (= expected (read-events queries)) (pr-str queries))))
+    (is (= [(ids 2)] (mapv :event/id (read-events {:tags #{a b}})))
+        "A normal multi-tag query remains conjunctive")
+    (is (= (subvec ids 0 4)
+           (mapv :event/id (read-events [{:tags #{a}} {:tags #{b}}]))))
+    (let [queries (into [{:tags #{a}} {:tags #{b}}]
+                        (map (fn [_] {:tags #{[:missing (uuid/v4)]}}) (range 600)))]
+      (is (= (subvec ids 0 4) (mapv :event/id (read-events queries)))
+          "Many alternatives do not require one SQL compound branch per tag"))
+    (is (nil? (backend/single-tag-union [{:tags #{a} :limit 1} {:tags #{b} :limit 1}])))
+    (is (nil? (backend/single-tag-union [{:tags #{a} :reverse? true} {:tags #{b} :reverse? true}])))))
+
+(deftest singleton-tag-batch-keeps-indexed-tag-access
+  (let [a [:member (uuid/v4)] b [:member (uuid/v4)]
+        _ (append-event! :test/alpha #{a b})
+        query (backend/single-tag-union
+                [{:tenant-id *tenant-id* :tags #{a} :types #{:test/alpha}}
+                 {:tenant-id *tenant-id* :tags #{b} :types #{:test/alpha}}])
+        {:keys [sql params]} (#'sqlite-core/build-single-query query true)
+        details (mapv :detail (jdbc/execute! (pool) (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                           {:builder-fn rs/as-unqualified-lower-maps}))]
+    (is (not (clojure.string/includes? sql "UNION")))
+    (is (some #(re-find #"SEARCH t USING" %) details) (pr-str details))
+    (is (not-any? #(re-find #"SCAN [te](?: |$)" %) details) (pr-str details))))
+
+(deftest singleton-tag-reads-preserve-filter-order-and-bound-semantics
+  (let [processor (uuid/v4)
+        other-tag (uuid/v4)
+        other-tenant (uuid/v4)
+        absent-tenant (uuid/v4)
+        rows (mapv (fn [[type tags]] (append-event! type tags {}))
+                   [[:test/alpha #{[:processor processor]}]
+                    [:test/beta #{[:processor processor] [:other other-tag]}]
+                    [:test/alpha #{[:other other-tag]}]
+                    [:test/alpha #{[:processor processor]}]
+                    [:test/gamma #{[:processor processor]}]
+                    [:test/beta #{[:processor processor]}]])
+        foreign (first (es/append *event-store*
+                                 {:tenant-id other-tenant
+                                  :events [(es/->event {:type :test/alpha
+                                                       :tags #{[:processor processor]}})]}))
+        ids (mapv :event/id rows)]
+    (doseq [tenant [*tenant-id* other-tenant absent-tenant]
+            types [nil #{} #{:test/alpha} #{:test/beta} #{:test/alpha :test/beta}]
+            after [nil (ids 0) (ids 2) (ids 5)]
+            as-of [nil (ids 0) (ids 3) (ids 5)]
+            reverse? [false true]
+            limit [nil 1 3]]
+      (let [query (cond-> {:tenant-id tenant :tags #{[:processor processor]} :reverse? reverse?}
+                    (some? types) (assoc :types types)
+                    after (assoc :after after)
+                    as-of (assoc :as-of as-of)
+                    limit (assoc :limit limit))
+            source (cond (= tenant *tenant-id*) rows (= tenant other-tenant) [foreign] :else [])
+            eligible (filter (fn [event]
+                               (and (contains? (:event/tags event) [:processor processor])
+                                    (or (nil? types) (contains? types (:event/type event)))
+                                    (or (nil? after) (uuid/< after (:event/id event)))
+                                    (or (nil? as-of) (not (uuid/< as-of (:event/id event)))))) source)
+            ordered (if reverse? (reverse eligible) eligible)
+            expected (mapv :event/id (if limit (take limit ordered) ordered))]
+        (let [actual (es/read *event-store* query)]
+          (if (and after as-of)
+            (is (= ::anom/incorrect (::anom/category actual)) (str query))
+            (is (= expected (mapv :event/id (into [] actual))) (str query))))))))
+
+(deftest singleton-tag-checkpoint-cas-streams-newest-without-aggregation
+  (let [processor (uuid/v4)
+        tag [:processor processor]
+        rows (mapv #(append-event! :test/alpha #{tag} {:n %}) (range 50))
+        _other-type (append-event! :test/beta #{tag} {})
+        query {:tenant-id *tenant-id* :types #{:test/alpha}
+               :tags #{tag} :reverse? true :limit 1}
+        observed (atom nil)]
+    (doseq [any-tag? [false true]]
+      (let [{:keys [sql params]} (#'sqlite-core/build-single-query query any-tag?)
+            details (mapv :detail (jdbc/execute! (pool)
+                                                (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                                {:builder-fn rs/as-unqualified-maps}))]
+        (is (re-find #"(?i)SEARCH t.*tenant_id=\? AND tag=\?" (first details)) (str details))
+        (is (not-any? #(re-find #"(?i)TEMP B-TREE|SCAN " %) details) (str details))
+        (is (= [(str (:event/id (peek rows)))]
+               (mapv :id (jdbc/execute! (pool) (into [sql] params)
+                                       {:builder-fn rs/as-unqualified-maps}))))))
+    (let [result (es/append *event-store*
+                            {:tenant-id *tenant-id*
+                             :events [(es/->event {:type :test/alpha :tags #{tag}})]
+                             :cas (assoc (dissoc query :tenant-id)
+                                         :predicate-fn (fn [events]
+                                                         (reset! observed (mapv :event/id (into [] events)))
+                                                         false))})]
+      (is (= ::anom/conflict (::anom/category result)))
+      (is (= [(:event/id (peek rows))] @observed)))))
