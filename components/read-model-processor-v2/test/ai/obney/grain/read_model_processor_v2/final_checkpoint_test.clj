@@ -18,7 +18,8 @@
   (doseq [n [0 1 127 128 129 256]]
     (fixture/keyed-fixture
       (fn []
-        (let [ctx fixture/*keyed-ctx*
+        ;; Fixed batches: this test is about the boundary of a full batch.
+        (let [ctx (assoc fixture/*keyed-ctx* :read-model/batch-size 128)
               model (fixture/keyed-register! fixture/keyed-history-step {:result fixture/keyed-total})]
           (rmp/progress ctx model)
           (if (zero? n)
@@ -43,7 +44,7 @@
                       (when (and @fail? (:fail? event)) (throw (ex-info "tail failed" {})))
                       (fixture/keyed-history-step state event))
                     {:result fixture/keyed-total})
-            ctx fixture/*keyed-ctx*]
+            ctx (assoc fixture/*keyed-ctx* :read-model/batch-size 128)]
         (fixture/keyed-append! (conj (vec (repeat 128 {:owner "a" :delta 1}))
                                      {:owner "a" :delta 2 :fail? true}))
         (is (thrown-with-msg? Exception #"tail failed" (rmp/value ctx model "a")))
@@ -59,7 +60,7 @@
 (deftest source-failure-before-tail-publication-keeps-tail-and-checkpoint-absent
   (fixture/keyed-fixture
     (fn []
-      (let [ctx fixture/*keyed-ctx*
+      (let [ctx (assoc fixture/*keyed-ctx* :read-model/batch-size 128)
             model (fixture/keyed-register! fixture/keyed-history-step {:result fixture/keyed-total})
             read-events es/read]
         (rmp/progress ctx model)

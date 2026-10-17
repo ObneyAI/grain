@@ -169,6 +169,13 @@
             (loop [found found acc initial]
               (check! false)
               (if-not found acc
+                ;; OPT-10: copy the key, then check bounds with the intrinsic
+                ;; Arrays/compareUnsigned (as before OPT-1). In-range keys are
+                ;; copied anyway; only the one terminating key per scan is an
+                ;; extra copy. Comparing on the cursor's direct buffer, byte by
+                ;; byte (OPT-1) or with ByteBuffer/mismatch, was measured slower
+                ;; per scanned entry: index-keys of 100 ids on S desk/tickets
+                ;; 53.5 us (per-byte) / 48.2 us (mismatch) vs 38.5 us (this).
                 (let [k (copy-buffer (.key cursor))]
                   (if (or (and lower (neg? (byte-compare k lower)))
                           (and upper (not (neg? (byte-compare k upper)))))
@@ -188,8 +195,11 @@
           (and (= (nth prefix i) (aget key i)) (recur (inc i)))))))
 
 (defn- invalidate-proofs! [proofs key]
+  ;; Copy only when some proof actually overlaps; most writes touch none.
   (when proofs
-    (vswap! proofs #(into [] (remove (fn [[_ prefix]] (overlapping-prefix? prefix key))) %))))
+    (let [current @proofs]
+      (when (some (fn [[_ prefix]] (overlapping-prefix? prefix key)) current)
+        (vreset! proofs (into [] (remove (fn [[_ prefix]] (overlapping-prefix? prefix key))) current))))))
 
 (defn- same-validation? [[validator prefix] other-validator other-prefix]
   (and (identical? validator other-validator) (= prefix other-prefix)))
@@ -237,7 +247,14 @@
                                                             (when deleted? (vreset! modified? true))
                                                             deleted?))))
                                 :reduce (fn [options rf initial]
-                                          (invoke false #(scan db txn k-buf spare options rf initial check!)))}
+                                          (invoke false #(scan db txn k-buf spare options rf initial check!)))
+                                ;; Map capacity vs the data file's last allocated page
+                                ;; (high-water, including free pages), as committed.
+                                :space (fn []
+                                         (invoke false #(let [info (.info env)]
+                                                          {:map-bytes (.mapSize info)
+                                                           :high-water-bytes (* (inc (.lastPageNumber info))
+                                                                                (long (.pageSize (.stat env))))})))}
                     operations (cond-> operations
                                  proofs
                                  (assoc :with-validation

@@ -7,8 +7,8 @@
             [com.brunobonacci.mulog :as u]
             [malli.core :as m])
   (:import [java.lang.ref WeakReference]
-           [java.io ByteArrayOutputStream DataOutputStream EOFException]
-           [java.nio ByteBuffer ByteOrder BufferUnderflowException]
+           [java.io EOFException]
+           [java.nio ByteBuffer ByteOrder]
            [java.security MessageDigest]
            [java.util Arrays ArrayList Comparator HashMap HashSet HexFormat
             IdentityHashMap Locale PriorityQueue UUID]
@@ -845,103 +845,405 @@
             0 arrays)
     out))
 
-(defn- key-write-physical-string! [^DataOutputStream out ^String value]
-  (dotimes [i (.length value)]
-    (let [c (int (.charAt value i))
-          hi (bit-shift-right c 8)
-          lo (bit-and 255 c)]
-      (.writeByte out hi) (when (zero? hi) (.writeByte out 255))
-      (.writeByte out lo) (when (zero? lo) (.writeByte out 255)))))
+(definterface KeyOut
+  (^void writeByte [^long v])
+  (^void writeShort [^long v])
+  (^void writeLong [^long v]))
 
-(defn- key-write-compact-string! [^DataOutputStream out ^String value]
-  (dotimes [i (.length value)]
-    (let [c (int (.charAt value i))]
-      (cond
-        (zero? c) (do (.writeByte out 0) (.writeByte out 255))
-        (< c 128) (.writeByte out c)
-        :else (do (.writeByte out 128) (.writeShort out c))))))
+;; Unsynchronized big-endian writer with DataOutputStream's byte layout.
+(deftype KeyBuffer [^:unsynchronized-mutable ^bytes buf ^:unsynchronized-mutable ^long n]
+  KeyOut
+  (writeByte [_ v]
+    (when (= n (alength buf)) (set! buf (Arrays/copyOf buf (* 2 (alength buf)))))
+    (aset buf n (unchecked-byte v))
+    (set! n (inc n)))
+  (writeShort [this v]
+    (.writeByte this (bit-shift-right v 8))
+    (.writeByte this v))
+  (writeLong [this v]
+    (.writeByte this (unsigned-bit-shift-right v 56)) (.writeByte this (unsigned-bit-shift-right v 48))
+    (.writeByte this (unsigned-bit-shift-right v 40)) (.writeByte this (unsigned-bit-shift-right v 32))
+    (.writeByte this (unsigned-bit-shift-right v 24)) (.writeByte this (unsigned-bit-shift-right v 16))
+    (.writeByte this (unsigned-bit-shift-right v 8)) (.writeByte this v))
+  clojure.lang.IDeref
+  (deref [_] (Arrays/copyOf buf n))
+  java.io.Closeable
+  (close [_] (set! n 0)
+    ;; Do not retain a scratch buffer grown by one unusually large key.
+    (when (> (alength buf) 1024) (set! buf (byte-array 128)))))
 
-(defn- key-write-key! [^DataOutputStream out value write-string!]
+(def ^:private ^ThreadLocal key-buffers
+  (ThreadLocal/withInitial (reify java.util.function.Supplier (get [_] (KeyBuffer. (byte-array 128) 0)))))
+
+;; ---------------------------------------------------------------------------
+;; OPT-8 (W3): one compact, order-preserving value encoding for every index
+;; member, group key, address and sort-data field (key-encode and
+;; key-encode-compact are the same function). Type tags keep the cross-type
+;; order of the former (KF9 physical) encoding:
+;;   01 nil | 02 false | 03 true | 10-12 string | 18-28 integer | 30 UUID |
+;;   38-3A keyword | 40 vector (elements, then 00)
+;; Strings compare by UTF-16 code unit, as before. T is 10 for a string and 38
+;; for a keyword (its printed form without the leading ':'):
+;;   first unit c:  none or c < 2 -> T, then the units in state B;
+;;                  2 <= c < 256  -> T+1, c, then state A;
+;;                  c >= 256      -> T+2, hi, lo, then state B.
+;;   state A (after a unit < 256):  00 end | 01 c (c < 3) | c-1 (3 <= c < 256) |
+;;                                  FF hi lo (c >= 256, then state B)
+;;   state B (otherwise):           00 00 end | 00 01 c (c < 2) |
+;;                                  00 c (2 <= c < 256, then state A) | hi lo (c >= 256)
+;; In each state the code words are prefix-free and increase with the unit,
+;; the end word is the smallest, and the state after a prefix depends only on
+;; that prefix: byte order is string order and every encoding is
+;; self-delimiting. Mixed-script aware: ASCII and Latin-1 cost 1 B per unit
+;; after the first, other BMP units 2 B (3 B when entered from state A), and
+;; no string is ever longer than in the former physical encoding (3 B per unit
+;; below 256, 2 B otherwise, 2 B end; proof in the OPT-8 report).
+;; Integers (any integer type within long range): 20 is zero; 20+n then the
+;; n-byte big-endian value for a positive; 20-n then the one's complement of
+;; the n-byte magnitude for a negative (n minimal, 1..8).
+
+(def ^:private ^:const tag-string 0x10)
+(def ^:private ^:const tag-integer 0x20)
+(def ^:private ^:const tag-uuid 0x30)
+(def ^:private ^:const tag-keyword 0x38)
+(def ^:private ^:const tag-vector 0x40)
+
+(defn- key-write-string!
+  "Units of s from start, as one tagged value (tag base T)."
+  [^KeyOut out ^String s ^long start ^long tag]
+  (let [n (.length s)]
+    (if (= start n)
+      (do (.writeByte out tag) (.writeByte out 0) (.writeByte out 0))
+      (let [c0 (long (int (.charAt s start)))
+            a0 (cond (< c0 2) (do (.writeByte out tag) (.writeByte out 0) (.writeByte out 1) (.writeByte out c0) false)
+                     (< c0 256) (do (.writeByte out (inc tag)) (.writeByte out c0) true)
+                     :else (do (.writeByte out (+ tag 2)) (.writeShort out c0) false))]
+        (loop [i (inc start) a? a0]
+          (if (< i n)
+            (let [c (long (int (.charAt s i)))]
+              (if a?
+                (cond (< c 3) (do (.writeByte out 1) (.writeByte out c) (recur (inc i) true))
+                      (< c 256) (do (.writeByte out (dec c)) (recur (inc i) true))
+                      :else (do (.writeByte out 255) (.writeShort out c) (recur (inc i) false)))
+                (cond (< c 2) (do (.writeByte out 0) (.writeByte out 1) (.writeByte out c) (recur (inc i) false))
+                      (< c 256) (do (.writeByte out 0) (.writeByte out c) (recur (inc i) true))
+                      :else (do (.writeShort out c) (recur (inc i) false)))))
+            (if a? (.writeByte out 0) (do (.writeByte out 0) (.writeByte out 0)))))))))
+
+(defn- key-write-integer! [^KeyOut out ^long v]
+  (if (zero? v)
+    (.writeByte out tag-integer)
+    (let [negative? (neg? v)
+          u (if negative? (unchecked-negate v) v)
+          n (quot (+ (- 64 (Long/numberOfLeadingZeros u)) 7) 8)
+          x (if negative? (bit-not u) u)]
+      (.writeByte out (if negative? (- tag-integer n) (+ tag-integer n)))
+      (loop [k (dec n)]
+        (when (>= k 0)
+          (.writeByte out (unsigned-bit-shift-right x (* 8 k)))
+          (recur (dec k)))))))
+
+(defn- key-write-key! [^KeyOut out value]
+  (cond
+    (nil? value) (.writeByte out 1)
+    (boolean? value) (.writeByte out (if value 3 2))
+    (string? value) (key-write-string! out value 0 tag-string)
+    (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE)) (key-write-integer! out (long value))
+    (uuid? value)
+    (do (.writeByte out tag-uuid)
+        (.writeLong out (.getMostSignificantBits ^UUID value))
+        (.writeLong out (.getLeastSignificantBits ^UUID value)))
+    (keyword? value) (key-write-string! out (str value) 1 tag-keyword)
+    (vector? value)
+    (do (.writeByte out tag-vector) (reduce (fn [_ v] (key-write-key! out v)) nil value) (.writeByte out 0))
+    :else (throw (ex-info "Unsupported keyed-fold key" {:value value}))))
+
+(defn key-encode ^bytes [value]
+  ;; Encoding never re-enters itself through user code, so one scratch buffer
+  ;; per thread is safe; close resets it even when the value is rejected.
+  (with-open [^KeyBuffer out (.get key-buffers)]
+    (key-write-key! out value)
+    @out))
+
+(defn key-encode-compact
+  "Same as key-encode since OPT-8 (one encoding for keys and sort data)."
+  ^bytes [value] (key-encode value))
+
+;; The former physical encoding, kept only as the input of namespace registry
+;; digests (namespace-digest), so registry addresses are unchanged by OPT-8.
+(defn- key-write-legacy! [^KeyOut out value]
   (cond
     (nil? value) (.writeByte out 1)
     (boolean? value) (.writeByte out (if value 3 2))
     (string? value)
-    (do (.writeByte out 16)
-        (write-string! out value)
-        (.writeShort out 0))
+    (let [^String value value]
+      (.writeByte out 16)
+      (dotimes [i (.length value)]
+        (let [c (int (.charAt value i)) hi (bit-shift-right c 8) lo (bit-and 255 c)]
+          (.writeByte out hi) (when (zero? hi) (.writeByte out 255))
+          (.writeByte out lo) (when (zero? lo) (.writeByte out 255))))
+      (.writeShort out 0))
     (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
     (do (.writeByte out 32) (.writeLong out (bit-xor (long value) Long/MIN_VALUE)))
     (uuid? value)
     (do (.writeByte out 48)
         (.writeLong out (.getMostSignificantBits ^UUID value))
         (.writeLong out (.getLeastSignificantBits ^UUID value)))
-    (keyword? value)
-    (do (.writeByte out 56) (key-write-key! out (str value) write-string!))
+    (keyword? value) (do (.writeByte out 56) (key-write-legacy! out (str value)))
     (vector? value)
-    (do (.writeByte out 64) (doseq [v value] (key-write-key! out v write-string!)) (.writeByte out 0))
+    (do (.writeByte out 64) (reduce (fn [_ v] (key-write-legacy! out v)) nil value) (.writeByte out 0))
     :else (throw (ex-info "Unsupported keyed-fold key" {:value value}))))
 
-(defn- key-encode-with ^bytes [write-string! value]
-  (let [out (ByteArrayOutputStream.)]
-    (key-write-key! (DataOutputStream. out) value write-string!)
-    (.toByteArray out)))
-
-(defn key-encode ^bytes [value]
-  (key-encode-with key-write-physical-string! value))
-
-(defn key-encode-compact ^bytes [value]
-  (key-encode-with key-write-compact-string! value))
-
-(defn- key-tuple-prefix-with ^bytes [encode components]
-  (when-not (vector? components)
-    (throw (ex-info "Tuple prefix must be a vector" {:prefix components})))
-  (let [encoded (encode components)]
-    (java.util.Arrays/copyOf encoded (dec (alength encoded)))))
+(defn- key-encode-legacy ^bytes [value]
+  (with-open [^KeyBuffer out (.get key-buffers)]
+    (key-write-legacy! out value)
+    @out))
 
 (defn key-tuple-prefix
   "Encode complete leading vector components, omitting only the outer terminator."
   ^bytes [components]
-  (key-tuple-prefix-with key-encode components))
+  (when-not (vector? components)
+    (throw (ex-info "Tuple prefix must be a vector" {:prefix components})))
+  (let [encoded (key-encode components)]
+    (java.util.Arrays/copyOf encoded (dec (alength encoded)))))
 
-(defn key-compact-tuple-prefix ^bytes [components]
-  (key-tuple-prefix-with key-encode-compact components))
+(defn key-compact-tuple-prefix
+  "Same as key-tuple-prefix since OPT-8."
+  ^bytes [components] (key-tuple-prefix components))
 
-(defn- key-read-key! [^ByteBuffer in]
-  (case (bit-and 255 (.get in))
-    1 nil 2 false 3 true
-    16 (let [out (StringBuilder.)]
-         (loop []
-           (let [b (bit-and 255 (.get in))]
-             (cond
-               (zero? b)
-               (case (bit-and 255 (.get in))
-                 0 (.toString out)
-                 255 (do (.append out (char 0)) (recur))
-                 (throw (ex-info "Invalid ordered string escape" {})))
-               (< b 128) (do (.append out (char b)) (recur))
-               (= b 128) (let [c (bit-and 65535 (.getShort in))]
-                           (when (< c 128) (throw (ex-info "Noncanonical ordered character" {})))
-                           (.append out (char c)) (recur))
-               :else (throw (ex-info "Invalid ordered string byte" {}))))))
-    32 (bit-xor (.getLong in) Long/MIN_VALUE)
-    48 (UUID. (.getLong in) (.getLong in))
-    56 (keyword (subs (key-read-key! in) 1))
-    64 (loop [out []]
-         (.mark in)
-         (if (zero? (.get in)) out
-           (do (.reset in) (recur (conj out (key-read-key! in))))))
-    (throw (ex-info "Invalid ordered key type" {}))))
+;; The one decoder and the one skipper of this grammar (OPT-8 merges the former
+;; key-read-key!/key-skip and the OPT-9 member decoder). Both read through an
+;; XOR mask (255 for inverted, descending bytes; 0 otherwise) from a position
+;; array pos = [index limit]; reading at or past limit is EOF.
+(defn- member-byte ^long [^bytes a ^longs pos ^long mask]
+  (let [i (aget pos 0)]
+    (when (>= i (aget pos 1)) (throw (EOFException.)))
+    (aset pos 0 (inc i))
+    (bit-xor mask (bit-and 255 (aget a i)))))
+
+(defn- invalid-member! []
+  (throw (ex-info "Invalid ordered key encoding" {:type :grain.read-model/invalid-cache})))
+
+(defn- member-string!
+  "Read (out non-nil) or skip the units of a string value whose tag was T+t."
+  [^bytes a ^longs pos mask t ^StringBuilder out]
+  (let [mask (long mask) t (long t)]
+    (loop [a? (case t
+                0 false
+                1 (let [c (member-byte a pos mask)]
+                    (when (< c 2) (invalid-member!))
+                    (when out (.append out (char c)))
+                    true)
+                2 (let [hi (member-byte a pos mask) lo (member-byte a pos mask)]
+                    (when (zero? hi) (invalid-member!))
+                    (when out (.append out (char (bit-or (bit-shift-left hi 8) lo))))
+                    false)
+                (invalid-member!))]
+      (let [b (member-byte a pos mask)]
+        (if a?
+          (cond
+            (zero? b) nil
+            (= b 1) (let [c (member-byte a pos mask)]
+                      (when (> c 2) (invalid-member!))
+                      (when out (.append out (char c)))
+                      (recur true))
+            (= b 255) (let [hi (member-byte a pos mask) lo (member-byte a pos mask)]
+                        (when (zero? hi) (invalid-member!))
+                        (when out (.append out (char (bit-or (bit-shift-left hi 8) lo))))
+                        (recur false))
+            :else (do (when out (.append out (char (inc b)))) (recur true)))
+          (if (zero? b)
+            (let [e (member-byte a pos mask)]
+              (cond
+                (zero? e) nil
+                (= e 1) (let [c (member-byte a pos mask)]
+                          (when (> c 1) (invalid-member!))
+                          (when out (.append out (char c)))
+                          (recur false))
+                :else (do (when out (.append out (char e))) (recur true))))
+            (let [lo (member-byte a pos mask)]
+              (when out (.append out (char (bit-or (bit-shift-left b 8) lo))))
+              (recur false))))))))
+
+(defn- member-read!
+  "Read (build?) or skip one value at pos."
+  [^bytes a ^longs pos mask build?]
+  (let [mask (long mask)
+        tag (member-byte a pos mask)]
+    (cond
+      (= tag 1) nil (= tag 2) false (= tag 3) true
+      (and (>= tag 0x10) (<= tag 0x12)) (let [out (when build? (StringBuilder.))]
+                                           (member-string! a pos mask (- tag 0x10) out)
+                                           (when out (.toString out)))
+      (and (>= tag 0x18) (<= tag 0x28))
+      (let [n (Math/abs (- tag tag-integer))
+            x (loop [i 0 x 0] (if (= i n) x (recur (inc i) (bit-or (bit-shift-left x 8) (member-byte a pos mask)))))]
+        (when build?
+          (cond (= tag tag-integer) 0
+                (> tag tag-integer) (if (neg? x) (invalid-member!) x)
+                :else (unchecked-negate (if (= n 8) (bit-not x) (bit-and (bit-not x) (dec (bit-shift-left 1 (* 8 n)))))))))
+      (= tag tag-uuid)
+      (let [hi (loop [i 0 x 0] (if (= i 8) x (recur (inc i) (bit-or (bit-shift-left x 8) (member-byte a pos mask)))))
+            lo (loop [i 0 x 0] (if (= i 8) x (recur (inc i) (bit-or (bit-shift-left x 8) (member-byte a pos mask)))))]
+        (when build? (UUID. hi lo)))
+      (and (>= tag 0x38) (<= tag 0x3A)) (let [out (when build? (StringBuilder.))]
+                                           (member-string! a pos mask (- tag tag-keyword) out)
+                           (when out (keyword (.toString out))))
+      (= tag tag-vector)
+      (loop [out (when build? (transient []))]
+        (let [i (aget pos 0)]
+          (when (>= i (aget pos 1)) (throw (EOFException.)))
+          (if (zero? (bit-xor mask (bit-and 255 (aget a i))))
+            (do (aset pos 0 (inc i)) (some-> out persistent!))
+            (let [v (member-read! a pos mask build?)] (recur (when out (conj! out v)))))))
+      :else (invalid-member!))))
 
 (defn key-decode-compact
-  "Decode one compact ordered value, optionally within a metadata field."
+  "Decode one ordered value, optionally a metadata field of exactly length bytes."
   ([^bytes value] (key-decode-compact value 0 (alength value)))
   ([^bytes value ^long offset ^long length]
-   (try
-     (key-read-key! (ByteBuffer/wrap value offset length))
-     (catch BufferUnderflowException _ (throw (EOFException.))))))
+   (let [end (+ offset length)
+         pos (doto (long-array 2) (aset 0 offset) (aset 1 end))
+         decoded (member-read! value pos 0 true)]
+     (when-not (= (aget pos 0) end) (invalid-member!))
+     decoded)))
+
+;; Skip one value from index i without decoding it; returns the index after
+;; it. Same grammar as member-read!, on primitive indexes (hot read path: every
+;; level-zero entry a page or slice returns skips its sort value; descending
+;; reads split members into value and id suffix, OPT-5/OPT-7).
+(defn- member-at ^long [^bytes a ^long i ^long mask] (bit-xor mask (bit-and 255 (aget a i))))
+
+(defn- skip-member-string ^long [^bytes a ^long i ^long mask ^long t]
+  ;; state: 1 = A, 0 = B
+  (loop [i (long (case t 0 i 1 (inc i) 2 (+ i 2) (invalid-member!))) state (if (= t 1) 1 0)]
+    (let [b (member-at a i mask)]
+      (if (= state 1)
+        (cond (zero? b) (inc i)
+              (= b 1) (recur (+ i 2) 1)
+              (= b 255) (recur (+ i 3) 0)
+              :else (recur (inc i) 1))
+        (if (zero? b)
+          (let [e (member-at a (inc i) mask)]
+            (cond (zero? e) (+ i 2)
+                  (= e 1) (recur (+ i 3) 0)
+                  :else (recur (+ i 2) 1)))
+          (recur (+ i 2) 0))))))
+
+(defn- skip-member-key ^long [^bytes a ^long i ^long mask]
+  (let [tag (member-at a i mask)]
+    (cond
+      ;; two-argument comparisons only: 3-argument <= is a boxing varargs call
+      (and (>= tag 1) (<= tag 3)) (inc i)
+      (and (>= tag 0x10) (<= tag 0x12)) (skip-member-string a (inc i) mask (- tag 0x10))
+      (and (>= tag 0x18) (<= tag 0x28)) (+ i 1 (Math/abs (- tag tag-integer)))
+      (= tag tag-uuid) (+ i 17)
+      (and (>= tag 0x38) (<= tag 0x3A)) (skip-member-string a (inc i) mask (- tag tag-keyword))
+      (= tag tag-vector) (loop [i (inc i)]
+                           (if (zero? (member-at a i mask)) (inc i) (recur (skip-member-key a i mask))))
+      :else (long (invalid-member!)))))
+
+(defn key-skip
+  "Offset just past the ordered value encoded at offset i of a. (The compact?
+   argument is ignored since OPT-8: there is one encoding.)"
+  (^long [^bytes a ^long i] (skip-member-key a i 0))
+  (^long [^bytes a ^long i _compact?] (skip-member-key a i 0)))
+
+;; OPT-8: level-zero members end in the owner's id suffix
+;;   key-encode((str id)) ++ tail
+;; where tail is the id's type tag alone (10 string, 20 integer, 30 UUID,
+;; 38 keyword, 01 nil, 02/03 boolean: the id is a function of (str id) and its
+;; type) or, for a vector id, key-encode(id). Ties therefore still order by
+;; (str id) then by the former typed encoding's first byte, exactly as the KF9
+;; suffix key-encode((str id)) ++ key-encode(id) did, without its second copy.
+(def ^:private id-tail-string (byte-array [tag-string]))
+(def ^:private id-tail-integer (byte-array [tag-integer]))
+(def ^:private id-tail-uuid (byte-array [tag-uuid]))
+(def ^:private id-tail-keyword (byte-array [tag-keyword]))
+(def ^:private id-tail-nil (byte-array [1]))
+(def ^:private id-tail-false (byte-array [2]))
+(def ^:private id-tail-true (byte-array [3]))
+
+(defn key-id-tail
+  "Type part of an owner's member suffix (shared arrays: never mutate)."
+  ^bytes [id]
+  (cond
+    (string? id) id-tail-string
+    (uuid? id) id-tail-uuid
+    (and (integer? id) (<= Long/MIN_VALUE id Long/MAX_VALUE)) id-tail-integer
+    (keyword? id) id-tail-keyword
+    (nil? id) id-tail-nil
+    (boolean? id) (if id id-tail-true id-tail-false)
+    :else (key-encode id)))
+
+(defn key-id-suffix
+  "key-encode((str id)) ++ key-id-tail(id)."
+  ^bytes [id]
+  (let [s (key-encode (str id)) t (key-id-tail id)
+        out (Arrays/copyOf s (+ (alength s) (alength t)))]
+    (System/arraycopy t 0 out (alength s) (alength t))
+    out))
+
+;; Lowercase hex digit values by unit (0..256), -1 otherwise.
+(def ^:private ^"[J" hex-values
+  (let [a (long-array 257 -1)]
+    (dotimes [i 10] (aset a (+ 48 i) (long i)))
+    (dotimes [i 6] (aset a (+ 97 i) (long (+ 10 i))))
+    a))
+
+(defn- member-uuid-fast
+  "The UUID whose canonical (str id) is encoded at i (tag 11, first unit,
+   35 state-A units, 00), or nil when the bytes are not that shape."
+  [^bytes a ^long i ^long mask]
+  (when (and (<= (+ i 38) (alength a)) (= 0x11 (member-at a i mask)) (zero? (member-at a (+ i 37) mask)))
+    (let [^longs hex hex-values]
+      (loop [k 0 hi 0 lo 0]
+        (if (= k 36)
+          (UUID. hi lo)
+          ;; unit k: the raw first unit, then state-A single bytes (unit - 1)
+          (let [c (if (zero? k) (member-at a (inc i) mask) (inc (member-at a (+ i 1 k) mask)))]
+            (if (or (= k 8) (= k 13) (= k 18) (= k 23))
+              (when (= c 45) (recur (inc k) hi lo))
+              (let [v (aget hex c)]
+                (when-not (neg? v)
+                  (if (< k 18)
+                    (recur (inc k) (bit-or (bit-shift-left hi 4) v) lo)
+                    (recur (inc k) hi (bit-or (bit-shift-left lo 4) v))))))))))))
+
+(defn- member-read-id!
+  "Read an owner id suffix at pos: key-encode((str id)), its string read
+   through smask, then the ascending tail."
+  [^bytes a ^longs pos ^long smask]
+  (let [start (aget pos 0)
+        ;; common case first: a canonical UUID string + UUID tail (39 bytes)
+        fast (when (and (< (+ start 38) (aget pos 1)) (= tag-uuid (bit-and 255 (aget a (+ start 38)))))
+               (member-uuid-fast a start smask))]
+    (if fast
+      (do (aset pos 0 (+ start 39)) fast)
+      (let [end (skip-member-key a start smask)
+            _ (when (> (inc end) (aget pos 1)) (throw (EOFException.)))
+            tail (bit-and 255 (aget a end))]
+        (if (= tail tag-uuid)
+          (do (aset pos 0 (inc end))
+              (or (member-uuid-fast a start smask)
+                  (let [p (doto (long-array 2) (aset 0 start) (aset 1 end))
+                        s (member-read! a p smask true)]
+                    (when-not (string? s) (invalid-member!))
+                    (try (UUID/fromString s) (catch IllegalArgumentException _ (invalid-member!))))))
+          (let [s (member-read! a pos smask true)]
+            (when-not (string? s) (invalid-member!))
+            (case (long (member-byte a pos 0))
+              0x10 s
+              0x20 (try (Long/parseLong s) (catch NumberFormatException _ (invalid-member!)))
+              0x38 (if (.startsWith ^String s ":") (keyword (subs s 1)) (invalid-member!))
+              1 nil 2 false 3 true
+              0x40 (do (aset pos 0 (dec (aget pos 0))) (member-read! a pos 0 true))
+              (invalid-member!))))))))
 
 (defn key-descending ^bytes [^bytes key]
-  (byte-array (map #(unchecked-byte (bit-xor 255 (bit-and 255 %))) key)))
+  (let [n (alength key) out (byte-array n)]
+    (dotimes [i n] (aset out i (unchecked-byte (bit-xor 255 (aget key i)))))
+    out))
 
 (defn key-prefix-end
   "Exclusive upper bound of a byte prefix, or nil when it has no upper bound."
@@ -981,7 +1283,9 @@
                   (string? (second scope)) (boolean (re-matches #"[0-9a-f]+" (second scope))))))))
 
 (defn- namespace-digest [identity]
-  (.digest (MessageDigest/getInstance "SHA-256") (key-encode identity)))
+  ;; OPT-8: digests keep the former physical encoding, so registry
+  ;; addresses (and deferred-build marker addresses) are unchanged.
+  (.digest (MessageDigest/getInstance "SHA-256") (key-encode-legacy identity)))
 
 (defn- namespace-forward-key [identity]
   (key-join namespace-registry-prefix (byte-array [1]) (namespace-digest identity)))
@@ -1188,22 +1492,192 @@
 
 
 (def ranked-empty-key (byte-array 0))
+;; Promotion: a member reaches level l iff the low 4l bits of its hash are zero
+;; (probability 16^-l). Before OPT-3 the hash was ThreadLocalRandom, so equal
+;; event streams produced different bytes. Promotion is now SipHash-2-4 of
+;; (index, direction, member) under a 128-bit key. Keyed caches use a random key
+;; generated once per cache and stored in it (keyed-promotion-key); callers that
+;; choose ids or values therefore cannot grind levels. :read-model/promotion-key
+;; pins a key (tests, benchmarks, byte-parity runs). No reader or remover
+;; rehashes: levels are discovered from storage (ranked-remove!, rank, nth,
+;; ranges), so caches built with random or differently keyed promotion stay
+;; valid and can be mixed with new members.
 (defn ranked-random-hash [_] (.nextInt (ThreadLocalRandom/current)))
+
+(def ^:private ^"[J" ranked-default-promotion-key
+  ;; Public key for standalone ranked configs only (tests, tools). Keyed indexes
+  ;; never use it: their configs require a cache or pinned key.
+  (long-array [0x677261696e2d726d 0x702d70726f6d6f74]))
+
+(defmacro ^:private sip-round [[v0 v1 v2 v3] & body]
+  `(let [~v0 (unchecked-add ~v0 ~v1) ~v1 (Long/rotateLeft ~v1 13) ~v1 (bit-xor ~v1 ~v0)
+         ~v0 (Long/rotateLeft ~v0 32)
+         ~v2 (unchecked-add ~v2 ~v3) ~v3 (Long/rotateLeft ~v3 16) ~v3 (bit-xor ~v3 ~v2)
+         ~v0 (unchecked-add ~v0 ~v3) ~v3 (Long/rotateLeft ~v3 21) ~v3 (bit-xor ~v3 ~v0)
+         ~v2 (unchecked-add ~v2 ~v1) ~v1 (Long/rotateLeft ~v1 17) ~v1 (bit-xor ~v1 ~v2)
+         ~v2 (Long/rotateLeft ~v2 32)]
+     ~@body))
+
+;; SipHash-2-4 over the message a[off..] ++ b, read in place (no concatenation).
+(defn- sip-byte ^long [^bytes a ^long off ^bytes b ^long i]
+  (let [n (- (alength a) off)]
+    (bit-and 0xff (if (< i n) (aget a (unchecked-int (+ off i))) (aget b (unchecked-int (- i n)))))))
+
+(defn- sip-word ^long [^bytes a ^long off ^bytes b ^long i]
+  ;; Little-endian 8 bytes at message offset i.
+  (let [n (- (alength a) off)]
+    (if (or (>= i n) (<= (+ i 8) n))
+      (let [^bytes src (if (< i n) a b) j (unchecked-int (if (< i n) (+ off i) (- i n)))]
+        (bit-or (bit-and 0xff (aget src j))
+                (bit-shift-left (bit-and 0xff (aget src (unchecked-add-int j 1))) 8)
+                (bit-shift-left (bit-and 0xff (aget src (unchecked-add-int j 2))) 16)
+                (bit-shift-left (bit-and 0xff (aget src (unchecked-add-int j 3))) 24)
+                (bit-shift-left (bit-and 0xff (aget src (unchecked-add-int j 4))) 32)
+                (bit-shift-left (bit-and 0xff (aget src (unchecked-add-int j 5))) 40)
+                (bit-shift-left (bit-and 0xff (aget src (unchecked-add-int j 6))) 48)
+                (bit-shift-left (bit-and 0xff (aget src (unchecked-add-int j 7))) 56)))
+      (loop [k 7 w 0]
+        (if (neg? k) w (recur (dec k) (bit-or (bit-shift-left w 8) (sip-byte a off b (+ i k)))))))))
+
+(defn siphash24
+  "SipHash-2-4 (Aumasson and Bernstein) under the 128-bit key [k0 k1] of a[off..] ++ b."
+  ^long [^longs key ^bytes a ^long off ^bytes b]
+  (let [len (+ (- (alength a) off) (alength b)) end (- len (rem len 8))
+        k0 (aget key 0) k1 (aget key 1)]
+    (loop [i 0
+           v0 (bit-xor k0 0x736f6d6570736575) v1 (bit-xor k1 0x646f72616e646f6d)
+           v2 (bit-xor k0 0x6c7967656e657261) v3 (bit-xor k1 0x7465646279746573)]
+      (if (< i end)
+        (let [m (sip-word a off b i) v3 (bit-xor v3 m)]
+          (sip-round [v0 v1 v2 v3]
+            (sip-round [v0 v1 v2 v3]
+              (recur (+ i 8) (bit-xor v0 m) v1 v2 v3))))
+        (let [m (loop [k (dec len) w (bit-shift-left len 56)]
+                  (if (< k end) w
+                    (recur (dec k) (bit-or w (bit-shift-left (sip-byte a off b k) (* 8 (- k end)))))))
+              v3 (bit-xor v3 m)]
+          (sip-round [v0 v1 v2 v3]
+            (sip-round [v0 v1 v2 v3]
+              (let [v0 (bit-xor v0 m) v2 (bit-xor v2 0xff)]
+                (sip-round [v0 v1 v2 v3]
+                  (sip-round [v0 v1 v2 v3]
+                    (sip-round [v0 v1 v2 v3]
+                      (sip-round [v0 v1 v2 v3]
+                        (bit-xor v0 v1 v2 v3)))))))))))))
+
+(defn ranked-promotion-hash
+  "Promotion hash of member key under the 128-bit key k (long[2], or a delay
+   of one, forced only here) and the index prefix from byte offset off (keyed
+   indexes skip their namespace ordinal, an allocation-order artifact, so equal
+   members level equally under one key)."
+  [k ^bytes prefix off ^bytes key]
+  (let [k (if (instance? clojure.lang.IDeref k) @k k)]
+    (when-not k (throw (ex-info "Keyed ranked index written without a promotion key" {})))
+    (siphash24 k prefix (long off) key)))
+
 (defn ranked-config
-  ([prefix] (ranked-config prefix ranked-random-hash 6))
+  "Without hash-fn, members are hashed with ranked-promotion-hash: under the
+   transaction's ::promotion-key when the config is :keyed? (required), else
+   under the public default key."
+  ([prefix] {:prefix prefix :levels 6 :hash-offset 0})
   ([prefix hash-fn levels]
    (when-not (<= 2 levels 8)
      (throw (IllegalArgumentException. "Ranked index requires 2 to 8 levels")))
    {:prefix prefix :hash-fn hash-fn :levels levels}))
-(defn ranked-prefix ^bytes [cfg level]
+
+(defn- ranked-hash [tx cfg ^bytes key]
+  (if-let [f (:hash-fn cfg)] (f key)
+    (ranked-promotion-hash (or (::promotion-key tx) (when-not (:keyed? cfg) ranked-default-promotion-key))
+                           (:prefix cfg) (:hash-offset cfg 0) key)))
+
+;; Per-cache promotion key. Stored at KP9 0xFF: "KP9" differs at byte 1 from
+;; every other internal key space (KF9 KFS9 KR9 KRS9 KB9), and 0xFF never occurs
+;; in UTF-8, so no legacy string cache key (format-key / suffix-key) can equal it.
+(def ^:private promotion-key-address (byte-array [75 80 57 -1]))
+
+(defn- promotion-key-longs ^longs [^bytes raw]
+  ;; 16 bytes, k0 = bytes 0-7 and k1 = bytes 8-15 little-endian (SipHash reference).
+  (when-not (= 16 (alength raw))
+    (throw (ex-info "Promotion key must be 16 bytes" {:type :grain.read-model/invalid-promotion-key})))
+  (let [bb (.order (ByteBuffer/wrap raw) ByteOrder/LITTLE_ENDIAN)]
+    (long-array [(.getLong bb 0) (.getLong bb 8)])))
+
+(defn pinned-promotion-key
+  "Parse :read-model/promotion-key (16 bytes or 32 hex digits) into long[2].
+   TEST/BENCHMARK ONLY: a pinned key always wins over the cache's stored key
+   and is never persisted, so a pin left in production configuration makes
+   promotion levels predictable again (grindable by writers of indexed values
+   or ids). Production contexts must not set :read-model/promotion-key."
+  ^longs [pinned]
+  (promotion-key-longs
+    (cond (bytes? pinned) pinned
+          (and (string? pinned) (re-matches #"[0-9a-fA-F]{32}" pinned)) (.parseHex (HexFormat/of) pinned)
+          :else (throw (ex-info "Promotion key must be 16 bytes or 32 hexadecimal digits"
+                                {:type :grain.read-model/invalid-promotion-key})))))
+
+(defn keyed-promotion-key
+  "The cache's promotion key, read in the write transaction tx. The first
+   writer of a cache without one (new, or built before OPT-3) generates it with
+   SecureRandom and stores it in the same transaction; LMDB's single writer
+   serializes first opens, so every process sees one committed key. Earlier
+   members keep their stored levels; nothing rehashes. The key is stored in
+   plain form in the cache: anyone who can read the LMDB file (or a backup)
+   can grind levels, so treat cache files as trusted/sensitive."
+  ^longs [tx]
+  (promotion-key-longs
+    (or ((:get tx) promotion-key-address)
+        (let [raw (byte-array 16)]
+          (.nextBytes (java.security.SecureRandom.) raw)
+          ((:put tx) promotion-key-address raw)
+          raw))))
+
+(defn- with-promotion-key
+  "tx with the cache's promotion key attached as a delay, read or created in tx
+   only when a member is hashed. A pinned :read-model/promotion-key wins and is
+   never persisted. Used by keyed-apply-batch! and by the deferred build's
+   transactions (INT: OPT-3 x OPT-4), so a deferred build levels members under
+   the same key as the incremental path."
+  [ctx tx]
+  (assoc tx ::promotion-key (delay (if-let [pinned (:read-model/promotion-key ctx)]
+                                     (pinned-promotion-key pinned)
+                                     (keyed-promotion-key tx)))))
+(defn- ranked-level-prefix ^bytes [cfg level]
   (let [^bytes p (:prefix cfg) n (alength p) a (Arrays/copyOf p (inc n))]
-    (aset-byte a n (byte level)) a))
+    (aset a n (byte level)) a))
+(defn ranked-prefix
+  "Level prefix. Configs from a write session's cache share one read-only copy
+   per level (callers never mutate prefixes)."
+  ^bytes [cfg level]
+  (if-let [^objects cached (::level-prefixes cfg)]
+    (let [level (int level)]
+      (or (aget cached level)
+          (let [p (ranked-level-prefix cfg level)] (aset cached level p) p)))
+    (ranked-level-prefix cfg level)))
 (defn ranked-pack ^bytes [cfg level ^bytes key]
-  (let [^bytes p (ranked-prefix cfg level) n (alength p) a (Arrays/copyOf p (+ n (alength key)))]
-    (System/arraycopy key 0 a n (alength key)) (key-checked a)))
+  ;; One allocation: prefix, level byte and member.
+  (let [^bytes p (:prefix cfg) n (alength p) k (alength key) a (byte-array (+ n 1 k))]
+    (System/arraycopy p 0 a 0 n)
+    (aset a n (byte level))
+    (System/arraycopy key 0 a (inc n) k)
+    (key-checked a)))
 (defn ranked-unpack ^bytes [cfg ^bytes key]
   (Arrays/copyOfRange key (inc (alength ^bytes (:prefix cfg))) (alength key)))
-(defn ranked-after ^bytes [^bytes k] (Arrays/copyOf k (inc (alength k))))
+(defn ranked-after
+  "The scan bound just after key k: the smallest key above k among storable
+   keys (at most 511 bytes, LMDB's key limit), usable as an exclusive :to
+   (\"up to and including k\") or an inclusive :from (\"strictly after k\").
+   Below the limit that is k ++ 00. For a key of exactly 511 bytes k ++ 00
+   would not fit the store's key buffer (FINAL, OPT-8 audit C1: a descending
+   page crossing a 511-byte level-zero member threw BufferOverflowException);
+   no storable key lies strictly between k and its prefix end (any key above
+   k that starts with k is longer than 511 bytes; after the last non-FF byte
+   k holds only FF bytes), so the prefix end of k is the same bound. Keyed
+   keys start with a non-FF prefix byte, so it always exists."
+  ^bytes [^bytes k]
+  (if (< (alength k) 511)
+    (Arrays/copyOf k (inc (alength k)))
+    (or (key-prefix-end k)
+        (throw (ex-info "No scan bound after an all-FF key" {:bytes (alength k)})))))
 (defn ranked-encode-count ^bytes [n]
   (.array (doto (ByteBuffer/allocate 8) (.order ByteOrder/LITTLE_ENDIAN) (.putLong (long n)))))
 (defn ranked-decode-count [^bytes v]
@@ -1213,13 +1687,98 @@
 (defn- ranked-entry-count [cfg level ^bytes k v]
   (if (and (zero? level) (> (alength k) (inc (alength ^bytes (:prefix cfg)))))
     1 (ranked-decode-count v)))
+
+;; Span-count transaction cache (OPT-10, W9). Upper-level (level >= 1) span
+;; counts are read-modify-written on every member add/remove; within one
+;; keyed batch transaction the same few top-level spans are rewritten many
+;; times. With a cache installed (span-count-transaction, keyed-apply-batch!
+;; only), ranked-increment! keeps the new count in memory (one LMDB get on the
+;; span's first increment in the transaction, none after) and
+;; span-count-flush! writes each changed span once. Invariants:
+;; - Only VALUES are deferred. Every key insertion (ranked-set-count!) and
+;;   deletion (ranked-delete-count!) still goes to LMDB immediately and drops
+;;   the cached entry, so key-only scans (ranked-previous-key) see the exact
+;;   key set, and a deleted span is never resurrected by the flush.
+;; - Every reader of an upper-level count goes through the cache: point reads
+;;   (ranked-count-key) and every count-summing scan (ranked-count-range,
+;;   ranked-level-entries, ranked-get-nth, ranked-rank) via ranked-scan-count.
+;; - keyed-apply-batch! flushes (and clears) the cache after all index work and
+;;   before keyed-relevel!, membership-flush! and commit; the stored bytes are
+;;   exactly those of writing every increment through (same final counts, same
+;;   keys). Level-zero entries (members, sentinels) are never cached.
+;; The same transaction also caches index group records (W9, level-6 rows;
+;; keyed-update-group-at!) and text term counts (W10; text-search-change-count!),
+;; which are read-modify-written per change and read by nothing else in a
+;; write transaction; each changed row is written (or deleted) once per flush.
+;; INVARIANT (OPT-10 audit C3): unlike span keys, a group row or term-count row
+;; CREATED in a batch reaches LMDB only at a flush (its key is not inserted
+;; immediately), so the "exact key set" guarantee holds for span counts only.
+;; No code may scan the group (level 6) or term-count (text kind 1) prefixes
+;; inside a batch transaction before the flush; today the only such scans (the
+;; cold builders' groups-empty / keyed-empty-ranks? checks) run once at batch
+;; start, before any cached change, and searches and group enumeration are
+;; read paths.
+;; Bounded (FINAL, OPT-10 audit C1): keyed-apply-batch! flushes all three
+;; caches between owners whenever together they hold more than
+;; count-cache-flush-entries entries (count-caches-bound!). A flush only writes
+;; values and leaves LMDB holding exactly the rows writing every change through
+;; would have left at that point, and later changes re-read them, so the
+;; stored bytes do not depend on when (or how often) flushes happen.
+;; Flushes write in key order. Measured (OPT-10 REPORT and audit): w5x touch-3
+;; LMDB ops 92.9 -> 65.9 per event (thread CPU about -3% to -12%), I8 text
+;; insert ops -54%.
+(defn span-count-transaction
+  "Install the batch transaction's count caches: upper-level span counts
+   (here), index group counts (keyed-update-group-at!, group-count-flush!) and
+   text term counts (text-search-change-count!, term-count-flush!)."
+  [tx]
+  (assoc tx ::span-counts (HashMap.) ::group-counts (HashMap.) ::term-counts (HashMap.)))
+(defn- ranked-scan-count
+  "Count of a scanned entry, through the transaction's span-count cache."
+  [^HashMap cache cfg level ^bytes k v]
+  (or (when (and cache (pos? (long level)))
+        (when-let [^longs c (.get cache (ByteBuffer/wrap k))] (aget c 0)))
+      (ranked-entry-count cfg level k v)))
+(def ^:private count-cache-entry-order
+  ;; Flushes write in key order: deterministic and B-tree friendly.
+  (reify Comparator
+    (compare [_ a b]
+      (Arrays/compareUnsigned (.array ^ByteBuffer (.getKey ^java.util.Map$Entry a))
+                              (.array ^ByteBuffer (.getKey ^java.util.Map$Entry b))))))
+(defn- count-cache-entries
+  "The cache's entries in key order."
+  [^HashMap cache]
+  (doto (ArrayList. (.entrySet cache)) (.sort count-cache-entry-order)))
+(defn span-count-flush! [tx]
+  (when-let [^HashMap cache (::span-counts tx)]
+    (doseq [^java.util.Map$Entry e (count-cache-entries cache)]
+      ((:put tx) (.array ^ByteBuffer (.getKey e)) (ranked-encode-count (aget ^longs (.getValue e) 0))))
+    (.clear cache)))
 (defn ranked-count-key [tx cfg level key]
+  (let [k (ranked-pack cfg level key)
+        ^HashMap cache (when (pos? (long level)) (::span-counts tx))]
+    (or (when cache (when-let [^longs c (.get cache (ByteBuffer/wrap k))] (aget c 0)))
+        (when-let [v ((:get tx) k)] (ranked-entry-count cfg level k v)))))
+(defn ranked-set-count! [tx cfg level key n]
   (let [k (ranked-pack cfg level key)]
-    (when-let [v ((:get tx) k)] (ranked-entry-count cfg level k v))))
-(defn ranked-set-count! [tx cfg level key n] ((:put tx) (ranked-pack cfg level key) (ranked-encode-count n)))
+    (when-let [^HashMap cache (::span-counts tx)] (.remove cache (ByteBuffer/wrap k)))
+    ((:put tx) k (ranked-encode-count n))))
+(defn- ranked-delete-count! [tx cfg level key]
+  (let [k (ranked-pack cfg level key)]
+    (when-let [^HashMap cache (::span-counts tx)] (.remove cache (ByteBuffer/wrap k)))
+    ((:delete tx) k)))
 (defn ranked-increment! [tx cfg level key delta]
   ;; LMDB permits one writer. All reads/updates use that same write transaction.
-  (ranked-set-count! tx cfg level key (+ (or (ranked-count-key tx cfg level key) 0) delta)))
+  (let [k (ranked-pack cfg level key)
+        ^HashMap cache (when (pos? (long level)) (::span-counts tx))]
+    (if cache
+      (let [address (ByteBuffer/wrap k)]
+        (if-let [^longs c (.get cache address)]
+          (aset c 0 (+ (aget c 0) (long delta)))
+          (let [v ((:get tx) k)]
+            (.put cache address (long-array [(+ (long (or (when v (ranked-entry-count cfg level k v)) 0)) (long delta))])))))
+      (let [v ((:get tx) k)]
+        ((:put tx) k (ranked-encode-count (+ (or (when v (ranked-entry-count cfg level k v)) 0) delta)))))))
 
 (defn ranked-init! [tx cfg]
   ;; Upstream initLevels: preserve an already initialized sentinel.
@@ -1233,18 +1792,20 @@
 (defn ranked-previous-key [tx cfg level key or-equal?]
   ;; Upstream getPreviousKey. Range conflicts are unnecessary under LMDB's
   ;; serialized writer; this read and its following mutation cannot interleave.
+  ;; The level prefix is also the packed empty sentinel key.
   (or ((:reduce tx) {:prefix (ranked-prefix cfg level)
-                    :from (ranked-pack cfg level ranked-empty-key)
+                    :from (ranked-prefix cfg level)
                     :to ((if or-equal? ranked-after identity) (ranked-pack cfg level key)) :reverse? true}
        (fn [_ {:keys [k]}] (reduced (ranked-unpack cfg k))) nil)
       (throw (ex-info "no key found on level" {:level level}))))
 
 (defn ranked-count-range [tx cfg level begin end]
   ;; Upstream countRange; bounds are [begin,end).
-  ((:reduce tx) (cond-> {:prefix (ranked-prefix cfg level)}
-                 begin (assoc :from (ranked-pack cfg level begin))
-                 end (assoc :to (ranked-pack cfg level end)))
-   (fn [n {:keys [k v]}] (+ n (ranked-entry-count cfg level k v))) 0))
+  (let [cache (::span-counts tx)]
+    ((:reduce tx) (cond-> {:prefix (ranked-prefix cfg level)}
+                   begin (assoc :from (ranked-pack cfg level begin))
+                   end (assoc :to (ranked-pack cfg level end)))
+     (fn [n {:keys [k v]}] (+ n (ranked-scan-count cache cfg level k v))) 0)))
 
 (defn ranked-membership-key [cfg level key] (ranked-pack cfg (+ 16 level) key))
 
@@ -1268,14 +1829,19 @@
     (ranked-check-key! key)
     (when (and (:membership? cfg) (not (and (integer? ordinal) (<= 0 ordinal Integer/MAX_VALUE))))
       (throw (ex-info "Membership index requires a model-local ordinal" {})))
-    (let [hash ((:hash-fn cfg) key)]
-      (if (ranked-contains? tx cfg key) false
+    (let [k0 (ranked-pack cfg 0 key)
+          v0 ((:get tx) k0)]
+      ;; Inline ranked-contains? (OPT-1), reusing the packed level-zero key for
+      ;; the put. Hash only a new member (OPT-3): forcing the promotion-key
+      ;; delay on a duplicate add would create a cache key for nothing.
+      (if (pos? (or (when v0 (ranked-entry-count cfg 0 k0 v0)) 0)) false
+        (let [hash (ranked-hash tx cfg key)]
         (do
           ;; Same lowest-to-highest order as upstream's split dependencies.
           (dotimes [level (:levels cfg)]
             (cond
               (zero? level)
-              (do ((:put tx) (ranked-pack cfg 0 key) value)
+              (do ((:put tx) k0 value)
                   (when (:membership? cfg)
                     ((:put tx) (ranked-membership-key cfg 0 key) (membership-number-bytes ordinal))))
               (not (zero? (bit-and hash (dec (bit-shift-left 1 (* 4 level))))))
@@ -1302,7 +1868,7 @@
                     (.add right (int ordinal))
                     (membership-put! tx address left)
                     (membership-put! tx (ranked-membership-key cfg level key) right))))))
-          true)))))
+          true))))))
 
 (defn- ranked-append!
   "Insert a captured-hash member at the maximum of an initially empty index.
@@ -1349,7 +1915,7 @@
           ;; than rehashing: deletion stays correct if hash config changes.
           (let [count (ranked-count-key tx cfg level key)
                 prev (ranked-previous-key tx cfg level key false)]
-            (when count ((:delete tx) (ranked-pack cfg level key)))
+            (when count (ranked-delete-count! tx cfg level key))
             (ranked-increment! tx cfg level prev (+ -1 (or count 0)))
             (when (:membership? cfg)
               (let [address (ranked-membership-key cfg level prev)
@@ -1387,72 +1953,230 @@
           (if (neg? (Arrays/compareUnsigned member boundary))
             (recur (inc mid) hi) (recur lo mid)))))))
 
+;; Descending order without a stored descending copy (OPT-5/OPT-7).
+;; A stored descending copy ordered members by inverted value bytes followed by
+;; the ascending id suffix: values descend, and members with equal values
+;; (one "run") stay ascending by id. The same order is read from the ascending
+;; structure: runs are visited from the top down and each run is emitted
+;; ascending. A navigator exposes one item sequence (members, or the members of
+;; a filtered page plus virtual ones) by ascending position:
+;;   :total            item count
+;;   :forward  [p n]   items at ascending positions [p, p+n)
+;;   :reverse  [p n]   items at reverse positions [p, p+n) (position p is the
+;;                     item at ascending position total-1-p), highest first
+;;   :rank     [key]   number of items whose member sorts below key
+;;   :run      [v n]   the first n items of the run with value bytes v (the
+;;                     run is known to hold at least n items)
+;; Items are object arrays [member payload] (filter navigators mark virtual
+;; members with a third slot). Within one value run, members share their
+;; leading value encoding, which is prefix-free, so a run is exactly the
+;; members starting with its value bytes.
+;; Read-cost trade-off (OPT-57 audit condition 3, accepted for admin list
+;; views): unique-value descending pages cost the same as before, and real
+;; list-view mixes were neutral (L5 replica 0.93-1.10x CPU). Descending reads
+;; over LOW-CARDINALITY orderings pay more: an offset inside a long equal-value
+;; run needs two rank walks plus a forward read (1-row page inside a 6k run
+;; ~1.85x, 15 -> 35 LMDB ops; 25-row middle page ~1.34x); filtered descending
+;; pages over such runs up to ~1.7-1.9x; joined descending pages ordered by a
+;; 3-value index ~1.4x (CPU in span bitmap work, not I/O). Optional
+;; refinements: take a run's end from its level-6 group :total instead of a
+;; second rank walk; scan short in-run offsets instead of get-nth; share
+;; cached span counts between the rank and walk passes.
+(defn- ranked-run-value ^bytes [vlen ^objects item]
+  (let [^bytes m (aget item 0)] (Arrays/copyOf m (int (vlen m)))))
+
+(defn ranked-desc-items
+  "Items at descending positions [offset, offset+n): runs of equal value in
+   descending value order, each run ascending. Exactly the order of a stored
+   descending copy. Cost: one reverse walk when offset starts a run; for long
+   runs and offsets inside a run, also run bounds by rank and a forward walk."
+  [nav vlen offset n]
+  (let [total (long ((:total nav)))
+        out (ArrayList.)
+        value (partial ranked-run-value vlen)
+        need #(- (long n) (.size out))
+        ;; xs: reverse items starting at the top of a run; requested = how many
+        ;; were asked for (fewer returned means the sequence ended there).
+        from-top (fn [^java.util.List xs requested]
+                   (let [cnt (.size xs) complete? (< cnt (long requested))]
+                     (loop [i 0]
+                       (when (and (< i cnt) (pos? (need)))
+                         (let [^bytes v (value (.get xs i))
+                               j (long (loop [j (inc i)]
+                                         (if (and (< j cnt) (Arrays/equals v ^bytes (value (.get xs j)))) (recur (inc j)) j)))]
+                           (if (or (< j cnt) complete?)
+                             (do (loop [q (dec j)]
+                                   (when (and (>= q i) (pos? (need))) (.add out (.get xs q)) (recur (dec q))))
+                                 (recur j))
+                             ;; The last run may continue below xs. It holds more
+                             ;; items than are still needed (xs has need+1 items),
+                             ;; so the page ends with that run's first items.
+                             (.addAll out ((:run nav) v (need)))))))))]
+    (when (and (pos? n) (< -1 offset total))
+      (if (zero? offset)
+        (from-top ((:reverse nav) 0 (inc n)) (inc n))
+        ;; Look one item above offset to learn whether offset starts a run.
+        (let [^java.util.List ys ((:reverse nav) (dec offset) (+ 2 n))]
+          (if (or (< (.size ys) 2) (not (Arrays/equals ^bytes (value (.get ys 0)) ^bytes (value (.get ys 1)))))
+            (from-top (.subList ys 1 (.size ys)) (inc n))
+            ;; offset is inside a run [s, e) (ascending positions). Reverse
+            ;; position offset is ascending position a, and c of the run's
+            ;; items lie above a; descending position offset is the run's
+            ;; item at ascending position s + c.
+            (let [v (value (.get ys 1))
+                  s (long ((:rank nav) v)) e (long ((:rank nav) (key-prefix-end v)))
+                  a (- total 1 offset) c (- e 1 a)]
+              (.addAll out ((:forward nav) (+ s c) (min (need) (- e s c))))
+              (when (and (pos? (need)) (pos? s))
+                (from-top ((:reverse nav) (- total s) (inc (need))) (inc (need)))))))))
+    out))
+
+(defn- ranked-filter-navigator
+  "Navigator over the members of cfg whose model ordinal is in candidates, plus
+   virtual members (sorted by member) placed in member order. Span match counts
+   are cached across calls. Also returns :visits and :leaves counters."
+  [tx cfg ^RoaringBitmap candidates observe ^java.util.List virtual]
+  (let [counts (HashMap.) visits (volatile! 0) leaves (volatile! 0)
+        top (dec (:levels cfg))
+        matches (fn [level ^bytes member]
+                  (if (and (zero? level) (zero? (alength member))) 0
+                    (let [address (ranked-membership-key cfg level member)
+                          lookup (ByteBuffer/wrap address)]
+                      (or (.get counts lookup)
+                          (let [raw ((:get tx) address)
+                                _ (when raw (observe :membership-read (alength ^bytes raw)))
+                                n (if (zero? level)
+                                    (do (vswap! leaves inc)
+                                        (if (and raw (.contains candidates (int (membership-number-value raw)))) 1 0))
+                                    (if raw (RoaringBitmap/andCardinality candidates (membership-decode raw)) 0))]
+                            (.put counts lookup n) n)))))
+        vbound (fn [boundary] (ranked-virtual-bound virtual boundary))
+        vitem (fn [i] (let [^RankedVirtualMember m (.get virtual (int i))]
+                       ;; Third slot marks a virtual member (no ::leaf-payload).
+                       (object-array [(.-member m) (.-payload m) true])))
+        real-total (delay (if (.isEmpty candidates) 0
+                            ((:reduce tx) {:prefix (ranked-prefix cfg top)}
+                             (fn [n {:keys [k]}]
+                               (vswap! visits inc)
+                               (+ n (long (matches top (ranked-unpack cfg k))))) 0)))
+        total #(+ (long @real-total) (.size virtual))
+        forward
+        (fn [skip limit]
+          (let [remaining (volatile! skip) out (ArrayList.)]
+            (letfn [(visit [level {:keys [k v]} end]
+                      (let [member (ranked-unpack cfg k) real (matches level member)
+                            begin-virtual (vbound member)
+                            end-virtual (vbound end)
+                            n (+ real (- end-virtual begin-virtual))]
+                        (if (<= n @remaining)
+                          (vswap! remaining - n)
+                          (if (zero? level)
+                            (do
+                              ;; The real leaf starts this span; virtual members follow it.
+                              (when (pos? real)
+                                (if (pos? @remaining) (vswap! remaining dec) (.add out (object-array [member v]))))
+                              (let [start (+ begin-virtual @remaining)
+                                    stop (min end-virtual (+ start (- limit (.size out))))]
+                                (doseq [i (range start stop)] (.add out (vitem i)))
+                                (vreset! remaining 0)))
+                            (walk (dec level) member end)))))
+                    (walk [level begin end]
+                      ;; Delay one entry to obtain its span's exclusive upper bound.
+                      (let [last-entry
+                            ((:reduce tx) (cond-> {:prefix (ranked-prefix cfg level)
+                                                  :from (ranked-pack cfg level begin)}
+                                           end (assoc :to (ranked-pack cfg level end)))
+                             (fn [previous entry]
+                               (vswap! visits inc)
+                               (when previous (visit level previous (ranked-unpack cfg (:k entry))))
+                               (if (= limit (.size out)) (reduced nil) entry)) nil)]
+                        (when (and last-entry (< (.size out) limit)) (visit level last-entry end))))]
+              (when (and (pos? limit) (< skip (total)))
+                (if (zero? (long @real-total))
+                  (doseq [i (range skip (min (total) (+ skip limit)))] (.add out (vitem i)))
+                  (walk top ranked-empty-key nil))))
+            out))
+        reverse
+        (fn [skip limit]
+          (let [remaining (volatile! skip) out (ArrayList.)]
+            (letfn [(visit [level ^bytes member v upper]
+                      (let [real (long (matches level member))
+                            bv (long (vbound member)) ev (long (vbound upper))
+                            n (+ real (- ev bv))]
+                        (if (<= n @remaining)
+                          (vswap! remaining - n)
+                          (if (zero? level)
+                            ;; Highest first: the span's virtual members, then its leaf.
+                            (let [r (long @remaining)]
+                              (if (< r (- ev bv))
+                                (do (loop [i (- ev 1 r)]
+                                      (when (and (>= i bv) (< (.size out) limit)) (.add out (vitem i)) (recur (dec i))))
+                                    (when (and (pos? real) (< (.size out) limit)) (.add out (object-array [member v]))))
+                                (when (pos? real) (.add out (object-array [member v]))))
+                              (vreset! remaining 0))
+                            (walk (dec level) member upper)))))
+                    (walk [level begin end]
+                      ((:reduce tx) (cond-> {:prefix (ranked-prefix cfg level) :reverse? true
+                                            :from (ranked-pack cfg level begin)}
+                                     end (assoc :to (ranked-pack cfg level end)))
+                       (fn [upper {:keys [k v]}]
+                         (vswap! visits inc)
+                         (let [member (ranked-unpack cfg k)]
+                           (visit level member v upper)
+                           (if (= limit (.size out)) (reduced nil) member))) end))]
+              (when (and (pos? limit) (< skip (total)))
+                (if (zero? (long @real-total))
+                  (loop [i (- (total) 1 skip)]
+                    (when (and (>= i 0) (< (.size out) limit)) (.add out (vitem i)) (recur (dec i))))
+                  (walk top ranked-empty-key nil))))
+            out))
+        rank
+        (fn [^bytes key]
+          (+ (long (vbound key))
+             (if (zero? (long @real-total)) 0
+               (loop [level top begin ranked-empty-key acc 0]
+                 (let [[sum ^bytes last-member]
+                       ((:reduce tx) {:prefix (ranked-prefix cfg level) :from (ranked-pack cfg level begin)
+                                      :to (ranked-pack cfg level key)}
+                        (fn [[sum ^bytes previous] {:keys [k]}]
+                          (vswap! visits inc)
+                          [(+ (long sum) (if previous (long (matches level previous)) 0)) (ranked-unpack cfg k)])
+                        [0 nil])]
+                   (cond
+                     (nil? last-member) acc
+                     (zero? level) (+ acc (long sum) (long (matches 0 last-member)))
+                     :else (recur (dec level) last-member (+ acc (long sum)))))))))]
+    {:total total :forward forward :reverse reverse :rank rank
+     :run (fn [v n] (forward (rank v) n))
+     :visits visits :leaves leaves}))
+
 (defn ranked-filtered-page
   "Experimental span navigation. Candidate ordinals belong to this model.
-   Returns selected opaque level-zero payloads, never full model results."
+   Returns selected opaque level-zero payloads, never full model results.
+   With :desc and vlen (member -> length of its value encoding), the page is
+   read in descending order from this ascending structure (ranked-desc-items)."
   ([tx cfg candidates requested-page limit observe]
    (ranked-filtered-page tx cfg candidates requested-page limit observe []))
-  ([tx cfg ^RoaringBitmap candidates requested-page limit observe ^java.util.List virtual]
-  (let [counts (HashMap.) visits (volatile! 0) leaves (volatile! 0)
-        remaining (volatile! 0) out (java.util.ArrayList.)
-        top (dec (:levels cfg))]
-    (letfn [(matches [level member]
-              (if (and (zero? level) (zero? (alength ^bytes member))) 0
-                (let [address (ranked-membership-key cfg level member)
-                      lookup (ByteBuffer/wrap address)]
-                  (or (.get counts lookup)
-                      (let [raw ((:get tx) address)
-                            _ (when raw (observe :membership-read (alength ^bytes raw)))
-                            n (if (zero? level)
-                                (do (vswap! leaves inc)
-                                    (if (and raw (.contains candidates (int (membership-number-value raw)))) 1 0))
-                                (if raw (RoaringBitmap/andCardinality candidates (membership-decode raw)) 0))]
-                        (.put counts lookup n) n)))))
-            (visit [level {:keys [k v]} end]
-              (let [member (ranked-unpack cfg k) real (matches level member)
-                    begin-virtual (ranked-virtual-bound virtual member)
-                    end-virtual (ranked-virtual-bound virtual end)
-                    n (+ real (- end-virtual begin-virtual))]
-                (if (<= n @remaining)
-                  (vswap! remaining - n)
-                  (if (zero? level)
-                    (do
-                      ;; The real leaf starts this span; virtual members follow it.
-                      (when (pos? real)
-                        (if (pos? @remaining) (vswap! remaining dec) (.add out v)))
-                      (let [start (+ begin-virtual @remaining)
-                            stop (min end-virtual (+ start (- limit (.size out))))]
-                        (doseq [i (range start stop)]
-                          (.add out (.-payload ^RankedVirtualMember (.get virtual i))))
-                        (vreset! remaining 0)))
-                    (walk (dec level) member end)))))
-            (walk [level begin end]
-              ;; Delay one entry to obtain its span's exclusive upper bound.
-              (let [last-entry
-                    ((:reduce tx) (cond-> {:prefix (ranked-prefix cfg level)
-                                          :from (ranked-pack cfg level begin)}
-                                   end (assoc :to (ranked-pack cfg level end)))
-                     (fn [previous entry]
-                       (vswap! visits inc)
-                       (when previous (visit level previous (ranked-unpack cfg (:k entry))))
-                       (if (= limit (.size out)) (reduced nil) entry)) nil)]
-                (when (and last-entry (< (.size out) limit)) (visit level last-entry end))))]
-      (let [real-total (if (.isEmpty candidates) 0
-                    ((:reduce tx) {:prefix (ranked-prefix cfg top)}
-                     (fn [n {:keys [k]}]
-                       (vswap! visits inc)
-                       (+ n (matches top (ranked-unpack cfg k)))) 0))
-            total (+ real-total (.size virtual))
-            pages (max 1 (quot (+ total (dec limit)) limit))
-            page (min requested-page pages)]
-        (vreset! remaining (* (dec page) limit))
-        (when (pos? total)
-          (if (zero? real-total)
-            (doseq [i (range @remaining (min total (+ @remaining limit)))]
-              (.add out (.-payload ^RankedVirtualMember (.get virtual i))))
-            (walk top ranked-empty-key nil)))
-        {:payloads (vec out) :total total :total-pages pages :page page :page-size limit
-         :rank-entries-examined @visits :membership-leaves-examined @leaves})))))
+  ([tx cfg candidates requested-page limit observe virtual]
+   (ranked-filtered-page tx cfg candidates requested-page limit observe virtual :asc nil))
+  ([tx cfg ^RoaringBitmap candidates requested-page limit observe ^java.util.List virtual direction vlen]
+   (let [nav (ranked-filter-navigator tx cfg candidates observe virtual)
+         total (long ((:total nav)))
+         pages (max 1 (quot (+ total (dec limit)) limit))
+         page (min requested-page pages)
+         offset (* (dec page) limit)
+         items (if (= direction :desc)
+                 (ranked-desc-items nav vlen offset (min limit (- total offset)))
+                 ((:forward nav) offset limit))]
+     ;; OPT-9 W8: real leaves (2-element items) go through the config's
+     ;; ::leaf-payload (owner id decoded from the member); virtual members
+     ;; (3-element items, ranked-filter-navigator) keep their payload.
+     {:payloads (let [f (::leaf-payload cfg)]
+                  (mapv (fn [^objects item]
+                          (if (and f (== 2 (alength item))) (f (aget item 0) (aget item 1)) (aget item 1)))
+                        items))
+      :total total :total-pages pages :page page :page-size limit
+      :rank-entries-examined @(:visits nav) :membership-leaves-examined @(:leaves nav)})))
 
 (defn ranked-get-nth [tx cfg ordinal]
   ;; Upstream NthLookup: at each level subtract spans until a span contains
@@ -1460,10 +2184,11 @@
   (when-not (neg? ordinal)
     (loop [level (dec (:levels cfg)) key ranked-empty-key remaining ordinal]
       (when (>= level 0)
-        (let [found
+        (let [cache (::span-counts tx)
+              found
               ((:reduce tx) {:prefix (ranked-prefix cfg level) :from (ranked-pack cfg level key)}
                (fn [{:keys [remaining]} {:keys [k v]}]
-                 (let [key (ranked-unpack cfg k) n (ranked-entry-count cfg level k v)]
+                 (let [key (ranked-unpack cfg k) n (ranked-scan-count cache cfg level k v)]
                    (cond
                      (and (zero? remaining) (pos? (alength ^bytes key))) (reduced {:done key})
                      (> n remaining) (reduced {:descend key :remaining remaining})
@@ -1478,16 +2203,163 @@
   (ranked-check-key! key)
   (when (or (not null-if-missing?) (ranked-contains? tx cfg key))
     (loop [level (dec (:levels cfg)) rank-key ranked-empty-key ordinal 0]
-      (let [found ((:reduce tx) {:prefix (ranked-prefix cfg level) :from (ranked-pack cfg level rank-key)
+      (let [cache (::span-counts tx)
+            found ((:reduce tx) {:prefix (ranked-prefix cfg level) :from (ranked-pack cfg level rank-key)
                                :to (ranked-after (ranked-pack cfg level key))}
                    (fn [{:keys [ordinal]} {:keys [k v]}]
-                     (let [n (ranked-entry-count cfg level k v)] {:rank-key (ranked-unpack cfg k) :last-count n :ordinal (+ ordinal n)}))
+                     (let [n (ranked-scan-count cache cfg level k v)] {:rank-key (ranked-unpack cfg k) :last-count n :ordinal (+ ordinal n)}))
                    {:rank-key rank-key :last-count 0 :ordinal ordinal})
             next-rank (- (:ordinal found) (:last-count found))]
         (cond
           (Arrays/equals ^bytes (:rank-key found) ^bytes key) next-rank
           (zero? level) (+ next-rank (if (and (not null-if-missing?) (pos? (:last-count found))) 1 0))
           :else (recur (dec level) (:rank-key found) next-rank))))))
+
+;; Online re-leveling (OPT-6). A RankedSet with L levels is a pure function of
+;; its members, their promotion hashes and L: level l holds the sentinel plus
+;; every level-(l-1) key whose hash has its low 4l bits zero, each with the
+;; member count (and, for filtered indexes, the ordinal summary) of its span.
+;; Adding a top level therefore needs only the current top level; dropping one
+;; deletes it. Both run inside the caller's write transaction, so readers see
+;; the old or the new level count with matching levels, never a mix.
+
+(defn- ranked-level-entries
+  "[member count] of every entry at level, sentinel first, collected before
+   any write so no cursor is open while the caller writes."
+  ^ArrayList [tx cfg level]
+  (let [cache (::span-counts tx)]
+    ((:reduce tx) {:prefix (ranked-prefix cfg level)}
+     (fn [^ArrayList out {:keys [k v]}]
+       (.add out [(ranked-unpack cfg k) (ranked-scan-count cache cfg level k v)]) out)
+     (ArrayList.))))
+
+(defn- ranked-build-level!
+  "Write level (>= 1) from level-1: spans start at the sentinel and at every
+   promoted level-(level-1) key; counts and span summaries are sums/unions of
+   the level-(level-1) spans they cover. Same bytes as ranked-span-add! over
+   the same members (every sentinel summary is written, even empty)."
+  [tx cfg level]
+  (let [below (dec level) membership? (:membership? cfg)
+        mask (dec (bit-shift-left 1 (* 4 level)))
+        entries (ranked-level-entries tx cfg below)
+        flush! (fn [key n ^RoaringBitmap bits]
+                 (ranked-set-count! tx cfg level key n)
+                 (when membership?
+                   ;; A union can yield a run container (a full 2^16 chunk)
+                   ;; where element-wise adds keep a bitmap container; drop
+                   ;; run compression so bytes match the bulk build's adds.
+                   (.removeRunCompression bits)
+                   (membership-put! tx (ranked-membership-key cfg level key) bits)))]
+    (loop [i 0 key ranked-empty-key n 0 bits (when membership? (RoaringBitmap.))]
+      (if (= i (.size entries))
+        (flush! key n bits)
+        (let [[^bytes member c] (.get entries i)
+              promote? (and (pos? (alength member)) (zero? (bit-and (ranked-hash tx cfg member) mask)))
+              part (when membership?
+                     (if (zero? below)
+                       (if (pos? (alength member))
+                         (doto (RoaringBitmap.)
+                           (.add (int (membership-number-value ((:get tx) (ranked-membership-key cfg 0 member))))))
+                         (RoaringBitmap.))
+                       (membership-bitmap tx (ranked-membership-key cfg below member))))]
+          (if promote?
+            (do (flush! key n bits)
+                ;; Copy: part may be the level below's live pending bitmap.
+                (recur (inc i) member (long c) (when membership? (doto (RoaringBitmap.) (.or ^RoaringBitmap part)))))
+            (do (when membership? (.or ^RoaringBitmap bits ^RoaringBitmap part))
+                (recur (inc i) key (+ n (long c)) bits))))))))
+
+(defn- ranked-drop-level!
+  "Delete every count and span summary stored at level (>= 1)."
+  [tx cfg level]
+  (doseq [[member _] (ranked-level-entries tx cfg level)]
+    (ranked-delete-count! tx cfg level member)
+    (when (:membership? cfg) (membership-delete! tx (ranked-membership-key cfg level member))))
+  (when (:membership? cfg)
+    ;; Summaries without a count row cannot exist; remove any defensively.
+    (doseq [k ((:reduce tx) {:prefix (ranked-prefix cfg (+ 16 level))}
+               (fn [^ArrayList out {:keys [k]}] (.add out k) out) (ArrayList.))]
+      (membership-delete! tx k))))
+
+(defn ranked-relevel!
+  "Change an initialized index from (:levels cfg) to target levels in tx.
+   Growth builds each new top level from the one below (hashing only members
+   already promoted there, so towers stay nested under any hash history);
+   shrinking drops the top levels. Returns cfg with :levels target."
+  [tx cfg target]
+  (let [current (long (:levels cfg)) target (long target)]
+    (when-not (<= 2 target 6)
+      (throw (IllegalArgumentException. "Ranked index requires 2 to 6 levels")))
+    (cond
+      (< current target) (loop [level current]
+                           (when (< level target) (ranked-build-level! tx cfg level) (recur (inc level))))
+      (> current target) (loop [level (dec current)]
+                           (when (>= level target) (ranked-drop-level! tx cfg level) (recur (dec level)))))
+    (assoc cfg :levels target)))
+
+(defn- ranked-l0-scan
+  "Up to n level-zero items [member payload] within packed bounds [from, to)
+   (to nil = end of level zero), ascending or, with reverse?, descending."
+  ^ArrayList [tx cfg ^bytes from ^bytes to n reverse?]
+  (if-not (pos? (long n)) (ArrayList.)
+    ((:reduce tx) (cond-> {:prefix (ranked-prefix cfg 0) :from from}
+                    to (assoc :to to) reverse? (assoc :reverse? true))
+     (fn [^ArrayList out {:keys [k v]}]
+       (.add out (object-array [(ranked-unpack cfg k) v]))
+       (if (= (long n) (.size out)) (reduced out) out))
+     (ArrayList.))))
+
+(defn ranked-range-navigator
+  "Navigator (see ranked-desc-items) over the members within packed level-zero
+   bounds [lo, hi) (hi nil = end of level zero) that hold ascending ranks
+   [start, end). The bounds never split a run of equal values."
+  [tx cfg ^bytes lo ^bytes hi start end]
+  (let [start (long start) end (long end) size (- end start)
+        at (fn [r] (ranked-pack cfg 0 (ranked-get-nth tx cfg r)))]
+    {:total (constantly size)
+     :forward (fn [p n] (if (and (pos? (long n)) (< (long p) size))
+                          (ranked-l0-scan tx cfg (at (+ start (long p))) hi n false) (ArrayList.)))
+     :reverse (fn [p n] (if (and (pos? (long n)) (< (long p) size))
+                          (ranked-l0-scan tx cfg lo (if (zero? (long p)) hi (ranked-after (at (- end 1 (long p))))) n true)
+                          (ArrayList.)))
+     :rank (fn [key] (- (long (ranked-rank tx cfg key false)) start))
+     ;; A run's first member is the first key at or above its value bytes.
+     :run (fn [^bytes v n] (ranked-l0-scan tx cfg (ranked-pack cfg 0 v) hi n false))}))
+
+(defn ranked-desc-reduce
+  "Reduce the level-zero items [member payload] within packed bounds [lo, hi)
+   in descending order (runs of equal value descending, each run ascending),
+   holding at most chunk items: a run that does not fit is re-read forward
+   from its first member. Reads at most about twice the items."
+  [tx cfg vlen ^bytes lo ^bytes hi chunk rf init]
+  (let [chunk (long chunk)
+        value (partial ranked-run-value vlen)
+        ;; kv :reduce unwraps one reduced; keep the caller's reduced visible.
+        wrap (fn [acc item] (let [r (rf acc item)] (if (reduced? r) (reduced r) r)))]
+    (loop [to hi acc init]
+      (let [^ArrayList xs (ranked-l0-scan tx cfg lo to (inc chunk) true)
+            cnt (.size xs) complete? (<= cnt chunk)
+            [state x acc]
+            (loop [i 0 acc acc]
+              (if (>= i cnt) [:done nil acc]
+                (let [^bytes v (value (.get xs i))
+                      j (long (loop [j (inc i)]
+                                (if (and (< j cnt) (Arrays/equals v ^bytes (value (.get xs j)))) (recur (inc j)) j)))]
+                  (if (or (< j cnt) complete?)
+                    (let [acc (loop [q (dec j) acc acc]
+                                (if (< q i) acc
+                                  (let [acc (rf acc (.get xs q))] (if (reduced? acc) acc (recur (dec q) acc)))))]
+                      (if (reduced? acc) [:stop nil acc] (recur j acc)))
+                    ;; The lowest run may continue below xs: stream all of it.
+                    (let [g (ranked-pack cfg 0 v)
+                          acc ((:reduce tx) {:prefix (ranked-prefix cfg 0) :from g
+                                             :to (ranked-pack cfg 0 (key-prefix-end v))}
+                               (fn [acc {:keys [k v]}] (wrap acc (object-array [(ranked-unpack cfg k) v]))) acc)]
+                      (if (reduced? acc) [:stop nil acc] [:continue g acc]))))))]
+        (case state
+          :continue (recur x acc)
+          :stop (unreduced acc)
+          acc)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Sort metadata
@@ -1528,6 +2400,9 @@
 (defn sort-data-compare-field ^long [^bytes a ^bytes b ^long field]
   (Arrays/compareUnsigned a (sort-data-int-at a (* 4 field)) (sort-data-int-at a (* 4 (inc field)))
                           b (sort-data-int-at b (* 4 field)) (sort-data-int-at b (* 4 (inc field)))))
+
+(defn sort-data-field= [^bytes a ^bytes b ^long field]
+  (zero? (sort-data-compare-field a b field)))
 
 (deftype SortDataEntry [id ^bytes data ^bytes computed])
 
@@ -1572,11 +2447,36 @@
                  [term (.array out)])))))
 
 (defn- text-search-change-count! [tx cfg term delta]
-  (let [k (text-search-term-key cfg 1 term)
-        old (if-let [raw ((:get tx) k)] (sort-data-int-at raw 0) 0)
-        next (+ old delta)]
-    (when (neg? next) (throw (ex-info "Negative text posting count" {})))
-    (if (zero? next) ((:delete tx) k) ((:put tx) k (text-search-number-bytes next)))))
+  (let [k (text-search-term-key cfg 1 term)]
+    (if-let [^HashMap cache (::term-counts tx)]
+      ;; OPT-10 W10: the batch's term-count cache holds [count stored-before?];
+      ;; term-count-flush! writes each changed term count once.
+      (let [address (ByteBuffer/wrap k)
+            ^longs c (or (.get cache address)
+                         (let [raw ((:get tx) k)
+                               c (long-array [(if raw (sort-data-int-at raw 0) 0) (if raw 1 0)])]
+                           (.put cache address c) c))
+            next (+ (aget c 0) (long delta))]
+        (when (neg? next) (throw (ex-info "Negative text posting count" {})))
+        (aset c 0 next))
+      (let [old (if-let [raw ((:get tx) k)] (sort-data-int-at raw 0) 0)
+            next (+ old delta)]
+        (when (neg? next) (throw (ex-info "Negative text posting count" {})))
+        (if (zero? next) ((:delete tx) k) ((:put tx) k (text-search-number-bytes next)))))))
+
+(defn- term-count-flush!
+  "Write each term count changed in this transaction once (a delete when it
+   reached zero and a row was stored before), as writing every change through
+   would have left it. Term counts are read only by searches, never in a write
+   transaction."
+  [tx]
+  (when-let [^HashMap cache (::term-counts tx)]
+    (doseq [^java.util.Map$Entry e (count-cache-entries cache)
+            :let [^longs c (.getValue e) k (.array ^ByteBuffer (.getKey e))]]
+      (if (zero? (aget c 0))
+        (when (== 1 (aget c 1)) ((:delete tx) k))
+        ((:put tx) k (text-search-number-bytes (aget c 0)))))
+    (.clear cache)))
 
 (defn text-search-update!
   "Called only inside the fold's write transaction. before/after are included
@@ -1780,53 +2680,388 @@
 (defn- keyed-progress-key [b] (key-join b (byte-array [0])))
 (defn- keyed-count-key [b] (key-join b (byte-array [4])))
 (defn- keyed-included-key [b] (key-join b (byte-array [12])))
-(defn- keyed-index-config [b index direction]
-  (ranked-config (key-join b (byte-array [5]) (key-encode index)
-                           (byte-array [(if (= direction :desc) 1 0)]))))
-(defn- keyed-index-prefix [b index direction]
-  (ranked-prefix (keyed-index-config b index direction) 0))
+;; OPT-8: an index is addressed by its ordinal in the model, not by its
+;; encoded name: :identity is 0 and the declared indexes are 1, 2, ... in
+;; sorted name order (the order of their sort-data fields, keyed-index-fields:
+;; ordinal = field - 1). Ordinals below 255 take one byte; larger ones FF hi lo
+;; (prefix-free). Ordinals are positional, not stored: renaming or adding an
+;; index without a :version bump re-addresses indexes, as it already re-maps
+;; sort-data fields (see the OPT-8 report; an index-name fingerprint check
+;; belongs to OPT-10).
+(defn- keyed-index-ordinal ^long [d index]
+  (if (= :identity index)
+    0
+    (let [indexes (:indexes d)]
+      (when-not (contains? indexes index)
+        (throw (ex-info "Unknown keyed index" {:index index})))
+      (inc (long (reduce-kv (fn [n k _] (if (neg? (compare k index)) (inc (long n)) n)) 0 indexes))))))
+
+(defn- keyed-ordinal-code ^bytes [^long o]
+  (if (< o 255)
+    (byte-array [(unchecked-byte o)])
+    (let [x (- o 255)]
+      (when (> x 0xFFFF) (throw (ex-info "Too many keyed indexes" {:ordinal o})))
+      (byte-array [-1 (unchecked-byte (bit-shift-right x 8)) (unchecked-byte x)]))))
+
+;; {index -> ordinal code} per :indexes map (read paths build configs per
+;; call); codes are shared and never mutated (key-join copies them). Bounded:
+;; definitions are few, the cache is dropped if it ever grows past 4096.
+(def ^:private ^java.util.concurrent.ConcurrentHashMap keyed-ordinal-codes
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- keyed-index-ordinal-bytes ^bytes [d index]
+  (let [indexes (:indexes d {})
+        ^java.util.Map codes
+        (or (.get keyed-ordinal-codes indexes)
+            (let [m (HashMap.)]
+              (.put m :identity (keyed-ordinal-code 0))
+              (doseq [k (keys indexes)] (.put m k (keyed-ordinal-code (keyed-index-ordinal d k))))
+              (when (> (.size keyed-ordinal-codes) 4096) (.clear keyed-ordinal-codes))
+              (.put keyed-ordinal-codes indexes m)
+              m))]
+    (or (.get codes index) (throw (ex-info "Unknown keyed index" {:index index})))))
+
+(defn- keyed-index-config [b d index direction]
+  ;; Promotion hashes (index ordinal, direction, member) under the cache key,
+  ;; not the namespace ordinal.
+  (assoc (ranked-config (key-join b (byte-array [5]) (keyed-index-ordinal-bytes d index)
+                                  (byte-array [(if (= direction :desc) 1 0)])))
+         :hash-offset (alength ^bytes b) :keyed? true))
+;; OPT-5/OPT-7: only the ascending structure of an index is stored
+;; (direction byte 0); descending orders are read from it (ranked-desc-items,
+;; ranked-desc-reduce). The direction parameters below are always :asc.
+(defn- keyed-index-prefix [b d index direction]
+  (ranked-prefix (keyed-index-config b d index direction) 0))
 (defn- keyed-membership-config [b d index direction]
-  (assoc (keyed-index-config b index direction) :membership? (contains? (:filtered-indexes d) index)))
+  (assoc (keyed-index-config b d index direction) :membership? (contains? (:filtered-indexes d) index)))
+
+;; Per-index rank levels (OPT-6). Every included result has exactly one
+;; member in every index and direction, so each index of a namespace holds N =
+;; the namespace's included count (kind 4) members. The level count is chosen
+;; from N, the smallest L in [2, 6] with N <= 16^L (expected top-level spans
+;; <= 16), and stored once per index (both directions, and independent of
+;; whether a descending copy exists) at kind 13:
+;;   b ++ [13] ++ ordinal(index)  ->  [L]  (one byte, 2..6; OPT-8: the index
+;;   ordinal, keyed-index-ordinal-bytes, in place of key-encode(index))
+;; Readers and writers use the stored L; correctness never depends on L
+;; matching N (any L in range is a valid RankedSet), only cost does. Writers
+;; re-level every index in the transaction that changes N (keyed-relevel!),
+;; and the deferred build writes L = target(n) directly, so both produce the
+;; same structure for the same members. An index without a kind-13 row holds
+;; no members (it is created with its first member at keyed-min-levels).
+;; Six is the ceiling because level byte 6 holds group counts; beyond 16^6
+;; members the top level grows linearly (reads stay exact).
+(def ^:private keyed-min-levels 2)
+(def ^:private keyed-max-levels 6)
+
+(defn- keyed-target-levels
+  "Rank levels for an index of n members."
+  [n]
+  (loop [levels keyed-min-levels capacity 256]
+    (if (or (>= levels keyed-max-levels) (<= n capacity)) levels
+      (recur (inc levels) (* 16 capacity)))))
+
+(defn- keyed-levels-key [b d index] (key-checked (key-join b (byte-array [13]) (keyed-index-ordinal-bytes d index))))
+
+(defn- keyed-stored-levels
+  "Stored level count of index in namespace b, or nil when it has none."
+  [tx b d index]
+  (when-let [^bytes raw ((:get tx) (keyed-levels-key b d index))]
+    (let [levels (when (= 1 (alength raw)) (long (aget raw 0)))]
+      (when-not (and levels (<= keyed-min-levels levels keyed-max-levels))
+        (throw (ex-info "Invalid stored rank levels" {:type :grain.read-model/invalid-levels :index index})))
+      levels)))
+
+(defn- keyed-write-levels! [tx b d index levels]
+  ((:put tx) (keyed-levels-key b d index) (byte-array [(byte levels)])))
+
+(defn- keyed-read-config
+  "Ranked config of a stored index for reading in tx: the stored levels."
+  [tx b d cfg index]
+  (assoc cfg :levels (or (keyed-stored-levels tx b d index) keyed-min-levels)))
+
+;; Write-session caches. One keyed-apply-batch! transaction maintains one
+;; namespace b with one definition d, so each [index direction] config (and its
+;; encoded index name and level prefixes) is built once per transaction.
+;; Level-0 sentinels are never deleted, so one successful ensure-init per
+;; transaction and config suffices. (keyed-relevel!, OPT-6, may delete
+;; upper-level sentinels when an index shrinks; it runs after all index work of
+;; the batch and drops that index's session configs.)
+(defn- keyed-write-session [tx b]
+  (assoc tx ::keyed-session-base b ::keyed-session-configs (HashMap.)))
+
+(defn- keyed-session-config [tx b d index direction]
+  ;; ::levels is shared by both directions of an index: a volatile holding the
+  ;; stored level count (nil while the index has no members), read once.
+  (let [^HashMap configs (::keyed-session-configs tx)]
+    (if (and configs (identical? b (::keyed-session-base tx)))
+      (let [^objects pair (or (.get configs index)
+                              (let [pair (object-array 3)] (.put configs index pair) pair))
+            slot (if (= direction :desc) 1 0)
+            levels (or (aget pair 2) (aset pair 2 (volatile! (keyed-stored-levels tx b d index))))]
+        (or (aget pair slot)
+            (let [cfg (assoc (keyed-membership-config b d index direction)
+                             :levels (or @levels keyed-min-levels)
+                             ::levels levels ::levels-key (keyed-levels-key b d index)
+                             ::level-prefixes (object-array 24)
+                             ::initialized (volatile! false))]
+              (aset pair slot cfg)
+              cfg)))
+      (let [stored (keyed-stored-levels tx b d index)]
+        (assoc (keyed-membership-config b d index direction)
+               :levels (or stored keyed-min-levels)
+               ::levels (volatile! stored) ::levels-key (keyed-levels-key b d index))))))
+
+(defn- keyed-ensure-init! [tx cfg]
+  ;; A new index starts at (:levels cfg) (keyed-min-levels) and records it in
+  ;; the same transaction as its sentinels.
+  (let [init! (fn []
+                (when (nil? (ranked-count-key tx cfg 0 ranked-empty-key))
+                  (ranked-init! tx cfg)
+                  (when-let [k (::levels-key cfg)]
+                    ((:put tx) k (byte-array [(byte (:levels cfg))]))
+                    (vreset! (::levels cfg) (:levels cfg)))))]
+    (if-let [initialized (::initialized cfg)]
+      (when-not @initialized
+        (init!)
+        (vreset! initialized true))
+      (init!))))
+
+(defn- keyed-relevel!
+  "After a write that leaves n included results in namespace b, move every
+   initialized index to (keyed-target-levels n) levels and record it. Only the
+   ascending structure is stored (OPT-5/OPT-7), so only it is re-leveled. Runs
+   inside the batch transaction, before membership summaries are flushed;
+   session configs of re-leveled indexes are dropped."
+  [tx b d n]
+  (let [target (keyed-target-levels n)]
+    (doseq [index (conj (vec (keys (:indexes d))) :identity)]
+      (let [asc (keyed-session-config tx b d index :asc)
+            stored @(::levels asc)]
+        (when (and stored (not= stored target))
+          (ranked-relevel! tx asc target)
+          (keyed-write-levels! tx b d index target)
+          (some-> ^HashMap (::keyed-session-configs tx) (.remove index)))))))
+
+;; OPT-9 W8: a level-zero member's value is empty when its id decodes
+;; from the member key to exactly the value a Fressian payload would have
+;; returned (same value and type): UUID, String, Boolean, Long/Integer/Short
+;; (Fressian also returns Long), interned-equal keywords, and vectors of these.
+;; Any other id (BigInt/BigInteger, keywords whose printed form re-reads
+;; differently, ...) keeps the Fressian payload, so readers return exactly
+;; what they returned before.
+(def ^:private empty-payload (byte-array 0))
+(defn- keyed-id-exact? [id]
+  (cond
+    (or (uuid? id) (string? id) (boolean? id) (nil? id)) true
+    (or (instance? Long id) (instance? Integer id) (instance? Short id)) true
+    (keyword? id) (identical? id (keyword (subs (str id) 1)))
+    (vector? id) (every? keyed-id-exact? id)
+    :else false))
+(defn- keyed-id-payload ^bytes [id]
+  (if (keyed-id-exact? id) empty-payload (codec/encode id)))
+
+(definterface IKeyedOwner
+  (id [])
+  (^bytes idKey [])
+  (^bytes memberSuffix [])
+  (^bytes payload []))
+
+;; Per-owner encodings shared by every index and direction of one update.
+;; Computed on first use; the returned arrays are never mutated.
+(deftype KeyedOwner [owner-id
+                     ^:unsynchronized-mutable ^bytes id-key
+                     ^:unsynchronized-mutable ^bytes suffix
+                     ^:unsynchronized-mutable ^bytes encoded]
+  IKeyedOwner
+  (id [_] owner-id)
+  (idKey [_]
+    (when (nil? id-key) (set! id-key (key-encode owner-id)))
+    id-key)
+  (memberSuffix [_]
+    ;; OPT-8: key-encode((str id)) ++ type tail (key-id-suffix).
+    (when (nil? suffix) (set! suffix (key-id-suffix owner-id)))
+    suffix)
+  (payload [_]
+    (when (nil? encoded) (set! encoded (keyed-id-payload owner-id)))
+    encoded))
+
+(defn- keyed-owner ^KeyedOwner [id] (KeyedOwner. id nil nil nil))
+(defn- keyed-sort-value?
+  "True when value has exactly one ordered encoding among values it equals:
+   the types key-write-key! accepts, with vectors (never other sequentials)."
+  [value]
+  (or (nil? value) (boolean? value) (string? value) (uuid? value) (keyword? value)
+      (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
+      (and (vector? value) (every? keyed-sort-value? value))))
+(defn- keyed-owner-address [b kind ^KeyedOwner owner]
+  (key-checked (key-join b (byte-array [kind]) (.idKey owner))))
 (defn- keyed-sort-bytes [value direction]
-  (cond-> (key-encode value) (= direction :desc) key-descending))
+  ;; OPT-5/OPT-7: ascending bytes only (direction is always :asc).
+  (assert (= :asc direction))
+  (key-encode value))
+;; Member layouts (OPT-8; one value encoding, so the former compact/physical
+;; distinction is only a layout one now):
+;;   :identity (unfiltered)  key-encode(value) ++ key-id-tail(id), value = (str id),
+;;                           i.e. exactly the owner's id suffix
+;;   any other index         key-encode(value) ++ key-encode((str id)) ++ key-id-tail(id)
+;; (:identity in :filtered-indexes uses the second form, as before.)
 (defn- keyed-compact-identity? [d index]
   (and (= :identity index) (not (contains? (:filtered-indexes d) :identity))))
 (defn- keyed-index-sort-bytes [d index value direction]
+  (keyed-sort-bytes value direction))
+(defn- keyed-owner-member [d index direction value ^KeyedOwner owner]
   (if (keyed-compact-identity? d index)
-    (cond-> (key-encode-compact value) (= direction :desc) key-descending)
-    (keyed-sort-bytes value direction)))
+    (key-join (keyed-sort-bytes value direction) (key-id-tail (.id owner)))
+    (key-join (keyed-sort-bytes value direction) (.memberSuffix owner))))
 (defn- keyed-index-member [d index direction value id]
-  (if (keyed-compact-identity? d index)
-    (key-join (keyed-index-sort-bytes d index value direction) (key-encode id))
-    (key-join (keyed-sort-bytes value direction) (key-encode (str id)) (key-encode id))))
+  (keyed-owner-member d index direction value (keyed-owner id)))
+
+(defn- keyed-member-id
+  "OPT-9 W8 / OPT-8: the owner id at the end of a level-zero member that
+   starts at offset in k. Unfiltered :identity members are the id suffix
+   itself (its (str id) is the sort value, inverted when descending); other
+   members skip the sort value (inverted when descending) first. The suffix
+   is read by member-read-id!: (str id), then the type tail.
+   Since OPT-5/OPT-7 only ascending members are stored, so every caller
+   passes :asc; the descending mask path is kept for completeness only."
+  [d index direction ^bytes k offset]
+  (let [mask (if (= direction :desc) 255 0)]
+    (try
+      (let [identity? (keyed-compact-identity? d index)
+            start (if identity? (long offset) (skip-member-key k offset mask))
+            pos (doto (long-array 2) (aset 0 start) (aset 1 (alength k)))
+            id (member-read-id! k pos (if identity? mask 0))]
+        (when-not (= (aget pos 0) (alength k))
+          (throw (ex-info "Trailing bytes in index member" {:type :grain.read-model/invalid-cache})))
+        id)
+      (catch EOFException _
+        (throw (ex-info "Truncated index member" {:type :grain.read-model/invalid-cache})))
+      (catch IndexOutOfBoundsException _
+        (throw (ex-info "Truncated index member" {:type :grain.read-model/invalid-cache}))))))
+
+(defn- keyed-entry-id
+  "Owner id of a level-zero entry: its Fressian payload when one was kept,
+   else decoded from the member key."
+  [d index direction ^bytes k offset ^bytes v]
+  (if (pos? (alength v)) (codec/decode v) (keyed-member-id d index direction k offset)))
 (defn- keyed-fits-prefix?
   "A selection prefix must leave space for a member suffix within LMDB's key limit."
   ([^bytes prefix] (< (alength prefix) 511))
   ([cfg ^bytes prefix]
    (< (+ (alength ^bytes (ranked-prefix cfg 0)) (alength prefix)) 511)))
 
-(defn- keyed-update-group! [tx b index value delta]
+;; Descending reads (OPT-5/OPT-7): read from the ascending structure with runs of
+;; equal value re-reversed (ranked-desc-items / ranked-desc-reduce), so ties
+;; stay ascending by id, exactly as in the KF9 stored descending copy.
+(defn- keyed-value-length
+  "Member -> length of its leading value encoding, for index of d."
+  [_d _index]
+  (fn [^bytes member] (key-skip member 0)))
+
+(defn- keyed-update-group-at! [tx ^bytes group-prefix index value delta]
   ;; Levels 0..5 are the RankedSet. Level 6 stores one count per sort value,
   ;; shared by both directions; no duplicated root membership collection.
-  (let [k (key-checked (key-join (ranked-prefix (keyed-index-config b index :asc) 6) (key-encode value)))
-        before (some-> ((:get tx) k) codec/decode :total)
-        total (+ (or before 0) delta)]
-    (when (neg? total) (throw (ex-info "Negative index group count" {:index index :value value})))
-    (if (zero? total) ((:delete tx) k)
-      ((:put tx) k (codec/encode {:value value :total total})))))
+  ;; A decrement keeps the stored :value (OPT-9 audit C1): since OPT-9 W7 the
+  ;; removed value is decoded from compact sort data, which can change its
+  ;; form (BigInt -> Long, (keyword "a/b" "c") -> :a/b/c); an increment
+  ;; writes the extractor's own value, as before.
+  (let [k (key-checked (key-join group-prefix (key-encode value)))]
+    (if-let [^HashMap cache (::group-counts tx)]
+      ;; OPT-10 W9: the batch's group-count cache holds the current record (nil
+      ;; when the group is gone) and whether a row was stored before this
+      ;; transaction; group-count-flush! writes the final record once.
+      (let [address (ByteBuffer/wrap k)
+            ^objects slot (or (.get cache address)
+                              (let [raw ((:get tx) k)
+                                    slot (object-array [(some-> raw codec/decode) (some? raw)])]
+                                (.put cache address slot) slot))
+            record (aget slot 0)
+            total (+ (long (or (:total record) 0)) (long delta))]
+        (when (neg? total) (throw (ex-info "Negative index group count" {:index index :value value})))
+        (aset slot 0 (when-not (zero? total)
+                       {:value (if (and record (neg? (long delta))) (:value record) value) :total total})))
+      (let [record (some-> ((:get tx) k) codec/decode)
+            before (:total record)
+            total (+ (or before 0) delta)]
+        (when (neg? total) (throw (ex-info "Negative index group count" {:index index :value value})))
+        (if (zero? total) ((:delete tx) k)
+          ((:put tx) k (codec/encode {:value (if (and record (neg? (long delta))) (:value record) value)
+                                      :total total})))))))
 
-(defn- keyed-remove-index! [tx b d index direction position id]
-  (when (ranked-remove! tx (keyed-membership-config b d index direction) (keyed-index-member d index direction position id))
-    (when (= direction :asc) (keyed-update-group! tx b index position -1))))
+(defn- group-count-flush!
+  "Write each group changed in this transaction once: its final record, or a
+   delete when it reached zero and a row was stored before the transaction.
+   Stored bytes equal writing every change through: the final record is the
+   last change's record (a decrement keeps the record's :value, an increment
+   writes the extractor value, as in the uncached path; index values are
+   key-encodable scalars and vectors, whose Fressian round trip re-encodes to
+   the same bytes, so keeping the in-memory value equals keeping the decoded
+   one)."
+  [tx]
+  (when-let [^HashMap cache (::group-counts tx)]
+    (doseq [^java.util.Map$Entry e (count-cache-entries cache)
+            :let [^objects slot (.getValue e) k (.array ^ByteBuffer (.getKey e))]]
+      (if-let [record (aget slot 0)]
+        ((:put tx) k (codec/encode record))
+        (when (aget slot 1) ((:delete tx) k))))
+    (.clear cache)))
 
-(defn- keyed-add-index! [ctx tx b d index direction position id]
-  (let [cfg (keyed-membership-config b d index direction)
-        member (keyed-index-member d index direction position id)
-        payload (codec/encode id)]
-    (ranked-ensure-init! tx cfg)
+(def ^:private count-cache-flush-entries
+  ;; Entry bound of a batch transaction's count caches (OPT-10 audit C1). An
+  ;; entry costs about 200 B of heap (measured: 8.01 M text-term entries held
+  ;; 1,609 MB live), so 65,536 entries are about 13 MB. Steady-state batches stay
+  ;; far below it (w5x touch-3: a few hundred entries per 128-event batch); a
+  ;; batch of long high-entropy texts (each 1,000-character random CJK text adds
+  ;; about 1,000 term entries) flushes every ~65 owners instead of holding
+  ;; gigabytes. Not a tuning option: tests redefine it to force flushes.
+  65536)
+
+(defn- count-caches-bound!
+  "Flush the batch transaction's span-count, group-count and term-count caches
+   when together they hold more than count-cache-flush-entries entries. Called
+   between owners in keyed-apply-batch!; stored bytes are unchanged (see the
+   span-count cache comment). Because the check runs only between owners, one
+   owner's changes are never split across a flush, and the peak cache size is
+   the larger of the bound and a single owner's entries (e.g. one 100,000-
+   character random text adds ~100,000 term entries, ~19 MB)."
+  [tx]
+  (when-let [^HashMap spans (::span-counts tx)]
+    (when (> (+ (.size spans) (.size ^HashMap (::group-counts tx)) (.size ^HashMap (::term-counts tx)))
+             (long count-cache-flush-entries))
+      (span-count-flush! tx)
+      (group-count-flush! tx)
+      (term-count-flush! tx))))
+
+(defn- keyed-update-group!
+  ;; OPT-8: the former 5-arity (no definition) is gone: index addresses are
+  ;; ordinals of the definition. The rmp-stress harness self-test calls this
+  ;; 6-arity (outside a write session it reads the stored levels directly).
+  [tx b d index value delta]
+  (keyed-update-group-at! tx (ranked-prefix (keyed-session-config tx b d index :asc) 6) index value delta))
+
+;; OPT-9 W6: group counts (level 6) are kept, on the ascending
+;; config, for every declared index: keyed-index-groups is public on any index
+;; and the query engine enumerates equality-index groups (:related-groups,
+;; search joins), so none of them is provably never enumerated. The :identity
+;; index has no stored groups: its group for a value is the set of members
+;; whose (str id) equals it, counted from level zero where needed
+;; (keyed-identity-groups, keyed-index-rank).
+(defn- keyed-grouped? [index direction]
+  (and (= direction :asc) (not= :identity index)))
+
+(defn- keyed-remove-index! [tx b d index direction position ^KeyedOwner owner]
+  (when (ranked-remove! tx (keyed-session-config tx b d index direction) (keyed-owner-member d index direction position owner))
+    (when (keyed-grouped? index direction) (keyed-update-group! tx b d index position -1))))
+
+(defn- keyed-add-index! [ctx tx b d index direction position ^KeyedOwner owner]
+  (let [cfg (keyed-session-config tx b d index direction)
+        member (keyed-owner-member d index direction position owner)
+        payload (.payload owner)]
+    (keyed-ensure-init! tx cfg)
     (when (ranked-add! tx cfg member payload
-                       (when (:membership? cfg) (membership-ensure-ordinal! tx b id)))
-      (when (= direction :asc) (keyed-update-group! tx b index position 1)))
+                       (when (:membership? cfg) (membership-ensure-ordinal! tx b (.id owner))))
+      (when (keyed-grouped? index direction) (keyed-update-group! tx b d index position 1)))
     (keyed-observe! ctx :index-written (alength ^bytes payload))))
 
 (defn- keyed-empty-ranks? [tx cfg]
@@ -1855,33 +3090,33 @@
       ;; Check all directions before group counts or queued additions change.
       (doseq [index (conj (vec (keys (:indexes d))) :identity)
               :let [groups-empty? ((:reduce tx)
-                                    {:prefix (ranked-prefix (keyed-index-config b index :asc) 6)}
+                                    {:prefix (ranked-prefix (keyed-session-config tx b d index :asc) 6)}
                                     (fn [_ _] (reduced false)) true)]
-              direction [:asc :desc]
-              :let [cfg (keyed-membership-config b d index direction)]
+              direction [:asc]
+              :let [cfg (keyed-session-config tx b d index direction)]
               :when (and groups-empty? (keyed-empty-ranks? tx cfg))]
         (.put builders [index direction] {:cfg cfg :entries (ArrayList.) :initialized? (volatile! false)}))
       builders)))
 
-(defn- keyed-enqueue-index! [ctx tx b d builders index direction position id]
+(defn- keyed-enqueue-index! [ctx tx b d builders index direction position ^KeyedOwner owner]
   (if-let [{:keys [cfg entries initialized?]} (when builders (.get ^HashMap builders [index direction]))]
-    (let [member (keyed-index-member d index direction position id)
-          payload (codec/encode id)]
-      (when-not @initialized? (ranked-ensure-init! tx cfg) (vreset! initialized? true))
+    (let [member (keyed-owner-member d index direction position owner)
+          payload (.payload owner)]
+      (when-not @initialized? (keyed-ensure-init! tx cfg) (vreset! initialized? true))
       ;; Reserve ordinals and consume random hashes in original insertion order.
-      (let [ordinal (when (:membership? cfg) (membership-ensure-ordinal! tx b id))
+      (let [ordinal (when (:membership? cfg) (membership-ensure-ordinal! tx b (.id owner)))
             _ (ranked-check-key! member)
             _ (when (and (:membership? cfg)
                          (not (and (integer? ordinal) (<= 0 ordinal Integer/MAX_VALUE))))
                 (throw (ex-info "Membership index requires a model-local ordinal" {})))
-            hash ((:hash-fn cfg) member)]
+            hash (ranked-hash tx cfg member)]
         ;; Fail oversized physical keys before validating a later owner's result.
         (ranked-pack cfg 0 member)
         ;; Final states have one owner per key; each member includes its typed
         ;; key, making these initially empty index additions distinct.
         (.add ^ArrayList entries [member payload ordinal hash])
-        (when (= direction :asc) (keyed-update-group! tx b index position 1))))
-    (keyed-add-index! ctx tx b d index direction position id)))
+        (when (keyed-grouped? index direction) (keyed-update-group! tx b d index position 1))))
+    (keyed-add-index! ctx tx b d index direction position owner)))
 
 (defn- keyed-build-cold-indexes! [tx builders]
   (when builders
@@ -1892,6 +3127,123 @@
       (let [previous (object-array (repeat (:levels cfg) ranked-empty-key))]
         (doseq [[member payload ordinal hash] entries]
           (ranked-append! tx cfg member payload ordinal hash previous))))))
+
+;; OPT-9 W7: old index positions come from the owner's sort metadata
+;; (kind 11), never from the result row and never by re-running extractors.
+(defn- keyed-index-fields
+  "[[index sort-data-field] ...] for the non-identity indexes, in field order."
+  [d]
+  (into [] (map-indexed (fn [i index] [index (+ 2 i)])) (sort (keys (:indexes d)))))
+
+;; Index-layout fingerprint (OPT-10, W2 audit conditions C1/C2; FINAL: OPT-10
+;; audit C2 = OPT-8 audit C3). Since OPT-9 (W7) old index positions are read
+;; from kind 11 by sort-data field ordinal, and since OPT-8 index addresses
+;; (kind 5 configs, kind 13 levels) are index ordinals: the ordinal of an index
+;; is its rank among the model's SORTED non-identity index names. A definition
+;; change that keeps the index count but changes a name (e.g. {:a :x :b :y} ->
+;; {:c :x :b :y}: :b moves from field 3 to field 2) passes the field-count
+;; check in keyed-sort-data! and would make an UNRENAMED index read another
+;; index's data. The stored layout also depends on two more definition fields:
+;; - :filtered-indexes: membership configs and span bitmaps exist only for the
+;;   filtered indexes, model ordinals only when some index is filtered (or a
+;;   search exists), and the :identity member layout itself depends on whether
+;;   :identity is filtered (keyed-compact-identity?). A change gave silent
+;;   wrong pages, untyped NPE wedges or member decoder errors.
+;; - :searches names: postings and term counts live under key-encode(search
+;;   name), and only owners folded since the search existed have postings, so
+;;   an added or renamed search silently missed old owners.
+;; No other definition field changes stored layout: :events, :key/:route,
+;; :initial, :result, :include? and the schemas only change content (like an
+;; extractor change under the same index name, they cannot be detected and
+;; need a :version bump by contract); :version is part of the namespace
+;; identity. So the progress record (kind 0), which every batch and every
+;; catch-up already reads and decodes, stores under :index-layout the compact
+;; ordered key encoding of [sorted index names, sorted :filtered-indexes,
+;; sorted search names] (exact and injective: one byte array, decodable for
+;; the error), and any mismatch with the current definition throws
+;; :grain.read-model/invalid-cache before anything is read or written.
+;; Checked: at the start of every catch-up (so reads and writes of the model
+;; namespace, also with no new events), on a resumed deferred build's staged
+;; progress, and inside every batch transaction (model and staging
+;; namespaces; the staged progress written by the deferred build carries it
+;; and is published with the build). It is independent of the index count, so
+;; removing a model's last index is caught too. This is a contract check for
+;; definitions changed without a :version bump, not a cache-format guard.
+(defn- keyed-index-layout-value
+  "[sorted index names, sorted :filtered-indexes, sorted search names] of d."
+  [d]
+  [(vec (sort (keys (:indexes d)))) (vec (sort (:filtered-indexes d))) (vec (sort (keys (:searches d))))])
+
+(def ^:private ^java.util.concurrent.ConcurrentHashMap keyed-index-layouts
+  ;; definition -> its fingerprint. Lock-free reads (OPT-10 audit C4: it is
+  ;; looked up on every read session); registered definitions are the same
+  ;; map instance on every call (identity hit, cached map hash). Bounded:
+  ;; definitions are few, the cache is dropped if it ever grows past 4096.
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- keyed-index-layout
+  "The fingerprint stored in the progress record: key-encode-compact of
+   keyed-index-layout-value."
+  ^bytes [d]
+  (or (.get keyed-index-layouts d)
+      (let [fingerprint (key-encode-compact (keyed-index-layout-value d))]
+        (when (> (.size keyed-index-layouts) 4096) (.clear keyed-index-layouts))
+        (.put keyed-index-layouts d fingerprint)
+        fingerprint)))
+
+(defn- keyed-check-index-layout!
+  "Throws :grain.read-model/invalid-cache unless the stored progress record
+   (nil for a namespace never written) holds exactly d's index-layout
+   fingerprint. Allocation free on the matching path."
+  [progress d]
+  (when progress
+    (let [stored (:index-layout progress)]
+      (when-not (and (bytes? stored) (Arrays/equals ^bytes stored (keyed-index-layout d)))
+        (let [[indexes filtered searches] (keyed-index-layout-value d)
+              [stored-indexes stored-filtered stored-searches :as decoded]
+              (when (bytes? stored) (try (key-decode-compact stored) (catch Exception _ nil)))]
+          (throw (ex-info "Keyed model indexes, filtered indexes or searches differ from the ones this cache was built with; the definition changed without a version bump"
+                          {:type :grain.read-model/invalid-cache
+                           :stored-indexes (if (vector? decoded) stored-indexes stored)
+                           :indexes indexes
+                           :stored-filtered-indexes stored-filtered :filtered-indexes filtered
+                           :stored-searches stored-searches :searches searches})))))))
+
+(defn- keyed-public-progress
+  "The progress record as the read API returns it (without :index-layout)."
+  [progress]
+  (some-> progress (dissoc :index-layout)))
+
+(defn- keyed-sort-data!
+  "Stored sort data (kind 11) of an existing result. Old index positions are
+   read by field ordinal of the current definition: the ordinal of an index is
+   its rank among the SORTED non-identity index names. The stored field count
+   must equal 2 + the model's non-identity index count (OPT-9 audit C2), so an
+   index added or removed without a model version bump fails loudly here
+   instead of wedging catch-up. The field count alone does NOT catch a change
+   that keeps the count but changes a name: such a rename (or any other
+   name->field remap) would make OTHER, unrenamed indexes read their old
+   position from the wrong field and corrupt them (W2 audit C1). That case is
+   caught earlier by the index-name fingerprint in the progress record
+   (keyed-check-index-layout!); this count check stays as a second guard."
+  ^bytes [tx ^bytes sort-k id ^long field-count]
+  (let [^bytes data (or ((:get tx) sort-k)
+                        (throw (ex-info "Keyed sort metadata is missing for a stored result"
+                                        {:type :grain.read-model/invalid-cache :id id})))
+        stored (when (>= (alength data) 4) (dec (quot (sort-data-int-at data 0) 4)))]
+    (when-not (= stored field-count)
+      (throw (ex-info "Keyed sort metadata does not match the model's indexes; index definitions changed without a version bump"
+                      {:type :grain.read-model/invalid-cache :id id
+                       :stored-fields stored :expected-fields field-count})))
+    data))
+
+(defn- keyed-old-position
+  "The stored value of index at sort-data field. key-decode-compact
+   round-trips every value the index encoders accept to a value with the same
+   ordered encoding, so the member and group key it yields are the ones that
+   were written (I14 proves the resulting bytes equal the :indexes path)."
+  [_id _index ^bytes old-data field]
+  (sort-data-value old-data field))
 
 (defn- keyed-read-meta [tx k] (some-> ((:get tx) k) codec/decode))
 (defn- keyed-write! [tx k v] ((:put tx) k (codec/encode v)))
@@ -1909,15 +3261,628 @@
                           {:model name :kind kind :explanation (m/explain schema value)})))))
     (constantly nil)))
 
+;; ---------------------------------------------------------------------------
+;; Deferred cold builds
+;; ---------------------------------------------------------------------------
+;; A cold catch-up with a large backlog folds states and results into a
+;; private staging namespace without index work, builds every index structure
+;; once from the final stored results, then publishes by exchanging the
+;; staging and model registry records in one transaction. Readers resolve the
+;; model identity, so they see either the untouched cold namespace or the
+;; complete build, never a partial one; older processors never resolve the
+;; staging identity. Each model identity has one staging identity (bounded
+;; registry growth) and one KB9 marker naming the owning build, process and a
+;; heartbeat. A live foreign build is awaited; a crashed, failed or expired one
+;; is taken over and its fold resumed from the staging watermark.
+;;
+;; Documented costs (work, never correctness; OPT-4 audit):
+;; - A single source page slower than max-stall + lease in the middle of a fold
+;;   (after the owner has progressed, generation 0) causes one spurious
+;;   takeover: the taker resumes the staged fold and redoes the build, and the
+;;   old owner is superseded. A second consecutive stall doubles the next
+;;   owner's max-stall.
+;; - A third process's long write transaction can delay the owner's heartbeat
+;;   transaction long enough for a waiter to win the write lock and take over a
+;;   healthy owner, with the same cost.
+;; - A failure inside the build (after the fold), including transient ones
+;;   such as MapFull, writes the failure record and disables deferral for the
+;;   identity until it is warm; fold-phase failures keep the staged progress.
+;; - Replaced-namespace collection infers quiescence (two equal fingerprints
+;;   deferred-replaced-gc-ms apart); an older-version fold stalled for over an
+;;   hour between two batches could still be wiped under it.
+;; - Since INT, staged folds use the adaptive catch-up batch policy (OPT-2), so
+;;   one staged batch transaction holds up to :max-events events; the
+;;   heartbeat is stamped at the end of every such transaction.
+
+(def ^:private deferred-marker-prefix (byte-array [75 66 57]))
+(def ^:private deferred-default-threshold 1024)
+(def ^:private deferred-default-entries 1000000)
+(def ^:private deferred-default-lease-ms 30000)
+(def ^:private deferred-default-max-stall-ms 60000)
+(def ^:private deferred-default-max-stall-cap-ms (* 10 60 1000))
+(def ^:private deferred-replaced-gc-ms (* 60 60 1000))
+(def ^:private deferred-chunk 4096)
+
+(defn- with-namespace-space [identity f]
+  ;; Scoped identities live in their own registry and data prefixes.
+  (if (= 4 (count identity))
+    (let [prefix (byte-array [75 82 83 57])]
+      (binding [namespace-registry-prefix prefix
+                namespace-counter-key (key-join prefix (byte-array [0]))
+                namespace-data-prefix (byte-array [75 70 83 57])]
+        (f)))
+    (f)))
+
+(defn- namespace-prefix-of [tx identity]
+  (with-namespace-space identity #(get (namespace-resolve-known tx [identity]) identity)))
+
+(defn- namespace-ordinal-of [tx identity]
+  (let [next-id (namespace-counter tx)]
+    (when (and (some? next-id) (namespace-lookup tx identity next-id))
+      (:ordinal (:value (namespace-read-value tx (namespace-forward-key identity)))))))
+
+(defn- namespace-swap-checked! [tx a b]
+  (let [oa (namespace-ordinal-of tx a) ob (namespace-ordinal-of tx b)]
+    (when-not (and (some? oa) (some? ob) (not= oa ob))
+      (namespace-failure "Cannot exchange unregistered namespaces" {}))
+    (let [ra (codec/encode {:identity a :ordinal ob})
+          rb (codec/encode {:identity b :ordinal oa})]
+      ((:put tx) (namespace-forward-key a) ra)
+      ((:put tx) (namespace-reverse-key ob) ra)
+      ((:put tx) (namespace-forward-key b) rb)
+      ((:put tx) (namespace-reverse-key oa) rb)
+      (namespace-address ob))))
+
+(defn- namespace-swap!
+  "Exchange two registered identities' ordinals. The registry stays a bijection
+   under an unchanged counter, so every reader validates it as before."
+  [tx a b]
+  (with-namespace-space a
+    #(if-let [with-validation (:with-validation tx)]
+       (with-validation namespace-registry-prefix namespace-validate-allocation!
+         (fn [] (namespace-swap-checked! tx a b)))
+       (do (namespace-validate-allocation! tx)
+           (namespace-swap-checked! tx a b)))))
+
+(defn- deferred-staging-identity [identity]
+  ;; One staging identity per model identity: at most two registry records.
+  (assoc identity 1 (keyword "grain.read-model.staging"
+                             (str "s" (.formatHex (HexFormat/of) (namespace-digest identity))))
+                  2 1))
+(defn- deferred-slot
+  "KB9 + digest(identity) + kind: 1 build marker, 2 failed build, 3 replaced namespace."
+  [identity kind]
+  (key-join deferred-marker-prefix (namespace-digest identity) (byte-array [kind])))
+
+(defn- deferred-start-ms [^java.lang.ProcessHandle h]
+  (some-> ^java.util.Optional (.startInstant (.info h)) (.orElse nil) (#(.toEpochMilli ^java.time.Instant %))))
+(def ^:private deferred-self
+  (delay (let [h (java.lang.ProcessHandle/current)] {:pid (.pid h) :started (deferred-start-ms h)})))
+
+(defn- deferred-live?
+  "A marker owned by another running process with a fresh heartbeat. LMDB
+   environments are host-local, so process liveness is checked directly."
+  [{:keys [pid started at]} lease-ms]
+  (boolean
+    (and pid at (not= pid (:pid @deferred-self))
+         (< (- (System/currentTimeMillis) at) lease-ms)
+         (let [^java.util.Optional o (java.lang.ProcessHandle/of (long pid))]
+           (and (.isPresent o)
+                (let [^java.lang.ProcessHandle h (.get o)]
+                  (and (.isAlive h) (= started (deferred-start-ms h)))))))))
+
+(defn- deferred-marker [tx identity] (some-> ((:get tx) (deferred-slot identity 1)) codec/decode))
+
+(defn- deferred-guard!
+  "Ownership check and heartbeat, inside every staging transaction."
+  [tx staging]
+  (let [m (some-> ((:get tx) (:marker staging)) codec/decode)]
+    (when-not (= (:build staging) (:build m))
+      (throw (ex-info "Deferred cold build was superseded" {:type ::deferred-superseded})))
+    ((:put tx) (:marker staging) (codec/encode (assoc m :at (System/currentTimeMillis))))))
+
+(defn- deferred-stamp!
+  "Refresh the heartbeat at the end of a long staging transaction (after its
+   guard), so that a waiter never sees a heartbeat older than the transaction.
+   folded? marks real progress: the takeover generation resets to zero."
+  ([tx staging] (deferred-stamp! tx staging false))
+  ([tx staging folded?]
+   (when-let [m (some-> ((:get tx) (:marker staging)) codec/decode)]
+     (when (= (:build staging) (:build m))
+       ((:put tx) (:marker staging)
+                  (codec/encode (cond-> (assoc m :at (System/currentTimeMillis))
+                                  folded? (assoc :progressed true :generation 0))))))))
+
+(defn- deferred-max-stall-ms
+  "Effective max-stall for an owner claimed at takeover generation g: the base
+   doubles per consecutive takeover without progress, up to the cap. A slow
+   first event (e.g. a slow resume query) therefore converges once the
+   effective stall exceeds its latency, while a hung owner is still taken over
+   within cap + lease.
+
+   Worst case (OPT-4 audit): after at least four consecutive unprogressed
+   takeovers (slow first events or crash loops; 60 s doubled four times
+   exceeds the cap) a genuinely hung owner is taken over only after
+   cap + lease (default 10 min + 30 s, about 10.5 min; lowered from 30 min
+   at wave-2 integration).
+   Meanwhile every waiting process holds its JVM's cache lock in
+   deferred-await!, so all keyed reads in that JVM (every tenant and model)
+   stall for that time. The baseline has no cross-process waiting: each JVM
+   holds its lock only for its own (slower, incremental) build. Lower
+   :read-model/deferred-build-max-stall-cap-ms to bound this further."
+  [ctx generation]
+  (let [base (long (:read-model/deferred-build-max-stall-ms ctx deferred-default-max-stall-ms))
+        cap (long (:read-model/deferred-build-max-stall-cap-ms ctx deferred-default-max-stall-cap-ms))]
+    (max base (min cap (* base (bit-shift-left 1 (min 30 (long generation))))))))
+
+(defn- deferred-progress!
+  "Record that the owning build thread made progress (an event read, a batch,
+   a chunk or a sort). The heartbeat only extends the lease while it is recent."
+  [staging]
+  (when-let [^java.util.concurrent.atomic.AtomicLong p (:progress staging)]
+    (.set p (System/currentTimeMillis))))
+
+(defn- deferred-heartbeat!
+  "Keep an owned build's lease alive between staging transactions (source
+   reads, sorting) from a daemon thread. Returns a stop function. The thread
+   stops by itself once the marker names another build."
+  [ctx staging lease-ms]
+  (let [running (volatile! true)
+        ^java.util.concurrent.atomic.AtomicLong progress (:progress staging)
+        ^java.util.concurrent.atomic.AtomicLong generation (:generation staging)
+        recent? #(or (nil? progress)
+                     (< (- (System/currentTimeMillis) (.get progress))
+                        (deferred-max-stall-ms ctx (if generation (.get generation) 0))))
+        interval (max 5 (quot (long lease-ms) 3))
+        t (doto (Thread.
+                  ^Runnable
+                  (fn []
+                    (try
+                      (loop []
+                        (Thread/sleep interval)
+                        (when (and @running
+                                   ;; A stuck build thread stops extending its lease, so
+                                   ;; another process can take over after max-stall + lease.
+                                   (or (not (recent?))
+                                       (kv/transact (:cache ctx) :write
+                                     (fn [tx]
+                                       (let [m (some-> ((:get tx) (:marker staging)) codec/decode)]
+                                         (when (and @running (= (:build staging) (:build m)) (:pid m))
+                                           ((:put tx) (:marker staging)
+                                                      (codec/encode (assoc m :at (System/currentTimeMillis))))
+                                           true))))))
+                          (recur)))
+                      (catch InterruptedException _ nil)
+                      (catch Throwable _ nil)))
+                  "grain-deferred-build-heartbeat")
+            (.setDaemon true)
+            (.start))]
+    (fn [] (vreset! running false) (.interrupt t) (.join t 1000))))
+
+(defn- keyed-wipe!
+  "Delete every row under prefix, in bounded chunks within this transaction."
+  [tx ^bytes prefix]
+  (loop []
+    (let [^ArrayList ks ((:reduce tx) {:prefix prefix}
+                         (fn [^ArrayList out {:keys [k]}]
+                           (.add out k)
+                           (if (= deferred-chunk (.size out)) (reduced out) out))
+                         (ArrayList.))]
+      (when-not (.isEmpty ks)
+        (doseq [k ks] ((:delete tx) k))
+        (recur)))))
+
+(defn- deferred-lease-ms [ctx] (:read-model/deferred-build-lease-ms ctx deferred-default-lease-ms))
+
+(defn- deferred-claim!
+  "Claim identity's staging build. Returns the build, :wait while another live
+   process owns it, :restart when identity no longer resolves to the cold
+   namespace b the caller read (another build published meanwhile), or nil
+   when a failed build disabled deferral for identity. A stale marker's fold
+   is resumed, never discarded."
+  [ctx identity b]
+  (let [staging (deferred-staging-identity identity)
+        build (str (random-uuid))]
+    (kv/transact (:cache ctx) :write
+      (fn [tx]
+        (let [m (deferred-marker tx identity)
+              current (namespace-prefix-of tx identity)]
+          (cond
+            ;; Re-validate under this write transaction: after a publish the
+            ;; staging identity owns the replaced namespace, which must never
+            ;; be taken (or wiped) as a new staging area.
+            (not (and current (Arrays/equals ^bytes current ^bytes b)
+                      (nil? (:watermark (keyed-read-meta tx (keyed-progress-key b))))))
+            :restart
+            (and m (deferred-live? m (deferred-lease-ms ctx))) :wait
+            ((:get tx) (deferred-slot identity 2)) nil
+            :else
+            (let [prefix (get (with-namespace-space staging #(namespace-allocate! tx [staging])) staging)
+                  ;; Taking over an owner whose lease lapsed before it folded
+                  ;; anything doubles the next owner's max-stall (bounded).
+                  ;; Only this owning claim writes the generation.
+                  generation (if (and m (:pid m) (not (:progressed m)))
+                               (min 30 (inc (long (:generation m 0))))
+                               0)]
+              (when-not m (keyed-wipe! tx prefix))
+              ((:put tx) (deferred-slot identity 1)
+                         (codec/encode (merge {:identity identity :staging staging :build build
+                                               :at (System/currentTimeMillis)
+                                               :generation generation :progressed false}
+                                              @deferred-self)))
+              {:identity staging :prefix prefix :marker (deferred-slot identity 1)
+               :build build :resumed? (some? m)
+               :progress (java.util.concurrent.atomic.AtomicLong. (System/currentTimeMillis))
+               :generation (java.util.concurrent.atomic.AtomicLong. generation)})))))))
+
+(defn- deferred-release!
+  "Keep the staged fold for the next attempt, which may be in any process."
+  [ctx staging]
+  (kv/transact (:cache ctx) :write
+    (fn [tx]
+      (let [m (some-> ((:get tx) (:marker staging)) codec/decode)]
+        (when (= (:build m) (:build staging))
+          ((:put tx) (:marker staging) (codec/encode (assoc m :pid nil :at nil))))))))
+
+(defn- deferred-abandon! [ctx identity staging failed?]
+  (kv/transact (:cache ctx) :write
+    (fn [tx]
+      ;; Only the owner wipes, and only the namespace the staging identity
+      ;; still resolves to (an owned marker implies no publish happened).
+      (when (and (= (:build staging) (:build (deferred-marker tx identity)))
+                 (Arrays/equals ^bytes (namespace-prefix-of tx (:identity staging)) ^bytes (:prefix staging)))
+        (keyed-wipe! tx (:prefix staging))
+        ((:delete tx) (:marker staging))
+        ;; A deterministic build failure would recur on every retry; later
+        ;; catch-ups use incremental batches.
+        (when failed?
+          ((:put tx) (deferred-slot identity 2) (codec/encode {:identity identity})))))))
+
+(defn- deferred-await!
+  "Wait while another live process builds identity (bounded by its lease)."
+  [ctx identity]
+  (loop []
+    (when (kv/transact (:cache ctx) :read
+            #(some-> (deferred-marker % identity) (deferred-live? (deferred-lease-ms ctx))))
+      (Thread/sleep 50)
+      (recur))))
+
+(defn- deferred-fingerprint
+  "Activity fingerprint of a namespace: its progress record (every batch of any
+   processor version rewrites it) and whether any row exists."
+  [tx ^bytes prefix]
+  [(some-> ((:get tx) (keyed-progress-key prefix)) (#(.formatHex (HexFormat/of) ^bytes %)))
+   ((:reduce tx) {:prefix prefix} (fn [_ _] (reduced true)) false)])
+
+(defn- deferred-clean-stale!
+  "Warm namespaces with work: stop and wipe a non-live build, drop a failure
+   record, and collect a replaced namespace only once it is quiescent: its
+   fingerprint must be unchanged across two observations at least
+   deferred-replaced-gc-ms apart (any fold activity restarts the clock). An
+   absent KB9 scope costs one seek."
+  [ctx identity]
+  (let [cache (:cache ctx)
+        scope (key-join deferred-marker-prefix (namespace-digest identity))
+        now (System/currentTimeMillis)
+        plan (fn [tx]
+               (let [m (deferred-marker tx identity)
+                     live? (and m (deferred-live? m (deferred-lease-ms ctx)))
+                     replaced (some-> ((:get tx) (deferred-slot identity 3)) codec/decode)
+                     staging-prefix (namespace-prefix-of tx (deferred-staging-identity identity))
+                     fp (when (and replaced staging-prefix (not live?)) (deferred-fingerprint tx staging-prefix))
+                     observed? (and replaced (contains? replaced :observed-at))]
+                 {:staging-prefix staging-prefix
+                  :stale-marker? (and m (not live?))
+                  :failure? (some? ((:get tx) (deferred-slot identity 2)))
+                  :collect? (and fp observed? (= fp (:fingerprint replaced))
+                                 (>= (- now (:observed-at replaced)) deferred-replaced-gc-ms))
+                  :observe (when (and fp (not (and observed? (= fp (:fingerprint replaced)))))
+                             (assoc replaced :fingerprint fp :observed-at now))}))]
+    (when (kv/transact cache :read #((:reduce %) {:prefix scope} (fn [_ _] (reduced true)) false))
+      (let [{:keys [stale-marker? failure? collect? observe]} (kv/transact cache :read plan)]
+        (when (or stale-marker? failure? collect? observe)
+          (kv/transact cache :write
+            (fn [tx]
+              (let [{:keys [staging-prefix stale-marker? failure? collect? observe]} (plan tx)]
+                (when (and staging-prefix (or stale-marker? collect?))
+                  (keyed-wipe! tx staging-prefix))
+                (when stale-marker? ((:delete tx) (deferred-slot identity 1)))
+                (when failure? ((:delete tx) (deferred-slot identity 2)))
+                (cond collect? ((:delete tx) (deferred-slot identity 3))
+                      observe ((:put tx) (deferred-slot identity 3) (codec/encode observe)))))))))))
+
+(defn- deferred-scan!
+  "Visit every row under prefix. Rows are read in chunks so that the visitor's
+   writes never interleave with an open cursor."
+  [tx ^bytes prefix f]
+  (loop [from nil]
+    (let [^ArrayList chunk ((:reduce tx) (cond-> {:prefix prefix} from (assoc :from from))
+                            (fn [^ArrayList out e]
+                              (.add out e)
+                              (if (= deferred-chunk (.size out)) (reduced out) out))
+                            (ArrayList.))]
+      (doseq [e chunk] (f e))
+      (when (= deferred-chunk (.size chunk))
+        (recur (ranked-after (:k (.get chunk (dec deferred-chunk)))))))))
+
+(defn- deferred-chunks!
+  "Process rows under prefix in chunks of at most size rows, each in its own
+   guarded write transaction (the staging namespace is private until publish)."
+  [ctx staging ^bytes prefix size f]
+  (loop [from nil]
+    (when-let [next (kv/transact (:cache ctx) :write
+                      (fn [tx]
+                        (deferred-guard! tx staging)
+                        (let [tx (with-promotion-key ctx tx)
+                              ^ArrayList rows ((:reduce tx) (cond-> {:prefix prefix} from (assoc :from from))
+                                               (fn [^ArrayList out e]
+                                                 (.add out e)
+                                                 (if (= size (.size out)) (reduced out) out))
+                                               (ArrayList.))]
+                          (f tx rows)
+                          (deferred-stamp! tx staging)
+                          (when (= size (.size rows)) (ranked-after (:k (.get rows (dec size))))))))]
+      (deferred-progress! staging)
+      (recur next))))
+
+;; Span construction over members in ascending order: level-zero members are
+;; written by the caller; every upper-level span is written once, when it closes.
+(defn- ranked-spans [cfg]
+  (let [levels (int (:levels cfg))]
+    {:keys (object-array (repeat levels ranked-empty-key))
+     :counts (long-array levels)
+     :bits (object-array (repeatedly levels #(RoaringBitmap.)))}))
+
+(defn- ranked-span-flush! [tx cfg {:keys [^objects keys ^longs counts ^objects bits]} level]
+  (ranked-set-count! tx cfg level (aget keys level) (aget counts level))
+  (when (:membership? cfg)
+    ((:put tx) (ranked-membership-key cfg level (aget keys level)) (membership-encode (aget bits level)))))
+
+(defn- ranked-span-add! [tx cfg {:keys [^objects keys ^longs counts ^objects bits] :as spans} ^bytes member ordinal]
+  (let [levels (int (:levels cfg)) membership? (:membership? cfg)
+        hash (ranked-hash tx cfg member)]
+    (loop [level 1]
+      (when (< level levels)
+        (if (zero? (bit-and hash (dec (bit-shift-left 1 (* 4 level)))))
+          (do (ranked-span-flush! tx cfg spans level)
+              (aset keys level member)
+              (aset counts level 1)
+              (when membership?
+                (aset bits level (doto (RoaringBitmap.) (.add (int ordinal))))))
+          (do (aset counts level (inc (aget counts level)))
+              (when membership? (.add ^RoaringBitmap (aget bits level) (int ordinal)))))
+        (recur (inc level))))))
+
+(defn- ranked-span-finish! [tx cfg spans]
+  ;; Every touched sentinel keeps a summary, even an empty one.
+  (loop [level 1] (when (< level (:levels cfg)) (ranked-span-flush! tx cfg spans level) (recur (inc level)))))
+
+(defn- ranked-bulk-load!
+  "Write sorted, distinct [member payload ordinal] entries into an empty index.
+   Persists the same members, towers, span counts and span summaries as
+   ranked-append! of each member in order, but writes every span once."
+  [tx cfg ^ArrayList entries]
+  (let [spans (ranked-spans cfg)]
+    (ranked-init! tx cfg)
+    (doseq [^objects entry entries]
+      (let [^bytes member (aget entry 0) ordinal (aget entry 2)]
+        ((:put tx) (ranked-pack cfg 0 member) (aget entry 1))
+        (when (:membership? cfg)
+          ((:put tx) (ranked-membership-key cfg 0 member) (membership-number-bytes ordinal)))
+        (ranked-span-add! tx cfg spans member ordinal)))
+    (ranked-span-finish! tx cfg spans)))
+
+(def ^:private deferred-member-order
+  (reify Comparator
+    (compare [_ a b] (Arrays/compareUnsigned ^bytes (aget ^objects a 0) ^bytes (aget ^objects b 0)))))
+
+(defn- deferred-entry [d id indexes ordinal payload [index direction]]
+  (let [position (get indexes index)]
+    (object-array [(keyed-index-member d index direction position id) payload ordinal position
+                   (when (keyed-grouped? index direction) (key-encode position))])))
+
+(defn- deferred-sort! [index ^ArrayList entries]
+  (.sort entries deferred-member-order)
+  (dotimes [i (dec (.size entries))]
+    (when (zero? (Arrays/compareUnsigned ^bytes (aget ^objects (.get entries i) 0)
+                                         ^bytes (aget ^objects (.get entries (inc i)) 0)))
+      (throw (ex-info "Duplicate deferred index member" {:index index})))))
+
+(defn- deferred-write-groups!
+  "Group counts from ascending, value-ordered entries (equal values form one
+   run). merge? adds to counts written by earlier sorted runs.
+   Since OPT-9 W7 the group :value is decoded from the staged compact sort
+   data (kind 11), not taken from the extractor (OPT-9 audit C1, accepted and
+   documented): key bytes, order, totals and lookups are identical, but a few
+   value forms change: BigInt/BigInteger values come back as Long (= to the
+   original), and a keyword whose printed form does not re-read identically,
+   e.g. (keyword \"a/b\" \"c\"), comes back as (keyword \"a\" \"b/c\") (not =).
+   index-groups therefore returns the decoded form after a bulk build."
+  [tx b d index ^ArrayList entries merge?]
+  (let [prefix (ranked-prefix (keyed-index-config b d index :asc) 6)
+        n (.size entries)]
+    (loop [i 0]
+      (when (< i n)
+        (let [^objects first-entry (.get entries i) ^bytes value-key (aget first-entry 4)
+              end (loop [j (inc i)]
+                    (if (and (< j n) (Arrays/equals value-key ^bytes (aget ^objects (.get entries j) 4)))
+                      (recur (inc j)) j))
+              k (key-checked (key-join prefix value-key))
+              before (if merge? (or (some-> ((:get tx) k) codec/decode :total) 0) 0)]
+          ((:put tx) k (codec/encode {:value (aget first-entry 3) :total (+ before (- end i))}))
+          (recur end))))))
+
+(defn- deferred-build!
+  "Build every index, group count and text posting from the staged results.
+   :read-model/deferred-build-entries bounds the index entries held in memory:
+   below it, several (index, direction) units share one sorted pass; above it,
+   each unit is built from sorted runs of that size and one ordered pass over
+   level zero. Text postings are written in chunks of the same size."
+  [ctx d staging]
+  (let [cache (:cache ctx) sb (:prefix staging)
+        searches (:searches d)
+        ordinals? (or (seq searches) (seq (:filtered-indexes d)))
+        units (vec (for [index (conj (vec (sort (keys (:indexes d)))) :identity)
+                         direction [:asc]]
+                     [index direction]))
+        {:keys [n touched?]}
+        (kv/transact cache :read
+          (fn [tx] {:n (or (keyed-read-meta tx (keyed-count-key sb)) 0)
+                    ;; Incremental folds initialize every index on the first
+                    ;; inclusion, which also writes the included bitmap.
+                    :touched? (some? ((:get tx) (keyed-included-key sb)))}))
+        budget (max 1 (long (:read-model/deferred-build-entries ctx deferred-default-entries)))
+        ;; OPT-6: every index is built directly at the level count the
+        ;; incremental path keeps for n members (keyed-relevel!).
+        levels (keyed-target-levels n)
+        unit-config (fn [index direction] (assoc (keyed-membership-config sb d index direction) :levels levels))
+        results (key-join sb (byte-array [2]))
+        index-fields (keyed-index-fields d)
+        ;; OPT-9 W7: staged results no longer carry :indexes; index
+        ;; values come from the owner's staged sort data (kind 11, written by
+        ;; the staging fold with every result), the identity value from its
+        ;; field 0 (the stored (str id)). The id is the result row's own :key,
+        ;; as the incremental path's owner id, so payload decisions (W8) and
+        ;; member suffixes match it exactly.
+        row (fn [tx ^bytes k v indexes?]
+              (let [{id :key value :value} (codec/decode v)]
+                [id value
+                 (when indexes?
+                   (let [sort-k (doto (Arrays/copyOf k (alength k)) (aset (alength ^bytes sb) (byte 11)))
+                         data (keyed-sort-data! tx sort-k id (+ 2 (count index-fields)))]
+                     (into {:identity (sort-data-value data 0)}
+                           (map (fn [[index field]] [index (keyed-old-position id index data field)]))
+                           index-fields)))
+                 (when ordinals?
+                   (or (membership-ordinal tx sb id)
+                       (throw (ex-info "Staged result has no model ordinal" {:id id}))))]))]
+    (when touched?
+      ;; A resumed build may hold index and text rows of an interrupted build.
+      (kv/transact cache :write
+        (fn [tx]
+          (deferred-guard! tx staging)
+          (keyed-wipe! tx (key-join sb (byte-array [5])))
+          (keyed-wipe! tx (key-join sb (byte-array [6])))))
+      (when (seq searches)
+        (let [terms (mapv (fn [[index extract]] [(text-search-config sb index) extract (HashMap.)]) searches)]
+          (deferred-chunks! ctx staging results budget
+            (fn [tx rows]
+              (doseq [{:keys [k v]} rows
+                      :let [[_ value _ ordinal] (row tx k v false)]
+                      [cfg extract ^HashMap counts] terms
+                      [term posting] (text-search-terms (text-search-normalize (extract value)))]
+                ((:put tx) (text-search-posting-key (text-search-term-key cfg 0 term) ordinal) posting)
+                (.put counts term (inc (long (or (.get counts term) 0)))))))
+          (kv/transact cache :write
+            (fn [tx]
+              (deferred-guard! tx staging)
+              (doseq [[cfg _ ^HashMap counts] terms
+                      ^java.util.Map$Entry entry (.entrySet counts)]
+                ((:put tx) (text-search-term-key cfg 1 (.getKey entry))
+                           (text-search-number-bytes (.getValue entry))))))))
+      (if (<= n budget)
+        (doseq [pass (partition-all (max 1 (quot budget (max 1 n))) units)]
+          (kv/transact cache :write
+            (fn [tx]
+              (deferred-guard! tx staging)
+              (let [tx (with-promotion-key ctx tx)
+                    lists (mapv (fn [unit] [unit (ArrayList. (int n))]) pass)]
+                (deferred-scan! tx results
+                  (fn [{:keys [k v]}]
+                    (let [[id _ indexes ordinal] (row tx k v true) payload (keyed-id-payload id)]
+                      (doseq [[unit ^ArrayList out] lists]
+                        (.add out (deferred-entry d id indexes ordinal payload unit))))))
+                (doseq [[[index direction] ^ArrayList entries] lists]
+                  (deferred-sort! index entries)
+                  (ranked-bulk-load! tx (unit-config index direction) entries)
+                  (keyed-write-levels! tx sb d index levels)
+                  (when (keyed-grouped? index direction) (deferred-write-groups! tx sb d index entries false))
+                  (.clear entries))
+                (deferred-stamp! tx staging))))
+          (deferred-progress! staging))
+        (doseq [[index direction :as unit] units
+                :let [cfg (unit-config index direction)
+                      spans (ranked-spans cfg)]]
+          (kv/transact cache :write (fn [tx] (deferred-guard! tx staging) (ranked-init! tx cfg)
+                                      (keyed-write-levels! tx sb d index levels)))
+          ;; Sorted runs of at most budget members, written at level zero.
+          (deferred-chunks! ctx staging results budget
+            (fn [tx ^ArrayList rows]
+              (let [entries (ArrayList. (.size rows))]
+                (doseq [{:keys [k v]} rows :let [[id _ indexes ordinal] (row tx k v true)]]
+                  (.add entries (deferred-entry d id indexes ordinal (keyed-id-payload id) unit)))
+                (deferred-sort! index entries)
+                (doseq [^objects e entries]
+                  ((:put tx) (ranked-pack cfg 0 (aget e 0)) (aget e 1))
+                  (when (:membership? cfg)
+                    ((:put tx) (ranked-membership-key cfg 0 (aget e 0)) (membership-number-bytes (aget e 2)))))
+                (when (keyed-grouped? index direction) (deferred-write-groups! tx sb d index entries true)))))
+          ;; One ordered pass over level zero closes every upper-level span.
+          (deferred-chunks! ctx staging (ranked-prefix cfg 0) budget
+            (fn [tx rows]
+              (doseq [{:keys [k]} rows
+                      :let [member (ranked-unpack cfg k)]
+                      :when (pos? (alength ^bytes member))]
+                (ranked-span-add! tx cfg spans member
+                                  (when (:membership? cfg)
+                                    (membership-number-value ((:get tx) (ranked-membership-key cfg 0 member))))))))
+          (kv/transact cache :write
+            (fn [tx] (deferred-guard! tx staging) (ranked-span-finish! tx cfg spans)))
+          (deferred-progress! staging))))))
+
+(defn- deferred-publish!
+  "Atomically publish a completed staging namespace as identity's namespace,
+   provided that namespace is still the cold one this build started from.
+   Returns the published prefix, or nil when another writer advanced it."
+  [ctx identity b staging]
+  (kv/transact (:cache ctx) :write
+    (fn [tx]
+      (deferred-guard! tx staging)
+      (let [progress (keyed-read-meta tx (keyed-progress-key b))
+            current (namespace-prefix-of tx identity)
+            empty-kind? (fn [kind] ((:reduce tx) {:prefix (key-join b (byte-array [kind]))}
+                                    (fn [_ _] (reduced false)) true))]
+        (when (and current (Arrays/equals ^bytes current ^bytes b)
+                   (nil? (:watermark progress)) (empty-kind? 1) (empty-kind? 2))
+          (let [published (namespace-swap! tx identity (:identity staging))]
+            ((:delete tx) (:marker staging))
+            ;; The replaced cold namespace now belongs to the staging identity.
+            (keyed-wipe! tx b)
+            ;; An older writer that resolved b before this swap may still fold
+            ;; into it for its own session; that copy is collected later.
+            ((:put tx) (deferred-slot identity 3) (codec/encode {:at (System/currentTimeMillis)}))
+            published))))))
+
+(defn- keyed-resolve [ctx identity]
+  (kv/transact (:cache ctx) :read #(namespace-prefix-of % identity)))
+
 (defn- keyed-apply-batch!
   ([ctx name d b validate-state! validate-result! events]
    (keyed-apply-batch! ctx name d b validate-state! validate-result! events nil))
   ([ctx name d b validate-state! validate-result! events through]
   (kv/transact (:cache ctx) :write
     (fn [tx]
-      (let [tx (membership-transaction tx)
+      (let [;; Logical bytes this batch writes (keys + values) feed the
+            ;; catch-up batch policy; they never affect what is written.
+            written (long-array 1)
+            put (:put tx)
+            tx (assoc tx :put (fn [^bytes k ^bytes v]
+                                (aset written 0 (+ (aget written 0) (alength k) (alength v)))
+                                (put k v)))
+            ;; INT (OPT-1 + OPT-2): the counting :put is installed first so the
+            ;; per-txn keyed write session and membership flushes both see it.
+            tx (keyed-write-session (membership-transaction tx) b)
+            ;; OPT-10 W9: upper-level span counts are written once per batch.
+            tx (span-count-transaction tx)
+            ;; OPT-3: per-cache promotion key, read or created in this txn
+            ;; (through the counting :put) only when a member is inserted.
+            tx (with-promotion-key ctx tx)
             identity-base (:ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix ctx)
+            deferred (::deferred ctx)
+            _ (when deferred (deferred-guard! tx deferred))
             before-progress (keyed-read-meta tx (keyed-progress-key b))
+            ;; OPT-10 (W2-C2): index names must match the stored fingerprint.
+            _ (keyed-check-index-layout! before-progress d)
             events (filterv #(or (nil? (:watermark before-progress))
                                 (pos? (compare (:event/id %) (:watermark before-progress)))) events)
             apply-input (fn [states id input]
@@ -1949,19 +3914,27 @@
                         (apply-input states ((:key d) event) event))) {} events)
             count-before (or (keyed-read-meta tx (keyed-count-key b)) 0)
             added (volatile! 0)
-            builders (keyed-cold-index-builders ctx tx b d before-progress states)]
+            builders (when-not deferred (keyed-cold-index-builders ctx tx b d before-progress states))
+            ordinals? (or (seq (:searches d)) (seq (:filtered-indexes d)))
+            ;; OPT-9 W7: sort-data field order of the non-identity indexes.
+            index-fields (keyed-index-fields d)]
         (doseq [[id state] states]
-          (let [value ((:result d identity) state)
+          ;; FINAL (OPT-10 audit C1): keep the batch's count caches bounded.
+          (count-caches-bound! tx)
+          (let [owner (keyed-owner id)
+                value ((:result d identity) state)
                 _ (validate-result! value)
-                result-k (keyed-address b 2 id)
+                result-k (keyed-owner-address b 2 owner)
+                sort-k (keyed-owner-address b 11 owner)
                 old (keyed-decode ctx :result-decoded ((:get tx) result-k))
                 included? ((:include? d (constantly true)) value)
+                ;; Non-identity index values. The identity index value is always
+                ;; (str id) and never changes for an owner.
                 indexes (when included?
-                          (assoc (into {} (map (fn [[index f]] [index (f value)])) (:indexes d))
-                                 :identity (str id)))]
+                          (into {} (map (fn [[index f]] [index (f value)])) (:indexes d)))]
             (keyed-observe! ctx :result-calculated 0)
             ;; State must advance even when its completion value is equal.
-            (keyed-write-observed! ctx tx :state-written (keyed-address b 1 id) state)
+            (keyed-write-observed! ctx tx :state-written (keyed-owner-address b 1 owner) state)
             (vswap! added + (- (if included? 1 0) (if old 1 0)))
             (when (not= (boolean included?) (boolean old))
               (let [ordinal (membership-ensure-ordinal! tx identity-base id)
@@ -1971,23 +3944,94 @@
                 (membership-put! tx (keyed-included-key b) bits)))
             (if-not included?
               (when old
-                (text-search-update! tx b (:searches d) id old nil)
-                (doseq [[index position] (:indexes old) direction [:asc :desc]]
-                  (keyed-remove-index! tx b d index direction position id))
-                ((:delete tx) (keyed-address b 11 id))
+                ;; A staging namespace holds no index entries until its build
+                ;; (OPT-4); index removal uses the write-session owner (OPT-1).
+                (when-not deferred
+                  (text-search-update! tx b (:searches d) id old nil)
+                  ;; OPT-9 W7: old positions come from the owner's sort
+                  ;; data, which holds every non-identity index value.
+                  (let [old-data (when (seq index-fields) (keyed-sort-data! tx sort-k id (+ 2 (count index-fields))))]
+                    (doseq [direction [:asc]]
+                      (keyed-remove-index! tx b d :identity direction (str id) owner))
+                    (doseq [[index field] index-fields
+                            :let [position (keyed-old-position id index old-data field)]
+                            direction [:asc]]
+                      (keyed-remove-index! tx b d index direction position owner))))
+                ((:delete tx) sort-k)
                 ((:delete tx) result-k))
               (when (or (nil? old) (not= (:value old) value))
-                (text-search-update! tx b (:searches d) id old {:value value})
-                (doseq [[index position] indexes
-                        direction [:asc :desc]
-                        :when (or (nil? old) (not= position (get-in old [:indexes index])))]
-                  (when old
-                    (keyed-remove-index! tx b d index direction (get-in old [:indexes index]) id))
-                  (keyed-enqueue-index! ctx tx b d builders index direction position id))
-                ((:put tx) (keyed-address b 11 id) (sort-data-encode id (dissoc indexes :identity)))
-                (keyed-write-observed! ctx tx :result-written result-k {:key id :value value :indexes indexes})))))
+                (let [;; Sort metadata is a pure function of id and index values
+                      ;; and is written with every result. An owner with no
+                      ;; non-identity index has constant sort data.
+                      new-data (when (or (nil? old) (seq index-fields))
+                                 (sort-data-encode id indexes))
+                      ;; OPT-9 W7: the stored sort data of an existing
+                      ;; owner gives its old index positions. Byte-equal fields
+                      ;; mean byte-equal members (since OPT-8 fields and member
+                      ;; values use the same injective encoding, key-write-key!).
+                      ;; Cost (OPT-9 audit C3): this is one extra kind-11 get on
+                      ;; EVERY value-changing update of an existing result when
+                      ;; the model has a non-identity index, also when no
+                      ;; indexed field changed (INT compared the decoded
+                      ;; :indexes for free); e.g. I1 :touch-1 on [:is :ik]
+                      ;; 4.03 -> 5.03 ops/event, no visible time cost. Index
+                      ;; extractors are deliberately not re-run to avoid it.
+                      old-data (when (and old (seq index-fields)) (keyed-sort-data! tx sort-k id (+ 2 (count index-fields))))]
+                  (if deferred
+                    ;; Reserve model ordinals at the same point as the
+                    ;; incremental path, so assignments are identical.
+                    (when ordinals? (membership-ensure-ordinal! tx b id))
+                    (do
+                      (text-search-update! tx b (:searches d) id old {:value value})
+                      (if (nil? old)
+                        (doseq [[index position] (assoc indexes :identity (str id))
+                                direction [:asc]]
+                          (keyed-enqueue-index! ctx tx b d builders index direction position owner))
+                        (doseq [[index field] index-fields
+                                :when (not (sort-data-field= old-data new-data field))
+                                :let [old-position (keyed-old-position id index old-data field)
+                                      position (get indexes index)]
+                                direction [:asc]]
+                          (keyed-remove-index! tx b d index direction old-position owner)
+                          (keyed-enqueue-index! ctx tx b d builders index direction position owner)))))
+                  ;; INVARIANT (OPT-1 W12b, OPT-9 W7): kind 11 is written only
+                  ;; here, in the same transaction and branch as the kind-2
+                  ;; result, and deleted only together with it, so an existing
+                  ;; result always has current sort data. Its put is skipped
+                  ;; when the new bytes equal the stored ones (or the model has
+                  ;; no non-identity index, so they cannot change). Every writer
+                  ;; of kind 2 (incremental or a deferred build's staging fold,
+                  ;; OPT-4) goes through this code; since OPT-9 (W7) the old index
+                  ;; positions, the deferred build's index entries and the
+                  ;; removal on exclusion are all read from kind 11, so a future
+                  ;; writer of kind 2 must also write kind 11. Likewise the
+                  ;; write-session ensure-init skip (W12a) assumes nothing in
+                  ;; this transaction deletes a level-0 sentinel of an index
+                  ;; that is still in use (the deferred build's kind 5/6 wipe
+                  ;; runs in its own guarded transactions, never here). Since
+                  ;; OPT-6, keyed-relevel! does delete upper-level sentinels in
+                  ;; this transaction when an index shrinks; that is safe: it
+                  ;; runs after all index work of the batch, never deletes
+                  ;; level 0, and drops the index's session configs, so no
+                  ;; stale ::initialized flag or level count is reused.
+                  (when-not (and old (or (empty? index-fields) (Arrays/equals ^bytes old-data ^bytes new-data)))
+                    ((:put tx) sort-k new-data)))
+                ;; OPT-9 W7: results no longer repeat the index values.
+                (keyed-write-observed! ctx tx :result-written result-k {:key id :value value})))))
         (keyed-build-cold-indexes! tx builders)
+        ;; OPT-10 W9/W10: all index and text work of the batch is done; write
+        ;; every changed span count, group record and term count once
+        ;; (re-leveling and later reads go to LMDB directly).
+        (span-count-flush! tx)
+        (group-count-flush! tx)
+        (term-count-flush! tx)
+        ;; OPT-6: N changed, so every index moves to the level count for the
+        ;; new N in this same transaction (staging namespaces hold no index
+        ;; rows; the deferred build sizes them at build time).
+        (when (and (not deferred) (seq events) (not (zero? @added)))
+          (keyed-relevel! tx b d (+ count-before @added)))
         (membership-flush! tx #(keyed-observe! ctx %1 %2))
+        (when deferred (deferred-stamp! tx deferred (boolean (seq events))))
         (when (seq events)
           (when-not (zero? @added) (keyed-write! tx (keyed-count-key b) (+ count-before @added))))
         ;; Only the final partial batch receives a captured head, after its
@@ -1997,10 +4041,13 @@
                                    (or (nil? (:checked-through before-progress))
                                        (pos? (compare through (:checked-through before-progress)))))
               progress (cond-> before-progress
+                         ;; A checked non-nil record already holds the names.
+                         (nil? before-progress) (assoc :index-layout (keyed-index-layout d))
                          (seq events) (assoc :watermark (:event/id (peek events)))
                          advance-through? (assoc :checked-through through))]
           (when (or (seq events) advance-through?)
-            (keyed-write! tx (keyed-progress-key b) progress))))))))
+            (keyed-write! tx (keyed-progress-key b) progress)))
+        {:events (count events) :bytes (aget written 0)})))))
 
 (defn- keyed-head [ctx]
   (let [result (es/head (:event-store ctx) (:tenant-id ctx))]
@@ -2081,48 +4128,351 @@
               true)
             (do (reset! empty-proofs* state) false)))))))
 
-(defn- keyed-checkpoint! [ctx b through]
+(defn- keyed-checkpoint! [ctx d b through]
   (kv/transact (:cache ctx) :write
     (fn [tx]
+      (when-let [staging (::deferred ctx)] (deferred-guard! tx staging))
       (let [p (keyed-read-meta tx (keyed-progress-key b)) old (:checked-through p)]
+        (keyed-check-index-layout! p d)
         (when (or (nil? old) (pos? (compare through old)))
-          (keyed-write! tx (keyed-progress-key b) (assoc p :checked-through through)))))))
+          (keyed-write! tx (keyed-progress-key b)
+                        (assoc (or p {:index-layout (keyed-index-layout d)}) :checked-through through)))))))
 
-(defn- keyed-catch-up! [ctx name d b through identity]
+(def ^:private default-catch-up-policy
+  ;; :min-events is the first batch of a warm catch-up, so a near-head
+  ;; catch-up commits exactly as a fixed 128-event batch did. A replay that
+  ;; keeps filling batches doubles toward :max-events while each committed
+  ;; batch wrote at most :max-bytes (logical key + value bytes). Above that the
+  ;; size holds, and only a batch over four times :max-bytes halves it (never
+  ;; below :min-events). Bytes are not assumed proportional to events: one
+  ;; large coalesced state costs the same in a small batch as in a big one.
+  ;; A never-built namespace has no history to be near, so it starts at
+  ;; :cold-events.
+  ;;
+  ;; Input: a batch is also cut once the estimated in-memory size of its
+  ;; accumulated source events reaches :max-input-bytes, so large payloads
+  ;; never hold more than that in one batch.
+  ;;
+  ;; Store space (stores that report it): large batches need unallocated map
+  ;; space because a write transaction cannot reuse the pages it frees, and a
+  ;; full, fragmented LMDB file cannot place large contiguous values. Once
+  ;; the file passes :max-map-fill of the map, or the unallocated tail is under
+  ;; four times the last batch's written bytes, the rest of the catch-up uses
+  ;; :min-events. A batch that still fails with a full map is retried in
+  ;; halves down to :min-events, and later batches stay at the size that fit.
+  ;;
+  ;; Operational notes (OPT-2 audit): the speed-up needs the LMDB file to stay
+  ;; at most :max-map-fill (half) of :map-size; size :map-size at about twice
+  ;; the expected file, since high-water never shrinks and past that point
+  ;; every catch-up runs at :min-events (today's speed). A cache already wedged
+  ;; by fragmentation at a full map recovers with `mdb_copy -c` or a larger
+  ;; map. The input estimate (keyed-input-size) charges opaque scalars 16 B, so
+  ;; numeric-heavy payloads (BigDecimal/BigInteger) can hold up to ~4.5x
+  ;; :max-input-bytes before the cut. Memory per batch is roughly batch events
+  ;; x input event size; :read-model/catch-up {:max-events ..} or
+  ;; :read-model/batch-size is the escape hatch for large-payload streams.
+  {:min-events 128 :cold-events 1024 :max-events 8192 :max-bytes (* 32 1024 1024)
+   :max-input-bytes (* 32 1024 1024) :max-map-fill 0.5})
+
+(def ^:private catch-up-policy-keys (set (keys default-catch-up-policy)))
+
+(defn- keyed-batch-policy
+  "Catch-up batch policy. :read-model/catch-up overrides the adaptive defaults
+   and is always validated; an explicit :read-model/batch-size then wins and
+   keeps every batch at exactly that size with no other bound. Batch size
+   never changes results, only commit granularity."
+  [ctx]
+  (let [overrides (:read-model/catch-up ctx)
+        _ (when-not (or (nil? overrides) (map? overrides))
+            (throw (ex-info "Keyed-fold catch-up policy must be a map" {:catch-up overrides})))
+        unknown (remove catch-up-policy-keys (keys overrides))
+        _ (when (seq unknown)
+            (throw (ex-info "Keyed-fold catch-up policy has unknown keys"
+                            {:unknown (vec unknown) :allowed (sort catch-up-policy-keys)})))
+        {:keys [min-events cold-events max-events max-bytes max-input-bytes max-map-fill] :as policy}
+        (merge default-catch-up-policy overrides)]
+    (when-not (and (pos-int? min-events) (pos-int? cold-events) (pos-int? max-events)
+                   (<= min-events cold-events max-events)
+                   (or (nil? max-bytes) (pos-int? max-bytes))
+                   (or (nil? max-input-bytes) (pos-int? max-input-bytes))
+                   (or (nil? max-map-fill) (and (number? max-map-fill) (< 0 max-map-fill) (<= max-map-fill 1))))
+      (throw (ex-info "Keyed-fold catch-up policy requires positive integer :min-events <= :cold-events <= :max-events, positive or nil :max-bytes and :max-input-bytes, and :max-map-fill in (0, 1] or nil"
+                      {:catch-up policy})))
+    (if-some [batch-size (:read-model/batch-size ctx)]
+      (do (when-not (pos-int? batch-size)
+            (throw (ex-info "Keyed-fold batch size must be positive" {:batch-size batch-size})))
+          {:min-events batch-size :cold-events batch-size :max-events batch-size
+           :max-bytes nil :max-input-bytes nil :max-map-fill nil})
+      policy)))
+
+(defn- keyed-input-size
+  "Rough in-memory size of a source event (UTF-16 strings, small per-object
+   overhead); only used to bound how much input one batch holds."
+  ^long [x]
+  (cond (string? x) (+ 40 (* 2 (.length ^String x)))
+        (map? x) (reduce-kv (fn [^long n k v] (+ n 32 (keyed-input-size k) (keyed-input-size v))) 48 x)
+        (bytes? x) (+ 16 (alength ^bytes x))
+        (coll? x) (reduce (fn [^long n v] (+ n 8 (keyed-input-size v))) 48 x)
+        :else 16))
+
+(defn- keyed-store-space
+  "{:map-bytes :high-water-bytes} when the store reports it, else nil."
+  [ctx]
+  (kv/transact (:cache ctx) :read #(when-let [space (:space %)] (space))))
+
+(defn- keyed-next-batch-limit
+  "Next batch size after a full batch, from the bytes the last one wrote and,
+   when known, the store's remaining map space."
+  [{:keys [min-events max-events max-bytes max-map-fill]} limit applied space]
+  (let [bytes (:bytes applied)
+        tail (when space (- (:map-bytes space) (:high-water-bytes space)))]
+    (cond (and space max-map-fill
+               (or (> (:high-water-bytes space) (* max-map-fill (:map-bytes space)))
+                   (< tail (* 4 (or bytes 0)))))
+          min-events
+          (or (nil? max-bytes) (nil? bytes) (<= bytes max-bytes)) (min max-events (* 2 limit))
+          (> bytes (* 4 max-bytes)) (max min-events (quot limit 2))
+          :else limit)))
+
+(defn- keyed-map-full? [t]
+  ;; Matched by class name: if lmdbjava ever renames Env$MapFullException,
+  ;; backoff silently stops and MapFull propagates as before this policy.
+  (loop [t t]
+    (cond (nil? t) false
+          (= "org.lmdbjava.Env$MapFullException" (.getName (class t))) true
+          :else (recur (.getCause ^Throwable t)))))
+
+(defn- keyed-apply-with-backoff!
+  "Apply one batch; if the store's map is full, the aborted batch is applied
+   again as two halves (recursively, down to min-events). Each applied part is
+   its own transaction carrying its own watermark, and only the last part
+   carries through. on-backoff receives the part size that is attempted."
+  [ctx name d b validate-state! validate-result! events through min-events on-backoff]
+  (try
+    (if through
+      (keyed-apply-batch! ctx name d b validate-state! validate-result! events through)
+      (keyed-apply-batch! ctx name d b validate-state! validate-result! events))
+    (catch Throwable t
+      (if (and (keyed-map-full? t) (> (count events) min-events))
+        (let [half (quot (inc (count events)) 2)
+              _ (on-backoff half)
+              first-part (keyed-apply-with-backoff! ctx name d b validate-state! validate-result!
+                                                    (subvec events 0 half) nil min-events on-backoff)
+              second-part (keyed-apply-with-backoff! ctx name d b validate-state! validate-result!
+                                                     (subvec events half) through min-events on-backoff)]
+          {:events (count events) :bytes (max (:bytes first-part 0) (:bytes second-part 0)) :backed-off true})
+        (throw t)))))
+
+(defn- keyed-deferrable? [ctx progress identity]
+  (let [threshold (:read-model/deferred-build-threshold ctx deferred-default-threshold)]
+    (boolean (and identity (nil? (:watermark progress)) (nil? (:read-model/observer ctx))
+                  (pos-int? threshold) (not (::no-deferral ctx))))))
+
+(defn- keyed-catch-up-step!
+  "One catch-up attempt. Returns the model's data prefix, or [::restart ctx]
+   when the identity must be re-resolved (another build published, a live
+   build was awaited, or publish was refused).
+
+   Batches follow the adaptive catch-up policy (keyed-batch-policy) whether
+   they fold into the model namespace or into a deferred build's staging
+   namespace: every batch is cut at the current limit or input budget, and
+   each full batch's written bytes and the store's space set the next limit.
+   A backlog that has reached neither the deferral threshold nor the input
+   budget (:max-input-bytes) is buffered and
+   later cut by exactly the same procedure, so its batch boundaries equal a
+   non-deferring catch-up's."
+  [ctx name d b through identity]
   (let [progress (kv/transact (:cache ctx) :read #(keyed-read-meta % (keyed-progress-key b)))
+        ;; OPT-10 (W2-C2): fail before any work, also when nothing is pending.
+        _ (keyed-check-index-layout! progress d)
         after (last (sort (keep #(get progress %) [:checked-through :watermark])))
-        batch-size (:read-model/batch-size ctx 128)]
-    (when-not (pos-int? batch-size)
-      (throw (ex-info "Keyed-fold batch size must be positive" {:batch-size batch-size})))
-    (when (and through (or (nil? after) (pos? (compare through after))))
+        ;; Validated before any work, also when nothing is pending.
+        policy (keyed-batch-policy ctx)
+        restart (fn [ctx] [::restart ctx])]
+    (if-not (and through (or (nil? after) (pos? (compare through after))))
+      b
       (let [source (:event-store ctx)
             stable? (es/stable-empty-intervals? source)
             proof-key (when stable? (empty-proof-key source identity d))]
-        (when-not (and stable? (empty-proof-covers? source proof-key after through))
-          (let [validate-state! (keyed-prepare-validation (:state-schema d) name :state)
-                validate-result! (keyed-prepare-validation (:result-schema d) name :result)
-                query (keyed-event-query ctx d after)
-                accepted? (volatile! false)
-                remaining (reduce
-                            (fn [batch event]
-                              (if (pos? (compare (:event/id event) through)) (reduced batch)
-                                (do
-                                  (when (and stable? (not @accepted?))
-                                    (empty-proof-forget! proof-key))
-                                  (vreset! accepted? true)
-                                  (let [batch (conj batch event)]
-                                    (if (= batch-size (count batch))
-                                      (do (keyed-apply-batch! ctx name d b validate-state! validate-result! batch) [])
-                                      batch)))))
-                            [] (if (seq query) (es/read source query) []))]
-            (when (seq remaining)
-              (keyed-apply-batch! ctx name d b validate-state! validate-result! remaining through))
-            ;; Only a completed, ordered read with no accepted source events
-            ;; can suppress a checkpoint. Route-empty events are not absence.
-            (when-not (or (seq remaining)
-                          (and stable? (not @accepted?)
-                               (empty-proof-remember! source proof-key after through)))
-              (keyed-checkpoint! ctx b through))))))))
+        (if (and stable? (empty-proof-covers? source proof-key after through))
+          b
+          (let [deferrable? (keyed-deferrable? ctx progress identity)
+                ;; An unpublished build of this cold namespace is resumed (or
+                ;; awaited while its owner is alive) before reading events.
+                pending? (and deferrable?
+                              (some? (kv/transact (:cache ctx) :read #(deferred-marker % identity))))
+                claimed (when pending? (deferred-claim! ctx identity b))]
+            (case claimed
+              :wait (do (deferred-await! ctx identity) (restart ctx))
+              :restart (restart ctx)
+              (let [validate-state! (keyed-prepare-validation (:state-schema d) name :state)
+                    validate-result! (keyed-prepare-validation (:result-schema d) name :result)
+                    staged (when claimed
+                             (kv/transact (:cache ctx) :read #(keyed-read-meta % (keyed-progress-key (:prefix claimed)))))
+                    read-after (last (sort (remove nil? [after (:checked-through staged) (:watermark staged)])))
+                    query (keyed-event-query ctx d read-after)
+                    accepted? (volatile! false)
+                    threshold (when deferrable? (:read-model/deferred-build-threshold ctx deferred-default-threshold))
+                    ;; Undecided until the backlog reaches the threshold; smaller
+                    ;; cold backlogs are applied exactly as without deferral.
+                    decided? (volatile! (or (not deferrable?) pending?))
+                    buffered (volatile! [])
+                    staging (volatile! claimed)
+                    beat (volatile! nil)
+                    own! (fn [s] (vreset! staging s)
+                           (when s (vreset! beat (deferred-heartbeat! ctx s (deferred-lease-ms ctx)))))
+                    min-events (:min-events policy)
+                    max-input (:max-input-bytes policy)
+                    adaptive? (not= min-events (:max-events policy))
+                    ;; Every batch still commits its states, results, indexes and
+                    ;; watermark in one transaction; only its size adapts. The
+                    ;; model namespace's own progress decides the cold start.
+                    limit (volatile! (if (nil? after) (:cold-events policy) min-events))
+                    ;; A size that hit a full map is never exceeded again here.
+                    ceiling (volatile! (:max-events policy))
+                    input (volatile! 0)
+                    on-backoff (fn [n] (vreset! ceiling (max min-events n)))
+                    apply! (fn [events through]
+                             (let [s @staging
+                                   applied (if s
+                                             (keyed-apply-with-backoff! (assoc ctx ::deferred s) name d (:prefix s)
+                                                                        validate-state! validate-result!
+                                                                        events through min-events on-backoff)
+                                             (keyed-apply-with-backoff! ctx name d b validate-state! validate-result!
+                                                                        events through min-events on-backoff))]
+                               (when s
+                                 (some-> ^java.util.concurrent.atomic.AtomicLong (:generation s) (.set 0))
+                                 (deferred-progress! s))
+                               (vreset! input 0)
+                               ;; The tail batch ends this catch-up: no next size.
+                               (when-not through
+                                 (vreset! limit (min @ceiling
+                                                     (keyed-next-batch-limit
+                                                       policy @limit applied
+                                                       (when (and adaptive? (:max-map-fill policy)) (keyed-store-space ctx))))))
+                               applied))
+                    ;; Add one event to the open batch; commit it once it reaches
+                    ;; the limit or the input budget. Returns the open batch.
+                    accumulate (fn [batch event]
+                                 (let [batch (conj batch event)
+                                       in (if max-input (vswap! input + (keyed-input-size event)) 0)]
+                                   (if (or (<= @limit (count batch)) (and max-input (>= in max-input)))
+                                     (do (apply! batch nil) [])
+                                     batch)))
+                    ;; Cut buffered events exactly as if they had been accumulated
+                    ;; while reading; returns the open (partial) batch.
+                    drain! (fn [events] (vreset! input 0) (reduce accumulate [] events))]
+                (when claimed (own! claimed))
+                (try
+                  ;; OPT-10 (W2-C2): a resumed build's staged rows were folded
+                  ;; under the staged index names. Checked inside the try, so a
+                  ;; mismatch releases the claim (the staged fold is kept).
+                  (keyed-check-index-layout! staged d)
+                  (let [remaining (reduce
+                                    (fn [batch event]
+                                      (if (pos? (compare (:event/id event) through)) (reduced batch)
+                                        (do
+                                          (when (and stable? (not @accepted?))
+                                            (empty-proof-forget! proof-key))
+                                          (vreset! accepted? true)
+                                          (deferred-progress! @staging)
+                                          (if-not @decided?
+                                            (let [batch (conj batch event)
+                                                  ;; The undecided buffer also respects the input
+                                                  ;; budget (INT audit condition 1): a backlog that
+                                                  ;; reaches :max-input-bytes is large, so it is
+                                                  ;; deferred now, and drain! then cuts its batches at
+                                                  ;; the budget. drain! resets the counter, so input is
+                                                  ;; never double-counted. Without a budget (explicit
+                                                  ;; :read-model/batch-size) only the threshold decides.
+                                                  in (if max-input (vswap! input + (keyed-input-size event)) 0)]
+                                              (if (and (< (count batch) threshold)
+                                                       (not (and max-input (>= in max-input))))
+                                                (do (vreset! buffered batch) batch)
+                                                (let [c (deferred-claim! ctx identity b)]
+                                                  (when (= :wait c)
+                                                    (throw (ex-info "Another process is building this model"
+                                                                    {:type ::deferred-await})))
+                                                  (when (= :restart c)
+                                                    (throw (ex-info "Another build published this model"
+                                                                    {:type ::deferred-restart})))
+                                                  (vreset! decided? true) (vreset! buffered nil)
+                                                  (own! c)
+                                                  (drain! batch))))
+                                            (accumulate batch event)))))
+                                    [] (if (seq query) (es/read source query) []))
+                        remaining (if @decided? remaining
+                                    (do (vreset! decided? true) (vreset! buffered nil) (drain! remaining)))]
+                    (when (seq remaining)
+                      (apply! remaining through))
+                    ;; Only a completed, ordered read with no accepted source events
+                    ;; can suppress a checkpoint. Route-empty events are not absence.
+                    (if-let [s @staging]
+                      (keyed-checkpoint! (assoc ctx ::deferred s) d (:prefix s) through)
+                      (when-not (or (seq remaining)
+                                    (and stable? (not @accepted?)
+                                         (empty-proof-remember! source proof-key after through)))
+                        (keyed-checkpoint! ctx d b through)))
+                    (if-let [s @staging]
+                      (do (try (deferred-build! ctx d s)
+                               (catch Throwable t
+                                 (when-not (= ::deferred-superseded (:type (ex-data t)))
+                                   (try (deferred-abandon! ctx identity s true)
+                                        (catch Throwable cleanup (.addSuppressed t cleanup))))
+                                 (throw t)))
+                          ;; Publishing is the last step before the read snapshot.
+                          (or (deferred-publish! ctx identity b s)
+                              (do (deferred-abandon! ctx identity s false)
+                                  (restart (assoc ctx ::no-deferral true)))))
+                      (do
+                        ;; Housekeeping only after a successful warm catch-up that
+                        ;; applied events: a failing batch leaves the cache exactly
+                        ;; as it was, and a read with no new events writes nothing.
+                        (when (and @accepted? (not deferrable?) (:watermark progress) identity)
+                          (deferred-clean-stale! ctx identity))
+                        b)))
+                  (catch Throwable e
+                    (let [s @staging]
+                      (cond
+                        (= ::deferred-await (:type (ex-data e)))
+                        (do (deferred-await! ctx identity) (restart ctx))
+
+                        (= ::deferred-restart (:type (ex-data e)))
+                        (restart ctx)
+
+                        (nil? s)
+                        (do
+                          ;; Like ordinary batches, batches that were complete
+                          ;; before a source failure stay committed.
+                          (when-not @decided?
+                            (try (drain! @buffered) (catch Throwable x (.addSuppressed e x))))
+                          (throw e))
+
+                        ;; Another process took over this build: read what it publishes.
+                        (= ::deferred-superseded (:type (ex-data e)))
+                        (restart ctx)
+
+                        :else
+                        (do
+                          ;; Keep the staged fold: the next attempt resumes from
+                          ;; its watermark, so a failing source still converges.
+                          (some-> @beat (apply []))
+                          (try (deferred-release! ctx s) (catch Throwable x (.addSuppressed e x)))
+                          (throw e)))))
+                  (finally (some-> @beat (apply []))))))))))))
+
+(defn- keyed-catch-up!
+  "Apply events through the captured head. Returns the model's data prefix,
+   which differs from b only after a deferred cold build was published.
+   Restarts (after awaiting or being superseded by another build) loop here
+   with a re-resolved prefix, never recursing."
+  [ctx name d b through identity]
+  (loop [ctx ctx b b]
+    (let [r (keyed-catch-up-step! ctx name d b through identity)]
+      (if (and (vector? r) (= ::restart (nth r 0 nil)))
+        (let [ctx (nth r 1)]
+          (recur ctx (or (keyed-resolve ctx identity) b)))
+        r))))
 
 (defn- keyed-identity-of [ctx] [(:tenant-id ctx) (:read-model/scope ctx)])
 
@@ -2161,9 +4511,7 @@
           (throw (ex-info "Expected a registered keyed fold" {:model name}))))
       ;; Duplicate requests still validate their own configuration even when
       ;; their namespace's catch-up is shared with an earlier request.
-      (when (and (seq names) (not (pos-int? (:read-model/batch-size ctx 128))))
-        (throw (ex-info "Keyed-fold batch size must be positive"
-                        {:batch-size (:read-model/batch-size ctx 128)}))))
+      (when (seq names) (keyed-batch-policy ctx)))
     (let [;; Reuse only immutable address preparation within this session. Heads,
           ;; registry validation and the snapshot are still acquired on every
           ;; session; nothing survives into a later request or cache reopen.
@@ -2185,22 +4533,26 @@
                                   (distinct names))]) requests)
           {:keys [prefixes prepared]}
           (locking cache
-            (let [prefixes (namespace-resolve! cache @identity-order)
+            (let [resolved (namespace-resolve! cache @identity-order)
+                  ;; A published deferred build replaces a model's prefix.
+                  prefixes (volatile! resolved)
                   heads (reduce (fn [heads [ctx _ _]]
                                   (let [id (:tenant-id ctx)]
                                     (if (contains? heads id) heads (assoc heads id (keyed-head ctx))))) {} requests)
                   caught-up (volatile! #{})
                   prepared (mapv
                              (fn [[ctx shared-identity model-identities]]
-                               (let [identity-prefix (get prefixes shared-identity)]
+                               (let [identity-prefix (get @prefixes shared-identity)]
                                  (doseq [[name identity] model-identities
                                          :when (not (contains? @caught-up identity))]
-                                   (keyed-catch-up! (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix identity-prefix)
-                                              name (get registry name) (get prefixes identity)
-                                              (get heads (:tenant-id ctx)) identity)
+                                   (let [b (get @prefixes identity)
+                                         current (keyed-catch-up! (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix identity-prefix)
+                                                                  name (get registry name) b
+                                                                  (get heads (:tenant-id ctx)) identity)]
+                                     (vswap! prefixes assoc identity (or current b)))
                                    (vswap! caught-up conj identity))
                                [ctx (select-keys registry (keys model-identities)) model-identities])) requests)]
-              {:prefixes prefixes :prepared prepared}))]
+              {:prefixes @prefixes :prepared prepared}))]
       (kv/transact cache :read
         (fn [tx]
           (f (mapv (fn [[ctx definitions model-identities]]
@@ -2243,7 +4595,7 @@
                (if right (membership-decode right) (RoaringBitmap.)))))))))
 
 (defn keyed-progress [ctx name d]
-  (keyed-with-reader ctx name d (fn [tx b _d _read] (keyed-read-meta tx (keyed-progress-key b)))))
+  (keyed-with-reader ctx name d (fn [tx b _d _read] (keyed-public-progress (keyed-read-meta tx (keyed-progress-key b))))))
 
 (defn keyed-search-keys [ctx name d options]
   (keyed-with-reader ctx name d
@@ -2330,6 +4682,17 @@
              :total total :total-pages pages :page page :page-size limit
              :sort-keys-read (aget counts 0)}))))))
 
+(defn- keyed-leaf-config
+  "OPT-9 W8: ranked-filtered-page returns owner ids for real leaves."
+  [cfg d index direction]
+  (assoc cfg ::leaf-payload (fn [^bytes member ^bytes v] (keyed-entry-id d index direction member 0 v))))
+
+(defn- keyed-page-key
+  "Real leaves arrive as decoded ids (keyed-leaf-config); virtual joined-page
+   members keep their Fressian payload. Ids are never byte arrays."
+  [p]
+  (if (bytes? p) (codec/decode p) p))
+
 (defn keyed-filtered-key-page [ctx name d keys options]
   (let [{:keys [index direction page limit]
          :or {index :identity direction :asc page 1 limit 25}} options]
@@ -2345,11 +4708,13 @@
             (let [ordinal (membership-ordinal tx b id)]
               (keyed-observe! ctx :candidate-ordinal-read (if (some? ordinal) 4 0))
               (when (some? ordinal) (.add candidates (int ordinal)))))
-          (let [result (ranked-filtered-page tx (keyed-membership-config b d index direction)
-                                            candidates page limit #(keyed-observe! ctx %1 %2))]
+          (let [result (ranked-filtered-page tx (keyed-leaf-config (keyed-read-config tx b d (keyed-membership-config b d index :asc) index)
+                                                                   d index :asc)
+                                            candidates page limit #(keyed-observe! ctx %1 %2) []
+                                            direction (keyed-value-length d index))]
             (-> result
                 (dissoc :payloads)
-                (assoc :keys (mapv codec/decode (:payloads result))
+                (assoc :keys (mapv keyed-page-key (:payloads result))
                        :candidate-keys-read @examined :sort-keys-read 0))))))))
 
 (defn keyed-joined-page [ctx membership-name membership-d name d options]
@@ -2361,7 +4726,7 @@
                    (#{:asc :desc} direction) (pos-int? page) (pos-int? limit))
       (throw (ex-info "Joined page requires a ranked index and an explicit missing value"
                       {:model name :options options})))
-    (let [missing-prefix (keyed-sort-bytes missing-value direction)]
+    (let [missing-prefix (keyed-sort-bytes missing-value :asc)]
       (if-not (:ai.obney.grain.read-model-processor-v2.core.keyed/session ctx)
         (keyed-read-session [[ctx [membership-name name]]] {membership-name membership-d name d}
                       (fn [[prepared]] (keyed-joined-page prepared membership-name membership-d name d options)))
@@ -2369,7 +4734,8 @@
           (fn [tx membership-base _ membership-read]
             (keyed-with-reader ctx name d
               (fn [_ b _ _]
-                (let [cfg (keyed-membership-config b d index direction)
+                (let [cfg (keyed-leaf-config (keyed-read-config tx b d (keyed-membership-config b d index :asc) index)
+                                             d index :asc)
                       observe #(keyed-observe! ctx %1 %2)
                       live (ranked-members tx cfg observe)
                       candidates (RoaringBitmap.) virtual (ArrayList.)
@@ -2382,7 +4748,7 @@
                                      (.add candidates (int ordinal))
                                      (do (observe :join-default-key 0)
                                          (.add virtual (RankedVirtualMember.
-                                                         (key-join missing-prefix (key-encode (str id)) (key-encode id))
+                                                         (key-join missing-prefix (key-id-suffix id))
                                                          (codec/encode id)))))))]
                   (if (contains? options :keys)
                     (let [seen (HashSet.)]
@@ -2395,14 +4761,16 @@
                              (fn [^RankedVirtualMember a ^RankedVirtualMember b]
                                (Arrays/compareUnsigned (.-member a) (.-member b)))))
                     ;; Identity order supplies default ties directly, even for desc.
-                    (let [prefix (keyed-index-prefix membership-base :identity :asc)]
+                    (let [prefix (keyed-index-prefix membership-base membership-d :identity :asc)
+                          offset (alength ^bytes prefix)]
                       ((:reduce tx) {:prefix prefix :from (ranked-after prefix)}
-                       (fn [_ {:keys [v]}]
+                       (fn [_ {:keys [k v]}]
                          (observe :join-membership-entry (alength ^bytes v))
-                         (collect! (codec/decode v)) nil) nil)))
-                  (let [result (ranked-filtered-page tx cfg candidates page limit observe virtual)]
+                         (collect! (keyed-entry-id membership-d :identity :asc k offset v)) nil) nil)))
+                  (let [result (ranked-filtered-page tx cfg candidates page limit observe virtual
+                                                     direction (keyed-value-length d index))]
                     (-> result (dissoc :payloads)
-                        (assoc :keys (mapv codec/decode (:payloads result))
+                        (assoc :keys (mapv keyed-page-key (:payloads result))
                                :membership-keys-examined @examined
                                :defaulted-keys (.size virtual) :sort-keys-read 0))))))))))))
 
@@ -2419,28 +4787,46 @@
       (throw (ex-info "Unknown result index or direction" {:model name :options options})))
     nil))
 
-(defn- keyed-selection-prefix [d options]
-  (let [compact? (keyed-compact-identity? d (:index options :identity))
-        encoded (cond
-                  (contains? options :equals) ((if compact? key-encode-compact key-encode) (:equals options))
-                  (contains? options :prefix) ((if compact? key-compact-tuple-prefix key-tuple-prefix) (:prefix options)))]
-    (cond-> encoded (and encoded (= :desc (:direction options))) key-descending)))
+(defn- keyed-selection-prefix
+  "Encoded selection value or tuple prefix (ascending bytes in both directions)."
+  [_d options]
+  (cond
+    (contains? options :equals) (key-encode (:equals options))
+    (contains? options :prefix) (key-tuple-prefix (:prefix options))))
 
 (defn- keyed-selection [b name d options]
   (keyed-validate-selection! name d options)
-  (let [prefix (keyed-selection-prefix d options)]
-    (cond-> (keyed-index-prefix b (:index options :identity) (:direction options :asc))
+  (let [index (:index options :identity)
+        prefix (keyed-selection-prefix d options)]
+    (cond-> (keyed-index-prefix b d index :asc)
       prefix (key-join prefix))))
 
 (defn- keyed-reduce-results [ctx name d tx b read options rf initial]
-  (let [prefix (keyed-selection b name d options)]
-    (if-not (keyed-fits-prefix? prefix) initial
+  (let [prefix (keyed-selection b name d options)
+        index (:index options :identity)
+        ;; Members are read from the ascending structure in both directions
+        ;; (OPT-5/OPT-7); ids decode from the member (OPT-9 W8).
+        offset (alength ^bytes (keyed-index-prefix b d index :asc))
+        step (fn [acc id]
+               (keyed-observe! ctx :index-entry 0)
+               (let [entry (keyed-decode ctx :result-decoded (read 2 id))]
+                 (rf acc (select-keys entry [:key :value]))))]
+    (cond
+      (not (keyed-fits-prefix? prefix)) initial
+      (= :desc (:direction options :asc))
+      ;; prefix is the ascending level-zero prefix plus the selection bytes;
+      ;; with no selection, start after the level-zero sentinel.
+      (let [cfg (keyed-index-config b d index :asc)
+            selected? (some? (keyed-selection-prefix d options))]
+        (ranked-desc-reduce tx cfg (keyed-value-length d index)
+                            (if selected? prefix (ranked-after prefix))
+                            (when selected? (key-prefix-end prefix))
+                            256 (fn [acc ^objects item]
+                                  (step acc (keyed-entry-id d index :asc (aget item 0) 0 (aget item 1))))
+                            initial))
+      :else
       ((:reduce tx) {:prefix prefix :from (ranked-after prefix)}
-     (fn [acc {:keys [v]}]
-       (keyed-observe! ctx :index-entry 0)
-       (let [id (codec/decode v)
-             entry (keyed-decode ctx :result-decoded (read 2 id))]
-         (rf acc (select-keys entry [:key :value])))) initial))))
+       (fn [acc {:keys [k v]}] (step acc (keyed-entry-id d index :asc k offset v))) initial))))
 
 (defn keyed-values [ctx name d options]
   ;; No resource is opened until reduction. A session-bound reducible must be
@@ -2467,25 +4853,58 @@
 (defn- keyed-page-ranges [tx cfg prefixes total]
   ;; Rank intervals are already in index order, including descending indexes.
   ;; Merging overlapping intervals makes duplicate/nested prefixes a true union.
-  (reduce (fn [ranges [start end :as interval]]
-            (if-let [[previous-start previous-end] (peek ranges)]
-              (if (<= start previous-end)
-                (conj (pop ranges) [previous-start (max end previous-end)])
-                (conj ranges interval))
-              [interval]))
-          []
-          (sort-by first
-                   (keep (fn [prefix]
-                           (when (or (nil? prefix) (keyed-fits-prefix? cfg prefix))
-                             (let [start (if prefix (ranked-rank tx cfg prefix false) 0)
-                                 end (if prefix
-                                       (if-let [end (key-prefix-end prefix)]
-                                         (ranked-rank tx cfg end false)
-                                         (ranked-size tx cfg))
-                                       total)]
-                             (when (< start end) [start end])))) prefixes))))
+  ;; Each interval also carries packed level-zero key bounds [lo, hi) (hi nil
+  ;; = end of level zero) for descending reads from the ascending structure;
+  ;; intervals that merge are adjacent in rank, so the union of their key
+  ;; ranges holds no other member.
+  (let [p0 (ranked-prefix cfg 0)
+        key-min (fn [^bytes a ^bytes b] (if (neg? (Arrays/compareUnsigned a b)) a b))
+        key-max (fn [^bytes a ^bytes b] (if (or (nil? a) (nil? b)) nil (if (neg? (Arrays/compareUnsigned a b)) b a)))]
+    (reduce (fn [ranges [start end lo hi :as interval]]
+              (if-let [[previous-start previous-end previous-lo previous-hi] (peek ranges)]
+                (if (<= start previous-end)
+                  (conj (pop ranges) [previous-start (max end previous-end)
+                                      (key-min lo previous-lo) (key-max hi previous-hi)])
+                  (conj ranges interval))
+                [interval]))
+            []
+            (sort-by first
+                     (keep (fn [prefix]
+                             (when (or (nil? prefix) (keyed-fits-prefix? cfg prefix))
+                               (let [start (if prefix (ranked-rank tx cfg prefix false) 0)
+                                     prefix-end (when prefix (key-prefix-end prefix))
+                                     end (if prefix
+                                           (if prefix-end
+                                             (ranked-rank tx cfg prefix-end false)
+                                             (ranked-size tx cfg))
+                                           total)]
+                                 (when (< start end)
+                                   [start end
+                                    (if prefix (key-join p0 prefix) (ranked-after p0))
+                                    (when prefix-end (key-join p0 prefix-end))])))) prefixes)))))
 
-(defn- keyed-read-page-ranges [ctx tx navigation-tx cfg read ranges offset limit]
+(defn- keyed-read-desc-page-ranges
+  "Descending page from ascending rank intervals: intervals from the top, each
+   read by ranked-desc-items (runs of equal value re-reversed)."
+  [ctx tx navigation-tx cfg vlen read ranges offset limit id-of]
+  (loop [ranges (seq (reverse ranges)) offset offset entries []]
+    (if-let [[start end lo hi] (first ranges)]
+      (let [size (- end start)]
+        (if (>= offset size)
+          (recur (next ranges) (- offset size) entries)
+          (let [items (ranked-desc-items (ranked-range-navigator navigation-tx cfg lo hi start end)
+                                         vlen offset (min (- size offset) (- limit (count entries))))
+                entries (reduce (fn [entries ^objects item]
+                                  (keyed-observe! ctx :index-entry 0)
+                                  (let [id (id-of (aget item 0) (aget item 1))
+                                        entry (keyed-decode ctx :result-decoded (read 2 id))]
+                                    (conj entries (select-keys entry [:key :value]))))
+                                entries items)]
+            (if (= limit (count entries)) entries
+              (recur (next ranges) 0 entries)))))
+      entries)))
+
+(defn- keyed-read-page-ranges [ctx tx navigation-tx cfg read ranges offset limit id-of]
   (loop [ranges (seq ranges) offset offset entries []]
     (if-let [[start end] (first ranges)]
       (let [size (- end start)]
@@ -2494,9 +4913,9 @@
           (let [stop (+ (count entries) (min (- size offset) (- limit (count entries))))
                 member (ranked-get-nth navigation-tx cfg (+ start offset))
                 entries ((:reduce tx) {:prefix (ranked-prefix cfg 0) :from (ranked-pack cfg 0 member)}
-                         (fn [entries {:keys [v]}]
+                         (fn [entries {:keys [k v]}]
                            (keyed-observe! ctx :index-entry 0)
-                           (let [id (codec/decode v)
+                           (let [id (id-of k v)
                                  entry (keyed-decode ctx :result-decoded (read 2 id))
                                  entries (conj entries (select-keys entry [:key :value]))]
                              (if (= stop (count entries)) (reduced entries) entries))) entries)]
@@ -2512,7 +4931,9 @@
   (let [prefixes (keyed-page-prefixes name d options)]
     (keyed-with-reader ctx name d
       (fn [tx b d read]
-        (let [cfg (keyed-index-config b (:index options :identity) (:direction options :asc))
+        (let [index (:index options :identity)
+              direction (:direction options :asc)
+              cfg (keyed-read-config tx b d (keyed-index-config b d index :asc) index)
               rank-examined (volatile! 0)
               navigation-tx (assoc tx :reduce
                                    (fn [bounds rf initial]
@@ -2526,11 +4947,17 @@
               limit (:limit options 25)
               pages (max 1 (quot (+ total (dec limit)) limit))
               page (min (:page options 1) pages)
-              entries (keyed-read-page-ranges ctx tx navigation-tx cfg read ranges (* (dec page) limit) limit)]
+              member-offset (alength ^bytes (ranked-prefix cfg 0))
+              entries (if (= :desc direction)
+                        (keyed-read-desc-page-ranges ctx tx navigation-tx cfg (keyed-value-length d index)
+                                                     read ranges (* (dec page) limit) limit
+                                                     #(keyed-entry-id d index :asc %1 0 %2))
+                        (keyed-read-page-ranges ctx tx navigation-tx cfg read ranges (* (dec page) limit) limit
+                                                #(keyed-entry-id d index :asc %1 member-offset %2)))]
           {:entries entries :total total :total-pages pages :page page :page-size limit
            :rows-examined (count entries) :rank-entries-examined @rank-examined
            :results-decoded (count entries)
-           :progress (keyed-read-meta tx (keyed-progress-key b))})))))
+           :progress (keyed-public-progress (keyed-read-meta tx (keyed-progress-key b)))})))))
 
 (defn- keyed-navigation-reader [ctx tx]
   (assoc tx :reduce
@@ -2545,18 +4972,60 @@
               (ranked-rank tx cfg end false) (ranked-size tx cfg))]
     [first end]))
 
+(defn- keyed-identity-count
+  "OPT-9 W6: members of the :identity index whose value (str id) equals
+   value; what its stored group :total was."
+  [tx b d value]
+  (let [p (key-join (keyed-index-prefix b d :identity :asc) (keyed-index-sort-bytes d :identity value :asc))]
+    (if (keyed-fits-prefix? p) ((:reduce tx) {:prefix p} (fn [n _] (inc n)) 0) 0)))
+
+(defn- keyed-identity-groups
+  "OPT-9 W6: :identity groups derived from level zero, equal to the
+   {:value :total} records KF9 stored: same values, totals and order (member
+   values order strings as group keys do, and members of one value are
+   contiguous)."
+  [ctx tx b d values]
+  (let [group-prefix (ranked-prefix (keyed-index-config b d :identity :asc) 6)]
+    (if (some? values)
+      (keyed-reduce-distinct (fn [groups value]
+                               (keyed-observe! ctx :index-group 0)
+                               ;; Same oversized-key failure as a stored group lookup.
+                               (key-checked (key-join group-prefix (key-encode value)))
+                               (let [n (keyed-identity-count tx b d value)]
+                                 (if (pos? n) (conj groups {:value value :total n}) groups))) [] values)
+      (let [prefix (keyed-index-prefix b d :identity :asc)
+            offset (alength ^bytes prefix)
+            close (fn [groups ^objects open]
+                    (if (aget open 0)
+                      (do (keyed-observe! ctx :index-group 0)
+                          (conj groups {:value (aget open 0) :total (aget open 1)}))
+                      groups))
+            open (object-array 2)]
+        (close ((:reduce tx) {:prefix prefix :from (ranked-after prefix)}
+                (fn [groups {:keys [^bytes k]}]
+                  (let [value (member-read! k (doto (long-array 2) (aset 0 (long offset)) (aset 1 (alength k))) 0 true)]
+                    (if (= value (aget open 0))
+                      (do (aset open 1 (num (inc (long (aget open 1))))) groups)
+                      (let [groups (close groups open)]
+                        (aset open 0 value) (aset open 1 (num 1))
+                        groups)))) [])
+               open)))))
+
 (defn keyed-index-groups
   ([ctx name d index] (keyed-index-groups ctx name d index nil))
   ([ctx name d index values]
    (keyed-validate-selection! name d {:index index})
    (keyed-with-reader ctx name d
      (fn [tx b _ _read]
-       (let [prefix (ranked-prefix (keyed-index-config b index :asc) 6)]
-         (if (some? values)
+       (let [prefix (ranked-prefix (keyed-index-config b d index :asc) 6)]
+         (cond
+           (= :identity index) (keyed-identity-groups ctx tx b d values)
+           (some? values)
            (keyed-reduce-distinct (fn [groups value]
                               (keyed-observe! ctx :index-group 0)
                               (if-let [group (keyed-read-meta tx (key-checked (key-join prefix (key-encode value))))]
                                 (conj groups group) groups)) [] values)
+           :else
            ((:reduce tx) {:prefix prefix}
             (fn [groups {:keys [v]}]
               (keyed-observe! ctx :index-group 0)
@@ -2576,36 +5045,45 @@
     (keyed-validate-group! name d selection)
     (keyed-with-reader ctx name d
       (fn [tx b _ _read]
-        (let [cfg (keyed-index-config b (:index options :identity) (:direction options :asc))
+        ;; One equal-value group is in the same (ascending id) order in both
+        ;; directions, so it is always read from the ascending structure.
+        (let [cfg (keyed-read-config tx b d (keyed-index-config b d (:index options :identity) :asc)
+                                     (:index options :identity))
               offset (:offset options 0) limit (:limit options 25)
               prefix (key-join (ranked-prefix cfg 0)
-                               (keyed-index-sort-bytes d (:index options :identity) (:equals options) (:direction options :asc)))
+                               (keyed-index-sort-bytes d (:index options :identity) (:equals options) :asc))
               start (when (keyed-fits-prefix? prefix)
                       (if (zero? offset)
                       prefix
                       (let [navigation (keyed-navigation-reader ctx tx)
-                            [first end] (keyed-group-bounds navigation cfg d (:index options :identity) (:direction options :asc) (:equals options))]
+                            [first end] (keyed-group-bounds navigation cfg d (:index options :identity) :asc (:equals options))]
                         (when (< offset (- end first))
                           (ranked-pack cfg 0 (ranked-get-nth navigation cfg (+ first offset)))))))]
           (if-not start []
+              (let [index (:index options :identity) direction :asc
+                    member-offset (alength ^bytes (ranked-prefix cfg 0))]
               ((:reduce tx) {:prefix prefix :from start}
-               (fn [ids {:keys [v]}]
+               (fn [ids {:keys [k v]}]
                  (keyed-observe! ctx :index-entry 0)
-                 (let [ids (conj ids (codec/decode v))]
-                   (if (= limit (count ids)) (reduced ids) ids))) [])))))))
+                 (let [ids (conj ids (keyed-entry-id d index direction k member-offset v))]
+                   (if (= limit (count ids)) (reduced ids) ids))) []))))))))
 
 (defn keyed-index-rank [ctx name d selection id]
   (keyed-validate-group! name d selection)
   (when (nil? id) (throw (ex-info "Instance key cannot be nil" {:model name})))
   (keyed-with-reader ctx name d
-    (fn [tx b _ _read]
-      (let [tx (keyed-navigation-reader ctx tx) direction (:direction selection :asc)
+    (fn [raw-tx b _ _read]
+      ;; Ranks within one equal-value group are direction independent
+      ;; (OPT-5/OPT-7: read from the ascending structure).
+      (let [tx (keyed-navigation-reader ctx raw-tx) direction :asc
             index (:index selection :identity) value (:equals selection)
-            cfg (keyed-index-config b index direction)]
+            cfg (keyed-read-config tx b d (keyed-index-config b d index direction) index)]
         (if (and (keyed-compact-identity? d index) (not= value (str id)))
-          (let [group-key (key-join (ranked-prefix (keyed-index-config b index :asc) 6) (key-encode value))
-                group (when (<= (alength ^bytes group-key) 511) (keyed-read-meta tx group-key))]
-            {:rank (if (and group (string? value) (pos? (compare (str id) value))) (:total group) 0)
+          ;; OPT-9 W6: the :identity group's total is counted from
+          ;; level zero (no stored group); only needed when id sorts after it.
+          (let [group-key (key-join (ranked-prefix (keyed-index-config b d index :asc) 6) (key-encode value))]
+            {:rank (if (and (<= (alength ^bytes group-key) 511) (string? value) (pos? (compare (str id) value)))
+                     (keyed-identity-count raw-tx b d value) 0)
              :present? false})
           (let [member (keyed-index-member d index direction value id)
                 first (ranked-rank tx cfg (keyed-index-sort-bytes d index value direction) false)]

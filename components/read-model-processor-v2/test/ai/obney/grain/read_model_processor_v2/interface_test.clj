@@ -1592,35 +1592,56 @@
         (is (= {:count 1} (rmp/p (make-context) (make-args))))))))
 
 ;; fold key test
-(defn- fold-key-read-physical-key! [^ByteBuffer in]
-  (case (bit-and 255 (.get in))
-    1 nil 2 false 3 true
-    16 (let [out (StringBuilder.)
-             read-unit (fn [] (let [b (bit-and 255 (.get in))]
-                               (if (zero? b)
-                                 (case (bit-and 255 (.get in)) 0 -1 255 0
-                                   (throw (ex-info "Invalid ordered string escape" {}))) b)))]
-         (loop []
-           (let [hi (read-unit)]
-             (if (= -1 hi) (.toString out)
-               (let [lo (read-unit)]
-                 (when (= -1 lo) (throw (ex-info "Truncated ordered character" {})))
-                 (.append out (char (+ (bit-shift-left hi 8) lo))) (recur))))))
-    32 (bit-xor (.getLong in) Long/MIN_VALUE)
-    48 (UUID. (.getLong in) (.getLong in))
-    56 (keyword (subs (fold-key-read-physical-key! in) 1))
-    64 (loop [out []]
-         (.mark in)
-         (if (zero? (.get in)) out
-           (do (.reset in) (recur (conj out (fold-key-read-physical-key! in))))))
-    (throw (ex-info "Invalid ordered key type" {}))))
+;; OPT-8: an independent test oracle for the ordered key grammar (see the
+;; encoding comment at core key-write-key!); production decodes with
+;; core/key-decode-compact.
+(defn- fold-key-read-ordered-string! [^ByteBuffer in t]
+  (let [out (StringBuilder.)
+        u (fn [] (bit-and 255 (.get in)))
+        noncanonical #(throw (ex-info "Noncanonical ordered character" {}))
+        escape #(throw (ex-info "Invalid ordered string escape" {}))
+        unit (fn [] (let [hi (u) lo (u)] (+ (bit-shift-left hi 8) lo)))]
+    (loop [a? (case (long t)
+                0 false
+                1 (let [c (u)] (when (< c 2) (noncanonical)) (.append out (char c)) true)
+                2 (let [c (unit)] (when (< c 256) (noncanonical)) (.append out (char c)) false))]
+      (let [b (u)]
+        (if a?
+          (cond (zero? b) (.toString out)
+                (= 1 b) (let [c (u)] (when (> c 2) (escape)) (.append out (char c)) (recur true))
+                (= 255 b) (let [c (unit)] (when (< c 256) (noncanonical)) (.append out (char c)) (recur false))
+                :else (do (.append out (char (inc b))) (recur true)))
+          (if (zero? b)
+            (let [e (u)]
+              (cond (zero? e) (.toString out)
+                    (= 1 e) (let [c (u)] (when (> c 1) (escape)) (.append out (char c)) (recur false))
+                    :else (do (.append out (char e)) (recur true))))
+            (do (.append out (char (+ (bit-shift-left b 8) (u)))) (recur false))))))))
 
-(defn fold-key-decode-physical
-  "Test oracle for physical key round-trips; production only decodes metadata."
-  ([^bytes value] (fold-key-decode-physical value 0 (alength value)))
+(defn- fold-key-read-ordered-key! [^ByteBuffer in]
+  (let [tag (bit-and 255 (.get in))]
+    (cond
+      (= tag 1) nil (= tag 2) false (= tag 3) true
+      (<= 16 tag 18) (fold-key-read-ordered-string! in (- tag 16))
+      (<= 24 tag 40) (let [n (Math/abs (long (- tag 32)))
+                           x (reduce (fn [x _] (+ (* 256 x) (bit-and 255 (.get in)))) 0N (range n))]
+                       (long (cond (= tag 32) 0
+                                   (> tag 32) x
+                                   :else (- (- (.pow (biginteger 256) (int n)) 1 x)))))
+      (= tag 48) (UUID. (.getLong in) (.getLong in))
+      (<= 56 tag 58) (keyword (fold-key-read-ordered-string! in (- tag 56)))
+      (= tag 64) (loop [out []]
+                   (.mark in)
+                   (if (zero? (.get in)) out
+                     (do (.reset in) (recur (conj out (fold-key-read-ordered-key! in))))))
+      :else (throw (ex-info "Invalid ordered key type" {})))))
+
+(defn fold-key-decode-ordered
+  "Test oracle for ordered key round-trips (independent of core's decoder)."
+  ([^bytes value] (fold-key-decode-ordered value 0 (alength value)))
   ([^bytes value ^long offset ^long length]
    (try
-     (fold-key-read-physical-key! (ByteBuffer/wrap value offset length))
+     (fold-key-read-ordered-key! (ByteBuffer/wrap value offset length))
      (catch BufferUnderflowException _ (throw (EOFException.))))))
 
 (defn fold-key-encoded-order [xs encode]
@@ -1670,34 +1691,40 @@
                  (String. (char-array (map char (range 65536))))]]
     (let [encoded (core/key-encode value)
           data (core/key-join (byte-array [99 98 97]) encoded (core/key-encode "following field"))]
-      (is (= value (fold-key-decode-physical encoded)))
-      (is (= value (fold-key-decode-physical data 3 (alength encoded))))
-      (is (thrown? java.io.EOFException (fold-key-decode-physical data 3 (dec (alength encoded))))
+      (is (= value (fold-key-decode-ordered encoded)))
+      (is (= value (fold-key-decode-ordered data 3 (alength encoded))))
+      (is (thrown? java.io.EOFException (fold-key-decode-ordered data 3 (dec (alength encoded))))
           "A truncated field must not consume its following field")
-      (let [decoded (fold-key-decode-physical data 3 (alength encoded))]
+      (let [decoded (fold-key-decode-ordered data 3 (alength encoded))]
         (java.util.Arrays/fill data (byte 0))
         (is (= value decoded) "Results do not retain the mutable input view"))))
+  ;; OPT-8 grammar: 00 01 c in state B only escapes units 0 and 1; tag 11
+  ;; only starts with a unit in [2, 256); a truncated unit is EOF.
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid ordered string escape"
-                       (fold-key-decode-physical (byte-array [16 0 1]))))
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Truncated ordered character"
-                       (fold-key-decode-physical (byte-array [16 1 0 0])))))
+                       (fold-key-decode-ordered (byte-array [16 0 1 2 0 0]))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Noncanonical ordered character"
+                       (fold-key-decode-ordered (byte-array [17 1 0]))))
+  (is (thrown? java.io.EOFException (fold-key-decode-ordered (byte-array [18 78])))))
 
 (deftest string-encoding-preserves-stored-bytes
-  ;; These are the existing wire bytes, expressed as unsigned decimal values.
+  ;; OPT-8 wire bytes (mixed-script string code), unsigned decimal values.
   (doseq [[value expected] [["" [16 0 0]]
-                           ["Ada" [16 0 255 65 0 255 100 0 255 97 0 0]]
-                           ["\u0000" [16 0 255 0 255 0 0]]
-                           ["\u00ff\u0100" [16 0 255 255 1 0 255 0 0]]
-                           ["\ud83d\ude00" [16 216 61 222 0 255 0 0]]
-                           ["\ud800" [16 216 0 255 0 0]]
-                           ["\udfff" [16 223 255 0 0]]]]
+                           ["Ada" [17 65 99 96 0]]
+                           ["\u0000" [16 0 1 0 0 0]]
+                           ["\u00ff\u0100" [17 255 255 1 0 0 0]]
+                           ["\ud83d\ude00" [18 216 61 222 0 0 0]]
+                           ["\ud800" [18 216 0 0 0]]
+                           ["\udfff" [18 223 255 0 0]]
+                           [:a/b [57 97 46 97 0]]
+                           [0 [32]] [-1 [31 254]] [256 [34 1 0]]]]
     (is (= expected (mapv #(bit-and 255 %) (core/key-encode value)))))
   ;; Cover every UTF-16 code unit, including unpaired surrogates. The digest
-  ;; freezes the old encoding; the length also checks zero-byte escaping.
+  ;; freezes the OPT-8 encoding; the length checks the state code:
+  ;; 1 tag + 3 + 3 (units 0, 1) + 2 (unit 2) + 253 + 3 (unit 256) + 2 x 65279 + 2.
   (let [value (String. (char-array (map char (range 65536))))
         encoded (core/key-encode value)]
-    (is (= 131587 (alength ^bytes encoded)))
-    (is (= "039b63a1afbedb79d5cd86d3e4fd896ec8d041380f1f6d7850fd21f1d1957d76"
+    (is (= 130825 (alength ^bytes encoded)))
+    (is (= "dad323ff40e109e3e0c8351e408acf6363f3907d32b7e00ffbece7f733e16a45"
            (.formatHex (java.util.HexFormat/of)
                        (.digest (java.security.MessageDigest/getInstance "SHA-256") encoded))))))
 
@@ -2042,7 +2069,7 @@
       (let [name (keyed-register! (fn [_ e] (select-keys e [:score])) {:indexes {:score :score}})
             random (java.util.Random. 72)
             seen (atom []) ctx (assoc *keyed-ctx* :read-model/observer #(swap! seen conj %))]
-        (with-redefs [core/ranked-random-hash (fn [_] (.nextInt random))]
+        (with-redefs [core/ranked-promotion-hash (fn [_ _ _ _] (.nextInt random))]
           (keyed-append! (mapv #(hash-map :owner (format "%05d" %)
                                     :score [(< % 3000) (quot % 2)]) (range 4096)))
           (rmp/page ctx name {}))
@@ -2114,7 +2141,7 @@
             random (java.util.Random. 321)
             work (atom []) ctx (assoc *keyed-ctx* :read-model/observer #(swap! work conj %))
             selection {:index :score :prefixes [["right"] ["left"] ["left" 0]] :limit 25}]
-        (with-redefs [core/ranked-random-hash (fn [_] (.nextInt random))]
+        (with-redefs [core/ranked-promotion-hash (fn [_ _ _ _] (.nextInt random))]
           (keyed-append! (mapv #(hash-map :owner (format "%05d" %) :included? true
                                     :score [(cond (< % 1500) "left" (< % 3500) "middle" :else "right")
                                             (quot % 2)]) (range 5000)))
@@ -2149,7 +2176,7 @@
             random (java.util.Random. 92)
             seen (atom []) ctx (assoc *keyed-ctx* :read-model/observer #(swap! seen conj %))]
         ;; Fixed random promotions make the work regression assertion reproducible.
-        (with-redefs [core/ranked-random-hash (fn [_] (.nextInt random))]
+        (with-redefs [core/ranked-promotion-hash (fn [_ _ _ _] (.nextInt random))]
           (keyed-append! (mapv #(hash-map :owner (format "%05d" %) :score (if (< % 3000) 0 1)) (range 4096)))
           (rmp/page ctx name {}))
         (doseq [options [{:index :score :page 164}
@@ -2719,12 +2746,12 @@
     (fn []
       (let [units (mapv #(str (char %)) (range 65536))
             encoded (mapv core/key-encode units)]
-        (is (every? true? (map #(= %1 (fold-key-decode-physical %2)) units encoded)))
+        (is (every? true? (map #(= %1 (fold-key-decode-ordered %2)) units encoded)))
         (is (every? neg? (map #(Arrays/compareUnsigned ^bytes %1 ^bytes %2) encoded (rest encoded))))
         (is (every? pos? (map #(Arrays/compareUnsigned ^bytes (core/key-descending %1) ^bytes (core/key-descending %2)) encoded (rest encoded)))))
       (doseq [a ["" "a" "a\u0000" "\u0000" "\u007f" "\u0080" "\u0101" "\ud800" "\udc00" "\ud800\udc00" "\ue000" "\uffff"]
               b ["" "a" "\u0000" "\u0101" "\uffff"]]
-        (is (= [a [b :x] 17] (fold-key-decode-physical (core/key-encode [a [b :x] 17]))))
+        (is (= [a [b :x] 17] (fold-key-decode-ordered (core/key-encode [a [b :x] 17]))))
         (let [prefix (core/key-tuple-prefix [a]) value (core/key-encode [a b])]
           (is (= (vec prefix) (vec (take (alength ^bytes prefix) value))))))
       (is (= 511 (alength ^bytes (core/key-checked (byte-array 511)))))
@@ -2766,8 +2793,9 @@
   (compact-cache-fixture
     (fn []
       (let [model (compact-cache-register! :compact-test/empty-boundary {})
-            overhead (alength ^bytes (#'core/keyed-index-prefix (byte-array 7) :identity :asc))
-            exact (apply str (repeat (- 511 overhead 3) "x"))
+            overhead (alength ^bytes (#'core/keyed-index-prefix (byte-array 7) {:indexes {}} :identity :asc))
+            ;; OPT-8: an ASCII string of n units encodes in n + 2 bytes.
+            exact (apply str (repeat (- 511 overhead 2) "x"))
             probes [exact (str exact "x") (apply str (repeat 200 "\u0101"))]]
         (is (= 511 (+ overhead (alength ^bytes (core/key-encode-compact exact)))))
         (compact-cache-append! (compact-cache-ctx) [{:owner "a" :score 1 :group ["a" 1] :text "alpha" :included? true}])
@@ -4161,7 +4189,7 @@
       (doseq [value [nil false true "" "a" "a\u0000b" "😀𐐀" (str (char 0xD800))
                      Long/MIN_VALUE -1 0 Long/MAX_VALUE :name :namespaced/name (random-uuid)
                      [] [nil "A" :x 42] [["nested"]]]]
-        (is (= value (fold-key-decode-physical (core/key-encode value))))))))
+        (is (= value (fold-key-decode-ordered (core/key-encode value))))))))
 
 (deftest repeated-and-concurrent-searches-match-literal-oracle
   (keyed-fixture
@@ -4261,7 +4289,7 @@
       (rmp/register-read-model! indexed step (assoc opts :filtered-indexes #{:name}))
       (es/append store {:tenant-id (:tenant-id ctx) :events events})
       ;; Same promotion decisions for both indexes: isolate membership overhead.
-      (with-redefs [core/ranked-random-hash ranked-set-crc-hash]
+      (with-redefs [core/ranked-promotion-hash (fn [_ _ _ k] (ranked-set-crc-hash k))]
         (let [build (into {} (for [model [plain indexed]]
                                (do (println :building n model) (flush)
                                    [model (dissoc (ranked-membership-measure #(rmp/progress ctx model)) :result)])))

@@ -80,7 +80,10 @@
 (defn run-build [batch n filtered? & [instrumentation]]
   (with-redefs-fn {batch-var batch} #(workload n filtered? instrumentation)))
 (defn median [values] (nth (vec (sort values)) (quot (count values) 2)))
-(with-redefs [core/ranked-random-hash #(java.util.Arrays/hashCode ^bytes %)]
+(with-redefs [;; Fixed promotion (the member's Arrays/hashCode) for reproducible counts.
+              ;; Pre-OPT-3 code drew from ranked-random-hash; since OPT-3 every promotion
+              ;; goes through ranked-promotion-hash [key prefix offset member].
+              core/ranked-promotion-hash (fn [_ _ _ member] (java.util.Arrays/hashCode ^bytes member))]
   (doseq [n [318 1000] filtered? [false true]]
     (dotimes [_ 4] (run-build legacy-batch n filtered?) (run-build candidate-batch n filtered?))
     (let [pairs (mapv (fn [iteration]

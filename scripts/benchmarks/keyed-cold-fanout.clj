@@ -64,7 +64,10 @@
 (let [cursor-var #'lmdb-core/with-scan-cursor
       cursor-fn @cursor-var
       tx-var #'kv/transact tx-fn @tx-var]
-  (with-redefs [core/ranked-random-hash #(java.util.Arrays/hashCode ^bytes %)]
+  (with-redefs [;; Fixed promotion (the member's Arrays/hashCode) for reproducible counts.
+                ;; Pre-OPT-3 code drew from ranked-random-hash; since OPT-3 every promotion
+                ;; goes through ranked-promotion-hash [key prefix offset member].
+                core/ranked-promotion-hash (fn [_ _ _ member] (java.util.Arrays/hashCode ^bytes member))]
     (doseq [membership? [false true] n [10 100 318 1000]]
       (workload n membership?)
       (let [samples (repeatedly 5 #(workload n membership?))

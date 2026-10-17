@@ -553,3 +553,37 @@
         (deref holder 10000 ::timeout)
         (kv/stop cache)
         (delete-dir-recursively dir)))))
+
+(deftest randomized-range-bounds-match-unsigned-byte-order
+  ;; OPT-10: scan bound checks (changed by OPT-1 and again by OPT-10);
+  ;; every range must equal a naive unsigned-order filter,
+  ;; including keys that are prefixes of a bound, bounds that are prefixes of
+  ;; keys, 0x00/0x7F/0x80/0xFF bytes and long shared prefixes.
+  (let [r (java.util.Random. 17)
+        alphabet (byte-array (map unchecked-byte [0 1 127 128 254 255]))
+        shared (byte-array (repeatedly 40 #(unchecked-byte (.nextInt r 256))))
+        rand-key (fn []
+                   (let [tail (byte-array (.nextInt r 5))]
+                     (dotimes [i (alength tail)] (aset tail i (aget alphabet (.nextInt r (alength alphabet)))))
+                     (if (zero? (.nextInt r 4)) tail
+                         (byte-array (concat (take (.nextInt r 41) shared) tail)))))
+        cmp (fn [^bytes a ^bytes b] (java.util.Arrays/compareUnsigned a b))
+        keys (->> (repeatedly 400 rand-key) (remove #(zero? (alength ^bytes %)))
+                  (map vec) distinct (map byte-array) (sort cmp) vec)]
+    (kv/transact *cache* :write (fn [tx] (doseq [k keys] ((:put tx) k (byte-array [1])))))
+    (kv/transact *cache* :read
+      (fn [tx]
+        (dotimes [_ 1500]
+          (let [opt (fn [] (when (pos? (.nextInt r 3)) (rand-key)))
+                prefix (opt) from (opt) to (opt) reverse? (.nextBoolean r)
+                options (cond-> {:reverse? reverse?}
+                          (seq prefix) (assoc :prefix prefix) (seq from) (assoc :from from) (seq to) (assoc :to to))
+                in? (fn [^bytes k]
+                      (and (or (empty? prefix)
+                               (and (>= (alength k) (alength ^bytes prefix))
+                                    (= (vec prefix) (vec (take (alength ^bytes prefix) k)))))
+                           (or (empty? from) (not (neg? (cmp k from))))
+                           (or (empty? to) (neg? (cmp k to)))))
+                expected (mapv vec (cond-> (filter in? keys) reverse? reverse))
+                got ((:reduce tx) options (fn [out {:keys [k]}] (conj out (vec k))) [])]
+            (is (= expected got) (pr-str (update-vals options #(if (bytes? %) (vec %) %))))))))))

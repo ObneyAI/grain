@@ -17,7 +17,7 @@
             rows (mapv (fn [n] [n {:score (when (odd? n) (mod n 5))}]) (range 80))
             append-var (ns-resolve 'ai.obney.grain.read-model-processor-v2.core 'ranked-append!)
             append! @append-var]
-        (with-redefs [core/ranked-random-hash (constantly 0)]
+        (with-redefs [core/ranked-promotion-hash (constantly 0)]
           (rmp/progress ctx model)
           (let [before (fixture/keyed-stored-bytes) calls (atom 0)]
             (fixture/keyed-append! [{:inputs rows}])
@@ -41,11 +41,13 @@
         run (fn [legacy? splits?]
               (fixture/keyed-fixture
                 (fn []
-                  (let [ctx (cond-> (assoc fixture/*keyed-ctx* :tenant-id tenant)
+                  (let [ctx (cond-> (assoc fixture/*keyed-ctx* :tenant-id tenant
+                                           ;; byte parity across two caches needs one promotion key
+                                           :read-model/promotion-key "000102030405060708090a0b0c0d0e0f")
                               legacy? (assoc :read-model/observer (fn [_])))
                         random (java.util.Random. 41) counter (atom 0)
                         model :cold-append-test/captured-towers]
-                    (with-redefs [core/ranked-random-hash (if splits? (constantly 0) (fn [_] (.nextInt random)))
+                    (with-redefs [core/ranked-promotion-hash (if splits? (constantly 0) (fn [_ _ _ _] (.nextInt random)))
                                   time/now (constantly frozen-time)
                                   uuid/v7 #(java.util.UUID. 1152921504606875648 (swap! counter inc))]
                       (rmp/register-read-model! model merge

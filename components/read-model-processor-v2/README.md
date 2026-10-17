@@ -60,6 +60,14 @@ use ascending string order, even for descending pages. Changing an extractor
 requires the usual model version change. Opaque extractors still work through
 the existing low-level APIs.
 
+Any change that alters what a keyed model stores needs a `:version` bump.
+Grain detects part of this contract: if the index names, `:filtered-indexes` or
+search names differ from the ones a cache was built with, reads and writes fail
+with `:grain.read-model/invalid-cache` and nothing is written. Changes under the
+same names (an index extractor, a search's fields, `:include?`, `:result`,
+`:initial` or the handled events) cannot be detected and silently keep the old
+derived data until the version changes.
+
 ## Choosing the application API
 
 | Need | API |
@@ -143,17 +151,32 @@ joined pages. Grouped ordering reports its group count as `:related-groups` in
 Direct use of a related ordering requires exact equal membership;
 per-model bitmaps over shared tenant identity ordinals prove this without
 reading every result. Membership changes commit with state, indexes and progress.
-The derived key format is now KF9: older derived data is ignored and normal replay
-builds the current format. Storage is addressed by tenant, model and version
-within the configured cache, which belongs to its event store. There is no
-application-supplied history identifier or backfill command.
+The derived data uses the KF9 key prefixes. Storage is addressed by tenant, model
+and version within the configured cache, which belongs to its event store. There
+is no application-supplied history identifier or backfill command.
 
-KF9 uses durable short namespace addresses and compact strings in non-filtered
-implicit identity ordering. Explicit indexes, filtered identity indexes and
-typed identity suffixes retain their existing encoding. This preserves accepted
-key sizes and ordering for Unicode strings and mixed identity types; it does not
-require an ASCII-only schema. Sort metadata values use the compact representation
-without changing the ordering exposed by queries.
+**Caches must be wiped when this layout ships.** The index layout changed
+underneath the same KF9 prefixes and there is no format guard. A cache written by
+an earlier build is not detected; it may be misread or fail with
+`:grain.read-model/invalid-cache`. Delete the cache directory on rollout and let
+normal replay rebuild it.
+
+KF9 uses durable short namespace addresses. Every index key, identity suffix and
+sort metadata value uses one compact order-preserving encoding:
+- Index names become one-byte ordinals, numbered by sorted name.
+- Strings take one byte per ASCII or Latin-1 character and two per other BMP
+  character, and are never longer than the former encoding.
+- Integers use a variable-length encoding.
+- Each member stores its identity once, as text plus a one-byte type tag.
+
+Ordering matches the former encoding for Unicode strings and mixed identity
+types, so queries see the same order. No ASCII-only schema is required. The
+511-byte key limit holds about 459 ASCII or 229 CJK characters of an indexed
+value.
+
+Descending pages are served from the ascending index, and each index grows its
+rank levels as it grows. Cold builds sort and append the final results instead of
+maintaining indexes per event.
 
 Namespace reservation is atomic and distinct from fold publication. A failed
 first fold can leave a complete empty reservation, but cannot publish its states,
