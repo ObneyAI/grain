@@ -1408,10 +1408,13 @@
     (do (namespace-validate-allocation! tx)
         (namespace-allocate-checked! tx identities))))
 
-(defn namespace-resolve! [cache identities]
+(defn- namespace-check-identities! [cache identities]
   (when-not (and cache (sequential? identities) (every? namespace-valid-identity? identities))
     (throw (ex-info "Expected cache and tenant/model/version namespace identities with optional event scope"
-                    {:type :grain.read-model/invalid-namespace})))
+                    {:type :grain.read-model/invalid-namespace}))))
+
+(defn namespace-resolve! [cache identities]
+  (namespace-check-identities! cache identities)
   (let [groups (group-by count (distinct identities))
         resolve! (fn [identities]
                    (if (empty? identities) {}
@@ -2478,17 +2481,28 @@
         ((:put tx) k (text-search-number-bytes (aget c 0)))))
     (.clear cache)))
 
-(defn text-search-update!
-  "Called only inside the fold's write transaction. before/after are included
-   result entries or nil. Removed identities retain their ordinal for re-entry."
-  [tx b searches id before after]
+(defn- text-search-changes
+  "[[index old-terms next-terms] ...] for the searches whose normalized text
+   differs between before and after (included result entries or nil). Pure, so
+   a batch prepares it outside its write transaction (keyed-prepare-owner); the
+   changes are written by text-search-apply!."
+  [searches before after]
+  (into []
+        (keep (fn [[index extract]]
+                (let [old (when before (text-search-normalize (extract (:value before))))
+                      next (when after (text-search-normalize (extract (:value after))))]
+                  (when (not= old next)
+                    [index (if old (text-search-terms old) {}) (if next (text-search-terms next) {})]))))
+        searches))
+
+(defn- text-search-apply!
+  "Write prepared text-search-changes of id. Removed identities retain their
+   ordinal for re-entry."
+  [tx b searches id changes]
   (when (seq searches)
     (let [ordinal (membership-ensure-ordinal! tx b id)]
-      (doseq [[index extract] searches
-              :let [old (when before (text-search-normalize (extract (:value before))))
-                    next (when after (text-search-normalize (extract (:value after))))]
-              :when (not= old next)]
-        (let [cfg (text-search-config b index) old (if old (text-search-terms old) {}) next (if next (text-search-terms next) {})]
+      (doseq [[index old next] changes]
+        (let [cfg (text-search-config b index)]
           (doseq [[term _] old :when (not (contains? next term))]
             ((:delete tx) (text-search-posting-key (text-search-term-key cfg 0 term) ordinal))
             (text-search-change-count! tx cfg term -1))
@@ -3247,10 +3261,9 @@
 
 (defn- keyed-read-meta [tx k] (some-> ((:get tx) k) codec/decode))
 (defn- keyed-write! [tx k v] ((:put tx) k (codec/encode v)))
-(defn- keyed-write-observed! [ctx tx operation k value]
-  (let [bytes (codec/encode value)]
-    ((:put tx) k bytes)
-    (keyed-observe! ctx operation (alength ^bytes bytes))))
+(defn- keyed-put-observed! [ctx tx operation k ^bytes bytes]
+  ((:put tx) k bytes)
+  (keyed-observe! ctx operation (alength bytes)))
 (defn- keyed-prepare-validation [schema name kind]
   (if schema
     (let [schema (m/schema schema)
@@ -3359,17 +3372,50 @@
 (def ^:private deferred-self
   (delay (let [h (java.lang.ProcessHandle/current)] {:pid (.pid h) :started (deferred-start-ms h)})))
 
+(def ^:private deferred-owners*
+  ;; {[store identity] build}: the deferred builds a thread of this process
+  ;; owns right now. A marker naming this process is live exactly while its
+  ;; build is registered here; one left by a finished or failed attempt is not.
+  (atom {}))
+
+(defn- deferred-owner-key [ctx identity]
+  ;; The environment, never the store record (callers may assoc it).
+  (let [cache (:cache ctx)] [(or (:env cache) cache) identity]))
+
+(defn- deferred-own!
+  "Register build as identity's in-process owner unless another thread owns it."
+  [ctx identity build]
+  (let [k (deferred-owner-key ctx identity)
+        [_ owners] (swap-vals! deferred-owners* #(if (contains? % k) % (assoc % k build)))]
+    (= build (get owners k))))
+
+(defn- deferred-disown!
+  "Drop build's in-process ownership; a no-op when it is not the owner."
+  [ctx identity build]
+  (let [k (deferred-owner-key ctx identity)]
+    (swap! deferred-owners* #(if (= build (get % k)) (dissoc % k) %))
+    nil))
+
+(defn- deferred-owned?
+  "Some thread of this process owns identity's build (build, when given)."
+  ([ctx identity] (contains? @deferred-owners* (deferred-owner-key ctx identity)))
+  ([ctx identity build]
+   (boolean (and build (= build (get @deferred-owners* (deferred-owner-key ctx identity)))))))
+
 (defn- deferred-live?
-  "A marker owned by another running process with a fresh heartbeat. LMDB
-   environments are host-local, so process liveness is checked directly."
-  [{:keys [pid started at]} lease-ms]
+  "A marker owned by a build thread of this process, or by another running
+   process with a fresh heartbeat. LMDB environments are host-local, so process
+   liveness is checked directly."
+  [ctx identity {:keys [pid started at build]} lease-ms]
   (boolean
-    (and pid at (not= pid (:pid @deferred-self))
-         (< (- (System/currentTimeMillis) at) lease-ms)
-         (let [^java.util.Optional o (java.lang.ProcessHandle/of (long pid))]
-           (and (.isPresent o)
-                (let [^java.lang.ProcessHandle h (.get o)]
-                  (and (.isAlive h) (= started (deferred-start-ms h)))))))))
+    (if (and pid (= pid (:pid @deferred-self)))
+      (deferred-owned? ctx identity build)
+      (and pid at
+           (< (- (System/currentTimeMillis) at) lease-ms)
+           (let [^java.util.Optional o (java.lang.ProcessHandle/of (long pid))]
+             (and (.isPresent o)
+                  (let [^java.lang.ProcessHandle h (.get o)]
+                    (and (.isAlive h) (= started (deferred-start-ms h))))))))))
 
 (defn- deferred-marker [tx identity] (some-> ((:get tx) (deferred-slot identity 1)) codec/decode))
 
@@ -3405,10 +3451,10 @@
    exceeds the cap) a genuinely hung owner is taken over only after
    cap + lease (default 10 min + 30 s, about 10.5 min; lowered from 30 min
    at wave-2 integration).
-   Meanwhile every waiting process holds its JVM's cache lock in
-   deferred-await!, so all keyed reads in that JVM (every tenant and model)
-   stall for that time. The baseline has no cross-process waiting: each JVM
-   holds its lock only for its own (slower, incremental) build. Lower
+   Meanwhile every waiting process waits in deferred-await!, so reads of that
+   model namespace in those processes stall for that time (reads of other
+   models and tenants do not wait). The baseline has no cross-process waiting:
+   each JVM waited only for its own (slower, incremental) build. Lower
    :read-model/deferred-build-max-stall-cap-ms to bound this further."
   [ctx generation]
   (let [base (long (:read-model/deferred-build-max-stall-ms ctx deferred-default-max-stall-ms))
@@ -3479,41 +3525,50 @@
    process owns it, :restart when identity no longer resolves to the cold
    namespace b the caller read (another build published meanwhile), or nil
    when a failed build disabled deferral for identity. A stale marker's fold
-   is resumed, never discarded."
+   is resumed, never discarded. Another thread of this process building
+   identity is a live owner (:wait). A returned build stays registered as this
+   thread's until deferred-disown!."
   [ctx identity b]
   (let [staging (deferred-staging-identity identity)
         build (str (random-uuid))]
-    (kv/transact (:cache ctx) :write
-      (fn [tx]
-        (let [m (deferred-marker tx identity)
-              current (namespace-prefix-of tx identity)]
-          (cond
-            ;; Re-validate under this write transaction: after a publish the
-            ;; staging identity owns the replaced namespace, which must never
-            ;; be taken (or wiped) as a new staging area.
-            (not (and current (Arrays/equals ^bytes current ^bytes b)
-                      (nil? (:watermark (keyed-read-meta tx (keyed-progress-key b))))))
-            :restart
-            (and m (deferred-live? m (deferred-lease-ms ctx))) :wait
-            ((:get tx) (deferred-slot identity 2)) nil
-            :else
-            (let [prefix (get (with-namespace-space staging #(namespace-allocate! tx [staging])) staging)
-                  ;; Taking over an owner whose lease lapsed before it folded
-                  ;; anything doubles the next owner's max-stall (bounded).
-                  ;; Only this owning claim writes the generation.
-                  generation (if (and m (:pid m) (not (:progressed m)))
-                               (min 30 (inc (long (:generation m 0))))
-                               0)]
-              (when-not m (keyed-wipe! tx prefix))
-              ((:put tx) (deferred-slot identity 1)
-                         (codec/encode (merge {:identity identity :staging staging :build build
-                                               :at (System/currentTimeMillis)
-                                               :generation generation :progressed false}
-                                              @deferred-self)))
-              {:identity staging :prefix prefix :marker (deferred-slot identity 1)
-               :build build :resumed? (some? m)
-               :progress (java.util.concurrent.atomic.AtomicLong. (System/currentTimeMillis))
-               :generation (java.util.concurrent.atomic.AtomicLong. generation)})))))))
+    (if-not (deferred-own! ctx identity build)
+      :wait
+      (let [claimed
+            (try
+              (kv/transact (:cache ctx) :write
+                (fn [tx]
+                  (let [m (deferred-marker tx identity)
+                        current (namespace-prefix-of tx identity)]
+                    (cond
+                      ;; Re-validate under this write transaction: after a publish the
+                      ;; staging identity owns the replaced namespace, which must never
+                      ;; be taken (or wiped) as a new staging area.
+                      (not (and current (Arrays/equals ^bytes current ^bytes b)
+                                (nil? (:watermark (keyed-read-meta tx (keyed-progress-key b))))))
+                      :restart
+                      (and m (deferred-live? ctx identity m (deferred-lease-ms ctx))) :wait
+                      ((:get tx) (deferred-slot identity 2)) nil
+                      :else
+                      (let [prefix (get (with-namespace-space staging #(namespace-allocate! tx [staging])) staging)
+                            ;; Taking over an owner whose lease lapsed before it folded
+                            ;; anything doubles the next owner's max-stall (bounded).
+                            ;; Only this owning claim writes the generation.
+                            generation (if (and m (:pid m) (not (:progressed m)))
+                                         (min 30 (inc (long (:generation m 0))))
+                                         0)]
+                        (when-not m (keyed-wipe! tx prefix))
+                        ((:put tx) (deferred-slot identity 1)
+                                   (codec/encode (merge {:identity identity :staging staging :build build
+                                                         :at (System/currentTimeMillis)
+                                                         :generation generation :progressed false}
+                                                        @deferred-self)))
+                        {:identity staging :prefix prefix :marker (deferred-slot identity 1)
+                         :build build :resumed? (some? m)
+                         :progress (java.util.concurrent.atomic.AtomicLong. (System/currentTimeMillis))
+                         :generation (java.util.concurrent.atomic.AtomicLong. generation)})))))
+              (catch Throwable t (deferred-disown! ctx identity build) (throw t)))]
+        (when-not (map? claimed) (deferred-disown! ctx identity build))
+        claimed))))
 
 (defn- deferred-release!
   "Keep the staged fold for the next attempt, which may be in any process."
@@ -3539,11 +3594,13 @@
           ((:put tx) (deferred-slot identity 2) (codec/encode {:identity identity})))))))
 
 (defn- deferred-await!
-  "Wait while another live process builds identity (bounded by its lease)."
+  "Wait while another live process (bounded by its lease) or another thread of
+   this process builds identity."
   [ctx identity]
   (loop []
-    (when (kv/transact (:cache ctx) :read
-            #(some-> (deferred-marker % identity) (deferred-live? (deferred-lease-ms ctx))))
+    (when (or (deferred-owned? ctx identity)
+              (kv/transact (:cache ctx) :read
+                #(when-let [m (deferred-marker % identity)] (deferred-live? ctx identity m (deferred-lease-ms ctx)))))
       (Thread/sleep 50)
       (recur))))
 
@@ -3566,7 +3623,8 @@
         now (System/currentTimeMillis)
         plan (fn [tx]
                (let [m (deferred-marker tx identity)
-                     live? (and m (deferred-live? m (deferred-lease-ms ctx)))
+                     ;; A build thread of this process is live (never wiped here).
+                     live? (and m (deferred-live? ctx identity m (deferred-lease-ms ctx)))
                      replaced (some-> ((:get tx) (deferred-slot identity 3)) codec/decode)
                      staging-prefix (namespace-prefix-of tx (deferred-staging-identity identity))
                      fp (when (and replaced staging-prefix (not live?)) (deferred-fingerprint tx staging-prefix))
@@ -3605,25 +3663,45 @@
       (when (= deferred-chunk (.size chunk))
         (recur (ranked-after (:k (.get chunk (dec deferred-chunk)))))))))
 
+(defn- deferred-read
+  "(f tx) in a read transaction, for a write of the staging namespace that
+   follows (TXN: reading, decoding and sorting stay out of the build's write
+   transactions). The staging namespace is private until publish and only its
+   owning build writes it, so what f read is still current in any later
+   transaction whose deferred-guard! passes. A failure of f is raised after a
+   guarded write transaction, so a superseded build still fails as superseded
+   first, as when f ran after the guard."
+  [ctx staging f]
+  (try
+    (kv/transact (:cache ctx) :read f)
+    (catch Throwable t
+      (kv/transact (:cache ctx) :write #(deferred-guard! % staging))
+      (throw t))))
+
 (defn- deferred-chunks!
-  "Process rows under prefix in chunks of at most size rows, each in its own
-   guarded write transaction (the staging namespace is private until publish)."
-  [ctx staging ^bytes prefix size f]
+  "Process rows under prefix in chunks of at most size rows: (prepare tx rows)
+   reads each chunk in a read transaction (deferred-read) and (write tx
+   prepared) writes it in its own guarded write transaction."
+  [ctx staging ^bytes prefix size prepare write]
   (loop [from nil]
-    (when-let [next (kv/transact (:cache ctx) :write
-                      (fn [tx]
-                        (deferred-guard! tx staging)
-                        (let [tx (with-promotion-key ctx tx)
-                              ^ArrayList rows ((:reduce tx) (cond-> {:prefix prefix} from (assoc :from from))
-                                               (fn [^ArrayList out e]
-                                                 (.add out e)
-                                                 (if (= size (.size out)) (reduced out) out))
-                                               (ArrayList.))]
-                          (f tx rows)
-                          (deferred-stamp! tx staging)
-                          (when (= size (.size rows)) (ranked-after (:k (.get rows (dec size))))))))]
-      (deferred-progress! staging)
-      (recur next))))
+    (let [[prepared next]
+          (deferred-read ctx staging
+            (fn [tx]
+              (let [^ArrayList rows ((:reduce tx) (cond-> {:prefix prefix} from (assoc :from from))
+                                     (fn [^ArrayList out e]
+                                       (.add out e)
+                                       (if (= size (.size out)) (reduced out) out))
+                                     (ArrayList.))]
+                [(prepare tx rows)
+                 (when (= size (.size rows)) (ranked-after (:k (.get rows (dec size)))))])))]
+      (kv/transact (:cache ctx) :write
+        (fn [tx]
+          (deferred-guard! tx staging)
+          (write (with-promotion-key ctx tx) prepared)
+          (deferred-stamp! tx staging)))
+      (when next
+        (deferred-progress! staging)
+        (recur next)))))
 
 ;; Span construction over members in ascending order: level-zero members are
 ;; written by the caller; every upper-level span is written once, when it closes.
@@ -3767,12 +3845,16 @@
         (let [terms (mapv (fn [[index extract]] [(text-search-config sb index) extract (HashMap.)]) searches)]
           (deferred-chunks! ctx staging results budget
             (fn [tx rows]
-              (doseq [{:keys [k v]} rows
-                      :let [[_ value _ ordinal] (row tx k v false)]
-                      [cfg extract ^HashMap counts] terms
-                      [term posting] (text-search-terms (text-search-normalize (extract value)))]
-                ((:put tx) (text-search-posting-key (text-search-term-key cfg 0 term) ordinal) posting)
-                (.put counts term (inc (long (or (.get counts term) 0)))))))
+              (let [postings (ArrayList.)]
+                (doseq [{:keys [k v]} rows
+                        :let [[_ value _ ordinal] (row tx k v false)]
+                        [cfg extract ^HashMap counts] terms
+                        [term posting] (text-search-terms (text-search-normalize (extract value)))]
+                  (.add postings [(text-search-posting-key (text-search-term-key cfg 0 term) ordinal) posting])
+                  (.put counts term (inc (long (or (.get counts term) 0)))))
+                postings))
+            (fn [tx postings]
+              (doseq [[k posting] postings] ((:put tx) k posting))))
           (kv/transact cache :write
             (fn [tx]
               (deferred-guard! tx staging)
@@ -3782,23 +3864,26 @@
                            (text-search-number-bytes (.getValue entry))))))))
       (if (<= n budget)
         (doseq [pass (partition-all (max 1 (quot budget (max 1 n))) units)]
-          (kv/transact cache :write
-            (fn [tx]
-              (deferred-guard! tx staging)
-              (let [tx (with-promotion-key ctx tx)
-                    lists (mapv (fn [unit] [unit (ArrayList. (int n))]) pass)]
-                (deferred-scan! tx results
-                  (fn [{:keys [k v]}]
-                    (let [[id _ indexes ordinal] (row tx k v true) payload (keyed-id-payload id)]
-                      (doseq [[unit ^ArrayList out] lists]
-                        (.add out (deferred-entry d id indexes ordinal payload unit))))))
-                (doseq [[[index direction] ^ArrayList entries] lists]
-                  (deferred-sort! index entries)
-                  (ranked-bulk-load! tx (unit-config index direction) entries)
-                  (keyed-write-levels! tx sb d index levels)
-                  (when (keyed-grouped? index direction) (deferred-write-groups! tx sb d index entries false))
-                  (.clear entries))
-                (deferred-stamp! tx staging))))
+          (let [lists (deferred-read ctx staging
+                        (fn [tx]
+                          (let [lists (mapv (fn [unit] [unit (ArrayList. (int n))]) pass)]
+                            (deferred-scan! tx results
+                              (fn [{:keys [k v]}]
+                                (let [[id _ indexes ordinal] (row tx k v true) payload (keyed-id-payload id)]
+                                  (doseq [[unit ^ArrayList out] lists]
+                                    (.add out (deferred-entry d id indexes ordinal payload unit))))))
+                            (doseq [[[index] entries] lists] (deferred-sort! index entries))
+                            lists)))]
+            (kv/transact cache :write
+              (fn [tx]
+                (deferred-guard! tx staging)
+                (let [tx (with-promotion-key ctx tx)]
+                  (doseq [[[index direction] ^ArrayList entries] lists]
+                    (ranked-bulk-load! tx (unit-config index direction) entries)
+                    (keyed-write-levels! tx sb d index levels)
+                    (when (keyed-grouped? index direction) (deferred-write-groups! tx sb d index entries false))
+                    (.clear entries))
+                  (deferred-stamp! tx staging)))))
           (deferred-progress! staging))
         (doseq [[index direction :as unit] units
                 :let [cfg (unit-config index direction)
@@ -3812,20 +3897,25 @@
                 (doseq [{:keys [k v]} rows :let [[id _ indexes ordinal] (row tx k v true)]]
                   (.add entries (deferred-entry d id indexes ordinal (keyed-id-payload id) unit)))
                 (deferred-sort! index entries)
-                (doseq [^objects e entries]
-                  ((:put tx) (ranked-pack cfg 0 (aget e 0)) (aget e 1))
-                  (when (:membership? cfg)
-                    ((:put tx) (ranked-membership-key cfg 0 (aget e 0)) (membership-number-bytes (aget e 2)))))
-                (when (keyed-grouped? index direction) (deferred-write-groups! tx sb d index entries true)))))
+                entries))
+            (fn [tx ^ArrayList entries]
+              (doseq [^objects e entries]
+                ((:put tx) (ranked-pack cfg 0 (aget e 0)) (aget e 1))
+                (when (:membership? cfg)
+                  ((:put tx) (ranked-membership-key cfg 0 (aget e 0)) (membership-number-bytes (aget e 2)))))
+              (when (keyed-grouped? index direction) (deferred-write-groups! tx sb d index entries true))))
           ;; One ordered pass over level zero closes every upper-level span.
           (deferred-chunks! ctx staging (ranked-prefix cfg 0) budget
             (fn [tx rows]
-              (doseq [{:keys [k]} rows
-                      :let [member (ranked-unpack cfg k)]
-                      :when (pos? (alength ^bytes member))]
-                (ranked-span-add! tx cfg spans member
-                                  (when (:membership? cfg)
-                                    (membership-number-value ((:get tx) (ranked-membership-key cfg 0 member))))))))
+              (into [] (keep (fn [{:keys [k]}]
+                               (let [member (ranked-unpack cfg k)]
+                                 (when (pos? (alength ^bytes member))
+                                   [member (when (:membership? cfg)
+                                             (membership-number-value ((:get tx) (ranked-membership-key cfg 0 member))))]))))
+                    rows))
+            (fn [tx members]
+              (doseq [[member ordinal] members]
+                (ranked-span-add! tx cfg spans member ordinal))))
           (kv/transact cache :write
             (fn [tx] (deferred-guard! tx staging) (ranked-span-finish! tx cfg spans)))
           (deferred-progress! staging))))))
@@ -3856,10 +3946,165 @@
 (defn- keyed-resolve [ctx identity]
   (kv/transact (:cache ctx) :read #(namespace-prefix-of % identity)))
 
-(defn- keyed-apply-batch!
-  ([ctx name d b validate-state! validate-result! events]
-   (keyed-apply-batch! ctx name d b validate-state! validate-result! events nil))
-  ([ctx name d b validate-state! validate-result! events through]
+;; Optimistic batch preparation (TXN). LMDB admits one writer per environment,
+;; so the time catch-ups spend inside write transactions bounds how far
+;; catch-ups of different models scale in parallel. A batch is therefore
+;; prepared first in a READ transaction (keyed-prepare-batch): the fold
+;; (routes, reducers, state decoding and validation) and, per owner, the result
+;; and its validation, the old result, include?, index values, the encoded
+;; state and result, old and new sort data and text-search terms. The write
+;; transaction then validates the preparation and writes it, with all index,
+;; membership, count and progress maintenance exactly as before.
+;;
+;; Validation. A preparation reads only the batch namespace's progress record
+;; (kind 0) and its owners' states, results and sort data (kinds 1, 2, 11).
+;; Every transaction that changes kind 1, 2 or 11 rows of a namespace also
+;; changes its progress record: a batch writes them only for events after the
+;; stored watermark and stores the advanced watermark in the same transaction,
+;; and a wipe (publish, abandon, stale-build cleanup, claim) deletes the
+;; progress record with them. So when the write transaction reads progress
+;; bytes equal to those the preparation read, every row the preparation read
+;; is unchanged (a wipe followed by a refold to the same progress refolds the
+;; same events into the same rows), and the prepared batch is exactly what the
+;; write transaction would compute. This also assumes the owners of one batch
+;; have distinct addresses, since no owner's preparation sees another owner's
+;; writes; a batch with colliding owner addresses is prepared owner by owner
+;; in the write transaction (keyed-prepare-batch). Otherwise (another writer of the namespace
+;; committed in between, or a checkpoint moved :checked-through) the batch is
+;; prepared again inside the write transaction, as before. A staging
+;; namespace is also still guarded first in the write transaction
+;; (deferred-guard!).
+;;
+;; A preparation that fails with an Exception (a reducer, result, extractor or
+;; schema failure, an invalid cache) is discarded and the batch is prepared
+;; again inside the write transaction, so every such error is raised from
+;; there as before. An interrupt (or an interrupted thread) and any Error are
+;; raised at once, never retried: a cancelled catch-up stays cancelled. Inside
+;; the write transaction owners are prepared one at a time in the owner loop,
+;; so an owner's pure work still follows the writes of the owners before it.
+;; With a :read-model/observer the batch is always prepared inside its write
+;; transaction, so observed operations keep their order.
+(defn- keyed-fold-batch
+  "[events states]: the batch's events after the stored watermark and the
+   owner states they fold to, in fold order, with prior states read from tx.
+   Writes nothing."
+  [ctx name d b validate-state! before-progress events tx]
+  (let [events (filterv #(or (nil? (:watermark before-progress))
+                             (pos? (compare (:event/id %) (:watermark before-progress)))) events)
+        apply-input (fn [states id input]
+                      (when (nil? id)
+                        (throw (ex-info "Keyed-fold event has no owner"
+                                        {:model name :event-id (:event/id input)
+                                         :event-type (:event/type input)})))
+                      (let [k (keyed-address b 1 id)
+                            state (if (contains? states id) (get states id)
+                                    (if-let [raw ((:get tx) k)]
+                                      (keyed-decode ctx :state-decoded raw) (:initial d {})))
+                            next ((:reducer-fn d) state input)]
+                        (validate-state! next)
+                        (keyed-observe! ctx :event-applied 0)
+                        (assoc states id next)))]
+    [events
+     (reduce
+      (fn [states event]
+        (if-let [route (:route d)]
+          (let [inputs (route event)]
+            (when-not (sequential? inputs)
+              (throw (ex-info "Route must return an ordered sequence of [owner input] pairs"
+                              {:model name :event-id (:event/id event)})))
+            (reduce (fn [states entry]
+                      (when-not (and (vector? entry) (= 2 (count entry)))
+                        (throw (ex-info "Invalid routed [owner input] pair"
+                                        {:model name :event-id (:event/id event)})))
+                      (apply-input states (nth entry 0) (nth entry 1)))
+                    states inputs))
+          (apply-input states ((:key d) event) event))) {} events)]))
+
+(defn- keyed-prepare-owner
+  "The part of one owner's update that only reads namespace b: its result and
+   validation, old result, inclusion, index values, encoded state and result,
+   old and new sort data, and text-search changes, read from tx (the batch's
+   read or write transaction). Writes nothing."
+  [ctx d b deferred validate-result! index-fields tx id state]
+  (let [owner (keyed-owner id)
+        value ((:result d identity) state)
+        _ (validate-result! value)
+        result-k (keyed-owner-address b 2 owner)
+        sort-k (keyed-owner-address b 11 owner)
+        old (keyed-decode ctx :result-decoded ((:get tx) result-k))
+        included? ((:include? d (constantly true)) value)
+        ;; Non-identity index values. The identity index value is always
+        ;; (str id) and never changes for an owner.
+        indexes (when included?
+                  (into {} (map (fn [[index f]] [index (f value)])) (:indexes d)))
+        _ (keyed-observe! ctx :result-calculated 0)
+        ;; A staging namespace holds no index entries or postings until its
+        ;; build (OPT-4).
+        searches (when-not deferred (:searches d))
+        sort-data #(keyed-sort-data! tx sort-k id (+ 2 (count index-fields)))
+        prepared {:owner owner :old old :included? included? :indexes indexes
+                  :result-k result-k :sort-k sort-k :state (codec/encode state)}]
+    (cond
+      ;; OPT-9 W7: old positions come from the owner's sort data, which
+      ;; holds every non-identity index value.
+      (not included?)
+      (cond-> prepared
+        (and old (not deferred)) (assoc :text (text-search-changes searches old nil)
+                                        :old-data (when (seq index-fields) (sort-data))))
+
+      (or (nil? old) (not= (:value old) value))
+      (assoc prepared
+             :changed? true
+             ;; Sort metadata is a pure function of id and index values
+             ;; and is written with every result. An owner with no
+             ;; non-identity index has constant sort data.
+             :new-data (when (or (nil? old) (seq index-fields)) (sort-data-encode id indexes))
+             ;; OPT-9 W7: the stored sort data of an existing
+             ;; owner gives its old index positions. Byte-equal fields
+             ;; mean byte-equal members (since OPT-8 fields and member
+             ;; values use the same injective encoding, key-write-key!).
+             ;; Cost (OPT-9 audit C3): this is one extra kind-11 get on
+             ;; EVERY value-changing update of an existing result when
+             ;; the model has a non-identity index, also when no
+             ;; indexed field changed (INT compared the decoded
+             ;; :indexes for free); e.g. I1 :touch-1 on [:is :ik]
+             ;; 4.03 -> 5.03 ops/event, no visible time cost. Index
+             ;; extractors are deliberately not re-run to avoid it.
+             :old-data (when (and old (seq index-fields)) (sort-data))
+             :text (text-search-changes searches old {:value value})
+             ;; OPT-9 W7: results no longer repeat the index values.
+             :result (codec/encode {:key id :value value}))
+
+      :else prepared)))
+
+(defn- keyed-prepare-batch
+  "A batch prepared from tx: the progress bytes and record it read, the events
+   after that watermark, their owner states in fold order and, when owners?,
+   each owner's keyed-prepare-owner in the same order."
+  [ctx name d b validate-state! validate-result! events owners? tx]
+  (let [raw ((:get tx) (keyed-progress-key b))
+        before-progress (some-> raw codec/decode)
+        ;; OPT-10 (W2-C2): index names must match the stored fingerprint.
+        _ (keyed-check-index-layout! before-progress d)
+        [events states] (keyed-fold-batch ctx name d b validate-state! before-progress events tx)
+        index-fields (keyed-index-fields d)]
+    {:raw raw :progress before-progress :events events :states states
+     :owners (when owners?
+               (let [owners (mapv (fn [[id state]]
+                                    (keyed-prepare-owner ctx d b (::deferred ctx) validate-result! index-fields tx id state))
+                                  states)]
+                 ;; Owners that are not = but share an address (e.g.
+                 ;; (keyword "a/b" "c") and (keyword "a" "b/c")) must see each
+                 ;; other's writes: such a batch prepares its owners in the
+                 ;; write transaction.
+                 (when (= (count owners)
+                          (count (into #{} (map #(ByteBuffer/wrap (.idKey ^KeyedOwner (:owner %)))) owners)))
+                   owners)))}))
+
+(defn- keyed-write-batch!
+  "Commit one batch: validate prepared (keyed-prepare-batch from a read
+   transaction, or nil) or prepare the batch here, then write it."
+  [ctx name d b validate-state! validate-result! events through prepared]
   (kv/transact (:cache ctx) :write
     (fn [tx]
       (let [;; Logical bytes this batch writes (keys + values) feed the
@@ -3880,61 +4125,26 @@
             identity-base (:ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix ctx)
             deferred (::deferred ctx)
             _ (when deferred (deferred-guard! tx deferred))
-            before-progress (keyed-read-meta tx (keyed-progress-key b))
-            ;; OPT-10 (W2-C2): index names must match the stored fingerprint.
-            _ (keyed-check-index-layout! before-progress d)
-            events (filterv #(or (nil? (:watermark before-progress))
-                                (pos? (compare (:event/id %) (:watermark before-progress)))) events)
-            apply-input (fn [states id input]
-                          (when (nil? id)
-                            (throw (ex-info "Keyed-fold event has no owner"
-                                            {:model name :event-id (:event/id input)
-                                             :event-type (:event/type input)})))
-                          (let [k (keyed-address b 1 id)
-                                state (if (contains? states id) (get states id)
-                                        (if-let [raw ((:get tx) k)]
-                                          (keyed-decode ctx :state-decoded raw) (:initial d {})))
-                                next ((:reducer-fn d) state input)]
-                            (validate-state! next)
-                            (keyed-observe! ctx :event-applied 0)
-                            (assoc states id next)))
-            states (reduce
-                    (fn [states event]
-                      (if-let [route (:route d)]
-                        (let [inputs (route event)]
-                          (when-not (sequential? inputs)
-                            (throw (ex-info "Route must return an ordered sequence of [owner input] pairs"
-                                            {:model name :event-id (:event/id event)})))
-                          (reduce (fn [states entry]
-                                    (when-not (and (vector? entry) (= 2 (count entry)))
-                                      (throw (ex-info "Invalid routed [owner input] pair"
-                                                      {:model name :event-id (:event/id event)})))
-                                    (apply-input states (nth entry 0) (nth entry 1)))
-                                  states inputs))
-                        (apply-input states ((:key d) event) event))) {} events)
+            ;; TXN: the preparation holds iff the progress record is unchanged.
+            {before-progress :progress :keys [events states owners]}
+            (if (and prepared (Arrays/equals ^bytes ((:get tx) (keyed-progress-key b)) ^bytes (:raw prepared)))
+              prepared
+              (keyed-prepare-batch ctx name d b validate-state! validate-result! events false tx))
             count-before (or (keyed-read-meta tx (keyed-count-key b)) 0)
             added (volatile! 0)
             builders (when-not deferred (keyed-cold-index-builders ctx tx b d before-progress states))
             ordinals? (or (seq (:searches d)) (seq (:filtered-indexes d)))
             ;; OPT-9 W7: sort-data field order of the non-identity indexes.
             index-fields (keyed-index-fields d)]
-        (doseq [[id state] states]
+        (doseq [[i [id state]] (map-indexed vector states)]
           ;; FINAL (OPT-10 audit C1): keep the batch's count caches bounded.
           (count-caches-bound! tx)
-          (let [owner (keyed-owner id)
-                value ((:result d identity) state)
-                _ (validate-result! value)
-                result-k (keyed-owner-address b 2 owner)
-                sort-k (keyed-owner-address b 11 owner)
-                old (keyed-decode ctx :result-decoded ((:get tx) result-k))
-                included? ((:include? d (constantly true)) value)
-                ;; Non-identity index values. The identity index value is always
-                ;; (str id) and never changes for an owner.
-                indexes (when included?
-                          (into {} (map (fn [[index f]] [index (f value)])) (:indexes d)))]
-            (keyed-observe! ctx :result-calculated 0)
+          (let [{:keys [owner old included? indexes result-k sort-k changed? old-data ^bytes new-data text]
+                 :as p}
+                (if owners (nth owners i)
+                    (keyed-prepare-owner ctx d b deferred validate-result! index-fields tx id state))]
             ;; State must advance even when its completion value is equal.
-            (keyed-write-observed! ctx tx :state-written (keyed-owner-address b 1 owner) state)
+            (keyed-put-observed! ctx tx :state-written (keyed-owner-address b 1 owner) (:state p))
             (vswap! added + (- (if included? 1 0) (if old 1 0)))
             (when (not= (boolean included?) (boolean old))
               (let [ordinal (membership-ensure-ordinal! tx identity-base id)
@@ -3947,77 +4157,58 @@
                 ;; A staging namespace holds no index entries until its build
                 ;; (OPT-4); index removal uses the write-session owner (OPT-1).
                 (when-not deferred
-                  (text-search-update! tx b (:searches d) id old nil)
-                  ;; OPT-9 W7: old positions come from the owner's sort
-                  ;; data, which holds every non-identity index value.
-                  (let [old-data (when (seq index-fields) (keyed-sort-data! tx sort-k id (+ 2 (count index-fields))))]
-                    (doseq [direction [:asc]]
-                      (keyed-remove-index! tx b d :identity direction (str id) owner))
-                    (doseq [[index field] index-fields
-                            :let [position (keyed-old-position id index old-data field)]
-                            direction [:asc]]
-                      (keyed-remove-index! tx b d index direction position owner))))
+                  (text-search-apply! tx b (:searches d) id text)
+                  (doseq [direction [:asc]]
+                    (keyed-remove-index! tx b d :identity direction (str id) owner))
+                  (doseq [[index field] index-fields
+                          :let [position (keyed-old-position id index old-data field)]
+                          direction [:asc]]
+                    (keyed-remove-index! tx b d index direction position owner)))
                 ((:delete tx) sort-k)
                 ((:delete tx) result-k))
-              (when (or (nil? old) (not= (:value old) value))
-                (let [;; Sort metadata is a pure function of id and index values
-                      ;; and is written with every result. An owner with no
-                      ;; non-identity index has constant sort data.
-                      new-data (when (or (nil? old) (seq index-fields))
-                                 (sort-data-encode id indexes))
-                      ;; OPT-9 W7: the stored sort data of an existing
-                      ;; owner gives its old index positions. Byte-equal fields
-                      ;; mean byte-equal members (since OPT-8 fields and member
-                      ;; values use the same injective encoding, key-write-key!).
-                      ;; Cost (OPT-9 audit C3): this is one extra kind-11 get on
-                      ;; EVERY value-changing update of an existing result when
-                      ;; the model has a non-identity index, also when no
-                      ;; indexed field changed (INT compared the decoded
-                      ;; :indexes for free); e.g. I1 :touch-1 on [:is :ik]
-                      ;; 4.03 -> 5.03 ops/event, no visible time cost. Index
-                      ;; extractors are deliberately not re-run to avoid it.
-                      old-data (when (and old (seq index-fields)) (keyed-sort-data! tx sort-k id (+ 2 (count index-fields))))]
-                  (if deferred
-                    ;; Reserve model ordinals at the same point as the
-                    ;; incremental path, so assignments are identical.
-                    (when ordinals? (membership-ensure-ordinal! tx b id))
-                    (do
-                      (text-search-update! tx b (:searches d) id old {:value value})
-                      (if (nil? old)
-                        (doseq [[index position] (assoc indexes :identity (str id))
-                                direction [:asc]]
-                          (keyed-enqueue-index! ctx tx b d builders index direction position owner))
-                        (doseq [[index field] index-fields
-                                :when (not (sort-data-field= old-data new-data field))
-                                :let [old-position (keyed-old-position id index old-data field)
-                                      position (get indexes index)]
-                                direction [:asc]]
-                          (keyed-remove-index! tx b d index direction old-position owner)
-                          (keyed-enqueue-index! ctx tx b d builders index direction position owner)))))
-                  ;; INVARIANT (OPT-1 W12b, OPT-9 W7): kind 11 is written only
-                  ;; here, in the same transaction and branch as the kind-2
-                  ;; result, and deleted only together with it, so an existing
-                  ;; result always has current sort data. Its put is skipped
-                  ;; when the new bytes equal the stored ones (or the model has
-                  ;; no non-identity index, so they cannot change). Every writer
-                  ;; of kind 2 (incremental or a deferred build's staging fold,
-                  ;; OPT-4) goes through this code; since OPT-9 (W7) the old index
-                  ;; positions, the deferred build's index entries and the
-                  ;; removal on exclusion are all read from kind 11, so a future
-                  ;; writer of kind 2 must also write kind 11. Likewise the
-                  ;; write-session ensure-init skip (W12a) assumes nothing in
-                  ;; this transaction deletes a level-0 sentinel of an index
-                  ;; that is still in use (the deferred build's kind 5/6 wipe
-                  ;; runs in its own guarded transactions, never here). Since
-                  ;; OPT-6, keyed-relevel! does delete upper-level sentinels in
-                  ;; this transaction when an index shrinks; that is safe: it
-                  ;; runs after all index work of the batch, never deletes
-                  ;; level 0, and drops the index's session configs, so no
-                  ;; stale ::initialized flag or level count is reused.
-                  (when-not (and old (or (empty? index-fields) (Arrays/equals ^bytes old-data ^bytes new-data)))
-                    ((:put tx) sort-k new-data)))
-                ;; OPT-9 W7: results no longer repeat the index values.
-                (keyed-write-observed! ctx tx :result-written result-k {:key id :value value})))))
+              (when changed?
+                (if deferred
+                  ;; Reserve model ordinals at the same point as the
+                  ;; incremental path, so assignments are identical.
+                  (when ordinals? (membership-ensure-ordinal! tx b id))
+                  (do
+                    (text-search-apply! tx b (:searches d) id text)
+                    (if (nil? old)
+                      (doseq [[index position] (assoc indexes :identity (str id))
+                              direction [:asc]]
+                        (keyed-enqueue-index! ctx tx b d builders index direction position owner))
+                      (doseq [[index field] index-fields
+                              :when (not (sort-data-field= old-data new-data field))
+                              :let [old-position (keyed-old-position id index old-data field)
+                                    position (get indexes index)]
+                              direction [:asc]]
+                        (keyed-remove-index! tx b d index direction old-position owner)
+                        (keyed-enqueue-index! ctx tx b d builders index direction position owner)))))
+                ;; INVARIANT (OPT-1 W12b, OPT-9 W7): kind 11 is written only
+                ;; here, in the same transaction and branch as the kind-2
+                ;; result, and deleted only together with it, so an existing
+                ;; result always has current sort data. Its put is skipped
+                ;; when the new bytes equal the stored ones (or the model has
+                ;; no non-identity index, so they cannot change). Every writer
+                ;; of kind 2 (incremental or a deferred build's staging fold,
+                ;; OPT-4) goes through this code; since OPT-9 (W7) the old index
+                ;; positions, the deferred build's index entries and the
+                ;; removal on exclusion are all read from kind 11, so a future
+                ;; writer of kind 2 must also write kind 11. Likewise the
+                ;; write-session ensure-init skip (W12a) assumes nothing in
+                ;; this transaction deletes a level-0 sentinel of an index
+                ;; that is still in use (the deferred build's kind 5/6 wipe
+                ;; runs in its own guarded transactions, never here). Since
+                ;; OPT-6, keyed-relevel! does delete upper-level sentinels in
+                ;; this transaction when an index shrinks; that is safe: it
+                ;; runs after all index work of the batch, never deletes
+                ;; level 0, and drops the index's session configs, so no
+                ;; stale ::initialized flag or level count is reused.
+                ;; TXN: kind 11 and kind 2 change only with the progress
+                ;; record (see Optimistic batch preparation).
+                (when-not (and old (or (empty? index-fields) (Arrays/equals ^bytes old-data new-data)))
+                  ((:put tx) sort-k new-data))
+                (keyed-put-observed! ctx tx :result-written result-k (:result p))))))
         (keyed-build-cold-indexes! tx builders)
         ;; OPT-10 W9/W10: all index and text work of the batch is done; write
         ;; every changed span count, group record and term count once
@@ -4047,7 +4238,34 @@
                          advance-through? (assoc :checked-through through))]
           (when (or (seq events) advance-through?)
             (keyed-write! tx (keyed-progress-key b) progress)))
-        {:events (count events) :bytes (aget written 0)})))))
+        {:events (count events) :bytes (aget written 0)}))))
+
+(defn- keyed-interrupt?
+  "t, or a cause of t, reports an interrupted thread."
+  [t]
+  (loop [^Throwable t t]
+    (cond (nil? t) false
+          (or (instance? InterruptedException t)
+              (instance? java.io.InterruptedIOException t)
+              (instance? java.nio.channels.ClosedByInterruptException t)) true
+          :else (recur (.getCause t)))))
+
+(defn- keyed-apply-batch!
+  ([ctx name d b validate-state! validate-result! events]
+   (keyed-apply-batch! ctx name d b validate-state! validate-result! events nil))
+  ([ctx name d b validate-state! validate-result! events through]
+   (keyed-write-batch! ctx name d b validate-state! validate-result! events through
+                       (when-not (:read-model/observer ctx)
+                         (try
+                           (kv/transact (:cache ctx) :read
+                             #(keyed-prepare-batch ctx name d b validate-state! validate-result! events true %))
+                           (catch Exception e
+                             ;; A cancelled catch-up stays cancelled (and Errors
+                             ;; propagate); any other failure is prepared again,
+                             ;; and raised there, in the write transaction.
+                             (when (or (keyed-interrupt? e) (.isInterrupted (Thread/currentThread)))
+                               (throw e))
+                             nil))))))
 
 (defn- keyed-head [ctx]
   (let [result (es/head (:event-store ctx) (:tenant-id ctx))]
@@ -4171,6 +4389,12 @@
   ;; :max-input-bytes before the cut. Memory per batch is roughly batch events
   ;; x input event size; :read-model/catch-up {:max-events ..} or
   ;; :read-model/batch-size is the escape hatch for large-payload streams.
+  ;; Parallel catch-ups (TXN): batches are prepared in read transactions, and
+  ;; an open read transaction keeps the pages freed after its snapshot from
+  ;; being reused by concurrent writers. Parallel cold builds of many models
+  ;; therefore grow the data file more than sequential ones: measured on the
+  ;; 99-model S cold build, +7-12% at 8 threads and up to ~20% at 16 threads.
+  ;; Leave that margin in :map-size, or cap the number of concurrent cold builds.
   {:min-events 128 :cold-events 1024 :max-events 8192 :max-bytes (* 32 1024 1024)
    :max-input-bytes (* 32 1024 1024) :max-map-fill 0.5})
 
@@ -4305,161 +4529,167 @@
             (case claimed
               :wait (do (deferred-await! ctx identity) (restart ctx))
               :restart (restart ctx)
-              (let [validate-state! (keyed-prepare-validation (:state-schema d) name :state)
-                    validate-result! (keyed-prepare-validation (:result-schema d) name :result)
-                    staged (when claimed
-                             (kv/transact (:cache ctx) :read #(keyed-read-meta % (keyed-progress-key (:prefix claimed)))))
-                    read-after (last (sort (remove nil? [after (:checked-through staged) (:watermark staged)])))
-                    query (keyed-event-query ctx d read-after)
-                    accepted? (volatile! false)
-                    threshold (when deferrable? (:read-model/deferred-build-threshold ctx deferred-default-threshold))
-                    ;; Undecided until the backlog reaches the threshold; smaller
-                    ;; cold backlogs are applied exactly as without deferral.
-                    decided? (volatile! (or (not deferrable?) pending?))
-                    buffered (volatile! [])
-                    staging (volatile! claimed)
-                    beat (volatile! nil)
-                    own! (fn [s] (vreset! staging s)
-                           (when s (vreset! beat (deferred-heartbeat! ctx s (deferred-lease-ms ctx)))))
-                    min-events (:min-events policy)
-                    max-input (:max-input-bytes policy)
-                    adaptive? (not= min-events (:max-events policy))
-                    ;; Every batch still commits its states, results, indexes and
-                    ;; watermark in one transaction; only its size adapts. The
-                    ;; model namespace's own progress decides the cold start.
-                    limit (volatile! (if (nil? after) (:cold-events policy) min-events))
-                    ;; A size that hit a full map is never exceeded again here.
-                    ceiling (volatile! (:max-events policy))
-                    input (volatile! 0)
-                    on-backoff (fn [n] (vreset! ceiling (max min-events n)))
-                    apply! (fn [events through]
-                             (let [s @staging
-                                   applied (if s
-                                             (keyed-apply-with-backoff! (assoc ctx ::deferred s) name d (:prefix s)
-                                                                        validate-state! validate-result!
-                                                                        events through min-events on-backoff)
-                                             (keyed-apply-with-backoff! ctx name d b validate-state! validate-result!
-                                                                        events through min-events on-backoff))]
-                               (when s
-                                 (some-> ^java.util.concurrent.atomic.AtomicLong (:generation s) (.set 0))
-                                 (deferred-progress! s))
-                               (vreset! input 0)
-                               ;; The tail batch ends this catch-up: no next size.
-                               (when-not through
-                                 (vreset! limit (min @ceiling
-                                                     (keyed-next-batch-limit
-                                                       policy @limit applied
-                                                       (when (and adaptive? (:max-map-fill policy)) (keyed-store-space ctx))))))
-                               applied))
-                    ;; Add one event to the open batch; commit it once it reaches
-                    ;; the limit or the input budget. Returns the open batch.
-                    accumulate (fn [batch event]
-                                 (let [batch (conj batch event)
-                                       in (if max-input (vswap! input + (keyed-input-size event)) 0)]
-                                   (if (or (<= @limit (count batch)) (and max-input (>= in max-input)))
-                                     (do (apply! batch nil) [])
-                                     batch)))
-                    ;; Cut buffered events exactly as if they had been accumulated
-                    ;; while reading; returns the open (partial) batch.
-                    drain! (fn [events] (vreset! input 0) (reduce accumulate [] events))]
-                (when claimed (own! claimed))
-                (try
-                  ;; OPT-10 (W2-C2): a resumed build's staged rows were folded
-                  ;; under the staged index names. Checked inside the try, so a
-                  ;; mismatch releases the claim (the staged fold is kept).
-                  (keyed-check-index-layout! staged d)
-                  (let [remaining (reduce
-                                    (fn [batch event]
-                                      (if (pos? (compare (:event/id event) through)) (reduced batch)
-                                        (do
-                                          (when (and stable? (not @accepted?))
-                                            (empty-proof-forget! proof-key))
-                                          (vreset! accepted? true)
-                                          (deferred-progress! @staging)
-                                          (if-not @decided?
-                                            (let [batch (conj batch event)
-                                                  ;; The undecided buffer also respects the input
-                                                  ;; budget (INT audit condition 1): a backlog that
-                                                  ;; reaches :max-input-bytes is large, so it is
-                                                  ;; deferred now, and drain! then cuts its batches at
-                                                  ;; the budget. drain! resets the counter, so input is
-                                                  ;; never double-counted. Without a budget (explicit
-                                                  ;; :read-model/batch-size) only the threshold decides.
-                                                  in (if max-input (vswap! input + (keyed-input-size event)) 0)]
-                                              (if (and (< (count batch) threshold)
-                                                       (not (and max-input (>= in max-input))))
-                                                (do (vreset! buffered batch) batch)
-                                                (let [c (deferred-claim! ctx identity b)]
-                                                  (when (= :wait c)
-                                                    (throw (ex-info "Another process is building this model"
-                                                                    {:type ::deferred-await})))
-                                                  (when (= :restart c)
-                                                    (throw (ex-info "Another build published this model"
-                                                                    {:type ::deferred-restart})))
-                                                  (vreset! decided? true) (vreset! buffered nil)
-                                                  (own! c)
-                                                  (drain! batch))))
-                                            (accumulate batch event)))))
-                                    [] (if (seq query) (es/read source query) []))
-                        remaining (if @decided? remaining
-                                    (do (vreset! decided? true) (vreset! buffered nil) (drain! remaining)))]
-                    (when (seq remaining)
-                      (apply! remaining through))
-                    ;; Only a completed, ordered read with no accepted source events
-                    ;; can suppress a checkpoint. Route-empty events are not absence.
-                    (if-let [s @staging]
-                      (keyed-checkpoint! (assoc ctx ::deferred s) d (:prefix s) through)
-                      (when-not (or (seq remaining)
-                                    (and stable? (not @accepted?)
-                                         (empty-proof-remember! source proof-key after through)))
-                        (keyed-checkpoint! ctx d b through)))
-                    (if-let [s @staging]
-                      (do (try (deferred-build! ctx d s)
-                               (catch Throwable t
-                                 (when-not (= ::deferred-superseded (:type (ex-data t)))
-                                   (try (deferred-abandon! ctx identity s true)
-                                        (catch Throwable cleanup (.addSuppressed t cleanup))))
-                                 (throw t)))
-                          ;; Publishing is the last step before the read snapshot.
-                          (or (deferred-publish! ctx identity b s)
-                              (do (deferred-abandon! ctx identity s false)
-                                  (restart (assoc ctx ::no-deferral true)))))
-                      (do
-                        ;; Housekeeping only after a successful warm catch-up that
-                        ;; applied events: a failing batch leaves the cache exactly
-                        ;; as it was, and a read with no new events writes nothing.
-                        (when (and @accepted? (not deferrable?) (:watermark progress) identity)
-                          (deferred-clean-stale! ctx identity))
-                        b)))
-                  (catch Throwable e
-                    (let [s @staging]
-                      (cond
-                        (= ::deferred-await (:type (ex-data e)))
-                        (do (deferred-await! ctx identity) (restart ctx))
-
-                        (= ::deferred-restart (:type (ex-data e)))
-                        (restart ctx)
-
-                        (nil? s)
+              (try
+                (let [validate-state! (keyed-prepare-validation (:state-schema d) name :state)
+                      validate-result! (keyed-prepare-validation (:result-schema d) name :result)
+                      staged (when claimed
+                               (kv/transact (:cache ctx) :read #(keyed-read-meta % (keyed-progress-key (:prefix claimed)))))
+                      read-after (last (sort (remove nil? [after (:checked-through staged) (:watermark staged)])))
+                      query (keyed-event-query ctx d read-after)
+                      accepted? (volatile! false)
+                      threshold (when deferrable? (:read-model/deferred-build-threshold ctx deferred-default-threshold))
+                      ;; Undecided until the backlog reaches the threshold; smaller
+                      ;; cold backlogs are applied exactly as without deferral.
+                      decided? (volatile! (or (not deferrable?) pending?))
+                      buffered (volatile! [])
+                      staging (volatile! claimed)
+                      beat (volatile! nil)
+                      own! (fn [s] (vreset! staging s)
+                             (when s (vreset! beat (deferred-heartbeat! ctx s (deferred-lease-ms ctx)))))
+                      min-events (:min-events policy)
+                      max-input (:max-input-bytes policy)
+                      adaptive? (not= min-events (:max-events policy))
+                      ;; Every batch still commits its states, results, indexes and
+                      ;; watermark in one transaction; only its size adapts. The
+                      ;; model namespace's own progress decides the cold start.
+                      limit (volatile! (if (nil? after) (:cold-events policy) min-events))
+                      ;; A size that hit a full map is never exceeded again here.
+                      ceiling (volatile! (:max-events policy))
+                      input (volatile! 0)
+                      on-backoff (fn [n] (vreset! ceiling (max min-events n)))
+                      apply! (fn [events through]
+                               (let [s @staging
+                                     applied (if s
+                                               (keyed-apply-with-backoff! (assoc ctx ::deferred s) name d (:prefix s)
+                                                                          validate-state! validate-result!
+                                                                          events through min-events on-backoff)
+                                               (keyed-apply-with-backoff! ctx name d b validate-state! validate-result!
+                                                                          events through min-events on-backoff))]
+                                 (when s
+                                   (some-> ^java.util.concurrent.atomic.AtomicLong (:generation s) (.set 0))
+                                   (deferred-progress! s))
+                                 (vreset! input 0)
+                                 ;; The tail batch ends this catch-up: no next size.
+                                 (when-not through
+                                   (vreset! limit (min @ceiling
+                                                       (keyed-next-batch-limit
+                                                         policy @limit applied
+                                                         (when (and adaptive? (:max-map-fill policy)) (keyed-store-space ctx))))))
+                                 applied))
+                      ;; Add one event to the open batch; commit it once it reaches
+                      ;; the limit or the input budget. Returns the open batch.
+                      accumulate (fn [batch event]
+                                   (let [batch (conj batch event)
+                                         in (if max-input (vswap! input + (keyed-input-size event)) 0)]
+                                     (if (or (<= @limit (count batch)) (and max-input (>= in max-input)))
+                                       (do (apply! batch nil) [])
+                                       batch)))
+                      ;; Cut buffered events exactly as if they had been accumulated
+                      ;; while reading; returns the open (partial) batch.
+                      drain! (fn [events] (vreset! input 0) (reduce accumulate [] events))]
+                  (when claimed (own! claimed))
+                  (try
+                    ;; OPT-10 (W2-C2): a resumed build's staged rows were folded
+                    ;; under the staged index names. Checked inside the try, so a
+                    ;; mismatch releases the claim (the staged fold is kept).
+                    (keyed-check-index-layout! staged d)
+                    (let [remaining (reduce
+                                      (fn [batch event]
+                                        (if (pos? (compare (:event/id event) through)) (reduced batch)
+                                          (do
+                                            (when (and stable? (not @accepted?))
+                                              (empty-proof-forget! proof-key))
+                                            (vreset! accepted? true)
+                                            (deferred-progress! @staging)
+                                            (if-not @decided?
+                                              (let [batch (conj batch event)
+                                                    ;; The undecided buffer also respects the input
+                                                    ;; budget (INT audit condition 1): a backlog that
+                                                    ;; reaches :max-input-bytes is large, so it is
+                                                    ;; deferred now, and drain! then cuts its batches at
+                                                    ;; the budget. drain! resets the counter, so input is
+                                                    ;; never double-counted. Without a budget (explicit
+                                                    ;; :read-model/batch-size) only the threshold decides.
+                                                    in (if max-input (vswap! input + (keyed-input-size event)) 0)]
+                                                (if (and (< (count batch) threshold)
+                                                         (not (and max-input (>= in max-input))))
+                                                  (do (vreset! buffered batch) batch)
+                                                  (let [c (deferred-claim! ctx identity b)]
+                                                    (when (= :wait c)
+                                                      (throw (ex-info "Another process is building this model"
+                                                                      {:type ::deferred-await})))
+                                                    (when (= :restart c)
+                                                      (throw (ex-info "Another build published this model"
+                                                                      {:type ::deferred-restart})))
+                                                    (vreset! decided? true) (vreset! buffered nil)
+                                                    (own! c)
+                                                    (drain! batch))))
+                                              (accumulate batch event)))))
+                                      [] (if (seq query) (es/read source query) []))
+                          remaining (if @decided? remaining
+                                      (do (vreset! decided? true) (vreset! buffered nil) (drain! remaining)))]
+                      (when (seq remaining)
+                        (apply! remaining through))
+                      ;; Only a completed, ordered read with no accepted source events
+                      ;; can suppress a checkpoint. Route-empty events are not absence.
+                      (if-let [s @staging]
+                        (keyed-checkpoint! (assoc ctx ::deferred s) d (:prefix s) through)
+                        (when-not (or (seq remaining)
+                                      (and stable? (not @accepted?)
+                                           (empty-proof-remember! source proof-key after through)))
+                          (keyed-checkpoint! ctx d b through)))
+                      (if-let [s @staging]
+                        (do (try (deferred-build! ctx d s)
+                                 (catch Throwable t
+                                   (when-not (= ::deferred-superseded (:type (ex-data t)))
+                                     (try (deferred-abandon! ctx identity s true)
+                                          (catch Throwable cleanup (.addSuppressed t cleanup))))
+                                   (throw t)))
+                            ;; Publishing is the last step before the read snapshot.
+                            (or (deferred-publish! ctx identity b s)
+                                (do (deferred-abandon! ctx identity s false)
+                                    (restart (assoc ctx ::no-deferral true)))))
                         (do
-                          ;; Like ordinary batches, batches that were complete
-                          ;; before a source failure stay committed.
-                          (when-not @decided?
-                            (try (drain! @buffered) (catch Throwable x (.addSuppressed e x))))
-                          (throw e))
+                          ;; Housekeeping only after a successful warm catch-up that
+                          ;; applied events: a failing batch leaves the cache exactly
+                          ;; as it was, and a read with no new events writes nothing.
+                          (when (and @accepted? (not deferrable?) (:watermark progress) identity)
+                            (deferred-clean-stale! ctx identity))
+                          b)))
+                    (catch Throwable e
+                      (let [s @staging]
+                        (cond
+                          (= ::deferred-await (:type (ex-data e)))
+                          (do (deferred-await! ctx identity) (restart ctx))
 
-                        ;; Another process took over this build: read what it publishes.
-                        (= ::deferred-superseded (:type (ex-data e)))
-                        (restart ctx)
+                          (= ::deferred-restart (:type (ex-data e)))
+                          (restart ctx)
 
-                        :else
-                        (do
-                          ;; Keep the staged fold: the next attempt resumes from
-                          ;; its watermark, so a failing source still converges.
-                          (some-> @beat (apply []))
-                          (try (deferred-release! ctx s) (catch Throwable x (.addSuppressed e x)))
-                          (throw e)))))
-                  (finally (some-> @beat (apply []))))))))))))
+                          (nil? s)
+                          (do
+                            ;; Like ordinary batches, batches that were complete
+                            ;; before a source failure stay committed.
+                            (when-not @decided?
+                              (try (drain! @buffered) (catch Throwable x (.addSuppressed e x))))
+                            (throw e))
+
+                          ;; Another process took over this build: read what it publishes.
+                          (= ::deferred-superseded (:type (ex-data e)))
+                          (restart ctx)
+
+                          :else
+                          (do
+                            ;; Keep the staged fold: the next attempt resumes from
+                            ;; its watermark, so a failing source still converges.
+                            (some-> @beat (apply []))
+                            (try (deferred-release! ctx s) (catch Throwable x (.addSuppressed e x)))
+                            (throw e)))))
+                    (finally
+                      (some-> @beat (apply []))
+                      ;; The in-process ownership ends with this attempt. A marker
+                      ;; it leaves naming this process is then no longer live.
+                      (some->> @staging :build (deferred-disown! ctx identity)))))
+              (finally (some->> claimed :build (deferred-disown! ctx identity)))))))))))
 
 (defn- keyed-catch-up!
   "Apply events through the captured head. Returns the model's data prefix,
@@ -4491,8 +4721,106 @@
   (let [read (fn [kind id] ((:get tx) (keyed-address b kind id)))]
     (fn [f] (f tx b d read))))
 
+(defn- namespace-resolve-in
+  "Every identity's prefix in tx without allocating, or nil when one is unregistered."
+  [tx identities]
+  (let [{ordinary 3 scoped 4} (group-by count identities)]
+    (when-let [ordinary (if (seq ordinary) (namespace-resolve-known tx ordinary) {})]
+      (when-let [scoped (if (seq scoped)
+                          (with-namespace-space (first scoped) #(namespace-resolve-known tx scoped))
+                          {})]
+        (merge ordinary scoped)))))
+
+(defn- keyed-fresh?
+  "Whether namespace b holds identity's model through the captured head: the
+   no-work condition of keyed-catch-up-step!. Throws invalid-cache when b was
+   built with other index names."
+  [tx ctx d identity b through]
+  (let [progress (keyed-read-meta tx (keyed-progress-key b))
+        _ (keyed-check-index-layout! progress d)
+        after (last (sort (keep #(get progress %) [:checked-through :watermark])))]
+    (boolean
+      (or (not (and through (or (nil? after) (pos? (compare through after)))))
+          (let [source (:event-store ctx)]
+            (and (es/stable-empty-intervals? source)
+                 (empty-proof-covers? source (empty-proof-key source identity d) after through)))))))
+
+;; {[store identity] promise}: the catch-up in flight for a namespace identity
+;; in this process. Other threads that need it wait for its outcome instead of
+;; running their own (formerly they queued on one store-wide monitor).
+;;
+;; A hung in-process catch-up (for example a deferred build owner stuck in a
+;; source read) therefore blocks reads of its own model namespace in this JVM
+;; for as long as it hangs, possibly indefinitely, also after another process
+;; takes the build over and publishes: waiters re-check every
+;; keyed-catch-up-wait-ms and continue only once the namespace is fresh for
+;; their own head without them (e.g. a publish through that head). Reads of
+;; every other namespace are unaffected; the store-wide lock blocked them all.
+(def ^:private keyed-catch-ups* (atom {}))
+
+(def ^:private keyed-catch-up-wait-ms
+  ;; Backstop only: a waiter re-checks freshness and waits again.
+  10000)
+
+(def ^:private keyed-catch-up-foreign-failures
+  ;; Failed catch-ups of other threads after which a waiter that is still
+  ;; behind makes its own attempt outside the single flight.
+  3)
+
+(defn- keyed-catch-up-single!
+  "Bring identity's namespace to through, running at most one catch-up per
+   identity at a time in this process. Returns {identity prefix} when this
+   thread's own catch-up produced the prefix, else nil (already fresh, or
+   another thread caught up; the caller re-checks).
+
+   A failure is thrown only in the thread whose attempt failed, as under the
+   former store-wide lock: waiters only learn that it failed (never its
+   Throwable or an interrupt), re-check and may run the next attempt. After
+   keyed-catch-up-foreign-failures failed attempts of other threads, a waiter
+   that is still behind makes its own attempt without waiting further, so a
+   persistent failure reaches every caller from its own attempt. Only then
+   may same-identity attempts overlap; incremental batches are idempotent
+   (watermark) and a deferred build stays single-owner (deferred-claim!).
+   An attempt that succeeded for an older head is not counted: the waiter
+   re-checks and competes for the next attempt."
+  [ctx name d identity shared-identity through]
+  (let [cache (:cache ctx)
+        k [(or (:env cache) cache) identity]
+        catch-up! (fn [b shared]
+                    (keyed-catch-up! (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix shared)
+                                     name d b through identity))]
+    (loop [failures 0]
+      (when-let [[b shared] (kv/transact cache :read
+                              (fn [tx]
+                                (let [prefixes (namespace-resolve-in tx [identity shared-identity])
+                                      b (get prefixes identity)]
+                                  (when-not (and b (keyed-fresh? tx ctx d identity b through))
+                                    [b (get prefixes shared-identity)]))))]
+        (if (>= failures keyed-catch-up-foreign-failures)
+          {identity (or (catch-up! b shared) b)}
+          (let [p (promise)
+                [_ running] (swap-vals! keyed-catch-ups* #(if (contains? % k) % (assoc % k p)))
+                winner (get running k)]
+            (if (identical? p winner)
+              (let [done (volatile! false)]
+                (try
+                  (let [r {identity (or (catch-up! b shared) b)}] (vreset! done true) r)
+                  (finally
+                    ;; Removed before delivery: a waiter woken by this outcome
+                    ;; can never find (and count) the same promise again.
+                    (swap! keyed-catch-ups* #(if (identical? p (get % k)) (dissoc % k) %))
+                    (deliver p (if @done ::done ::failed)))))
+              ;; A timeout (nil) or a success only re-checks; a failure counts.
+              (recur (cond-> failures (identical? ::failed (deref winner keyed-catch-up-wait-ms nil)) inc)))))))))
+
 (defn keyed-read-session
-  "Prepare explicit model namespaces and catch up before one finite read snapshot."
+  "Prepare explicit model namespaces and catch up before one finite read snapshot.
+
+   No process-wide lock is held. The heads are captured first; a read that
+   finds every namespace registered and at its head in one snapshot is served
+   from that snapshot. Otherwise the namespaces are registered and caught up
+   (one catch-up per namespace identity at a time in this process, see
+   keyed-catch-up-single!) and the check is repeated in a new snapshot."
   [requests registry f]
   (when-not (seq requests) (throw (ex-info "Read session requires at least one request" {})))
   (let [cache (:cache (ffirst requests))
@@ -4531,38 +4859,61 @@
                            [ctx (identity-for ctx :grain.read-query/shared-identities {:version 1})
                             (into {} (map (fn [name] [name (identity-for ctx name (get registry name))]))
                                   (distinct names))]) requests)
-          {:keys [prefixes prepared]}
-          (locking cache
-            (let [resolved (namespace-resolve! cache @identity-order)
-                  ;; A published deferred build replaces a model's prefix.
-                  prefixes (volatile! resolved)
-                  heads (reduce (fn [heads [ctx _ _]]
-                                  (let [id (:tenant-id ctx)]
-                                    (if (contains? heads id) heads (assoc heads id (keyed-head ctx))))) {} requests)
-                  caught-up (volatile! #{})
-                  prepared (mapv
-                             (fn [[ctx shared-identity model-identities]]
-                               (let [identity-prefix (get @prefixes shared-identity)]
-                                 (doseq [[name identity] model-identities
-                                         :when (not (contains? @caught-up identity))]
-                                   (let [b (get @prefixes identity)
-                                         current (keyed-catch-up! (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/shared-identity-prefix identity-prefix)
-                                                                  name (get registry name) b
-                                                                  (get heads (:tenant-id ctx)) identity)]
-                                     (vswap! prefixes assoc identity (or current b)))
-                                   (vswap! caught-up conj identity))
-                               [ctx (select-keys registry (keys model-identities)) model-identities])) requests)]
-              {:prefixes @prefixes :prepared prepared}))]
-      (kv/transact cache :read
-        (fn [tx]
-          (f (mapv (fn [[ctx definitions model-identities]]
-                     (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/session
-                            {:cache cache :event-store event-store :identity (keyed-identity-of ctx)
-                             :definitions definitions
-                             :readers (into {} (map (fn [[name d]]
-                                                      [name (keyed-prepare-reader tx
-                                                              (get prefixes (get model-identities name)) d)]))
-                                            definitions)})) prepared)))))))
+          identity-order @identity-order
+          _ (namespace-check-identities! cache identity-order)
+          ;; Strong consistency: every model is read at or past these heads,
+          ;; captured before any freshness check or catch-up.
+          heads (reduce (fn [heads [ctx _ _]]
+                          (let [id (:tenant-id ctx)]
+                            (if (contains? heads id) heads (assoc heads id (keyed-head ctx))))) {} requests)
+          prepared (mapv (fn [[ctx _ model-identities]]
+                           [ctx (select-keys registry (keys model-identities)) model-identities]) requests)
+          ;; One snapshot resolves, checks and serves every model, so a
+          ;; publish (a registry swap) is seen by all of them or by none.
+          serve (fn [verified]
+                  (kv/transact cache :read
+                    (fn [tx]
+                      (let [prefixes (namespace-resolve-in tx identity-order)
+                            fresh? (fn [[ctx _ model-identities]]
+                                     (every? (fn [[name identity]]
+                                               (let [b (get prefixes identity)]
+                                                 ;; A prefix this session's own catch-up returned
+                                                 ;; holds the head while identity resolves to it.
+                                                 (or (when-let [^bytes v (get verified identity)] (Arrays/equals v ^bytes b))
+                                                     (keyed-fresh? tx ctx (get registry name) identity b
+                                                                   (get heads (:tenant-id ctx))))))
+                                             model-identities))]
+                        (if-not (and prefixes (every? fresh? requests))
+                          ::stale
+                          (f (mapv (fn [[ctx definitions model-identities]]
+                                     (assoc ctx :ai.obney.grain.read-model-processor-v2.core.keyed/session
+                                            {:cache cache :event-store event-store :identity (keyed-identity-of ctx)
+                                             :definitions definitions
+                                             :readers (into {} (map (fn [[name d]]
+                                                                      [name (keyed-prepare-reader tx
+                                                                              (get prefixes (get model-identities name)) d)]))
+                                                            definitions)})) prepared)))))))]
+      (loop [verified {}]
+        (let [result (serve verified)]
+          (if-not (identical? ::stale result)
+            result
+            (do
+              ;; Registration takes the store's write transaction, not a lock.
+              (namespace-resolve! cache identity-order)
+              (recur
+                (first
+                  (reduce (fn [acc [ctx shared-identity model-identities]]
+                            (reduce (fn [[verified done :as acc] [name identity]]
+                                      (if (contains? done identity)
+                                        acc
+                                        ;; One model at a time: a thread never holds one
+                                        ;; identity's catch-up while waiting for another's.
+                                        [(merge verified
+                                                (keyed-catch-up-single! ctx name (get registry name) identity
+                                                                        shared-identity (get heads (:tenant-id ctx))))
+                                         (conj done identity)]))
+                                    acc model-identities))
+                          [verified #{}] requests))))))))))
 
 (defn- keyed-with-reader [ctx name d f]
   (if-let [s (:ai.obney.grain.read-model-processor-v2.core.keyed/session ctx)]

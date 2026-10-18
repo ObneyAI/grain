@@ -334,9 +334,20 @@
   (count (filter #(let [h (vec (take 3 (key %)))] (or (= h [75 82 57]) (= (vec (take 4 (key %))) [75 82 83 57])))
                  (fixture/keyed-stored-bytes))))
 
+(defn- as-another-process
+  "Run f as a different (live) process would: another pid, none of this
+   process's in-process build ownership."
+  [f]
+  (let [parent (.get (.parent (java.lang.ProcessHandle/current)))]
+    (with-redefs-fn {(cv 'deferred-self) (delay {:pid (.pid ^java.lang.ProcessHandle parent)
+                                                 :started (@(cv 'deferred-start-ms) parent)})
+                     (cv 'deferred-owners*) (atom {})}
+      f)))
+
 (defn- publish-during-build
   "Redefinition of deferred-build! that first runs a complete, independent
-   catch-up of the same identity (another process/build that publishes)."
+   catch-up of the same identity (another process/build that publishes; it
+   judges this build's lease expired and takes it over)."
   [identity-of]
   (let [build @(cv 'deferred-build!) catch-up @(cv 'keyed-catch-up!) nested (atom 0)]
     {(cv 'deferred-build!)
@@ -344,7 +355,8 @@
        (when (= 1 (swap! nested inc))
          (let [identity (identity-of ctx)
                b (get (core/namespace-resolve! (:cache ctx) [identity]) identity)]
-           (catch-up ctx model d b (@(cv 'keyed-head) ctx) identity)))
+           (as-another-process
+             #(catch-up (assoc ctx :read-model/deferred-build-lease-ms 0) model d b (@(cv 'keyed-head) ctx) identity))))
        (build ctx d staging))}))
 
 (deftest another-build-publishing-during-ours-leaves-no-copy
@@ -572,8 +584,10 @@
                   b (get (core/namespace-resolve! (:cache ctx) [identity]) identity)]
               (Thread/sleep (+ stall (* 3 lease)))
               (is (> (marker-age) lease) "With no progress the heartbeat stops and the lease lapses")
-              ;; Another owner takes over (as a process whose claim found the lease expired).
-              (let [taken (claim ctx identity b)]
+              ;; Another process takes over: its claim finds the lease expired. (A
+              ;; thread of this process would instead see the in-process owner
+              ;; as live and wait.)
+              (let [taken (as-another-process #(claim ctx identity b))]
                 (is (map? taken))
                 (is (:resumed? taken) "The taker resumes the staged fold")
                 (deliver wake true)
@@ -590,13 +604,20 @@
       (let [ctx (assoc fixture/*keyed-ctx* :tenant-id tenant :read-model/deferred-build-max-stall-ms 1000
                        :read-model/deferred-build-max-stall-cap-ms 6000)
             identity [tenant model 1]
-            claim @(cv 'deferred-claim!) stamp @(cv 'deferred-stamp!) stall @(cv 'deferred-max-stall-ms)
+            claim* @(cv 'deferred-claim!) stamp @(cv 'deferred-stamp!) stall @(cv 'deferred-max-stall-ms)
+            ;; Each claim is an attempt of this process that then ends without
+            ;; releasing its marker (as a dead build thread would), so the next
+            ;; claim finds a same-process marker that is no longer live.
+            claim (fn [ctx identity b]
+                    (let [c (claim* ctx identity b)]
+                      (when (map? c) (@(cv 'deferred-disown!) ctx identity (:build c)))
+                      c))
             marker #(kv/transact (:cache ctx) :read (fn [tx] (@(cv 'deferred-marker) tx identity)))]
         (register!)
         (fixture/keyed-append! ctx (bodies 7 50))
         (let [b (get (core/namespace-resolve! (:cache ctx) [identity]) identity)
-              ;; Same-process markers are always stale, so each claim is a takeover of
-              ;; an owner that never folded anything.
+              ;; A same-process marker whose build is no longer owned in-process is
+              ;; stale, so each claim is a takeover of an owner that never folded anything.
               gens (vec (for [_ (range 6)] (do (claim ctx identity b) (:generation (marker)))))]
           (is (= [0 1 2 3 4 5] gens) "Each takeover without progress raises the generation")
           (is (= [1000 2000 4000 6000 6000] (mapv #(stall ctx %) [0 1 2 3 30])) "Doubling, capped")
