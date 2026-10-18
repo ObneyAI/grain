@@ -150,6 +150,7 @@
    Context fields `:read-model/name` and `:read-model/cache-tier` are attached
    to every metric event for observability."
   (:require [ai.obney.grain.read-model-processor-v2.core :as core]
+            [ai.obney.grain.read-model-processor-v2.core.keyed :as-alias keyed]
             [malli.core :as m]))
 
 (defn p
@@ -178,38 +179,30 @@
    {:keys [_f _query _name _version _scope _partition-fn _entity-id-fn _partition-key] :as args}]
   (core/p context args))
 
-;; ---------------------------------------------------------------------------
-;; Read Model Registry
-;; ---------------------------------------------------------------------------
-
 (def read-model-registry*
   "Global registry atom. Maps qualified keyword to
    `{:reducer-fn f :events #{...} :version n :partition-fn f? :entity-id-fn f? :l1-ttl-ms n?}`."
   (atom {}))
 
+(defn- validate-registration! [rm-name opts]
+  (core/keyed-validate! rm-name opts)
+  (when-let [schema (:schema opts)]
+    (try
+      (m/schema schema)
+      (catch Exception cause
+        (throw (ex-info "Read model state schema is malformed"
+                        {:read-model/name rm-name :schema schema}
+                        cause))))))
+
 (defn register-read-model!
   "Register a read model reducer and its opts under `rm-name` (qualified keyword).
    Called automatically by `defreadmodel`; use directly for programmatic registration."
   [rm-name reducer-fn opts]
-  (core/keyed-validate! rm-name opts)
-  (when-let [schema (:schema opts)]
-    (try
-      (m/schema schema)
-      (catch Exception cause
-        (throw (ex-info "Read model state schema is malformed"
-                        {:read-model/name rm-name :schema schema}
-                        cause)))))
+  (validate-registration! rm-name opts)
   (swap! read-model-registry* assoc rm-name (merge {:reducer-fn reducer-fn} opts)))
 
 (defn ^:no-doc register-declared! [rm-name reducer-fn opts definition]
-  (core/keyed-validate! rm-name opts)
-  (when-let [schema (:schema opts)]
-    (try
-      (m/schema schema)
-      (catch Exception cause
-        (throw (ex-info "Read model state schema is malformed"
-                        {:read-model/name rm-name :schema schema}
-                        cause)))))
+  (validate-registration! rm-name opts)
   (swap! read-model-registry*
          (fn [registry]
            (when-let [existing (get registry rm-name)]
@@ -312,10 +305,6 @@
                   (:partition-key scope) (assoc :partition-key (:partition-key scope))
                   (:l1-ttl-ms entry)    (assoc :l1-ttl-ms (:l1-ttl-ms entry)))))))
 
-;; ---------------------------------------------------------------------------
-;; Keyed folds
-;; ---------------------------------------------------------------------------
-
 (defn scoped-context
   "Return a context whose keyed reads replay only the requested event scope.
    Accepts {:tags #{[tag UUID] ...}} or {:queries [{:tags ... :types ...} ...]}.
@@ -377,9 +366,6 @@
   [context name options]
   (core/keyed-page context name (keyed-definition context name) options))
 
-;; Advanced composition: index metadata and candidate-ID pages.
-;; Prefer query for declarative list pages; it coordinates these operations.
-
 (defn index-groups
   "Return distinct index values in ascending order as {:value v :total n}.
    Reads maintained group counts without loading any member results.
@@ -413,7 +399,7 @@
    forward metadata for candidates; never decodes their full result/state.
    Work scales with candidates, not page size. Ties stay ascending by string ID."
   ([context name options]
-   (core/keyed-key-page context name (keyed-definition context name) :ai.obney.grain.read-model-processor-v2.core.keyed/all options))
+   (core/keyed-key-page context name (keyed-definition context name) ::keyed/all options))
   ([context name keys options]
    (core/keyed-key-page context name (keyed-definition context name) keys options)))
 
@@ -439,7 +425,7 @@
    Defaulted candidate IDs may be sorted; no result or default entry is persisted."
   [context membership-model ordering-model options]
   (core/keyed-joined-page context membership-model (keyed-definition context membership-model)
-                     ordering-model (keyed-definition context ordering-model) options))
+                          ordering-model (keyed-definition context ordering-model) options))
 
 (defn index-keys
   "Read instance identities from an equality group without loading results.
@@ -483,10 +469,6 @@
   ([requests f]
    (core/keyed-read-session requests @read-model-registry* f)))
 
-;; ---------------------------------------------------------------------------
-;; Declarative queries over keyed results
-;; ---------------------------------------------------------------------------
-
 (defn order-key
   "Pure index extractor for query-visible fields. Text is case folded, nil is
    empty text, keywords use their name. One field yields a scalar; several a tuple.
@@ -528,10 +510,6 @@
              :same-members? (fn [ctx a b]
                               (or (= a b) (core/keyed-same-members? ctx a (get registry a) b (get registry b))))}]
     (core/query-execute api context plan request)))
-
-;; ---------------------------------------------------------------------------
-;; Legacy L1 cache
-;; ---------------------------------------------------------------------------
 
 (defn l1-clear!
   "Clear the L1 in-process cache. Useful for testing or after deployments."
