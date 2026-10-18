@@ -85,9 +85,9 @@
              :result [{:k "query/result"} {:note "or anomaly"}]
              :ds-result [{:k "datastar/hiccup" :tone "ds" :tip "the hiccup view datastar renders"}
                          {:k "datastar/signals" :tone "ds" :tip "signals to patch on the client"}]}}
-     {:m "defreadmodel" :sig "(defreadmodel :area/name {opts} [state event] & body)" :p "Fold events into a read-model projection"
-      :keys {:opts [{:k "events" :req true} {:k "version"} {:k "partition-fn"} {:k "entity-id-fn"} {:k "l1-ttl-ms"}]
-             :result [{:note "{entity-id → entity}"}]}}
+     {:m "defreadmodel" :sig "(defreadmodel :area name {opts} \"doc\"? [state event] & body)" :p "Fold events into a read model: one state, or one state per key with :key/:route"
+      :keys {:opts [{:k "events" :req true} {:k "version"} {:k "key"} {:k "route"} {:k "initial"} {:k "result"} {:k "include?"} {:k "indexes"} {:k "searches"} {:k "partition-fn"} {:k "entity-id-fn"} {:k "l1-ttl-ms"}]
+             :result [{:note "next state; keyed: per-instance state"}]}}
      {:m "defprocessor" :sig "(defprocessor :area/name {opts} [ctx] & body)" :p "React to events; issue follow-up commands"
       :keys {:opts [{:k "topics" :req true} {:k "grain.event-model/produces"} {:k "grain.event-model/reads"}]
              :result [{:k "result/events"} {:k "result/effect"} {:k "result/checkpoint"} {:k "result/cas"} {:k "result/on-success"} {:k "result/on-failure"} {:note "{} no-op / anomaly"}]}}

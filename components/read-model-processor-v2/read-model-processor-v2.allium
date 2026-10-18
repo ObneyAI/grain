@@ -39,7 +39,7 @@
 --     only the (state, watermark) round-trip and tier-agreement guarantees are
 --     specified, not the byte layout or key bytes
 --   - serialization / wire format (Fressian) — only the round-trip guarantee
---   - the precise eviction policy (LRU by entry count), segment count (64),
+--   - the precise eviction policy (LRU by projection), segment count (64),
 --     hash-segmentation thresholds and write-back batching counts: these are
 --     performance tunings recorded as config, not behavioural promises
 --   - CloudWatch / mulog metrics and the cache-tier trace labels
@@ -268,12 +268,15 @@ config {
     -- behavioural promise — a dropped entry is simply recomputed on next read.
     l1_max_entries: Integer = 10000
 
-    -- A durable-tier write-back happens only when a single catch-up read folds
-    -- at least this many new events, to amortise serialization cost. The count is
-    -- per catch-up, not cumulative across reads: several reads each folding fewer
-    -- than the threshold leave the durable copy untouched even though their total
-    -- exceeds it. Below the threshold the in-process tier still reflects the new
-    -- events; only the durable copy lags, and a cold read re-folds the remainder.
+    -- For an unpartitioned read model, a durable-tier write-back after an
+    -- incremental catch-up happens only when that catch-up folds at least this
+    -- many new events, to amortise serialization cost. The first fold into an
+    -- empty durable tier is always written, and partitioned read models write
+    -- every change. The count is per catch-up, not cumulative across reads:
+    -- several reads each folding fewer than the threshold leave the durable copy
+    -- untouched even though their total exceeds it. Below the threshold the
+    -- in-process tier still reflects the new events; only the durable copy lags,
+    -- and a cold read re-folds the remainder.
     write_back_threshold: Integer = 10
 }
 
@@ -458,9 +461,10 @@ contract KeyedFoldMaterialization {
         -- check must never discard state required to interpret the next event.
 
     @invariant DisposableMaterialization
-        -- Incompatible stored formats are not migrated. A new storage-format
-        -- identity materializes through normal event folding; old derived data
-        -- is unused and may be discarded independently of the event history.
+        -- Incompatible stored formats are not migrated, and stored data carries
+        -- no format identity. A storage layout change is deployed with an empty
+        -- cache, which materializes through normal event folding; derived data
+        -- may be discarded at any time independently of the event history.
         -- Changing or restoring a derived representation never rewrites source
         -- events or rewinds durable processor checkpoints. Before serving a
         -- fresh read, a rebuilt or restored representation satisfies the same
@@ -700,9 +704,11 @@ contract KeyedFoldReads {
         -- Reported metadata reads include rejected candidates. Empty matches
         -- retain the ordinary empty-page and clamping semantics.
         -- Identity slices and rank probes do not load result or state payloads.
-        -- Group enumeration reads one maintained count per distinct value,
-        -- without loading representative results. Counts change in the
-        -- same transaction as membership; empty groups disappear.
+        -- Group enumeration of a declared index reads one maintained count per
+        -- distinct value, without loading representative results. Counts change
+        -- in the same transaction as membership; empty groups disappear. The
+        -- identity index keeps no group counts; its groups are counted from
+        -- its entries, still without loading results.
         -- All operations respect the same read-session snapshot and identity.
         -- Missing groups have zero count; slices beyond their end are empty.
         -- These reads create no stored join, mutation API or refresh lifecycle.

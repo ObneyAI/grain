@@ -192,7 +192,9 @@ Accepted keys:
 
 ### `projection`
 
-Projects a registered read model:
+Projects a registered ordinary read model with `rmp/project`. Keyed models
+(declared with `:key` or `:route`) are not supported here; read them with
+`rmp/value`, `rmp/page` or `rmp/query` from the REPL.
 
 ```clojure
 (tools/projection :example/counters)
