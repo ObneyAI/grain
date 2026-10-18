@@ -17,7 +17,21 @@
   [kv-store args]
   (p/put! kv-store args))
 
+(defn read-snapshot
+  "Call f with a get function accepting {:k bytes}. All reads observe one
+   consistent snapshot and return copied byte arrays (or nil for missing keys).
+   Complete reads eagerly on the calling thread; do not retain the get function
+   or use it after f returns. Returns f's result."
+  [kv-store f]
+  (p/read-snapshot kv-store f))
+
 (defn put-batch!
   [kv-store args]
   (p/put-batch! kv-store args))
 
+(defn transact
+  "Run f in a read snapshot or atomic write transaction. Operations accept byte
+   keys/values; :reduce accepts {:prefix :from :to :reverse?}, a reducer, and an
+   initial value. Bounds are [from,to). Operations cannot escape the callback."
+  [kv-store mode f]
+  (p/transact kv-store mode f))

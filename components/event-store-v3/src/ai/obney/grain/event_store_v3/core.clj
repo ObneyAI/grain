@@ -70,6 +70,22 @@
   [event-store]
   (p/tenants event-store))
 
+(defn stable-empty-intervals? [event-store]
+  (and (satisfies? p/EventStoreStableEmptyIntervals event-store)
+       (true? (p/stable-empty-intervals? event-store))))
+
+(defn head
+  [event-store tenant-id]
+  (if-not (uuid? tenant-id)
+    {::anom/category ::anom/incorrect
+     ::anom/message "Expected a UUID tenant identity"}
+    (if (satisfies? p/EventStoreHead event-store)
+      (p/head event-store tenant-id)
+      ;; Existing third-party stores retain the same finite-head read behavior.
+      (let [events (p/read event-store {:tenant-id tenant-id :reverse? true :limit 1})]
+        (if (anomaly? events) events
+          (reduce (fn [_ event] (reduced (:event/id event))) nil events))))))
+
 (defn read
   [event-store args]
   (if-let [validation-error (mc/explain ::schemas/read-args args)]

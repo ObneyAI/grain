@@ -49,65 +49,65 @@ SSE patch rendering.
 Commands and queries are addressed by keywords, not literal routes:
 
 ```clojure
-(ns app.students.ui
+(ns app.customers.ui
   (:require [ai.obney.grain.datastar.ui :as ui]))
 
-(defn student-typeahead []
+(defn customer-typeahead []
   (ui/with-signals [query {:init ""}]
     [:section.typeahead
-     [:label {:for "student-search"} "Find student"]
-     [:input#student-search
+     [:label {:for "customer-search"} "Find customer"]
+     [:input#customer-search
       {:bind/value query
        :placeholder "Search by name, email, or id"
-       :on/input {:effect (ui/refresh :students/typeahead-page
+       :on/input {:effect (ui/refresh :customers/typeahead-page
                                       {:q query})
                   :modifiers {:debounce "250ms"}}}]
-     [:div#student-results]]))
+     [:div#customer-results]]))
 
-(defn student-index-screen []
+(defn customer-index-screen []
   (ui/with-signals [selected-id {:init nil}
                     documents-open? {:init false}
                     saving? {:init false}]
-    [:main.students-screen
+    [:main.customers-screen
      [:header
-      [:h1 "Students"]
-      [:a {:href (ui/href :students/new-student-page)}
-       "New student"]]
+      [:h1 "Customers"]
+      [:a {:href (ui/href :customers/new-customer-page)}
+       "New customer"]]
 
-     (student-typeahead)
+     (customer-typeahead)
 
-     [:section.student-workspace
+     [:section.customer-workspace
       [:nav
-       [:a {:href (ui/href :students/profile-page
-                          {:path-params {:student-id selected-id}})}
+       [:a {:href (ui/href :customers/profile-page
+                          {:path-params {:customer-id selected-id}})}
         "Profile"]
        [:button {:on/click {:effect (ui/effects
                                       (ui/set-signal documents-open? true)
-                                      (ui/refresh :students/documents-panel
-                                                  {:student-id selected-id}))}}
+                                      (ui/refresh :customers/documents-panel
+                                                  {:customer-id selected-id}))}}
         "Documents"]]
 
       [:section {:bind/show documents-open?}
-       [:div#student-documents]]
+       [:div#customer-documents]]
 
       [:button {:bind/attr {:disabled (ui/js "!" selected-id " || " saving?)}
                 :on/click {:effect (ui/effects
                                      (ui/set-signal saving? true)
-                                     (ui/dispatch :students/archive
-                                                  {:student-id selected-id}))}}
-       "Archive student"]]]))
+                                     (ui/dispatch :customers/archive
+                                                  {:customer-id selected-id}))}}
+       "Archive customer"]]]))
 ```
 
 Lower it before rendering:
 
 ```clojure
-(ui/hiccup (student-index-screen))
+(ui/hiccup (customer-index-screen))
 ```
 
 The checked output contains generated Datastar signal names and Datastar action
 strings. The source keeps local signal handles (`query`, `selected-id`,
-`documents-open?`, `saving?`) and route refs (`:students/typeahead-page`,
-`:students/profile-page`, `:students/documents-panel`, `:students/archive`).
+`documents-open?`, `saving?`) and route refs (`:customers/typeahead-page`,
+`:customers/profile-page`, `:customers/documents-panel`, `:customers/archive`).
 The typeahead has its own scoped `query` signal, separate from the screen's
 state.
 
@@ -138,19 +138,19 @@ and explicit payload to Grain's shared Datastar action endpoint.
 (require '[ai.obney.grain.command-processor-v2.interface :refer [defcommand]]
          '[ai.obney.grain.query-processor.interface :refer [defquery]])
 
-(defquery :students typeahead-page
+(defquery :customers typeahead-page
   {:authorized? (constantly true)
-   :datastar/path "/students/typeahead"}
+   :datastar/path "/customers/typeahead"}
   [context]
   ...)
 
-(defquery :students profile
+(defquery :customers profile
   {:authorized? (constantly true)
-   :datastar/path "/students/:student-id"}
+   :datastar/path "/customers/:customer-id"}
   [context]
   ...)
 
-(defcommand :students archive-student
+(defcommand :customers archive-customer
   {:authorized? (constantly true)}
   [context]
   ...)
@@ -159,22 +159,22 @@ and explicit payload to Grain's shared Datastar action endpoint.
 The UI refers to those queries and commands by registry keyword:
 
 ```clojure
-(defn student-search []
+(defn customer-search []
   (ui/with-signals [query {:init ""}
                     selected-id {:init nil}]
     [:section
      [:input {:bind/value query
-              :placeholder "Search students"
-              :on/input {:effect (ui/refresh :students/typeahead-page
+              :placeholder "Search customers"
+              :on/input {:effect (ui/refresh :customers/typeahead-page
                                              {:q query})
                          :modifiers {:debounce "300ms"}}}]
 
-     [:a {:href (ui/href :students/profile
-                        {:path-params {:student-id selected-id}})}
+     [:a {:href (ui/href :customers/profile
+                        {:path-params {:customer-id selected-id}})}
       "Open profile"]
 
      [:button {:bind/attr {:disabled (ui/js "!" selected-id)}
-               :on/click {:effect (ui/dispatch :students/archive-student
+               :on/click {:effect (ui/dispatch :customers/archive-customer
                                                {:id selected-id})}}
       "Archive"]]))
 ```
@@ -182,13 +182,13 @@ The UI refers to those queries and commands by registry keyword:
 At the render boundary:
 
 ```clojure
-(ui/hiccup (student-search))
+(ui/hiccup (customer-search))
 ```
 
 For tests or non-default registries, pass an explicit registry:
 
 ```clojure
-(ui/hiccup (student-search) {:query-registry registry})
+(ui/hiccup (customer-search) {:query-registry registry})
 ```
 
 ## Signals
@@ -219,7 +219,7 @@ Signal handles are lexical values. Pass them directly:
 [:input {:bind/value query
          :bind/text (ui/trimmed query)}]
 
-(ui/refresh :students/typeahead-page {:q query})
+(ui/refresh :customers/typeahead-page {:q query})
 (ui/present? query)
 ```
 
@@ -228,8 +228,8 @@ generates deterministic scoped names:
 
 ```clojure
 [:div
- (student-typeahead)
- (student-typeahead)]
+ (customer-typeahead)
+ (customer-typeahead)]
 ```
 
 Application code should not use `with-signal-scope` for normal UI. It exists
@@ -322,7 +322,7 @@ Raw, non-DSL Hiccup attributes pass through unchanged.
 Checked events use explicit maps:
 
 ```clojure
-{:on/input {:effect (ui/refresh :students/typeahead-page {:q query})
+{:on/input {:effect (ui/refresh :customers/typeahead-page {:q query})
             :modifiers {:debounce "300ms"}}}
 ```
 
@@ -385,9 +385,9 @@ string/number/keyword/symbol values lower to dotted suffix values.
 Checked navigation and server interaction use route refs:
 
 ```clojure
-(ui/dispatch :students/archive {:id student-id})
-(ui/refresh :students/typeahead-page {:q query})
-(ui/href :students/profile {:path-params {:student-id student-id}})
+(ui/dispatch :customers/archive {:id customer-id})
+(ui/refresh :customers/typeahead-page {:q query})
+(ui/href :customers/profile {:path-params {:customer-id customer-id}})
 ```
 
 Rules:
@@ -402,13 +402,13 @@ Rules:
 Route options:
 
 ```clojure
-(ui/href :students/profile
-         {:path-params {:student-id student-id}
+(ui/href :customers/profile
+         {:path-params {:customer-id customer-id}
           :query-params {:tab "documents"}})
 
-(ui/refresh :students/profile
+(ui/refresh :customers/profile
             {:tab "documents"}
-            {:path-params {:student-id student-id}
+            {:path-params {:customer-id customer-id}
              :query-params {:tab "documents"}})
 ```
 

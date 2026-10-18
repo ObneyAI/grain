@@ -193,7 +193,12 @@ Captures the deprecated v1 read-model processor: the read side of CQRS where a p
 
 Captures the read side of grain's CQRS model: a projection engine that folds a tenant's event stream through a pure reducer into queryable state, memoised in a two-tier cache and advanced incrementally from a stored watermark. The spec records behavioural guarantees only — fold correctness and determinism, gapless reprocessing-free catch-up, cache tier-agreement, per-tenant/per-scope isolation, size-transparent and partitioned storage with cross-partition move detection, and serialization round-trip — via module-level contracts, external-entity placeholders, expression-bearing invariants and code-facing surfaces.
 
-<sub>entities 4 · rules 3 · contracts 6 · invariants 9 · surfaces 2</sub>
+<sub>entities 4 · rules 3 · contracts 10 · invariants 9 · surfaces 3</sub>
+
+The [keyed-fold and composed-query contracts](../components/read-model-processor-v2/read-model-processor-v2.allium)
+cover independent per-key state, compact results, indexes and four-key declarative
+queries. See the [API guide](../components/read-model-processor-v2/README.md).
+Computed ordering still scans candidates; the declaration does not remove that cost.
 
 ### [`todo-processor`](../components/todo-processor/todo-processor.allium)
 

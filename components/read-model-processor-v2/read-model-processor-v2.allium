@@ -3,6 +3,13 @@
 --
 -- Distilled from components/read-model-processor-v2 (grain).
 --
+-- Keyed execution: independent per-instance state and compact results, atomic
+-- index maintenance, indexed pagination/search, and composed read queries are
+-- specified by KeyedFoldDefinition, KeyedFoldMaterialization, KeyedFoldReads and
+-- ComposedReadQuery, exposed through KeyedFoldBoundary. They do not use legacy
+-- L1/TTL caches, speculative routing or deferred write-back. The original
+-- projection entities, rules and invariants below describe the legacy project API.
+--
 -- Scope: The read side of grain's CQRS model. A read model is a pure reducer
 --        `(state, event) -> state` that folds a tenant's event stream into a
 --        queryable state map. This processor turns that reducer plus a query
@@ -270,6 +277,596 @@ config {
     write_back_threshold: Integer = 10
 }
 
+contract KeyedFoldDefinition {
+    initial: () -> Any
+    key: (event: Any) -> Any
+    route: (event: Any) -> Any
+    step: (state: Any, event: Any) -> Any
+    result: (state: Any) -> Any
+    include: (result: Any) -> Boolean
+
+    @invariant IndependentPureFunctions
+        -- Each model is independently defined. Initial state, routing, reduction,
+        -- result calculation, and result-index extraction are deterministic.
+        -- Reducers receive ordinary immutable detached state and their routed
+        -- input (the original event for key-based definitions); result functions
+        -- receive only that model instance's state.
+        -- No callback requires transaction handles, storage mutations, another
+        -- projection, request context, a clock, or external effects. The caller
+        -- supplies functions honouring this obligation; runtime enforcement of
+        -- arbitrary program purity is not promised.
+
+    @invariant StableOwnership
+        -- A keyed definition supplies exactly one of key or route. Key supplies
+        -- one supported non-null stable owner and passes the original event.
+        -- Route supplies a finite ordered sequence of two-element vectors
+        -- [owner, input], determined solely from the original event. An empty
+        -- sequence deliberately selects no state; nil, malformed pairs and null
+        -- owners are errors. Several inputs for the same owner apply in their
+        -- returned order, after all inputs from earlier stored events.
+        -- Each owner's reduction must have all the state it needs inside that
+        -- instance. The processor never infers ownership by probing a reducer
+        -- with empty state, consulting another projection, or using live context.
+
+    @invariant OriginalEventProgress
+        -- Routed inputs are transient reducer arguments, never appended events.
+        -- Event selection, ordering and progress use the original stored event.
+        -- All inputs from one event are processed within one batch transaction;
+        -- their states, results, indexes and progress commit together or not at
+        -- all. Even an event with no inputs advances progress on success.
+
+    @invariant LocalCompletion
+        -- The result is a pure function of accumulated state, not an independently
+        -- advancing projection. Omitting the function means identity. Completion
+        -- is nondestructive: later events continue from accumulated state, not
+        -- from the compact result. It may be evaluated after a batch rather than
+        -- after every event without changing the observable answer.
+
+    @invariant ExplicitResultMembership
+        -- An optional pure inclusion predicate decides whether a completion is
+        -- published as a readable result. It defaults to inclusion, including
+        -- nil. Excluded keys retain accumulated state so later events can make
+        -- them eligible. Inclusion changes atomically add or remove the result,
+        -- every index entry and the counted membership with state and progress.
+        -- Exclusion does not evaluate index extractors. Predicate failure rolls
+        -- back the batch. Changing this predicate requires a new model version.
+
+    @invariant EvolutionAndCompatibility
+        -- Changes to routing, reduction, result calculation, initial state,
+        -- schemas, or indexes require a new model version and fresh fold.
+        -- Existing declarations without keyed execution retain their previous
+        -- projection behaviour and return shapes. Keyed and legacy identities
+        -- cannot accidentally read one another's materializations.
+
+    @invariant EffectiveDeclarationOptions
+        -- Unknown options and options belonging only to the other execution
+        -- model are rejected at registration, with the offending keys reported.
+        -- Diagnostics name the model, distinguish unknown from inapplicable
+        -- options, list supported options and explain how to correct the declaration.
+        -- A typo cannot silently discard inclusion, result or index behavior.
+        -- Keyed state validation is declared with state-schema, and result
+        -- validation with result-schema. The schema option belongs only to
+        -- ordinary projections and is rejected on keyed definitions, even when
+        -- state-schema is also present. Ordinary schema behavior is unchanged.
+        -- Filtered paging support is named filtered-indexes. No alternate
+        -- declaration spelling is accepted. Updating application declarations
+        -- to this name preserves materialization identity without replay.
+}
+
+contract KeyedFoldMaterialization {
+    catch_up: (context: Any, model: Any) -> Any
+
+    @invariant RequestedScopeBeforeMaterialization
+        -- A caller's requested event scope constrains source selection before
+        -- folding or index maintenance. A scoped read materializes only that
+        -- scope's model instance; it never first catches up the model over the
+        -- tenant's whole subscribed history and then filters the results.
+        -- Reading additional scopes builds their materializations on demand.
+        -- Events outside the requested scope do not cause state, result, index,
+        -- or count updates and cannot fail that scope's reduction.
+        -- An absent scope requests the whole subscribed tenant stream.
+
+    @invariant FoldEquivalence
+        -- At a requested scope's committed progress H, each instance state equals
+        -- reduction from the declared initial state over exactly the inputs routed
+        -- from subscribed tenant events matching that scope through H, preserving
+        -- event and input order. Its result equals result(state). Batch boundaries,
+        -- prior read choices, restart, and
+        -- interleaving other keys or scopes cannot change that answer.
+
+    @invariant ContextSuppliesTenancy
+        -- Tenant identity comes from trusted caller context. The configured
+        -- cache belongs to its event store; no additional history identifier
+        -- is supplied by the application.
+        -- State, results, indexes, progress, and read positions are isolated by
+        -- tenant, model, version, and requested event scope within that cache;
+        -- instances are distinguished by key. Definitions contain no tenant-routing
+        -- or cross-tenant selector.
+        -- A single-tenant deployment uses the same definitions and contracts.
+
+    @invariant StableMaterializationIdentity
+        -- Internal addressing choices are invisible to callers. Concurrent first
+        -- use, later reads, and reopening the configured cache resolve the same
+        -- tenant, model, and version consistently; distinct scopes never alias.
+        -- A read session keeps one consistent resolution for its lifetime.
+        -- Failed or uncertain identity initialization cannot expose another
+        -- scope's materialization or make partially published results readable.
+        -- Inconsistent durable identity information encountered while resolving
+        -- an address fails explicitly before serving or replacing data through
+        -- that address; it is not guessed or reassigned.
+        -- A whole-registry integrity check may be reused only with evidence
+        -- that intervening writes preserved the checked invariants. An unchanged
+        -- counter or store handle alone is insufficient. Raw or unknown registry
+        -- mutations and reopening invalidate such reuse before new allocation.
+
+    @invariant CoordinatedPublication
+        -- A successful batch publishes all its affected accumulated states,
+        -- results, index changes, counts, and requested scope's progress together.
+        -- Every event covered by advanced progress has its complete effects committed.
+        -- Result calculation and indexing have no independent refresh checkpoint.
+        -- After an ordered source read finishes, its final partial batch may
+        -- publish the captured-head freshness checkpoint in the same atomic
+        -- unit. Failure publishes neither that batch nor its freshness checkpoint;
+        -- earlier full batches remain independently durable. Existing newer
+        -- progress is preserved even when a concurrent writer applied the tail.
+
+    @invariant IndependentScopeProgress
+        -- Completing one scope cannot mark an unread scope, a broader scope,
+        -- or the unscoped model as caught up. Each requested scope resumes from
+        -- its own durable progress. Overlapping scopes preserve their own fold
+        -- equivalence without skipping or double-applying matching inputs.
+
+    @invariant FailureAndRestart
+        -- Failure in routing, reduction, completion, validation, encoding, or
+        -- indexing publishes none of that batch. Earlier successful batches
+        -- remain committed. Recovery resumes from durable progress and agrees
+        -- with a clean replay. An uncertain commit outcome must be resolved from
+        -- persisted progress before replaying, not guessed from in-memory state.
+
+    @invariant ConcurrentProgress
+        -- Concurrent readers and catch-up attempts cannot double-apply committed
+        -- events, regress progress, or overwrite newer state with an older fold.
+        -- Application reducers do not coordinate writers themselves.
+
+    @invariant FiniteFreshness
+        -- A read captures a finite source head and catches its requested scope up
+        -- through that head before serving fresh data. Newer committed state may be
+        -- observed; later events cannot cause an unbounded chase. A failed
+        -- catch-up is an error rather than a successful stale fallback.
+        -- Capturing the head from a built-in store reads its committed identity
+        -- directly, without decoding the latest transaction marker or payload.
+        -- Every session still reads current durable progress and captures its
+        -- source head. An explicitly stable source permits bounded reuse of a
+        -- completed scoped read proving no matching events in an interval. A
+        -- proof is specific to the live source identity, tenant, model version,
+        -- exact event scope and subscribed types; it applies only when current
+        -- progress and the captured head lie within that proven empty interval.
+        -- Such reads need neither another event query nor a progress rewrite.
+        -- An advanced head, progress outside the proof, source reopen or changed selector
+        -- returns to ordinary reading. Failed reads and reductions never create
+        -- evidence; a routed event with no inputs still advances normal progress.
+        -- Evidence retains no source or cache owner strongly and has fixed entry
+        -- and identity-size bounds. When admission has no room, ordinary durable
+        -- checkpointing is preserved so a broad working set cannot thrash into
+        -- repeated idle event queries. Unsupported sources keep ordinary catch-up.
+        -- A large source batch therefore does not inflate every later freshness
+        -- check. Stores without direct-head support retain bounded reverse reads.
+
+    @invariant EqualResultsPreserveState
+        -- If new state has an equal result, changed state and progress still
+        -- commit. Result/index replacement may be omitted. A result equality
+        -- check must never discard state required to interpret the next event.
+
+    @invariant DisposableMaterialization
+        -- Incompatible stored formats are not migrated. A new storage-format
+        -- identity materializes through normal event folding; old derived data
+        -- is unused and may be discarded independently of the event history.
+        -- Changing or restoring a derived representation never rewrites source
+        -- events or rewinds durable processor checkpoints. Before serving a
+        -- fresh read, a rebuilt or restored representation satisfies the same
+        -- captured-head freshness contract as an ordinary materialization.
+
+    @invariant TimeDoesNotMutateMaterialization
+        -- Advancing the query date alone does not change accumulated state,
+        -- results, indexes, or model progress. Time-dependent answers evaluate
+        -- date-independent results with an explicit query date. Ordinary event
+        -- catch-up remains allowed when a date-changing query also sees events.
+}
+
+contract KeyedFoldReads {
+    state: (context: Any, model: Any, key: Any, not_found: Any) -> Any
+    value: (context: Any, model: Any, key: Any, not_found: Any) -> Any
+    values: (context: Any, model: Any, selection: Any) -> Any
+    page: (context: Any, model: Any, selection: Any) -> Any
+    index_groups: (context: Any, model: Any, index: Any) -> Any
+    index_keys: (context: Any, model: Any, selection: Any) -> Any
+    index_rank: (context: Any, model: Any, selection: Any, key: Any) -> Any
+    search_keys: (context: Any, model: Any, selection: Any) -> Any
+    key_page: (context: Any, model: Any, keys: Any, selection: Any) -> Any
+    filtered_key_page: (context: Any, model: Any, keys: Any, selection: Any) -> Any
+    joined_page: (context: Any, membership_model: Any, ordering_model: Any, selection: Any) -> Any
+
+    @invariant RankedJoinWithMissingValues
+        -- An identity join may take membership from one model and stored ordering
+        -- from another within one read session. Only included membership-model
+        -- instances qualify. Optional candidate identities restrict that set.
+        -- Missing or excluded ordering results take the caller's explicit default
+        -- sort value, interleaved with real equal-valued results by ascending
+        -- string identity in both directions. No default result is persisted.
+        -- Exact totals, clamping and page keys match full join-and-sort semantics.
+        -- The ordering index must opt into rank membership. Query-time computed
+        -- sorting is unsupported. Selection decodes no result or state payloads.
+        -- Without candidates, selection traverses membership identities. With
+        -- candidates, it probes their membership metadata. Defaulted identities
+        -- may be sorted for tie ordering; all work and allocation remain measured.
+        -- This does not imply constant-time joins or page-sized total metadata work.
+
+    @invariant ExperimentalFilteredRanks
+        -- A model may opt selected stored indexes into experimental membership
+        -- summaries. Enabling or changing this selection requires a new model
+        -- version. Summaries publish atomically with ordinary index changes.
+        -- Filtered-key paging is the public operation for this capability.
+        -- Ordinary indexes already support rank navigation;
+        -- the optional capability adds efficient selection within a subset.
+        -- Ranked matching-key pages have the same membership, order, counts,
+        -- clamping and ties as matching-key pages with a stored sort order.
+        -- Duplicate, excluded and absent keys do not inflate counts. Candidate
+        -- identities are resolved in the target model; model-local numeric
+        -- identities are never interchangeable across independent models.
+        -- Query-time sort callbacks and indexes not opted in are rejected.
+        -- Navigation counts matching members in stored spans and skips spans
+        -- before the requested offset, without sorting candidate values or
+        -- decoding complete result/state payloads. Resolving candidates and
+        -- intersecting summaries may still require population-proportional work.
+        -- The existing matching-key page remains available for comparison.
+
+    @invariant SearchPublication
+        -- Named searchable text is extracted purely from each included result.
+        -- Text changes, exclusion and re-entry update exact substring matches
+        -- in the same transaction as results and progress. Failure leaves none
+        -- of the batch visible. Restart uses persisted search entries, with no
+        -- second checkpoint, external search service or application cache writes.
+        -- Changing text extraction requires a new model version and fresh fold.
+
+    @invariant ExactTextMatching
+        -- Matching uses Locale-independent lowercasing and Unicode code points.
+        -- Contains queries require at least three code points. Explicit prefix
+        -- and suffix queries support nonempty fragments for query-time composition.
+        -- Repeated grams, positions and boundaries are significant: results are
+        -- exact literal matches, not approximate candidates or token matches.
+        -- Search returns detached instance identities without loading result or
+        -- accumulated-state payloads. Cache, tenant, model and version isolation
+        -- and prepared read-session lifetime are the same as other keyed reads.
+
+    @invariant MatchingKeyPages
+        -- A query may supply candidate identities and order their existing result
+        -- membership using stored compact sort values before selecting a page.
+        -- Duplicate identities count once and excluded or absent identities do
+        -- not count. Counts, clamping and ascending string-key ties are exact.
+        -- Optional query-time sort calculation receives identity and the chosen
+        -- stored sort value, without loading complete results or changing them.
+        -- Matching-key sorting may visit all candidates; this is not filtered
+        -- rank seeking. Only the application-selected rows need full hydration.
+        -- Page selection retains sort records only for the requested prefix
+        -- (page number times page size), or fewer when fewer candidates qualify.
+        -- It still examines every candidate needed for exact membership and
+        -- totals. Beyond-end requests clamp to the real last page, including
+        -- requests whose nominal offset exceeds machine integer bounds.
+
+    @invariant StateAndValueAreDistinct
+        -- State reads return accumulated state; value, result traversal, and
+        -- result pages return completion values with their instance identities.
+        -- Returned values are detached and remain usable after reads complete.
+        -- Callers never receive a mutable storage handle as projection state.
+
+    @invariant AbsenceIsExplicit
+        -- Reading a never-seen key returns not_found and does not instantiate
+        -- state or add a row to traversal. Stored nil is a present value, distinct
+        -- from absence when the caller supplies a distinct not_found marker.
+        -- Empty accumulated state does not implicitly delete an instance.
+        -- Explicitly excluded results return not_found and do not appear in
+        -- traversal or counts; their accumulated state remains readable.
+        -- Domain membership can exclude a present result; storage presence
+        -- alone does not establish inclusion in a query's root model.
+
+    @invariant ResultReadIsolation
+        -- When no catch-up is needed, result-only reads and traversals do not
+        -- load accumulated-state payloads. Catch-up loads the states of affected
+        -- keys, not the whole model population. One large key may remain costly;
+        -- this contract does not bound the size of an application's local state.
+
+    @invariant IndexAgreement
+        -- Index membership and ordering are calculated only from committed
+        -- results. Replacing a result removes obsolete index positions. A page's
+        -- entries, order, count, and progress agree within one committed snapshot.
+        -- Equal sort values use the string form of the instance key ascending
+        -- as the final tie-breaker in both sort directions.
+        -- Oversized storage keys fail with an identifiable key-too-large error
+        -- before committing the affected batch; values are never truncated.
+
+    @invariant CompleteWithinRequestedScope
+        -- Traversal, search, pages, and counts cover the complete requested
+        -- event scope through captured progress, including matching instances
+        -- that were not cached before the request. An incomplete cache is never
+        -- reported as a complete answer. Scope constrains materialization;
+        -- result membership and index selection then apply before pagination.
+        -- Completeness within one scope does not require materializing another
+        -- scope or the entire tenant population.
+
+    @invariant RepresentationPreservesAdmissionAndOrder
+        -- A storage representation change does not newly reject a previously
+        -- accepted valid input as an oversized key merely because its encoding
+        -- differs. It does not narrow an existing accepted string domain.
+        -- String ordering retains UTF-16 code-unit comparison, including NUL,
+        -- supplementary pairs, and unpaired surrogates. Tuple components keep
+        -- their ordinary types and boundaries in either direction.
+        -- Distinct supported identities with the same string form remain
+        -- distinct and retain their deterministic typed ordering. Descending
+        -- sort values do not reverse ascending identity ties.
+        -- Exact counts, presence, and insertion ranks remain unchanged for
+        -- absent identities, including a requested identity group different
+        -- from the absent key's string form and an empty or non-string group.
+
+    @invariant TraversalAndLifetime
+        -- Traversal can be consumed without materializing the full result set,
+        -- honours early termination, and releases read resources on completion
+        -- or failure. Its valid consumption lifetime is explicit. Detached
+        -- accumulated state or result values do not expire with the traversal.
+
+    @invariant CompositionRemainsAQuery
+        -- Queries can combine independent models' results in a scoped read
+        -- session sharing one cache and event store. Each prepared model retains
+        -- its requested event scope. Catch-up runs once per model and scope before
+        -- the session's reads, without each addressed read starting
+        -- another replay. This creates no shared model definition, version, or
+        -- checkpoint and no persisted cross-model dependency graph. No historical
+        -- atomic snapshot across independent event logs is implied.
+
+    @invariant SelectionBeforePaging
+        -- Application membership, search, computed ordering, and missing-value
+        -- rules apply to the complete candidate population before pagination.
+        -- A direct source index may be used only when it preserves these rules.
+        -- Query composition may scan compact results. Exact counts, arbitrary
+        -- substring matches and computed sorts have no constant-time
+        -- guarantee and may require work proportional to the candidate population.
+
+    @invariant RankedSourcePages
+        -- A direct index page uses maintained ranks to seek its offset and to
+        -- count an equality or tuple-prefix selection, rather than enumerating all preceding or
+        -- matching members. Only returned result payloads are decoded. Counts,
+        -- clamping, ascending key ties and read-session isolation are unchanged.
+        -- Rank metadata commits with index membership in the fold transaction.
+        -- Navigation has probabilistic bounds; this promises neither constant
+        -- time nor page-sized work for arbitrary cross-model composition.
+
+    @invariant TuplePrefixSelection
+        -- Result traversal and direct pages may select vector-valued index
+        -- entries by their complete leading components. A prefix [true] selects
+        -- vectors beginning with true; it does not select scalar true. Components
+        -- retain their ordinary types and exact boundaries: a string component
+        -- is an equality match, not a text-prefix search, and a nested vector
+        -- component must match in full. The empty prefix selects all vectors.
+        -- Matching entries retain the index's ordinary ascending or descending
+        -- order and ascending identity ties. Exact totals, empty pages, clamping,
+        -- updates and read-session isolation follow ordinary indexed pages.
+        -- Prefixes must be vectors and cannot be combined with equality selection.
+        -- Selection reuses existing ordered index membership and ranks, without
+        -- scanning candidate sort metadata or introducing a second materialization.
+
+    @invariant TuplePrefixUnionPages
+        -- A page may select a union of complete-component tuple prefixes from
+        -- one stored index. Results use that index's global order, independent
+        -- of supplied prefix order. Duplicate and overlapping prefixes include
+        -- each instance only once; an empty collection selects no instances.
+        -- Exact total, page clamping, both directions and ascending identity
+        -- ties have the same semantics as single-prefix paging. A page can cross
+        -- several selected ranges without loading the intervening results.
+        -- Stored rank bounds count and skip whole ranges. Work scales with
+        -- requested ranges and page size, not with the selected population or
+        -- skipped pages. Only returned results are decoded. The selection uses
+        -- one tenant-scoped prepared snapshot and reflects canonical updates.
+        -- Each prefix must be a vector; union selection cannot be combined with
+        -- single-prefix or equality selection. No additional index or persisted
+        -- union state is required.
+
+    @invariant ReadOnlyIndexComposition
+        -- Queries may enumerate distinct sort values and their exact counts,
+        -- or read counts for specified values without enumerating other groups,
+        -- seek a bounded slice of instance identities within an equality group,
+        -- and obtain a key's insertion rank and presence within that group.
+        -- A slice starting at offset zero seeks the group's stored key prefix
+        -- directly, without rank navigation or reading other groups. Nonzero
+        -- offsets retain rank navigation so skipped members are not scanned.
+        -- Queries may also read selected forward index values for specified
+        -- identities, or reduce them across the model. Each entry contains its
+        -- identity and only the requested named index values. Absent identities
+        -- are omitted; a stored nil remains a present index value. Enumeration
+        -- is reducible and honours early termination.
+        -- Temporary duplicate tracking and field assembly are local to each
+        -- reduction; they need not rebuild immutable intermediates per item.
+        -- Returned metadata maps remain detached immutable values, and repeating
+        -- a reduction starts with fresh duplicate tracking.
+        -- This reads compact index metadata, never result or reducer-state
+        -- payloads, and does not claim
+        -- page-sized work when a calculation examines every candidate.
+        -- Computed ordering may consume several named forward index values
+        -- in one pass over candidate identities or all included identities.
+        -- Each candidate's sort expression is evaluated once; selection and
+        -- stable identity ties do not require decoding full model results.
+        -- A query may filter candidates using the same named index values
+        -- before ordering. The predicate runs once per distinct present
+        -- candidate; only accepted candidates are ordered and counted.
+        -- Filtering and ordering share one metadata read per candidate.
+        -- Reported metadata reads include rejected candidates. Empty matches
+        -- retain the ordinary empty-page and clamping semantics.
+        -- Identity slices and rank probes do not load result or state payloads.
+        -- Group enumeration reads one maintained count per distinct value,
+        -- without loading representative results. Counts change in the
+        -- same transaction as membership; empty groups disappear.
+        -- All operations respect the same read-session snapshot and identity.
+        -- Missing groups have zero count; slices beyond their end are empty.
+        -- These reads create no stored join, mutation API or refresh lifecycle.
+}
+
+contract ComposedReadQuery {
+    execute: (context: Any, definition: Any, request: Any) -> Any
+
+    @invariant ApplicationSuppliesMeaning
+        -- A definition names one root keyed model, to-one keyed relationships,
+        -- searchable result fields, and allowed orderings, including pure
+        -- calculations with explicit dependencies. The caller supplies
+        -- request parameters, including a date when calculations require it.
+        -- Existing canonical reducers, keyed models and compact results remain
+        -- independently defined. Authorization and rendering remain in the application.
+        -- Applications supply no rank probes, candidate-set mutation, merge
+        -- algorithms, read-session coordination, or execution-path selection.
+
+    @invariant QueryNotProjection
+        -- The definition does not create a persisted joined result or a new
+        -- event-consuming reducer. Root inclusion determines one row per root
+        -- key. Relationships do not multiply rows or silently remove a root.
+        -- Stored indexes remain derived from independently owned results;
+        -- application code does not maintain or refresh them.
+
+    @invariant ExplicitDependencies
+        -- Related keys refer to a root key or previously bound result field.
+        -- The relationship setting :key specifies the lookup ID. The expression
+        -- [:id alias] obtains a binding's instance identity; :key is not also
+        -- an expression operator. Field references remain :alias/field.
+        -- Calculated orderings declare every value and request parameter they use.
+        -- Callbacks receive these values, never storage access or request context.
+        -- Definition cycles and unresolved references are rejected.
+        -- A function dependency declaration does not establish that the function
+        -- is indexable, monotonic, or independent of request parameters.
+
+    @invariant IndexCorrespondence
+        -- Pure order-key and search-text extractor helpers declare which result
+        -- fields they extract and their normalization. The planner matches that
+        -- information structurally; it never guesses arbitrary function meaning.
+        -- Existing opaque extractors remain usable through the low-level API.
+        -- A related model's ordering can serve a root page directly only when
+        -- stored exact identity membership proves their included keys equal.
+        -- Otherwise preserve root membership with an exact selection strategy.
+        -- Membership summaries commit with each independent fold's results and
+        -- progress. They contain identities, not cross-model business values.
+
+    @invariant MinimalDeclaration
+        -- The data surface has four sections: from, related, search
+        -- and orders. From binds exactly one alias to a root model;
+        -- related binds aliases to named models and explicit lookup keys.
+        -- There is no fields section or output-field mapping. Search references
+        -- bound result fields directly; orders maps public names to ordered
+        -- lists of result-field references or pure calls with explicit arguments.
+        -- The request chooses order, direction,
+        -- page, limit, search text and explicit calculation parameters.
+        -- This initial surface fixes search to space-separated, case-insensitive
+        -- literal text with the existing three-code-point minimum. Text ordering
+        -- is case-insensitive with missing text treated as empty; final root-ID
+        -- ties remain case-sensitive ascending strings. These are documented
+        -- semantics, not application knobs. The caller supplies its default order
+        -- when normalizing the page request; map iteration never chooses defaults.
+
+    @invariant BoundResults
+        -- Each selected row returns the root and related compact results under
+        -- their declared aliases. A reserved key field carries root identity;
+        -- aliases may not use that reserved name. Preserve identity for ties.
+        -- Return exact pagination metadata alongside these rows. Grain loads
+        -- declared relationships for selected rows even when those relationships
+        -- did not participate in search or ordering.
+        -- Application views may consume these results directly or use existing
+        -- pure business functions to shape a display row. Display calculations
+        -- run after page selection; they are not another query declaration layer.
+
+    @invariant RelationshipIntegrity
+        -- Relationships are required unless a single missing policy explicitly
+        -- supplies a default value, including nil for an optional relationship.
+        -- Syntax is missing: error (also the default), or missing:
+        -- [default, value]. Separate required and optional flags do not exist.
+        -- Defaults apply only to an absent result, not a stored nil or a failing
+        -- validator. Pure validation receives the lookup key and resolved value,
+        -- including any explicitly defaulted value. Its return value is ignored;
+        -- throwing reports a domain-integrity error, never a fallback lookup.
+        -- Missing required data or domain-validation failure is an explicit
+        -- query error. It must not silently drop a row or substitute history.
+        -- Validators run on accessed results, including related results read
+        -- to resolve ordering groups. They do not audit unaccessed results.
+        -- Reusing a result obtained during page selection does not bypass its
+        -- relationship validator. Selected results satisfy validation regardless
+        -- of which index or ordering supplied them.
+
+    @invariant QuerySemantics
+        -- Search and ordering apply before page selection. Counts are exact,
+        -- numbered pages clamp, and final ties use ascending string root ID in
+        -- either direction. Allowed sorts and text normalization are explicit.
+        -- Search is case-insensitive literal substring matching of the declared
+        -- fields separated by spaces, including matches crossing field boundaries.
+        -- Nonempty searches shorter than
+        -- three Unicode code points are unsupported without a population query.
+        -- A related result's rename changes the next query without rewriting roots.
+
+    @invariant ExecutionOwnership
+        -- Grain resolves dependencies, prepares reads, selects an execution
+        -- strategy, combines memberships and searches, selects the page and
+        -- composes its rows. Application definitions name no storage ranks,
+        -- postings, bitmap operations, or strategy-specific callbacks.
+        -- Native indexed paths retain existing read and page-depth bounds.
+        -- Applications calculate display-only values for selected rows. Grain
+        -- evaluates declared calculations when ordering requires them. A calculated sort
+        -- may require values for all matches; the declaration cannot make an
+        -- arbitrary pure calculation efficiently orderable by itself.
+
+    @invariant InitialExecutionLimits
+        -- Indexed text composition supports one contiguous root text segment,
+        -- optionally followed by one related text segment reached through an
+        -- exact equality index on the root or a same-key related model. Text
+        -- extractors must match the fields. Grain handles the separator between
+        -- segments. One text index serves both root-only and related searches;
+        -- search-text accepts only a nonempty vector of result-field keywords,
+        -- with no options argument or caller-supplied separator suffix. Its
+        -- extracted text joins those fields with spaces and adds no suffix.
+        -- A non-nil related default cannot serve as indexed search text: it is
+        -- not present in the related model's index. Reject that search shape.
+        -- Unsupported search shapes and missing field-order index support fail
+        -- during definition validation, before event catch-up or query reads.
+        -- This validation also applies when obtaining subscription dependencies.
+        -- Definition errors identify the offending order or search relationship,
+        -- model and field references. Missing-index errors show the required
+        -- extractor or explain why the relationship shape is unsupported.
+        -- Corrections are available in both the message and structured error
+        -- data; calculation suggestions disclose candidate-dependent work.
+        -- Plain field orders never fall back to population-result scanning.
+        -- If current membership prevents the supported indexed execution, fail
+        -- explicitly instead. An explicit call expression opts into calculation.
+        -- Calculation arguments are resolved eagerly; all declared arguments
+        -- may be read for every candidate, even if the function could ignore an
+        -- argument for some inputs. This cost is measured, not assumed away.
+        -- A typed oversized-storage-key failure propagates to the caller. It
+        -- does not trigger another unindexed replay or a population scan.
+
+    @invariant IsolationAndFreshness
+        -- Every relationship uses the trusted context's event store, cache and
+        -- tenant. The application supplies no separate event-history identifier.
+        -- No definition supplies tenant routing. Dependencies use the existing
+        -- keyed read-session freshness and snapshot guarantees; this API
+        -- does not strengthen them into event-log transactions across folds.
+        -- Relevant model dependencies must be available to query subscription
+        -- wiring. Time-dependent calculations use the explicit request date.
+
+    @invariant HonestPerformance
+        -- Planning must expose population or candidate-dependent work for
+        -- inspection. Unsupported bounded execution is not silently described
+        -- as indexed pagination. Moving an existing scan into Grain does not
+        -- eliminate population-dependent work.
+        -- Validate against canonical composition and measure complete query plus
+        -- rendering, allocation, selectivity, page depth and concurrency.
+
+    @guidance
+        -- Scope is one root, to-one relationships, literal search,
+        -- declared orders and explicit pure
+        -- calculations. No general SQL language or collection aggregation API
+        -- is proposed. Existing low-level keyed APIs remain available.
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -458,6 +1055,8 @@ rule TenantFirstSeen {
 -- RM7: a cache entry belongs to exactly one tenant. No two tenants ever share an
 -- entry, so one tenant's events can never leak into another's projection — even
 -- when the same read model, scope and partition are read for both.
+-- Distinct identities remain isolated when their ordinary value hashes collide,
+-- in both resident and persisted caches.
 invariant CachePerTenant {
     for a in Caches:
         for b in Caches:
@@ -471,6 +1070,9 @@ invariant CachePerTenant {
 -- RM8: distinct scopes of the same read model and tenant are distinct cache
 -- entries. A scoped projection and the unscoped one (or two differently scoped
 -- ones) never share accumulated state.
+-- Collection iteration order is not scope identity: equal maps and sets retain
+-- the same cache identity regardless of their construction order. Partition
+-- identities follow the same rules.
 invariant CachePerScope {
     for a in Caches:
         for b in Caches:
@@ -628,6 +1230,19 @@ surface ReadModelProjection {
         -- and the read still completes correctly.
 }
 
+surface KeyedFoldBoundary {
+    contracts:
+        demands KeyedFoldDefinition
+        fulfils KeyedFoldMaterialization
+        fulfils KeyedFoldReads
+        fulfils ComposedReadQuery
+
+    @guarantee OneProjectionLifecycle
+        -- Application code supplies independent pure folds and optional result
+        -- functions. It does not maintain transactions, cache writes, checkpoints,
+        -- result invalidation, or a second summary-refresh lifecycle.
+}
+
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
@@ -635,3 +1250,8 @@ surface ReadModelProjection {
 open question "A read model's reducer can evolve only by bumping its version, which orphans the old cached state. Should the engine model reclamation of orphaned cache entries, or is that left to operational tooling?"
 open question "The durable write-back is deferred until write_back_threshold new events, so the durable tier can lag the in-process tier. Is the only consequence a colder cold-read (re-fold the remainder), or are there durability expectations on the cache worth stating explicitly?"
 open question "Cross-partition move detection relies on the reducer's partition function being stable for an unchanged entity. Should the spec state a contract that partition_of is deterministic and depends only on entity state, beyond the prose in contract Partitioning?"
+
+open question "Computed ordering: what bounded execution can support exact request-dependent calculated orders without a population scan or application-maintained state? The query surface alone does not resolve this."
+-- Query model dependencies are exposed as the existing model/version subscription
+-- map. Applications retain their endpoint declarations and time-based refresh
+-- keys; this API introduces no automatic clock scheduling or endpoint macro.
