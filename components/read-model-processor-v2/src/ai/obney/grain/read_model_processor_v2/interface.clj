@@ -201,13 +201,25 @@
   (validate-registration! rm-name opts)
   (swap! read-model-registry* assoc rm-name (merge {:reducer-fn reducer-fn} opts)))
 
+(defn- still-interned? [^clojure.lang.Var v]
+  (when-let [declaring-ns (find-ns (ns-name (.ns v)))]
+    (identical? v (.findInternedVar ^clojure.lang.Namespace declaring-ns (.sym v)))))
+
+(defn- conflicting-declaration? [existing reducer-fn definition]
+  (let [existing-fn (:reducer-fn existing)]
+    (and definition (:definition/value existing)
+         (if (and (var? existing-fn) (var? reducer-fn)
+                  (.sym ^clojure.lang.Var existing-fn) (.sym ^clojure.lang.Var reducer-fn))
+           (and (not= (symbol existing-fn) (symbol reducer-fn))
+                (still-interned? existing-fn))
+           (not= (:definition/value definition) (:definition/value existing))))))
+
 (defn ^:no-doc register-declared! [rm-name reducer-fn opts definition]
   (validate-registration! rm-name opts)
   (swap! read-model-registry*
          (fn [registry]
            (when-let [existing (get registry rm-name)]
-             (when (and definition (:definition/value existing)
-                        (not= (:definition/value definition) (:definition/value existing)))
+             (when (conflicting-declaration? existing reducer-fn definition)
                (throw (ex-info "Conflicting read model definition"
                                {:read-model/name rm-name :existing existing
                                 :candidate definition}))))

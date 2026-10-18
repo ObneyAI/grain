@@ -16,6 +16,7 @@
            [java.util Arrays ArrayList Comparator HashMap HashSet HexFormat
             IdentityHashMap Locale PriorityQueue UUID]
            [java.util.concurrent ThreadLocalRandom]
+           [java.util.concurrent.atomic AtomicLong]
            [org.roaringbitmap RoaringBitmap]))
 
 (def ^:const default-l1-ttl-ms 0)
@@ -23,36 +24,86 @@
 
 (def ^:private l1-cache* (atom {}))
 
-(defn l1-get-entry [cache-key]
-  (when-let [entry (get @l1-cache* cache-key)]
-    (swap! l1-cache* assoc-in [cache-key :accessed-at] (System/currentTimeMillis))
-    entry))
+(defn- l1-owner [{:keys [event-store cache]}]
+  (bit-or (bit-shift-left (long (System/identityHashCode event-store)) 32)
+          (bit-and (long (System/identityHashCode cache)) 0xffffffff)))
 
-(defn- l1-fresh-entry [state watermark]
+(defn- weak-ref [x]
+  (when (some? x) (WeakReference. x)))
+
+(defn- referent [ref]
+  (when ref (.get ^WeakReference ref)))
+
+(defn- collected? [ref]
+  (and (some? ref) (nil? (.get ^WeakReference ref))))
+
+(defn- l1-owned-by? [{[event-store-ref cache-ref] :owner} {:keys [event-store cache]}]
+  (and (identical? event-store (referent event-store-ref))
+       (identical? cache (referent cache-ref))))
+
+(defn- l1-owner-collected? [{owner-refs :owner}]
+  (boolean (some collected? owner-refs)))
+
+(defn- last-access ^long [entry]
+  (.get ^AtomicLong (:last-access entry)))
+
+(defn- l1-touch! [entry]
+  (.set ^AtomicLong (:last-access entry) (System/currentTimeMillis)))
+
+(defn- l1-owned-entry [context cache-key]
+  (when-let [entry (get (get @l1-cache* cache-key) (l1-owner context))]
+    (when (l1-owned-by? entry context)
+      (l1-touch! entry)
+      entry)))
+
+(defn l1-get-entry [cache-key]
+  (let [owners (vals (get @l1-cache* cache-key))]
+    (when (seq owners)
+      (let [entry (apply max-key last-access owners)]
+        (l1-touch! entry)
+        entry))))
+
+(defn- l1-fresh-entry [{:keys [event-store cache]} state watermark]
   (let [now (System/currentTimeMillis)]
-    {:state state :watermark watermark :accessed-at now :validated-at now}))
+    {:state state :watermark watermark :last-access (AtomicLong. now) :validated-at now
+     :owner [(weak-ref event-store) (weak-ref cache)]}))
+
+(defn- l1-store [entries context cache-key state watermark]
+  (let [live-owners (into {} (remove (comp l1-owner-collected? val)) (get entries cache-key))]
+    (assoc entries cache-key
+           (assoc live-owners (l1-owner context) (l1-fresh-entry context state watermark)))))
+
+(defn- most-recent-access [owners]
+  (reduce max 0 (map last-access (vals owners))))
 
 (defn- evict-least-recently-used! [max-entries]
-  (let [entry-count (count @l1-cache*)]
-    (if (> entry-count max-entries)
-      (let [eviction-count (- entry-count max-entries)
+  (let [key-count (count @l1-cache*)]
+    (if (> key-count max-entries)
+      (let [eviction-count (- key-count max-entries)
             oldest-keys (->> @l1-cache*
-                             (sort-by (comp :accessed-at val))
+                             (mapv (fn [[cache-key owners]] [cache-key (most-recent-access owners)]))
+                             (sort-by second)
                              (take eviction-count)
                              (map first))]
         (swap! l1-cache* #(reduce dissoc % oldest-keys))
         eviction-count)
       0)))
 
-(defn l1-put-entry! [cache-key state watermark max-entries]
-  (swap! l1-cache* assoc cache-key (l1-fresh-entry state watermark))
+(defn l1-put-entry! [context cache-key state watermark max-entries]
+  (swap! l1-cache* l1-store context cache-key state watermark)
   (evict-least-recently-used! (or max-entries default-l1-max-entries)))
 
-(defn l1-touch-validated! [cache-key]
-  (swap! l1-cache* assoc-in [cache-key :validated-at] (System/currentTimeMillis)))
+(defn l1-touch-validated! [context cache-key]
+  (let [owner (l1-owner context)
+        now (System/currentTimeMillis)]
+    (swap! l1-cache* (fn [entries]
+                       (let [owners (get entries cache-key)]
+                         (if-let [entry (get owners owner)]
+                           (assoc entries cache-key (assoc owners owner (assoc entry :validated-at now)))
+                           entries))))))
 
-(defn l1-update-entry! [cache-key state watermark]
-  (swap! l1-cache* assoc cache-key (l1-fresh-entry state watermark)))
+(defn l1-update-entry! [context cache-key state watermark]
+  (swap! l1-cache* l1-store context cache-key state watermark))
 
 (defn l1-invalidate! [cache-key]
   (swap! l1-cache* dissoc cache-key))
@@ -61,7 +112,7 @@
   (reset! l1-cache* {}))
 
 (defn l1-stats []
-  {:entries (count @l1-cache*)})
+  {:entries (reduce + 0 (map count (vals @l1-cache*)))})
 
 (defn- ordered-cache-values [encode key-fn values]
   (let [values (vec values)]
@@ -450,7 +501,7 @@
         max-entries (or l1-max-entries default-l1-max-entries)
         fold (fn [state events find-entity]
                (process-events-single-partition partition-key state events f partition-fn entity-id-fn find-entity))]
-    (if-let [l1 (l1-get-entry l1-key)]
+    (if-let [l1 (l1-owned-entry context l1-key)]
       (if (< (- (System/currentTimeMillis) (:validated-at l1)) ttl-ms)
         (u/trace ::l1-hit
           [:metric/name "ReadModelL1Hit" :metric/resolution :high
@@ -465,7 +516,7 @@
             (u/trace ::l1-revalidated
               [:metric/name "ReadModelL1Revalidated" :metric/resolution :high
                :read-model/cache-tier "l1-revalidated" :read-model/name name]
-              (do (l1-touch-validated! l1-key)
+              (do (l1-touch-validated! context l1-key)
                   (:state l1)))
             (let [{:keys [state event-count new-watermark] :as folded} (fold (:state l1) relevant find-entity)
                   watermark (or new-watermark (:watermark l1))]
@@ -473,7 +524,7 @@
                 [:metric/name "ReadModelL1Stale" :metric/resolution :high
                  :read-model/cache-tier "l1-stale" :read-model/name name
                  :read-model/events-processed event-count]
-                (do (l1-update-entry! l1-key state watermark)
+                (do (l1-update-entry! context l1-key state watermark)
                     (when manifest
                       (write-partition-update! cache cache-key manifest partition-key folded watermark))
                     state))))))
@@ -484,20 +535,20 @@
           (do (p-partitioned context (dissoc args :partition-key))
               (let [cached (read-single-partition cache cache-key partition-key)
                     state (or (:data cached) {})]
-                (l1-put-entry! l1-key state (:watermark cached) max-entries)
+                (l1-put-entry! context l1-key state (:watermark cached) max-entries)
                 state))
           (let [cached (read-single-partition cache cache-key partition-key)
                 cached-watermark (or (:watermark cached) (:global-watermark manifest))
                 cached-state (or (:data cached) {})
                 events (into [] (es/read event-store (add-watermark query cached-watermark)))]
             (if (empty? events)
-              (do (l1-put-entry! l1-key cached-state cached-watermark max-entries)
+              (do (l1-put-entry! context l1-key cached-state cached-watermark max-entries)
                   cached-state)
               (let [{:keys [state new-watermark] :as folded}
                     (fold cached-state events (entity-finder cache cache-key))
                     watermark (or new-watermark cached-watermark)]
                 (write-partition-update! cache cache-key manifest partition-key folded watermark)
-                (l1-put-entry! l1-key state watermark max-entries)
+                (l1-put-entry! context l1-key state watermark max-entries)
                 state))))))))
 
 (defn- p-partitioned-full
@@ -538,7 +589,7 @@
       (write-cache! cache cache-key state watermark))))
 
 (defn- p-unpartitioned
-  [{:keys [event-store cache tenant-id]}
+  [{:keys [event-store cache tenant-id] :as context}
    {:keys [f query name version scope l1-ttl-ms l1-max-entries]}]
   (u/with-context {:read-model/name name
                    :read-model/version version})
@@ -547,7 +598,7 @@
         query (inject-tenant-id query tenant-id)
         ttl-ms (or l1-ttl-ms default-l1-ttl-ms)
         max-entries (or l1-max-entries default-l1-max-entries)]
-    (if-let [l1 (l1-get-entry l1-key)]
+    (if-let [l1 (l1-owned-entry context l1-key)]
       (if (< (- (System/currentTimeMillis) (:validated-at l1)) ttl-ms)
         (u/trace ::l1-hit
           [:metric/name "ReadModelL1Hit" :metric/resolution :high
@@ -560,13 +611,13 @@
             (u/trace ::l1-revalidated
               [:metric/name "ReadModelL1Revalidated" :metric/resolution :high
                :read-model/cache-tier "l1-revalidated"]
-              (do (l1-touch-validated! l1-key)
+              (do (l1-touch-validated! context l1-key)
                   (:state l1)))
             (u/trace ::l1-stale
               [:metric/name "ReadModelL1Stale" :metric/resolution :high
                :read-model/cache-tier "l1-stale"
                :read-model/events-processed event-count]
-              (do (l1-update-entry! l1-key state watermark)
+              (do (l1-update-entry! context l1-key state watermark)
                   (when (>= event-count l2-write-back-min-events)
                     (write-cache! cache cache-key state watermark))
                   state)))))
@@ -582,7 +633,7 @@
                   watermark (or new-watermark (:watermark cached))]
               (when (>= event-count l2-write-back-min-events)
                 (write-back-l2! cache cache-key cached state watermark))
-              (l1-put-entry! l1-key state watermark max-entries)
+              (l1-put-entry! context l1-key state watermark max-entries)
               state))
           (u/trace ::l2-miss
             [:metric/name "ReadModelL2Miss" :metric/resolution :high
@@ -590,7 +641,7 @@
             (let [events (es/read event-store query)
                   {:keys [state new-watermark]} (process-events {} events f)]
               (write-cache! cache cache-key state new-watermark)
-              (l1-put-entry! l1-key state new-watermark max-entries)
+              (l1-put-entry! context l1-key state new-watermark max-entries)
               state)))))))
 
 (defn p [context {:keys [partition-fn entity-id-fn] :as args}]
