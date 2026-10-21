@@ -660,7 +660,9 @@
     ;; Deliver completion after the prior action's returned buffer is committed.
     (send-off buffer-agent
               (fn [batch] (deliver completed (count batch)) batch))
-    (let [wait-ms (max 0 (long (/ (- deadline (System/nanoTime)) 1000000)))
+    ;; Round up so returning a timeout cannot release an in-flight sink while
+    ;; the publisher still considers the deadline open for another document.
+    (let [wait-ms (max 0 (long (Math/ceil (/ (- deadline (System/nanoTime)) 1000000.0))))
           finished (deref completed wait-ms ::timeout)
           timed-out? (or (= finished ::timeout) (pos? finished))]
       (when timed-out?

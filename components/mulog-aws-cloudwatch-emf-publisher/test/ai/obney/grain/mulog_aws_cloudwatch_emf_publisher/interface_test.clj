@@ -867,7 +867,9 @@
           (is (true? (deref entered 1000 nil)))
           (let [result (deref draining 1000 nil)]
             (is (true? (:timed-out? result)))
-            (is (nil? (:retained-count result)))))
+            (is (nil? (:retained-count result)))
+            (is (<= @(.-drain-deadline instance) (System/nanoTime))
+                "timeout must not return while another document may still start")))
         (finally (deliver release true)))
       (is (await-for 2000 ab))
       (is (= 1 @writes) "untouched documents must not start a write after expiry")
