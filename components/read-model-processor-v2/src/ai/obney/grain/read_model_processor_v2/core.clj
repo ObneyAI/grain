@@ -4,6 +4,7 @@
             [ai.obney.grain.fressian-util.interface :as codec]
             [ai.obney.grain.kv-store.interface :as kv]
             [ai.obney.grain.read-model-processor-v2.core.keyed :as-alias keyed]
+            [ai.obney.grain.read-model-processor-v2.telemetry :as telemetry]
             [ai.obney.grain.read-model-processor-v2.core.read-query :as-alias read-query]
             [ai.obney.grain.read-model-processor-v2.core.span-membership :as-alias span-membership]
             [clojure.string :as str]
@@ -507,27 +508,28 @@
           [:metric/name "ReadModelL1Hit" :metric/resolution :high
            :read-model/cache-tier "l1-hit" :read-model/name name]
           (:state l1))
-        (let [events (into [] (es/read event-store (add-watermark query (:watermark l1))))
+        (let [started (System/nanoTime)
+              events (into [] (es/read event-store (add-watermark query (:watermark l1))))
               find-entity (when manifest (entity-finder cache cache-key))
               relevant (partition-relevant-events
                         (:state l1) events entity-id-fn
                         (fn [eid event] (relevant-to-partition? f partition-fn partition-key find-entity eid event)))]
           (if (empty? relevant)
-            (u/trace ::l1-revalidated
-              [:metric/name "ReadModelL1Revalidated" :metric/resolution :high
-               :read-model/cache-tier "l1-revalidated" :read-model/name name]
-              (do (l1-touch-validated! context l1-key)
-                  (:state l1)))
+            (try (do (l1-touch-validated! context l1-key)
+                  (:state l1))
+              (finally (u/log ::l1-revalidated :metric/name "ReadModelL1Revalidated" :metric/resolution :high
+               :read-model/cache-tier "l1-revalidated" :read-model/name name
+                 :mulog/duration (- (System/nanoTime) started))))
             (let [{:keys [state event-count new-watermark] :as folded} (fold (:state l1) relevant find-entity)
                   watermark (or new-watermark (:watermark l1))]
-              (u/trace ::l1-stale
-                [:metric/name "ReadModelL1Stale" :metric/resolution :high
-                 :read-model/cache-tier "l1-stale" :read-model/name name
-                 :read-model/events-processed event-count]
-                (do (l1-update-entry! context l1-key state watermark)
+              (try (do (l1-update-entry! context l1-key state watermark)
                     (when manifest
                       (write-partition-update! cache cache-key manifest partition-key folded watermark))
-                    state))))))
+                    state)
+              (finally (u/log ::l1-stale :metric/name "ReadModelL1Stale" :metric/resolution :high
+                 :read-model/cache-tier "l1-stale" :read-model/name name
+                 :read-model/events-processed event-count
+                 :mulog/duration (- (System/nanoTime) started))))))))
       (u/trace ::l1-miss
         [:metric/name "ReadModelL1Miss" :metric/resolution :high
          :read-model/cache-tier "l1-miss" :read-model/name name]
@@ -553,7 +555,11 @@
 
 (defn- p-partitioned-full
   [{:keys [event-store cache]} {:keys [f query partition-fn entity-id-fn]} cache-key manifest]
-  (let [partitions (if manifest (read-all-partitions cache cache-key manifest) {})
+  (u/trace ::partitioned-full
+    [:metric/name (if manifest "ReadModelL2Hit" "ReadModelL2Miss")
+     :metric/resolution :high
+     :read-model/cache-tier (if manifest "l2-hit" "l2-miss")]
+      (let [partitions (if manifest (read-all-partitions cache cache-key manifest) {})
         watermark (:global-watermark manifest)
         events (if watermark
                  (es/read event-store (add-watermark query watermark))
@@ -567,7 +573,7 @@
                            (or new-watermark watermark)
                            (keys partitions))
         (write-entity-index! cache cache-key entity-index)))
-    (reduce merge {} (vals partitions))))
+    (reduce merge {} (vals partitions)))))
 
 (defn- p-partitioned
   [{:keys [cache tenant-id] :as context}
@@ -592,7 +598,7 @@
   [{:keys [event-store cache tenant-id] :as context}
    {:keys [f query name version scope l1-ttl-ms l1-max-entries]}]
   (u/with-context {:read-model/name name
-                   :read-model/version version})
+                   :read-model/version version}
   (let [cache-key (format-scoped-key name version (if scope [tenant-id scope] tenant-id))
         l1-key (String. ^bytes cache-key)
         query (inject-tenant-id query tenant-id)
@@ -604,23 +610,24 @@
           [:metric/name "ReadModelL1Hit" :metric/resolution :high
            :read-model/cache-tier "l1-hit"]
           (:state l1))
-        (let [events (es/read event-store (add-watermark query (:watermark l1)))
+        (let [started (System/nanoTime)
+              events (es/read event-store (add-watermark query (:watermark l1)))
               {:keys [state event-count new-watermark]} (process-events (:state l1) events f)
               watermark (or new-watermark (:watermark l1))]
           (if (zero? event-count)
-            (u/trace ::l1-revalidated
-              [:metric/name "ReadModelL1Revalidated" :metric/resolution :high
-               :read-model/cache-tier "l1-revalidated"]
-              (do (l1-touch-validated! context l1-key)
-                  (:state l1)))
-            (u/trace ::l1-stale
-              [:metric/name "ReadModelL1Stale" :metric/resolution :high
-               :read-model/cache-tier "l1-stale"
-               :read-model/events-processed event-count]
-              (do (l1-update-entry! context l1-key state watermark)
+            (try (do (l1-touch-validated! context l1-key)
+                  (:state l1))
+              (finally (u/log ::l1-revalidated :metric/name "ReadModelL1Revalidated" :metric/resolution :high
+               :read-model/cache-tier "l1-revalidated"
+                 :mulog/duration (- (System/nanoTime) started))))
+            (try (do (l1-update-entry! context l1-key state watermark)
                   (when (>= event-count l2-write-back-min-events)
                     (write-cache! cache cache-key state watermark))
-                  state)))))
+                  state)
+              (finally (u/log ::l1-stale :metric/name "ReadModelL1Stale" :metric/resolution :high
+               :read-model/cache-tier "l1-stale"
+               :read-model/events-processed event-count
+                 :mulog/duration (- (System/nanoTime) started)))))))
       (u/trace ::l1-miss
         [:metric/name "ReadModelL1Miss" :metric/resolution :high
          :read-model/cache-tier "l1-miss"]
@@ -642,12 +649,13 @@
                   {:keys [state new-watermark]} (process-events {} events f)]
               (write-cache! cache cache-key state new-watermark)
               (l1-put-entry! context l1-key state new-watermark max-entries)
-              state)))))))
+              state))))))))
 
 (defn p [context {:keys [partition-fn entity-id-fn] :as args}]
-  (if (and partition-fn entity-id-fn)
+  (u/with-context {:read-model/name (:name args) :read-model/version (:version args)}
+    (if (and partition-fn entity-id-fn)
     (p-partitioned context args)
-    (p-unpartitioned context args)))
+    (p-unpartitioned context args))))
 
 (defn key-join ^bytes [& arrays]
   (let [out (byte-array (reduce (fn [size ^bytes a] (+ size (alength a))) 0 arrays))]
@@ -3372,13 +3380,16 @@
           ((:put tx) (deferred-slot identity marker-kind-failed) (codec/encode {:identity identity})))))))
 
 (defn- deferred-await! [ctx identity]
-  (loop []
+  (telemetry/owned! "ReadModelWaitDuration" nil
+    (assoc (telemetry/dimensions ctx (::metric-model ctx) "keyed") :read-model-wait-kind "cold-build")
+    (fn []
+    (loop []
     (when (or (deferred-owned? ctx identity)
               (kv/transact (:cache ctx) :read
                 #(when-let [marker (deferred-marker % identity)]
                    (deferred-live? ctx identity marker (deferred-lease-ms ctx)))))
       (Thread/sleep 50)
-      (recur))))
+      (recur))))))
 
 (defn- deferred-fingerprint [tx ^bytes prefix]
   [(some-> ((:get tx) (keyed-progress-key prefix)) (#(.formatHex (HexFormat/of) ^bytes %)))
@@ -3851,7 +3862,7 @@
        (Arrays/equals ^bytes ((:get tx) (keyed-progress-key b)) ^bytes (:raw prepared))))
 
 (defn- keyed-write-batch! [ctx name d b validate-state! validate-result! events through prepared]
-  (kv/transact (:cache ctx) :write
+  (let [result (kv/transact (:cache ctx) :write
     (fn [tx]
       (let [written (long-array 1)
             tx (batch-transaction ctx tx b written)
@@ -3886,7 +3897,13 @@
         (when (and (seq events) (not (zero? @added)))
           (keyed-write! tx (keyed-count-key b) (+ count-before @added)))
         (advance-progress! tx d b before-progress events through)
-        {:events (count events) :bytes (aget written 0)}))))
+        {:events (count events) :bytes (aget written 0)})))]
+    (let [dims (assoc (telemetry/dimensions ctx name "keyed")
+                      :read-model-target (if (::deferred ctx) "staging" "live"))]
+      (telemetry/counter! "ReadModelCommittedEvents" (:events result) dims)
+      (telemetry/counter! "ReadModelCommittedBatches" 1 dims)
+      (telemetry/counter! "ReadModelEncodedBytesWritten" (:bytes result) dims))
+    result))
 
 (defn- keyed-interrupt? [t]
   (loop [^Throwable t t]
@@ -4113,6 +4130,9 @@
     (catch Throwable t
       (if (and (keyed-map-full? t) (> (count events) min-events))
         (let [half (quot (inc (count events)) 2)
+              _ (telemetry/counter! "ReadModelBatchBackoff" 1
+                                   (assoc (telemetry/dimensions ctx name "keyed")
+                                          :read-model-target (if (::deferred ctx) "staging" "live")))
               _ (on-backoff half)
               first-part (keyed-apply-with-backoff! ctx name d b validate-state! validate-result!
                                                     (subvec events 0 half) nil min-events on-backoff)
@@ -4298,6 +4318,7 @@
                    :own! (fn [s]
                            (vreset! staging s)
                            (when s
+                             (telemetry/cold-start!)
                              (vreset! beat (deferred-heartbeat! ctx s (deferred-lease-ms ctx)))))
                    :batcher (catch-up-batcher ctx name d b policy (nil? after)
                                               validate-state! validate-result! staging))]
@@ -4305,9 +4326,13 @@
       ((:own! run) claimed))
     (try
       (keyed-check-index-layout! staged d)
-      (finish-catch-up! run (fold-source-events! run))
+      (let [result (finish-catch-up! run (fold-source-events! run))]
+        (when (restart? result) (telemetry/cold-result! "superseded"))
+        result)
       (catch Throwable e
-        (recover-from-catch-up-failure! run e))
+        (let [result (recover-from-catch-up-failure! run e)]
+          (when (restart? result) (telemetry/cold-result! "superseded"))
+          result))
       (finally
         (some-> @beat (apply []))
         (some->> @staging :build (deferred-disown! ctx identity))))))
@@ -4333,20 +4358,25 @@
                         (restart ctx))
               :restart (restart ctx)
               (try
-                (catch-up-from-source! {:ctx ctx :name name :d d :b b :identity identity
+                (telemetry/cold-owned! (telemetry/dimensions ctx name "keyed") (map? claimed)
+                  (fn []
+                  (catch-up-from-source! {:ctx ctx :name name :d d :b b :identity identity
                                         :progress progress :after after :through through
                                         :policy policy :source source :stable? stable? :proof-key proof-key
-                                        :deferrable? deferrable? :pending? pending? :claimed claimed})
+                                        :deferrable? deferrable? :pending? pending? :claimed claimed})))
                 (finally
                   (some->> claimed :build (deferred-disown! ctx identity)))))))))))
 
 (defn- keyed-catch-up! [ctx name d b through identity]
-  (loop [ctx ctx b b]
+  (telemetry/owned! "ReadModelCatchUpDuration" "ReadModelCatchUpFailed"
+    (telemetry/dimensions ctx name "keyed")
+    (fn []
+    (loop [ctx (assoc ctx ::metric-model name) b b]
     (let [result (keyed-catch-up-step! ctx name d b through identity)]
       (if (restart? result)
         (let [ctx (nth result 1)]
           (recur ctx (or (keyed-resolve ctx identity) b)))
-        result))))
+        result))))))
 
 (defn- keyed-identity-of [ctx]
   [(:tenant-id ctx) (:read-model/scope ctx)])
@@ -4423,7 +4453,9 @@
             (if (identical? flight running-flight)
               (run-as-single-flight! flight-key flight #(catch-up! b shared))
               (recur (cond-> foreign-failures
-                       (identical? ::failed (deref running-flight keyed-catch-up-wait-ms nil)) inc)))))))))
+                       (identical? ::failed (telemetry/owned! "ReadModelWaitDuration" nil
+                         (assoc (telemetry/dimensions ctx name "keyed") :read-model-wait-kind "catch-up")
+                         #(deref running-flight keyed-catch-up-wait-ms nil))) inc)))))))))
 
 (defn- validate-session-request! [cache event-store registry [ctx names]]
   (keyed-validate-scope! (:read-model/scope ctx))
@@ -5323,7 +5355,7 @@
                   :param (if (contains? params (second expr))
                            (get params (second expr))
                            (query-fail "Missing calculation parameter" {:parameter (second expr)}))
-                  :call (apply (second expr) (map evaluate (drop 2 expr))))))]
+                  :call (apply telemetry/consumer-call (second expr) (mapv evaluate (drop 2 expr))))))]
       {:evaluate evaluate
        :row (fn [] (into {:key id} (map (fn [alias] [alias (result alias)])) (:aliases plan)))})))
 

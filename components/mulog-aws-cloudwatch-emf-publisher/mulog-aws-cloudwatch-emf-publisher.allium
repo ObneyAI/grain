@@ -95,11 +95,31 @@ contract MetricPublication {
         -- silently changing its lifetime semantics.
 
     @invariant LegacyClassification
-        -- During migration, an unregistered named metric_value is a Count
-        -- counter, while an unregistered named duration with no metric_value is
+        -- During migration, an unknown application metric with a named
+        -- metric_value is a Count counter, while an unknown named duration with
+        -- no metric_value is
         -- a Milliseconds timer. Low and standard resolution map to standard
         -- storage; high or unspecified resolution maps to high storage.
         -- Unsupported resolution requests are invalid.
+
+    @invariant ReadModelSemanticFallback
+        -- The eleven core read-model measurements have built-in type, unit and
+        -- resolution semantics even when the consumer has no registry or an
+        -- older registry lacks their names. In particular, encoded write bytes
+        -- publish as Bytes without requiring consumer startup code changes.
+        -- An actual configured definition always takes precedence. Fallback
+        -- supplies semantics only: dimensional validation continues using the
+        -- actual configured definition, or legacy app-name/env handling when
+        -- no definition exists. It neither fabricates an empty dimensional
+        -- declaration nor broadens dimensions or trusts arbitrary event units.
+        -- Unknown application metric inference remains unchanged.
+
+    @invariant OptionalReadModelIdentity
+        -- Read-model model names supplied as optional top-level fields become
+        -- dimensions only when allowed by the deployment's vocabulary. Unknown
+        -- optional model names are omitted so aggregate measurements survive.
+        -- Explicit dimension maps and other configured vocabularies stay strict;
+        -- this exception never permits unbounded model-name dimension values.
 
     @invariant Validation
         -- Names, values, timestamps, units, resolutions and dimensions meet both

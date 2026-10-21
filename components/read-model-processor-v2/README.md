@@ -604,7 +604,9 @@ Unpartitioned reads emit mulog traces named `ReadModelL1Hit`,
 `ReadModelL1Revalidated`, `ReadModelL1Stale`, `ReadModelL1Miss`,
 `ReadModelL2Hit` and `ReadModelL2Miss`, with `:read-model/cache-tier`.
 Single-partition reads emit the four L1 traces, which also carry
-`:read-model/name`. Reads of all partitions emit no traces.
+`:read-model/name`. Full partition projections emit `ReadModelL2Hit` or
+`ReadModelL2Miss`, according to whether a partition manifest was present. All
+ordinary-model paths retain model name/version context.
 
 ### Partitioned models
 
@@ -647,3 +649,48 @@ clojure -J--add-opens=java.base/java.nio=ALL-UNNAMED \
   -Sdeps '{:paths ["resources" "../../components/read-model-processor-v2/test"] :deps {bench/sqlite {:local/root "../../components/event-store-sqlite-v3"}}}' \
   -M -m ai.obney.grain.read-model-processor-v2.interface-test 10000 /tmp/ranked-membership.edn
 ```
+
+## Production metrics
+
+Read-model operations emit μ/log metrics automatically, independently of
+`:read-model/observer`. Enabling metrics does not disable speculative preparation,
+optimized index builders, or staged cold builds. The observer remains a diagnostic
+hook with its existing execution-path effects.
+
+| Metric | Meaning |
+| --- | --- |
+| `ReadModelReadDuration` | One completed public logical read, including failures. Reducible reads are timed during consumption, including consumer work; creating an unconsumed reducible emits no duration. Each subsequent reduction is another attempt. |
+| `ReadModelReadFailed` | Read definition, validation, materialization, or storage failure. Caller callback errors and cancellation do not increment this counter. |
+| `ReadModelCatchUpDuration`, `ReadModelCatchUpFailed` | One locally owned keyed catch-up, including internal restarts. Waiting readers do not duplicate catch-up attempts. |
+| `ReadModelCommittedEvents` | Source events accepted by successfully committed physical keyed batches. Routing to multiple owners counts the source event once. Speculative reducer calls and rolled-back writes do not count. |
+| `ReadModelCommittedBatches` | Successful physical keyed batch transactions, including each successful leaf after map-full splitting. Checkpoint-only transactions do not count. |
+| `ReadModelEncodedBytesWritten` | Encoded key/value bytes passed to put operations by committed keyed batches, including repeated writes. This is neither disk growth nor total cold-build/index finalization I/O. |
+| `ReadModelWaitDuration` | Time waiting for another local catch-up owner or a staged-build owner. |
+| `ReadModelBatchBackoff` | Map-full failures that actually trigger a batch split. |
+| `ReadModelColdBuildDuration`, `ReadModelColdBuildFailed` | One owned staged cold-build attempt, including replay, index finalization, and publication. Resumed ownership starts a new attempt. Small builds performed in place are covered by catch-up metrics. Supersession/restart and cancellation are not failures. |
+
+Durations use milliseconds at high resolution. Counters use standard resolution
+and Count, except encoded bytes, which uses Bytes. Read outcomes are `success`,
+`failure`, `consumer-error`, or `cancelled`; a staged build that loses ownership or
+must restart uses `superseded`. Errors retain their original throwable identity.
+A query or read-session owns one read duration; its synchronous internal reads
+and reads made in the session callback do not duplicate that denominator. An
+independent read on another thread owns its own attempt. An internal read failure
+propagated through a callback remains a processor failure.
+
+Bounded optional dimension names are `:read-model-operation`, `:read-model-kind`
+(`ordinary`, `partitioned`, `keyed`), `:read-model-scope` (`tenant`, `scoped`,
+`partition`), `:read-model-outcome`, `:read-model-wait-kind` (`catch-up`,
+`cold-build`), and `:read-model-target` (`live`, `staging`). Scope labels describe
+only the mode. Tenant IDs, keys, selectors, versions, and search text are never
+metric dimensions. `:read-model-name` is an optional allowlist of stringified
+qualified keywords. Unknown top-level model names are omitted while preserving
+the aggregate metric. Explicit `:metric/dimensions` remain strict.
+
+The CloudWatch EMF publisher recognizes the semantics of these eleven metrics
+with unchanged existing factory configuration, including custom registries that
+do not yet contain them. For dimensions, use `grain-metric-registry` with bounded
+values (the example application demonstrates all vocabularies). Without a
+configured definition, legacy app/env dimensions continue to work; configured
+definitions remain authoritative. Existing ordinary cache-tier timers now include
+event reading/folding, and full partition projections emit L2 hit/miss timings.

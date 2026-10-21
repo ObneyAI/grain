@@ -16,6 +16,7 @@
    components/read-model-processor-v2/README.md. The behavioural contract is
    read-model-processor-v2.allium in the same directory."
   (:require [ai.obney.grain.read-model-processor-v2.core :as core]
+            [ai.obney.grain.read-model-processor-v2.telemetry :as telemetry]
             [ai.obney.grain.read-model-processor-v2.core.keyed :as-alias keyed]
             [malli.core :as m]))
 
@@ -40,7 +41,8 @@
      :l1-max-entries L1 size limit (default 10000)"
   [{:keys [_event-store _cache _tenant-id] :as context}
    {:keys [_f _query _name _version _scope _partition-fn _entity-id-fn _partition-key] :as args}]
-  (core/p context args))
+  (telemetry/read! (telemetry/ordinary-context context args) (:name args)
+                   (telemetry/ordinary-kind args) "project" #(core/p context args)))
 
 (def read-model-registry*
   "Global registry atom: qualified model name -> the declaration's options
@@ -176,22 +178,25 @@
    :partition-key returns all partitions merged."
   ([context rm-name] (project context rm-name nil))
   ([context rm-name scope]
-   (let [entry (get @read-model-registry* rm-name)
-         _ (when (core/keyed? entry)
-             (throw (ex-info "Use value, state, values or page for a keyed fold" {:model rm-name})))
-         query (cond
-                 (:queries scope) (:queries scope)
-                 (:tags scope)    {:types (:events entry) :tags (:tags scope)}
-                 :else            {:types (:events entry)})]
-     (p context (cond-> {:f       (:reducer-fn entry)
-                         :query   query
-                         :name    rm-name
-                         :version (:version entry 1)
-                         :scope   scope}
-                  (:partition-fn entry)  (assoc :partition-fn (:partition-fn entry))
-                  (:entity-id-fn entry) (assoc :entity-id-fn (:entity-id-fn entry))
-                  (:partition-key scope) (assoc :partition-key (:partition-key scope))
-                  (:l1-ttl-ms entry)    (assoc :l1-ttl-ms (:l1-ttl-ms entry)))))))
+   (telemetry/read! (telemetry/ordinary-context context {:scope scope :partition-key (:partition-key scope)})
+     rm-name (telemetry/ordinary-kind (get @read-model-registry* rm-name)) "project"
+     (fn []
+       (let [entry (get @read-model-registry* rm-name)
+           _ (when (core/keyed? entry)
+               (throw (ex-info "Use value, state, values or page for a keyed fold" {:model rm-name})))
+           query (cond
+                   (:queries scope) (:queries scope)
+                   (:tags scope)    {:types (:events entry) :tags (:tags scope)}
+                   :else            {:types (:events entry)})]
+       (p context (cond-> {:f       (:reducer-fn entry)
+                           :query   query
+                           :name    rm-name
+                           :version (:version entry 1)
+                           :scope   scope}
+                    (:partition-fn entry)  (assoc :partition-fn (:partition-fn entry))
+                    (:entity-id-fn entry) (assoc :entity-id-fn (:entity-id-fn entry))
+                    (:partition-key scope) (assoc :partition-key (:partition-key scope))
+                    (:l1-ttl-ms entry)    (assoc :l1-ttl-ms (:l1-ttl-ms entry)))))))))
 
 (defn scoped-context
   "Return context with an event scope: keyed reads through it fold only the
@@ -222,14 +227,16 @@
    not-found to tell those apart from a stored nil result."
   ([context name key] (value context name key nil))
   ([context name key not-found]
-   (core/keyed-point context name (keyed-definition context name) key :value not-found)))
+   (telemetry/read! context name "keyed" "value"
+     #(core/keyed-point context name (keyed-definition context name) key :value not-found))))
 
 (defn state
   "Return the reducer state of instance key in keyed model name, or not-found
    (default nil). Excluded instances still have state."
   ([context name key] (state context name key nil))
   ([context name key not-found]
-   (core/keyed-point context name (keyed-definition context name) key :state not-found)))
+   (telemetry/read! context name "keyed" "state"
+     #(core/keyed-point context name (keyed-definition context name) key :state not-found))))
 
 (defn values
   "Return a reducible of {:key id :value result} for included instances, in
@@ -239,7 +246,8 @@
    snapshot; inside a read-session, reduce it before the session returns."
   ([context name] (values context name {}))
   ([context name selection]
-   (core/keyed-values context name (keyed-definition context name) selection)))
+   (telemetry/reducible-read context name "keyed" "values"
+     #(core/keyed-values context name (keyed-definition context name) selection))))
 
 (defn page
   "Return one page of included instances in index order.
@@ -254,7 +262,8 @@
    :rank-entries-examined. Counting and skipping pages use stored ranks and do
    not read the skipped entries."
   [context name options]
-  (core/keyed-page context name (keyed-definition context name) options))
+  (telemetry/read! context name "keyed" "page"
+     #(core/keyed-page context name (keyed-definition context name) options)))
 
 (defn index-groups
   "Return [{:value v :total n} ...] for the distinct values of index, in
@@ -262,10 +271,13 @@
    skipping duplicates and empty groups. Reads stored counts (for :identity, the
    identity index) and never loads results."
   ([context name index]
-   (core/keyed-index-groups context name (keyed-definition context name) index))
+   (telemetry/read! context name "keyed" "index-groups"
+     #(core/keyed-index-groups context name (keyed-definition context name) index)))
   ([context name index values]
-   (when (nil? values) (throw (ex-info "Expected group values, not nil" {:model name})))
-   (core/keyed-index-groups context name (keyed-definition context name) index values)))
+   (telemetry/read! context name "keyed" "index-groups"
+     (fn []
+       (when (nil? values) (throw (ex-info "Expected group values, not nil" {:model name})))
+       (core/keyed-index-groups context name (keyed-definition context name) index values)))))
 
 (defn search-keys
   "Return the IDs of included instances whose :searches text matches :query, a
@@ -274,7 +286,8 @@
    :suffix need 1). Shorter queries throw :grain.read-model/short-search. Does
    not load results."
   [context name options]
-  (core/keyed-search-keys context name (keyed-definition context name) options))
+  (telemetry/read! context name "keyed" "search-keys"
+     #(core/keyed-search-keys context name (keyed-definition context name) options)))
 
 (defn key-page
   "Sort candidate IDs (keys, or every included instance in the three-argument
@@ -290,9 +303,11 @@
    :total, :total-pages, :page, :page-size and :sort-keys-read. Reads the index
    data of every candidate, but no results. Ties are ascending by string ID."
   ([context name options]
-   (core/keyed-key-page context name (keyed-definition context name) ::keyed/all options))
+   (telemetry/read! context name "keyed" "key-page"
+     #(core/keyed-key-page context name (keyed-definition context name) ::keyed/all (telemetry/callback-options options))))
   ([context name keys options]
-   (core/keyed-key-page context name (keyed-definition context name) keys options)))
+   (telemetry/read! context name "keyed" "key-page"
+     #(core/keyed-key-page context name (keyed-definition context name) keys (telemetry/callback-options options)))))
 
 (defn filtered-key-page
   "Experimental. Return one page of candidate IDs (keys) in the stored order
@@ -301,7 +316,8 @@
    :direction, :page, :limit. Skips whole stored spans instead of sorting
    candidates; resolving the candidates still costs one lookup each."
   [context name keys options]
-  (core/keyed-filtered-key-page context name (keyed-definition context name) keys options))
+  (telemetry/read! context name "keyed" "filtered-key-page"
+     #(core/keyed-filtered-key-page context name (keyed-definition context name) keys (telemetry/callback-options options))))
 
 (defn joined-page
   "Experimental. Page the included IDs of membership-model in the order of an
@@ -311,8 +327,9 @@
    candidates. Reads both models in one snapshot. Without :keys it visits every
    membership ID; no results are loaded and nothing is stored."
   [context membership-model ordering-model options]
-  (core/keyed-joined-page context membership-model (keyed-definition context membership-model)
-                          ordering-model (keyed-definition context ordering-model) options))
+  (telemetry/read! context membership-model "keyed" "joined-page"
+     #(core/keyed-joined-page context membership-model (keyed-definition context membership-model)
+                          ordering-model (keyed-definition context ordering-model) options)))
 
 (defn index-keys
   "Return the IDs whose index value equals :equals, ascending by string ID.
@@ -320,7 +337,8 @@
    (default 25). :direction is accepted but does not change the order. An
    offset past the end returns []. Does not load results."
   [context name options]
-  (core/keyed-index-keys context name (keyed-definition context name) options))
+  (telemetry/read! context name "keyed" "index-keys"
+     #(core/keyed-index-keys context name (keyed-definition context name) options)))
 
 (defn index-values
   "Return a reducible of {:key id :value {index stored-value}} for the index
@@ -328,10 +346,13 @@
    four-argument form, for ids (duplicates and absent IDs are skipped). Does not
    load results. Inside a read-session, reduce it before the session returns."
   ([context name indexes]
-   (core/keyed-index-values context name (keyed-definition context name) indexes nil))
+   (telemetry/reducible-read context name "keyed" "index-values"
+     #(core/keyed-index-values context name (keyed-definition context name) indexes nil)))
   ([context name indexes ids]
-   (when (nil? ids) (throw (ex-info "Expected instance IDs, not nil" {:model name})))
-   (core/keyed-index-values context name (keyed-definition context name) indexes ids)))
+   (telemetry/reducible-read context name "keyed" "index-values"
+     (fn []
+       (when (nil? ids) (throw (ex-info "Expected instance IDs, not nil" {:model name})))
+       (core/keyed-index-values context name (keyed-definition context name) indexes ids)))))
 
 (defn index-rank
   "Return {:rank n :present? bool}: the zero-based position of id within the
@@ -339,14 +360,16 @@
    inserted when absent. Selection: :index, :equals (required); :direction is
    accepted but ignored."
   [context name selection id]
-  (core/keyed-index-rank context name (keyed-definition context name) selection id))
+  (telemetry/read! context name "keyed" "index-rank"
+     #(core/keyed-index-rank context name (keyed-definition context name) selection id)))
 
 (defn progress
   "Catch up keyed model name and return its progress, {:watermark event-id
    :checked-through event-id}: the last event folded and the latest head it
    was checked against."
   [context name]
-  (core/keyed-progress context name (keyed-definition context name)))
+  (telemetry/read! context name "keyed" "progress"
+     #(core/keyed-progress context name (keyed-definition context name))))
 
 (defn read-session
   "Catch up the named keyed models, then call f with a session context. Reads
@@ -360,7 +383,9 @@
   ([context model-names f]
    (read-session [[context model-names]] (fn [[prepared]] (f prepared))))
   ([requests f]
-   (core/keyed-read-session requests @read-model-registry* f)))
+   (telemetry/read! (ffirst requests) nil "keyed" "read-session"
+     #(core/keyed-read-session requests @read-model-registry*
+                               (fn [contexts] (telemetry/consumer-call f contexts))))))
 
 (defn order-key
   "Return an index extractor over result fields that query can match to an
@@ -392,17 +417,23 @@
    :grain.read-query/unsupported; [:call ...] orders evaluate every candidate.
    See the component README for the definition syntax."
   [context definition request]
-  (let [registry @read-model-registry*
-        plan (core/query-compile-definition definition registry)
-        api {:value #'value :values #'values :page #'page
-             :index-groups #'index-groups :index-keys #'index-keys :index-rank #'index-rank
-             :search-keys #'search-keys :key-page #'key-page
-             :filtered-key-page #'filtered-key-page :joined-page #'joined-page
-             :read-session (fn [ctx names f]
-                             (core/keyed-read-session [[ctx names]] registry (fn [[prepared]] (f prepared))))
-             :same-members? (fn [ctx a b]
-                              (or (= a b) (core/keyed-same-members? ctx a (get registry a) b (get registry b))))}]
-    (core/query-execute api context plan request)))
+  (telemetry/read! context nil "keyed" "query"
+    (fn []
+      (let [registry @read-model-registry*
+          plan (core/query-compile-definition definition registry)
+          api {:value #'value :values #'values :page #'page
+               :index-groups #'index-groups :index-keys #'index-keys :index-rank #'index-rank
+               :search-keys #'search-keys
+               ;; These are planner callbacks. User [:call] functions are tagged
+               ;; at evaluation; planner validation/storage errors remain failures.
+               :key-page (fn [ctx name keys options]
+                           (core/keyed-key-page ctx name (keyed-definition ctx name) keys options))
+               :filtered-key-page #'filtered-key-page :joined-page #'joined-page
+               :read-session (fn [ctx names f]
+                               (core/keyed-read-session [[ctx names]] registry (fn [[prepared]] (f prepared))))
+               :same-members? (fn [ctx a b]
+                                (or (= a b) (core/keyed-same-members? ctx a (get registry a) b (get registry b))))}]
+      (core/query-execute api context plan request)))))
 
 (defn l1-clear!
   "Empty the in-process L1 cache used by ordinary models."

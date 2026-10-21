@@ -42,7 +42,8 @@
 --   - the precise eviction policy (LRU by projection), segment count (64),
 --     hash-segmentation thresholds and write-back batching counts: these are
 --     performance tunings recorded as config, not behavioural promises
---   - CloudWatch / mulog metrics and the cache-tier trace labels
+--   - metric encoding and delivery, governed by the publisher; this component
+--     owns the read-model measurements described by ReadModelTelemetry
 --   - threads, atoms, transients and other in-process mechanics
 --
 -- Conformance properties RM1..RM11 correspond to the interface test suite
@@ -249,6 +250,84 @@ contract Partitioning {
     @invariant PartitionIsolation
         -- RM10: appending events to one partition does not alter another. Each
         -- partition is cached and caught up independently from its own watermark.
+}
+
+-- Read-model observations are independent of how metrics are encoded or sent.
+contract ReadModelTelemetry {
+    @invariant CoreMeasurements
+        -- ReadModelReadDuration, ReadModelCatchUpDuration,
+        -- ReadModelWaitDuration and ReadModelColdBuildDuration are nanosecond
+        -- duration observations published as millisecond high-resolution timers.
+        -- ReadModelReadFailed, ReadModelCatchUpFailed,
+        -- ReadModelCommittedEvents, ReadModelCommittedBatches,
+        -- ReadModelBatchBackoff and ReadModelColdBuildFailed are standard-
+        -- resolution Count counters. ReadModelEncodedBytesWritten is a standard-
+        -- resolution Bytes counter.
+
+    @invariant LogicalReadOwnership
+        -- One outer public projection, point/page/query read or explicit read
+        -- session owns one read-duration observation, on success or failure.
+        -- Nested implementation reads share that ownership instead of each
+        -- claiming another public read. Callback execution inside an explicit
+        -- session belongs to that session's wall time.
+        -- A lazy read owns its duration during each actual consumption, not
+        -- during construction. Unconsumed reducibles emit no successful read;
+        -- repeated reductions are separate consumptions. Early termination is
+        -- successful consumption. Duration includes the caller's reducing work.
+
+    @invariant FailureClassification
+        -- Read validation, definition and processor/storage failures increment
+        -- ReadModelReadFailed; caller callback errors and interruption do not
+        -- masquerade as processor failures. A processor failure raised by a
+        -- nested read remains a processor failure even inside a caller callback.
+        -- Owned catch-up failure increments ReadModelCatchUpFailed once; followers
+        -- observing that failure may retry and are not themselves failed owners.
+        -- Failures at read, catch-up and build layers may describe the same
+        -- operation and must not be summed into a total failure count.
+
+    @invariant ConfirmedBatchWork
+        -- Keyed source batch counters are emitted only after a successful
+        -- physical batch commit is confirmed. CommittedEvents counts the
+        -- filtered source events actually advanced, including an event routing
+        -- to no owners, not owner inputs or speculative reducer invocations.
+        -- CommittedBatches counts successful physical leaves, never failed
+        -- parents or aggregate split summaries. Failed preparation or rollback
+        -- adds no committed work; earlier successful batches remain counted
+        -- when a later tail fails and recovery resumes.
+        -- EncodedBytesWritten measures encoded key/value put bytes for those
+        -- source batches, not net disk growth, deletes or all finalization work.
+        -- Live and staging work remain distinguishable; staging writes do not
+        -- claim readable publication before the atomic namespace swap commits.
+
+    @invariant OwnedCatchUpAndContention
+        -- For keyed processing, one owner observes CatchUpDuration across the
+        -- logical restart loop.
+        -- Waiting followers observe actual single-flight or deferred-ownership
+        -- wait time, not another owner's catch-up duration. BatchBackoff counts
+        -- actual map-full split decisions, not ordinary batch attempts.
+        -- ColdBuildDuration covers one owned staged-build attempt through its
+        -- finalization/publication or exit. ColdBuildFailed counts a failed
+        -- attempt, never normal supersession, restart or resumed ownership alone.
+        -- A recovered build failure may coexist with a successful outer read.
+
+    @invariant BoundedDiagnosticDimensions
+        -- Operation, model kind, scope mode, outcome, target and wait kind use
+        -- finite vocabularies, distinct from unrelated framework vocabularies.
+        -- Model identity is an optional deployment allowlist; unknown optional
+        -- names are omitted without discarding the aggregate observation.
+        -- Tenant, instance and event identities, model versions, scope selectors
+        -- or hashes, raw queries/searches and exception messages are not metric
+        -- dimensions. Explicit publisher dimension declarations remain strict.
+
+    @invariant NonInterference
+        -- Telemetry preserves values, original exceptions, snapshots, reducer
+        -- executions, transaction boundaries, retries and batch policy. It does
+        -- not enable the benchmark observer, disable preparation or cold-build
+        -- optimizations, add source queries/scans, or emit per-row log events.
+        -- The processor is demand-driven: an old matching-event watermark or
+        -- empty-interval proof does not imply backlog or time-based staleness.
+        -- Observations are best-effort process telemetry, not durable exactly-
+        -- once accounting across uncertain commits or delivery failures.
 }
 
 ------------------------------------------------------------
@@ -1213,6 +1292,7 @@ surface ReadModelProjection {
         fulfils Projection
         fulfils Cache
         fulfils Partitioning
+        fulfils ReadModelTelemetry
 
     @guarantee CacheIsTransparent
         -- The state returned is the reducer folded over the matching event
@@ -1242,6 +1322,7 @@ surface KeyedFoldBoundary {
         fulfils KeyedFoldMaterialization
         fulfils KeyedFoldReads
         fulfils ComposedReadQuery
+        fulfils ReadModelTelemetry
 
     @guarantee OneProjectionLifecycle
         -- Application code supplies independent pure folds and optional result

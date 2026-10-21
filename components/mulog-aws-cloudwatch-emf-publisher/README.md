@@ -99,3 +99,20 @@ Malformed measurements and invalid aggregates are counted invalid independently
 of valid companions. EMF documents are split before their encoded UTF-8 size
 exceeds 1 MiB. Local acceptance does not establish CloudWatch extraction; check
 the logging pipeline and CloudWatch EMF validation metrics in deployment.
+
+Read-model processor metrics require no consumer startup/configuration changes.
+The publisher has a narrow semantic fallback for the eleven new `ReadModel*`
+read/catch-up/committed-work/wait/backoff/cold-build metrics described in the
+[read-model guide](../read-model-processor-v2/README.md#production-metrics). This
+preserves Bytes for `ReadModelEncodedBytesWritten`, standard-resolution work
+counters, and millisecond timers even when a deployment's custom registry predates
+these metrics. A configured definition takes precedence; fallback does not grant
+new dimension permissions or trust arbitrary event-supplied units.
+
+`grain-metric-registry` accepts bounded `:read-model-operation`,
+`:read-model-kind`, `:read-model-scope`, `:read-model-outcome`,
+`:read-model-wait-kind`, and `:read-model-target` vocabularies. These names are
+separate from generic operation/outcome dimensions. Optionally declare
+`:read-model-name #{":my-app/my-model"}`. An unknown top-level model name is
+omitted so aggregate publication continues; explicit `:metric/dimensions` values
+are validated strictly. No tenant IDs or instance keys are emitted as dimensions.

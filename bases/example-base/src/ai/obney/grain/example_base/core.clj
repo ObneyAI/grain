@@ -15,6 +15,7 @@
             [ai.obney.grain.query-request-handler.interface :as qrh]
             [ai.obney.grain.command-processor-v2.interface :as command-processor]
             [ai.obney.grain.query-processor.interface :as query-processor]
+            [ai.obney.grain.read-model-processor-v2.interface :as read-model]
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.event-store-v3.interface :as es]
@@ -105,6 +106,16 @@
                 :query (set (map str query-names))
                 :processor (set (map str processor-names))
                 :periodic (set (map str periodic-names))
+                :read-model-operation #{"project" "value" "state" "values" "page" "index-groups"
+                                        "search-keys" "key-page" "filtered-key-page" "joined-page"
+                                        "index-keys" "index-values" "index-rank" "progress"
+                                        "read-session" "query"}
+                :read-model-kind #{"ordinary" "partitioned" "keyed"}
+                :read-model-scope #{"tenant" "scoped" "partition"}
+                :read-model-outcome #{"success" "failure" "cancelled" "consumer-error" "superseded"}
+                :read-model-wait-kind #{"catch-up" "cold-build"}
+                :read-model-target #{"live" "staging"}
+                :read-model-name (set (map str (keys (read-model/global-read-model-registry))))
                 :backend #{"in-memory" "sqlite" "postgres"}
                 :operation #{"start" "append" "read" "transaction" "notification" "pool"}
                 :outcome #{"succeeded" "rejected" "anomaly" "failed"

@@ -22,6 +22,23 @@
    :percent "Percent"
    :none "None"})
 
+(def ^:private read-model-metrics
+  {"ReadModelReadDuration" [:timer :milliseconds :high]
+   "ReadModelReadFailed" [:counter :count :standard]
+   "ReadModelCatchUpDuration" [:timer :milliseconds :high]
+   "ReadModelCatchUpFailed" [:counter :count :standard]
+   "ReadModelCommittedEvents" [:counter :count :standard]
+   "ReadModelCommittedBatches" [:counter :count :standard]
+   "ReadModelEncodedBytesWritten" [:counter :bytes :standard]
+   "ReadModelWaitDuration" [:timer :milliseconds :high]
+   "ReadModelBatchBackoff" [:counter :count :standard]
+   "ReadModelColdBuildDuration" [:timer :milliseconds :high]
+   "ReadModelColdBuildFailed" [:counter :count :standard]})
+
+(def ^:private read-model-dimensions
+  #{:read-model-operation :read-model-kind :read-model-scope :read-model-outcome
+    :read-model-wait-kind :read-model-target :read-model-name})
+
 (def ^:private existing-grain-metrics
   {"CommandProcessed" [:timer :milliseconds :high]
    "CommandDuration" [:timer :milliseconds :high]
@@ -171,13 +188,15 @@
    (into {}
          (map (fn [[metric-name [metric-type unit resolution]]]
                 (let [allowed-names (into common-dimensions
-                                          (get metric-specific-dimensions metric-name #{}))]
+                                          (if (contains? read-model-metrics metric-name)
+                                            read-model-dimensions
+                                            (get metric-specific-dimensions metric-name #{})))]
                   [metric-name {:metric/type metric-type
                                 :metric/unit unit
                                 :metric/resolution resolution
                                 :metric/dimensions (select-keys dimension-values
                                                                 allowed-names)}])))
-         existing-grain-metrics)))
+         (merge existing-grain-metrics read-model-metrics))))
 
 (defn extend-grain-metric-registry
   "Builds a publisher registry containing Grain metrics and consumer-owned metrics.
@@ -271,7 +290,13 @@
   (if definition
     (let [declared (or (:metric/dimensions definition) {})
           explicit (or (:metric/dimensions event) {})
-          supplied (merge (select-keys event (keys declared)) explicit)]
+          top-level (select-keys event (keys declared))
+          top-level (if (and (contains? read-model-metrics (:metric/name event))
+                             (contains? top-level :read-model-name)
+                             (not (contains? (get declared :read-model-name #{}) (:read-model-name top-level))))
+                      (dissoc top-level :read-model-name)
+                      top-level)
+          supplied (merge top-level explicit)]
       (when (and (<= (count supplied) 30)
                  (unique-dimension-targets? supplied)
                  (every? #(contains? declared %) (keys explicit))
@@ -298,12 +323,17 @@
   (try
     (let [metric-name (:metric/name event)
           definition (definition-for config event)
+          ;; Fallback supplies semantics only. An actual configured definition
+          ;; remains authoritative, including its dimension permissions.
+          semantics (or definition
+                        (when-let [[type unit resolution] (get read-model-metrics metric-name)]
+                          {:metric/type type :metric/unit unit :metric/resolution resolution}))
           direct-value (:metric/value event)
           duration (:mulog/duration event)
-          metric-type (or (:metric/type definition)
+          metric-type (or (:metric/type semantics)
                           (when (some? direct-value) :counter)
                           (when (some? duration) :timer))
-          unit (or (:metric/unit definition)
+          unit (or (:metric/unit semantics)
                    (when (some? direct-value) :count)
                    (when (some? duration) :milliseconds))
           value (if (= metric-type :timer)
@@ -314,7 +344,7 @@
                       nil))
                   direct-value)
           timestamp (or (:mulog/timestamp event) now-ms)
-          resolution (normalize-resolution definition event)
+          resolution (normalize-resolution semantics event)
           dimensions (normalize-dimensions definition event)]
       (when (and (valid-name? metric-name)
                  (not= "_aws" metric-name)

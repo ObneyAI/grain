@@ -356,7 +356,8 @@
         (is (= 1 (count @accepted)))))))
 
 (deftest lifecycle-wrapper-drains-before-stopping-mulog
-  (let [started-publisher (atom nil)
+  (binding [mulog-core/*default-logger* (atom (buffer/ring-buffer 16))]
+   (let [started-publisher (atom nil)
         mulog-stopped (atom false)
         accepted (atom [])]
     (with-redefs [u/start-publisher!
@@ -375,7 +376,7 @@
         (let [result (stop)]
           (is (= 1 (:published-count result)))
           (is (= 1 (count @accepted)))
-          (is @mulog-stopped))))))
+          (is @mulog-stopped)))))))
 
 (deftest output-failure-retains-only-unaccepted-measurements-for-retry
   (let [attempts (atom 0)
@@ -776,6 +777,8 @@
             (try
               (u/log ::legacy-counter :metric/name "OldCounter" :metric/value 1)
               (u/log ::legacy-timer :metric/name "OldTimer" :mulog/duration 2500000)
+              (u/log ::read-model-bytes :metric/name "ReadModelEncodedBytesWritten" :metric/value 42)
+              (u/log ::read-model-read :metric/name "ReadModelReadDuration" :mulog/duration 3000000)
               (let [deadline (+ (System/nanoTime) 2000000000)
                     result
                     (loop []
@@ -785,11 +788,20 @@
                                                  (str/split-lines (str writer))))
                                      (catch Exception _ nil))]
                         (cond
-                          (and (:OldCounter values) (:OldTimer values)) values
+                          (and (:OldCounter values) (:OldTimer values)
+                               (:ReadModelEncodedBytesWritten values) (:ReadModelReadDuration values)) values
                           (< (System/nanoTime) deadline) (do (Thread/sleep 10) (recur))
                           :else values)))]
                 (is (= 1 (:OldCounter result)))
-                (is (= [2.5] (:OldTimer result))))
+                (is (= [2.5] (:OldTimer result)))
+                (is (= 42 (:ReadModelEncodedBytesWritten result)))
+                (is (= [3.0] (:ReadModelReadDuration result)))
+                (let [definitions (into {} (map (juxt :Name identity))
+                                        (mapcat #(get-in (json/read-str % :key-fn keyword)
+                                                        [:_aws :CloudWatchMetrics 0 :Metrics])
+                                                (str/split-lines (str writer))))]
+                  (is (= "Bytes" (get-in definitions ["ReadModelEncodedBytesWritten" :Unit])))
+                  (is (= 60 (get-in definitions ["ReadModelEncodedBytesWritten" :StorageResolution])))))
               (is (= :stopped (stop)))
               (finally (stop)))))))))
 
@@ -928,3 +940,39 @@
               (is (zero? (:published (sut/publisher-health @instance))))
               (is (empty? (.getWatches ^clojure.lang.Atom logger))))
             (finally (deliver release true) (stop))))))))
+
+(deftest read-model-fallback-preserves-legacy-configuration-and-units
+  (doseq [config [{} {:metric-registry {"Custom" {:metric/type :counter :metric/unit :count}}}]]
+    (let [{:keys [records]} (publish-events config
+                            [{:metric/name "ReadModelEncodedBytesWritten" :metric/value 1024
+                              :app-name "old-app" :env "prod" :read-model-name ":unbounded/model"}])]
+      (is (= 1 (count records)))
+      (is (= "Bytes" (:Unit (metric-definition (first records)))))
+      (is (= 60 (:StorageResolution (metric-definition (first records)))))
+      (is (= "old-app" (:app-name (first records))))
+      (is (nil? (:read-model-name (first records)))))))
+
+(deftest read-model-dimension-registry-is-optional-and-authoritative
+  (let [dims {:app-name #{"app"} :read-model-name #{":known/model"}
+              :read-model-operation #{"values"} :read-model-kind #{"keyed"}}
+        event {:metric/name "ReadModelReadDuration" :mulog/duration 1000000
+               :app-name "app" :read-model-name ":unknown/model"
+               :read-model-operation "values" :read-model-kind "keyed"}]
+    (doseq [allowed [{} {:app-name #{"app"}} dims]]
+      (let [{:keys [records]} (publish-events {:metric-registry (sut/grain-metric-registry allowed)} [event])]
+        (is (= 1 (count records)))
+        (is (nil? (:read-model-name (first records))))))
+    (let [config {:metric-registry (sut/grain-metric-registry dims)}]
+      (is (= ":known/model" (:read-model-name (first (:records (publish-events config [(assoc event :read-model-name ":known/model")]))))))
+      (is (empty? (:records (publish-events config [(assoc event :metric/dimensions {:read-model-name ":unknown/model"})]))))
+      (is (= 1 (count (:records (publish-events config [(assoc event :metric/dimensions {:read-model-name ":known/model"})]))))))))
+
+(deftest read-model-fallback-does-not-override-configured-or-arbitrary-semantics
+  (let [{:keys [records]} (publish-events
+                          {:metric-registry {"ReadModelEncodedBytesWritten"
+                                             {:metric/type :gauge :metric/unit :count :metric/resolution :high}}}
+                          [{:metric/name "ReadModelEncodedBytesWritten" :metric/value 17}])]
+    (is (= "Count" (:Unit (metric-definition (first records)))))
+    (is (= 1 (:StorageResolution (metric-definition (first records))))))
+  (is (empty? (:records (publish-events [{:metric/name "ArbitraryBytes" :metric/value 3 :metric/unit :bytes}]))))
+  (is (= "Count" (:Unit (metric-definition (first (:records (publish-events [{:metric/name "Arbitrary" :metric/value 3}]))))))))
