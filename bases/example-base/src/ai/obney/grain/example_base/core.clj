@@ -108,7 +108,8 @@
                 :backend #{"in-memory" "sqlite" "postgres"}
                 :operation #{"start" "append" "read" "transaction" "notification" "pool"}
                 :outcome #{"succeeded" "rejected" "anomaly" "failed"
-                           "retrying" "skipped" "triggered" "timed-out"}
+                           "retrying" "skipped" "triggered" "timed-out"
+                           "sampled" "saturated"}
                 :anomaly-category #{"incorrect" "not-found" "forbidden"
                                     "conflict" "fault" "busy" "unavailable"
                                     "interrupted"}

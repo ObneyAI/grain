@@ -43,7 +43,12 @@ value PublicationResult {
     published_count: Integer
     invalid_count: Integer
     failed_count: Integer
-    retained_count: Integer
+    dropped_count: Integer
+    -- Unresolved buffered or in-flight measurements at return, not a terminal
+    -- loss count. Null means queued or in-flight work has not finished and an
+    -- authoritative count is unavailable. A timed-out sink may later complete.
+    retained_count: Integer?
+    timed_out: Boolean
 }
 
 value PublisherHealth {
@@ -77,9 +82,10 @@ contract MetricPublication {
     health: () -> PublisherHealth
 
     @invariant MetricRegistryIsAuthoritative
-        -- A metric is publishable only when its name resolves to exactly one
-        -- definition. The definition supplies its type, unit, default resolution
-        -- and dimension vocabulary. Conflicting event metadata is invalid.
+        -- A registered metric follows exactly one authoritative definition,
+        -- supplying type, unit, default resolution and dimension vocabulary.
+        -- Conflicting event metadata is invalid. Unregistered metrics use the
+        -- migration classification below.
 
     @invariant ConsumerRegistryExtension
         -- A consumer may add application-owned metric definitions using the
@@ -91,8 +97,9 @@ contract MetricPublication {
     @invariant LegacyClassification
         -- During migration, an unregistered named metric_value is a Count
         -- counter, while an unregistered named duration with no metric_value is
-        -- a Milliseconds timer. Legacy low resolution maps to standard storage;
-        -- every other legacy request maps to high storage.
+        -- a Milliseconds timer. Low and standard resolution map to standard
+        -- storage; high or unspecified resolution maps to high storage.
+        -- Unsupported resolution requests are invalid.
 
     @invariant Validation
         -- Names, values, timestamps, units, resolutions and dimensions meet both
@@ -109,7 +116,7 @@ contract MetricPublication {
         -- Entity, tenant, request and event identifiers; raw URLs; messages;
         -- payload values; credentials; tokens and personal data are forbidden.
         -- No metric has more than 30 dimensions. Dimension names contain 1
-        -- through 255 permitted ASCII characters, cannot begin with a colon and
+        -- through 250 permitted ASCII characters, cannot begin with a colon and
         -- contain no control characters. Values contain 1 through 1024 permitted
         -- ASCII characters, include a non-whitespace character and contain no
         -- control characters.
@@ -127,6 +134,9 @@ contract MetricPublication {
         -- and resolution match. Counters sum; gauges publish the last valid
         -- value in source order; timer samples retain their individual values.
         -- The aggregate uses the latest source timestamp represented by it.
+        -- Arithmetic does not abort the flush. Aggregates satisfy the same
+        -- numeric bounds as source measurements; invalid aggregate groups are
+        -- accounted for without preventing unrelated valid metrics publishing.
 
     @invariant EmfDocumentShape
         -- Each sink record is exactly one valid JSON object with no surrounding
@@ -135,6 +145,9 @@ contract MetricPublication {
         -- Dimensions and Metrics. Referenced metric and dimension targets are
         -- non-nested members of the root object. Metric targets are numbers or
         -- arrays of no more than 100 numbers; dimension targets are strings.
+        -- Metric and normalized dimension target names are unique and do not
+        -- collide with each other or the reserved _aws metadata member. An
+        -- invalid target does not invalidate unrelated measurements in a batch.
 
     @invariant EmfDocumentBounds
         -- No EMF log event exceeds AWS's 1 MB log-event limit. No directive
@@ -169,6 +182,8 @@ contract MetricPublication {
     @invariant RetryBound
         -- An unacknowledged measurement is retried no more than the configured
         -- attempt limit. Exhausted measurements are removed and counted dropped.
+        -- Retry bookkeeping retains only buffered or in-flight measurements;
+        -- eviction, invalidation and terminal cleanup release their retry state.
 
     @invariant Overflow
         -- Capacity is bounded. Under default drop-newest, an event arriving at
@@ -176,9 +191,27 @@ contract MetricPublication {
         -- configured displacement also increments dropped exactly once.
 
     @invariant BoundedShutdown
-        -- Shutdown stops accepting events and drains until empty or its deadline.
-        -- Events remaining at the deadline are counted dropped, and shutdown
-        -- never waits beyond the configured deadline for publication.
+        -- Producers stop before telemetry is stopped. The lifecycle helper
+        -- includes completed emissions before its stop cutoff, including events
+        -- pending source dispatch or publisher enqueue, without consuming other
+        -- publishers' input or duplicating delivery. An emission still racing
+        -- the cutoff may be dropped, with explicit drop accounting.
+        -- Shutdown stops accepting events and drains until empty or its deadline;
+        -- it never waits beyond the configured deadline for publication.
+        -- At return, timed_out distinguishes incomplete drain and retained_count
+        -- reports unresolved buffered or in-flight measurements, or null when
+        -- queued or in-flight work prevents an authoritative count.
+        -- Pending work is
+        -- not simultaneously declared dropped and allowed to publish. A sink
+        -- already executing may complete after the deadline; its eventual
+        -- outcome is accounted for exactly once. Untouched work is discarded
+        -- and counted dropped during terminal cleanup. Repeated stopping is safe.
+
+    @invariant ExistingConsumerSetup
+        -- Existing consumers can continue creating the publisher through the
+        -- same factory and mu-log custom publisher configuration without source
+        -- changes. Registry adoption and the lifecycle helper are optional;
+        -- metric aggregation and emitted document shape may change.
 
     @invariant IndependentHealth
         -- Publisher health remains observable while the output sink is failing

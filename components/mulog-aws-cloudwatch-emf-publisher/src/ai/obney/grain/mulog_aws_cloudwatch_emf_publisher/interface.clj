@@ -2,6 +2,7 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [com.brunobonacci.mulog :as u]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [com.brunobonacci.mulog.buffer :as mb]
             [com.brunobonacci.mulog.publisher :as publisher]))
 
@@ -198,10 +199,12 @@
   (and (number? value)
        (Double/isFinite (double value))))
 
+(def ^:private max-cloudwatch-number
+  (bigint (.shiftLeft java.math.BigInteger/ONE 360)))
+
 (defn- valid-cloudwatch-number? [value]
-  ;; Double's finite range is narrower than CloudWatch's documented ±2^360
-  ;; range, so finite doubles need no additional magnitude check here.
-  (finite-number? value))
+  (and (finite-number? value)
+       (<= (- max-cloudwatch-number) value max-cloudwatch-number)))
 
 (defn- valid-timestamp? [timestamp now-ms]
   (and (integer? timestamp)
@@ -211,7 +214,8 @@
 
 (defn- valid-dimension-name? [name]
   (let [value (clojure.core/name name)]
-    (and (<= 1 (count value) 255)
+    (and (<= 1 (count value) 250)
+         (not= "_aws" value)
          (not (str/starts-with? value ":"))
          (some #(not (Character/isWhitespace ^char %)) value)
          (every? #(and (<= (int %) 127)
@@ -229,7 +233,8 @@
 (defn- valid-name? [value]
   (and (string? value)
        (<= 1 (count value) 255)
-       (some #(not (Character/isWhitespace ^char %)) value)))
+       (some #(not (Character/isWhitespace ^char %)) value)
+       (every? #(<= 32 (int %) 126) value)))
 
 (defn- valid-namespace? [value]
   (and (valid-name? value)
@@ -258,12 +263,17 @@
         :standard 60
         nil))))
 
+(defn- unique-dimension-targets? [dimensions]
+  (let [names (map name (keys dimensions))]
+    (= (count names) (count (set names)))))
+
 (defn- normalize-dimensions [definition event]
   (if definition
     (let [declared (or (:metric/dimensions definition) {})
           explicit (or (:metric/dimensions event) {})
           supplied (merge (select-keys event (keys declared)) explicit)]
       (when (and (<= (count supplied) 30)
+                 (unique-dimension-targets? supplied)
                  (every? #(contains? declared %) (keys explicit))
                  (every? (fn [[dimension value]]
                            (and (valid-dimension-name? dimension)
@@ -307,6 +317,8 @@
           resolution (normalize-resolution definition event)
           dimensions (normalize-dimensions definition event)]
       (when (and (valid-name? metric-name)
+                 (not= "_aws" metric-name)
+                 (not-any? #(= metric-name (first %)) dimensions)
                  (contains? #{:counter :timer :gauge} metric-type)
                  (contains? units unit)
                  (or (nil? (:metric/type event))
@@ -319,6 +331,7 @@
                  (or (= metric-type :gauge) (not (neg? value)))
                  (valid-timestamp? timestamp now-ms))
         {:offset offset
+         :source-offset (or (::source-offset (meta event)) offset)
          :event event
          :name metric-name
          :value value
@@ -331,16 +344,18 @@
 
 (defn- aggregate-measurements [measurements]
   (->> measurements
-       (group-by (juxt :name :dimensions :unit :resolution))
+       (group-by (juxt :name :dimensions :unit :resolution :metric-type))
        (mapcat
         (fn [[_ samples]]
-          (let [sample (last samples)
+          (let [samples (sort-by :source-offset samples)
+                sample (last samples)
                 timestamp (apply max (map :timestamp samples))
                 offsets (set (map :offset samples))
                 events (mapv :event samples)]
             (case (:metric-type sample)
               :counter [(assoc sample
-                               :value (reduce + (map :value samples))
+                               :value (try (reduce +' (map :value samples))
+                                           (catch Exception _ nil))
                                :timestamp timestamp
                                :offsets offsets
                                :events events)]
@@ -380,69 +395,120 @@
             with-dimensions
             measurements)))
 
-(defn- encode-documents [config measurements]
-  (->> measurements
-       (group-by (juxt :timestamp :dimensions))
-       (mapcat
-        (fn [[_ compatible]]
-          ;; Entries with the same name cannot share one JSON root target.
-          (let [by-name (group-by :name compatible)
-                rounds (apply max 0 (map count (vals by-name)))]
-            (mapcat
-             (fn [round]
-               (->> by-name
-                    vals
-                    (keep #(nth % round nil))
-                    (partition-all 100)
-                    (map (fn [entries]
-                           {:json (json/write-str
-                                  (document-map (:namespace config) entries))
-                            :measurements (vec entries)}))))
-             (range rounds)))))))
+(def ^:private max-document-bytes (* 1024 1024))
 
-(deftype ConfigurableBuffer [counter entries capacity overflow-policy accepting on-drop]
+(defn- encode-document [config entries]
+  (try
+    (let [encoded (json/write-str (document-map (:namespace config) entries))]
+      (when (<= (alength (.getBytes ^String encoded java.nio.charset.StandardCharsets/UTF_8))
+                max-document-bytes)
+        {:json encoded :measurements (vec entries)}))
+    (catch Exception _ nil)))
+
+(defn- pack-documents [config measurements]
+  ;; Check the encoded bytes, including JSON escapes, before accepting an entry.
+  ;; A singleton that cannot be encoded is isolated from all its companions.
+  (loop [remaining (seq measurements) entries [] encoded nil documents [] invalid 0]
+    (if-let [measurement (first remaining)]
+      (let [candidate (when (< (count entries) 100)
+                        (encode-document config (conj entries measurement)))]
+        (cond
+          candidate
+          (recur (next remaining) (conj entries measurement) candidate documents invalid)
+
+          (seq entries)
+          (recur remaining [] nil (conj documents encoded) invalid)
+
+          :else
+          (recur (next remaining) [] nil documents
+                 (+ invalid (count (:events measurement))))))
+      {:documents (cond-> documents encoded (conj encoded)) :invalid-count invalid})))
+
+(defn- encode-documents [config measurements]
+  (let [groups (group-by (juxt :timestamp :dimensions) measurements)]
+    (reduce
+     (fn [result [_ compatible]]
+       ;; Entries with the same name cannot share one JSON root target.
+       (let [by-name (group-by :name compatible)
+             rounds (apply max 0 (map count (vals by-name)))]
+         (reduce
+          (fn [result round]
+            (let [packed (pack-documents config
+                                         (keep #(nth % round nil) (vals by-name)))]
+              (-> result
+                  (update :documents into (:documents packed))
+                  (update :invalid-count + (:invalid-count packed)))))
+          result (range rounds))))
+     {:documents [] :invalid-count 0} groups)))
+
+(defprotocol ^:private RetainBuffer
+  (retain-buffer-events [batch events]))
+
+(deftype ConfigurableBuffer [counter entries capacity overflow-policy accepting on-drop on-remove]
   clojure.lang.Counted
   (count [_] (count entries))
 
   mb/PRingBuffer
   (enqueue [this event]
     (let [next-counter (inc counter)]
-      (if-not @accepting
-        (do (on-drop) this)
-        (if (< (count entries) capacity)
+      (cond
+        (not @accepting) (do (on-drop) this)
+        (< (count entries) capacity)
         (ConfigurableBuffer. next-counter (conj entries [next-counter event])
-                             capacity overflow-policy accepting on-drop)
+                             capacity overflow-policy accepting on-drop on-remove)
+        :else
         (do
           (on-drop)
           (case overflow-policy
             :drop-oldest
-            (ConfigurableBuffer. next-counter
-                                 (conj (vec (rest entries)) [next-counter event])
-                                 capacity overflow-policy accepting on-drop)
-            this))))))
+            (do
+              (on-remove [(second (first entries))])
+              (ConfigurableBuffer. next-counter
+                                   (conj (vec (rest entries)) [next-counter event])
+                                   capacity overflow-policy accepting on-drop on-remove))
+            this)))))
   (dequeue [_ offset]
-    (ConfigurableBuffer. counter
-                         (vec (remove #(<= (first %) (or offset 0)) entries))
-                         capacity overflow-policy accepting on-drop))
+    (let [[removed retained] (split-with #(<= (first %) (or offset 0)) entries)]
+      (on-remove (map second removed))
+      (ConfigurableBuffer. counter (vec retained) capacity overflow-policy accepting on-drop on-remove)))
   (clear [_]
-    (ConfigurableBuffer. counter [] capacity overflow-policy accepting on-drop))
-  (items [_] entries))
+    (on-remove (map second entries))
+    (ConfigurableBuffer. counter [] capacity overflow-policy accepting on-drop on-remove))
+  (items [_] entries)
 
-(defn- configurable-agent-buffer [config health accepting]
+  RetainBuffer
+  (retain-buffer-events [_ events]
+    (let [retained (java.util.IdentityHashMap.)]
+      (doseq [event events] (.put retained event true))
+      (on-remove (keep (fn [[_ event]] (when-not (.containsKey retained event) event)) entries))
+      ;; Keep original offsets and bypass acceptance: these events are retries,
+      ;; not new arrivals after shutdown.
+      (ConfigurableBuffer. counter
+                           (filterv #(.containsKey retained (second %)) entries)
+                           capacity overflow-policy accepting on-drop on-remove))))
+
+(defn- forget-attempts! [attempts events]
+  (locking attempts
+    (doseq [event events] (.remove ^java.util.IdentityHashMap attempts event))))
+
+(defn- configurable-agent-buffer [config health accepting attempts]
   (agent
    (ConfigurableBuffer. 0 [] (:buffer-capacity config)
                         (:overflow-policy config) accepting
-                        #(swap! health update :dropped inc))
+                        #(swap! health update :dropped inc)
+                        #(forget-attempts! attempts %))
    :error-mode :continue))
 
 (defn- retain-events [batch events]
-  (reduce mb/enqueue (mb/clear batch) events))
+  (if (satisfies? RetainBuffer batch)
+    (retain-buffer-events batch events)
+    (reduce mb/enqueue (mb/clear batch) events)))
 
 (defn- default-output-sink [document]
   (println document)
   :accepted)
 
-(deftype CloudWatchEMFPublisher [config buffer output-sink health attempts accepting]
+(deftype CloudWatchEMFPublisher [config buffer output-sink health attempts accepting drain-deadline]
   publisher/PPublisher
   (agent-buffer [_] buffer)
   (publish-delay [_] (:flush-interval config))
@@ -454,22 +520,40 @@
                            items)
           invalid (filterv (comp nil? #(nth % 2)) classified)
           valid (vec (keep #(nth % 2) classified))
-          documents (encode-documents config (aggregate-measurements valid))]
-      (swap! health update :invalid + (count invalid))
-      (loop [remaining documents
-             retained []]
-        (if-let [{:keys [json measurements]} (first remaining)]
-          (let [events (mapcat :events measurements)
+          aggregates (aggregate-measurements valid)
+          valid-aggregate? (fn [{:keys [value metric-type]}]
+                             (if (= metric-type :timer)
+                               (every? valid-cloudwatch-number? value)
+                               (valid-cloudwatch-number? value)))
+          invalid-aggregates (remove valid-aggregate? aggregates)
+          {:keys [documents invalid-count]}
+          (encode-documents config (filter valid-aggregate? aggregates))]
+      (forget-attempts! attempts (map second invalid))
+      (forget-attempts! attempts (mapcat :events invalid-aggregates))
+      (swap! health update :invalid + (count invalid) invalid-count
+             (reduce + 0 (map #(count (:events %)) invalid-aggregates)))
+      (loop [remaining documents]
+        (cond
+          (empty? remaining)
+          (do
+            (swap! health assoc :last-successful-flush-at now-ms)
+            (retain-events batch []))
+
+          (and @drain-deadline (>= (System/nanoTime) @drain-deadline))
+          (retain-events batch (mapcat #(mapcat :events (:measurements %)) remaining))
+
+          :else
+          (let [{:keys [json measurements]} (first remaining)
+                events (mapcat :events measurements)
                 accepted? (try
                             (output-sink json)
                             true
                             (catch Throwable _ false))]
             (if accepted?
               (do
-              (doseq [event events]
-                (locking attempts (.remove ^java.util.IdentityHashMap attempts event)))
-              (swap! health update :published + (count events))
-                (recur (rest remaining) retained))
+                (forget-attempts! attempts events)
+                (swap! health update :published + (count events))
+                (recur (rest remaining)))
               (do
                 (swap! health update :flush-failed inc)
                 (let [retryable
@@ -483,18 +567,12 @@
                            (if (< attempt (:max-delivery-attempts config))
                              true
                              (do
-                               (locking attempts
-                                 (.remove ^java.util.IdentityHashMap attempts event))
+                               (forget-attempts! attempts [event])
                                (swap! health update :dropped inc)
                                false))))
                        events)
-                      later-events (mapcat (fn [document]
-                                             (mapcat :events (:measurements document)))
-                                           (rest remaining))]
-                  (retain-events batch (concat retained retryable later-events))))))
-          (do
-            (swap! health assoc :last-successful-flush-at now-ms)
-            (retain-events batch retained)))))))
+                      later-events (mapcat #(mapcat :events (:measurements %)) (rest remaining))]
+                  (retain-events batch (concat retryable later-events)))))))))))
 
 (defn cloudwatch-emf-publisher
   "Creates a configurable CloudWatch EMF publisher.
@@ -507,13 +585,14 @@
         health (atom {:published 0 :dropped 0 :invalid 0 :flush-failed 0
                       :last-successful-flush-at nil})
         accepting (atom true)
-        buffer (configurable-agent-buffer config health accepting)]
+        attempts (java.util.IdentityHashMap.)
+        buffer (configurable-agent-buffer config health accepting attempts)]
     (when-not (valid-namespace? (:namespace config))
       (throw (ex-info "Invalid CloudWatch metric namespace"
                       {:namespace (:namespace config)})))
     (CloudWatchEMFPublisher. config buffer
                              (or (:output-sink config) default-output-sink)
-                             health (java.util.IdentityHashMap.) accepting)))
+                             health attempts accepting (atom nil))))
 
 (defn publisher-health
   "Returns health independently of the configured metric output sink."
@@ -530,43 +609,126 @@
      :buffer-utilization (/ (double buffered) (:buffer-capacity config))
      :last-successful-flush-at (:last-successful-flush-at totals)}))
 
-(defn final-drain
-  "Stops accepting no external source itself, but performs a deadline-bounded
-   drain of the publisher's current μ/log buffer and accounts for leftovers."
-  [publisher-instance]
+(defn- drain-publisher
+  [publisher-instance before]
   (let [buffer-agent (publisher/agent-buffer publisher-instance)
         config (.-config ^CloudWatchEMFPublisher publisher-instance)
         health (.-health ^CloudWatchEMFPublisher publisher-instance)
         accepting (.-accepting ^CloudWatchEMFPublisher publisher-instance)
-        before @health
-        timeout (:final-drain-timeout config)
-        deadline (+ (System/currentTimeMillis) timeout)]
-    (reset! accepting false)
-    (loop []
-      (when (and (pos? (count @buffer-agent))
-                 (< (System/currentTimeMillis) deadline))
-        (send buffer-agent #(publisher/publish publisher-instance %))
-        (await-for (max 1 (- deadline (System/currentTimeMillis))) buffer-agent)
-        (recur)))
-    (when (pos? (count @buffer-agent))
-      (let [remaining (count @buffer-agent)]
-        (swap! health update :dropped + remaining)
-        (send buffer-agent mb/clear)))
-    (let [after @health]
-      {:published-count (- (:published after) (:published before))
-       :invalid-count (- (:invalid after) (:invalid before))
-       :failed-count (- (:flush-failed after) (:flush-failed before))
-       :retained-count 0})))
+        deadline (+ (System/nanoTime) (* 1000000 (:final-drain-timeout config)))
+        completed (promise)]
+    (reset! (.-drain-deadline ^CloudWatchEMFPublisher publisher-instance) deadline)
+    (send-off buffer-agent
+              (fn [batch]
+                (reset! accepting false)
+                (let [remaining
+                      (loop [batch batch]
+                        (if (and (pos? (count batch)) (< (System/nanoTime) deadline))
+                          (recur (publisher/publish publisher-instance batch))
+                          batch))]
+                  remaining)))
+    ;; Deliver completion after the prior action's returned buffer is committed.
+    (send-off buffer-agent
+              (fn [batch] (deliver completed (count batch)) batch))
+    (let [wait-ms (max 0 (long (/ (- deadline (System/nanoTime)) 1000000)))
+          finished (deref completed wait-ms ::timeout)
+          timed-out? (or (= finished ::timeout) (pos? finished))]
+      (when timed-out?
+        ;; Never inspect stale agent state and drop an in-flight write here.
+        (send-off buffer-agent
+                  (fn [batch]
+                    (reset! accepting false)
+                    (swap! health update :dropped + (count batch))
+                    (mb/clear batch))))
+      (let [after @health]
+        {:published-count (- (:published after) (:published before))
+         :invalid-count (- (:invalid after) (:invalid before))
+         :failed-count (- (:flush-failed after) (:flush-failed before))
+         :dropped-count (- (:dropped after) (:dropped before))
+         :timed-out? timed-out?
+         :retained-count (when-not timed-out? finished)}))))
+
+(defn final-drain
+  "Closes input after already queued enqueues, then drains until the deadline.
+
+   A blocked sink cannot be cancelled safely. On timeout, :retained-count is nil
+   because queued or in-flight work has no authoritative remaining count.
+   Cleanup runs on the same agent after that write resolves, so each event is
+   counted published or dropped, never both. Producers must stop before draining."
+  [publisher-instance]
+  (drain-publisher publisher-instance
+                   @(.-health ^CloudWatchEMFPublisher publisher-instance)))
+
+(defn- merge-log-pairs [pairs]
+  (into {} (mapcat (fn [part]
+                    (if (sequential? part) (map vec (partition 2 part)) part))
+                  pairs)))
 
 (defn start-cloudwatch-emf-publisher!
-  "Starts the Grain EMF publisher through μ/log and returns a lifecycle-safe
-   stop function. Stopping first performs the bounded final drain, then
-   deregisters and stops μ/log's recurring publisher task."
+  "Starts publishing events from the currently bound μ/log logger.
+
+   A source watch forwards new events before μ/log's asynchronous dispatch can
+   remove them. μ/log schedules publication using a separate empty source, so
+   other publishers sharing the application's logger are unaffected. Stop the
+   application's producers first; the returned idempotent stop function removes
+   the watch, stops scheduling, then performs a bounded final drain."
   [config]
   (let [publisher-instance (cloudwatch-emf-publisher config)
-        stop-publisher (u/start-publisher! {:type :inline
-                                            :publisher publisher-instance})]
-    (fn stop-cloudwatch-emf-publisher []
-      (let [drain-result (final-drain publisher-instance)]
-        (stop-publisher)
-        drain-result))))
+        source mulog-core/*default-logger*
+        buffer-agent (publisher/agent-buffer publisher-instance)
+        lifecycle-lock (Object.)
+        active? (atom true)
+        startup-offsets (atom #{})
+        watch-key (Object.)
+        forward!
+        (fn [items]
+          (when (seq items)
+            (let [events (keep (fn [[offset pairs]]
+                                 (try (with-meta (merge-log-pairs pairs)
+                                        {::source-offset offset})
+                                      (catch Exception _ nil))) items)]
+              (if @active?
+                (send buffer-agent (partial reduce mb/enqueue) events)
+                ;; A callback from an append concurrent with stop may already be
+                ;; waiting for the lifecycle lock. Account for its events without
+                ;; queueing work behind the final drain.
+                (swap! (.-health ^CloudWatchEMFPublisher publisher-instance)
+                       update :dropped + (count events))))))]
+    (locking lifecycle-lock
+      (add-watch source watch-key
+                 (fn [_ _ old-buffer new-buffer]
+                   ;; Watches can execute out of source order. Each callback
+                   ;; owns only additions in its old/new transition; a shared
+                   ;; high-water mark would lose delayed callbacks after μ/log
+                   ;; dequeues the source. rseq examines only the new suffix.
+                   (try
+                     (let [previous-offset (or (ffirst (rseq (mb/items old-buffer))) 0)
+                           additions (->> (rseq (mb/items new-buffer))
+                                          (take-while #(> (first %) previous-offset))
+                                          reverse vec)]
+                       (locking lifecycle-lock
+                         (forward! (remove #(contains? @startup-offsets (first %)) additions))))
+                     (catch Exception _ nil))))
+      ;; A callback waiting on this lock may refer to events in the initial
+      ;; snapshot. Remember just those bounded source offsets to avoid replay.
+      (let [initial-items (vec (mb/items @source))]
+        (reset! startup-offsets (set (map first initial-items)))
+        (forward! initial-items)))
+    (try
+      (let [stop-publisher
+            (binding [mulog-core/*default-logger* (atom (mb/ring-buffer 1))]
+              (u/start-publisher! {:type :inline :publisher publisher-instance}))
+            stop-result
+            (delay
+              (let [before @(.-health ^CloudWatchEMFPublisher publisher-instance)]
+                (locking lifecycle-lock
+                  (reset! active? false)
+                  (remove-watch source watch-key)
+                  (stop-publisher))
+                (drain-publisher publisher-instance before)))]
+        (fn stop-cloudwatch-emf-publisher [] @stop-result))
+      (catch Throwable error
+        (locking lifecycle-lock
+          (reset! active? false)
+          (remove-watch source watch-key))
+        (throw error)))))

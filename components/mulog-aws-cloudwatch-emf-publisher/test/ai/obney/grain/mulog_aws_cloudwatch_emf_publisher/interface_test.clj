@@ -1,6 +1,7 @@
 (ns ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface-test
   (:require [com.brunobonacci.mulog.publisher :as publisher]
             [com.brunobonacci.mulog :as u]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface :as sut]
             [clojure.data.json :as json]
             [clojure.string :as str]
@@ -451,3 +452,479 @@
                     (and (sequential? values)
                          (<= (count values) 100))))
                 records))))
+
+
+(deftest counter-boundaries-and-invalid-aggregates-are-isolated
+  (let [{:keys [instance records]}
+        (publish-events
+         [{:metric/name "Large" :metric/value Long/MAX_VALUE}
+          {:metric/name "Large" :metric/value 1}
+          {:metric/name "TooLarge" :metric/value (Math/pow 2 360)}
+          {:metric/name "TooLarge" :metric/value (Math/pow 2 360)}
+          {:metric/name "Good" :metric/value 1}])
+        values (apply merge records)]
+    (is (= (inc (bigint Long/MAX_VALUE)) (:Large values)))
+    (is (= 1 (:Good values)))
+    (is (not (contains? values :TooLarge)))
+    (is (= 2 (:invalid (sut/publisher-health instance))))))
+
+(deftest emf-invalid-numbers-and-root-target-collisions-are-isolated
+  (doseq [bad [{:metric/name "TooLarge" :metric/value (Math/pow 2 361)}
+               {:metric/name "_aws" :metric/value 1}
+               {:metric/name "app-name" :metric/value 1 :app-name "app"}
+               {:metric/name "Bad\nName" :metric/value 1}
+               {:metric/name "BadéName" :metric/value 1}]]
+    (let [{:keys [instance records]} (publish-events [bad {:metric/name "Good" :metric/value 1}])]
+      (is (= 1 (count records)))
+      (is (= 1 (:Good (first records))))
+      (is (= 1 (:invalid (sut/publisher-health instance))))))
+  (let [{:keys [instance records]}
+        (publish-events
+         {:metric-registry {"Duplicate" {:metric/type :counter :metric/unit :count
+                                         :metric/dimensions {:a/x #{"one"} :b/x #{"two"}}}}}
+         [{:metric/name "Duplicate" :metric/value 1
+           :metric/dimensions {:a/x "one" :b/x "two"}}])]
+    (is (empty? records))
+    (is (= 1 (:invalid (sut/publisher-health instance))))))
+
+(deftest retry-state-is-bounded-by-buffered-events
+  (let [instance (sut/cloudwatch-emf-publisher
+                  {:buffer-capacity 1 :overflow-policy :drop-oldest
+                   :output-sink (fn [_] (throw (Exception. "offline")))})
+        ab (publisher/agent-buffer instance)]
+    (dotimes [i 20]
+      (send ab buffer/enqueue {:metric/name "Requests" :metric/value i})
+      (send ab #(publisher/publish instance %))
+      (is (await-for 2000 ab)))
+    (is (<= (.size ^java.util.IdentityHashMap (.-attempts instance)) 1))
+    (send ab buffer/clear)
+    (is (await-for 2000 ab))
+    (is (zero? (.size ^java.util.IdentityHashMap (.-attempts instance))))))
+
+(deftest final-drain-retries-after-input-closes
+  (let [attempts (atom 0)
+        instance (sut/cloudwatch-emf-publisher
+                  {:output-sink (fn [_] (when (= 1 (swap! attempts inc))
+                                         (throw (Exception. "temporary"))))})
+        ab (publisher/agent-buffer instance)]
+    (send ab buffer/enqueue {:metric/name "Requests" :metric/value 1})
+    (is (await-for 2000 ab))
+    (let [result (sut/final-drain instance)]
+      (is (= 2 @attempts))
+      (is (= 1 (:published-count result)))
+      (is (= 0 (:retained-count result)))
+      (is (zero? (:dropped (sut/publisher-health instance)))))))
+
+(deftest final-drain-waits-for-pending-enqueues
+  (let [entered (promise) release (promise)
+        accepted (atom [])
+        instance (sut/cloudwatch-emf-publisher {:output-sink #(swap! accepted conj %)})
+        ab (publisher/agent-buffer instance)]
+    (try
+      (send-off ab (fn [batch] (deliver entered true) (deref release 2000 nil) batch))
+      (is (true? (deref entered 1000 nil)))
+      (send ab buffer/enqueue {:metric/name "Pending" :metric/value 1})
+      (let [draining (future (sut/final-drain instance))]
+        (is (= ::waiting (deref draining 30 ::waiting))
+            "drain must not return while accepted enqueues are still queued")
+        (deliver release true)
+        (is (= 1 (:published-count (deref draining 2000 nil))))
+        (is (= 1 (count @accepted))))
+      (finally (deliver release true)))))
+
+(deftest drain-timeout-does-not-double-account-inflight-delivery
+  (let [entered (promise) release (promise)
+        instance (sut/cloudwatch-emf-publisher
+                  {:final-drain-timeout 30
+                   :output-sink (fn [_] (deliver entered true) (deref release 2000 nil))})
+        ab (publisher/agent-buffer instance)]
+    (try
+      (send ab buffer/enqueue {:metric/name "Slow" :metric/value 1})
+      ;; Start the blocked write before the short shutdown deadline, so agent
+      ;; startup/JIT scheduling cannot skip the write under test.
+      (send-off ab #(publisher/publish instance %))
+      (is (true? (deref entered 1000 nil)))
+      (let [result (sut/final-drain instance)]
+        (is (true? (:timed-out? result)))
+        (is (nil? (:retained-count result))
+            "the input barrier is queued behind the already in-flight sink")
+        (is (= 0 (:dropped (sut/publisher-health instance)))))
+      (finally (deliver release true)))
+    (is (await-for 2000 ab))
+    (is (= 1 (:published (sut/publisher-health instance))))
+    (is (= 0 (:dropped (sut/publisher-health instance))))
+    (is (zero? (:buffered (sut/publisher-health instance))))))
+
+(deftest timeout-during-final-drain-reports-unresolved-inflight-count
+  (let [entered (promise) release (promise)
+        instance (sut/cloudwatch-emf-publisher
+                  {:final-drain-timeout 200
+                   :output-sink (fn [_] (deliver entered true) (deref release 2000 nil))})
+        ab (publisher/agent-buffer instance)]
+    (try
+      (send ab buffer/enqueue {:metric/name "Slow" :metric/value 1})
+      (is (await-for 1000 ab))
+      (let [draining (future (sut/final-drain instance))]
+        (is (true? (deref entered 1000 nil)))
+        (let [result (deref draining 1000 nil)]
+          (is (true? (:timed-out? result)))
+          (is (nil? (:retained-count result)))
+          (is (zero? (:dropped (sut/publisher-health instance))))))
+      (finally (deliver release true)))
+    (is (await-for 2000 ab))
+    (is (= 1 (:published (sut/publisher-health instance))))
+    (is (zero? (:dropped (sut/publisher-health instance))))))
+
+(deftest lifecycle-stop-includes-source-events-before-dispatch
+  (let [logger (atom (buffer/ring-buffer 1000))
+        accepted (atom [])]
+    (binding [mulog-core/*default-logger* logger]
+      (let [stop (sut/start-cloudwatch-emf-publisher!
+                  {:output-sink #(swap! accepted conj %)})]
+        (u/log ::before-stop :metric/name "BeforeStop" :metric/value 1)
+        (let [result (stop)]
+          (is (= 1 (:published-count result)))
+          (is (= 1 (count @accepted)))
+          (is (= 1 (:BeforeStop (json/read-str (first @accepted) :key-fn keyword)))))))))
+
+;; This checker reads only emitted JSON and independently checks the relevant
+;; AWS EMF constraints; it does not call publisher validation/encoding helpers.
+(defn- assert-valid-emf-document [document]
+  (let [record (json/read-str document :bigdec true)
+        directives (get-in record ["_aws" "CloudWatchMetrics"])
+        limit (bigint (.shiftLeft java.math.BigInteger/ONE 360))
+        printable? #(and (string? %) (every? (fn [c] (<= 32 (int c) 126)) %))]
+    (is (<= (alength (.getBytes ^String document "UTF-8")) 1048576))
+    (is (integer? (get-in record ["_aws" "Timestamp"])))
+    (is (= 1 (count (re-seq #"\"_aws\":" document))))
+    (doseq [directive directives]
+      (is (and (printable? (get directive "Namespace"))
+               (<= 1 (count (get directive "Namespace")) 255)))
+      (is (<= 1 (count (get directive "Metrics")) 100))
+      (let [metric-names (map #(get % "Name") (get directive "Metrics"))
+            dimension-names (mapcat identity (get directive "Dimensions"))]
+        (is (= (count metric-names) (count (set metric-names))))
+        (is (empty? (filter (set metric-names) dimension-names)))
+        (is (not (contains? (set (concat metric-names dimension-names)) "_aws"))))
+      (doseq [dimensions (get directive "Dimensions")]
+        (is (<= (count dimensions) 30))
+        (is (= (count dimensions) (count (set dimensions))))
+        (doseq [dimension dimensions]
+          (is (and (printable? dimension) (<= 1 (count dimension) 250)))
+          (is (not (str/starts-with? dimension ":")))
+          (is (and (printable? (get record dimension))
+                   (<= 1 (count (get record dimension)) 1024)))))
+      (doseq [metric (get directive "Metrics")]
+        (let [name (get metric "Name")
+              target (get record name)
+              values (if (vector? target) target [target])]
+          (is (and (printable? name) (<= 1 (count name) 255)))
+          (is (contains? #{1 60} (get metric "StorageResolution")))
+          (is (<= 1 (count values) 100))
+          (is (every? #(and (number? %) (<= (- limit) % limit)) values)))))))
+
+(deftest exact-numeric-boundaries-remain-valid-after-aggregation
+  (let [limit (bigint (.shiftLeft java.math.BigInteger/ONE 360))
+        docs (atom [])
+        {:keys [instance]}
+        (publish-events
+         {:output-sink #(swap! docs conj %)
+          :metric-registry {"Negative" {:metric/type :gauge :metric/unit :count}}}
+         [{:metric/name "Boundary" :metric/value limit}
+          {:metric/name "Above" :metric/value (inc limit)}
+          {:metric/name "Sum" :metric/value limit}
+          {:metric/name "Sum" :metric/value 1}
+          {:metric/name "Negative" :metric/value (- (inc limit))}
+          {:metric/name "Good" :metric/value 1}])]
+    (doseq [document @docs] (assert-valid-emf-document document))
+    (is (= 4 (:invalid (sut/publisher-health instance))))
+    (is (= #{"Boundary" "Good"}
+           (set (mapcat #(map :Name (get-in (json/read-str % :key-fn keyword)
+                                           [:_aws :CloudWatchMetrics 0 :Metrics])) @docs))))))
+
+(deftest encoded-size-splits-documents-and-isolates-oversized-singletons
+  (let [large-number (bigdec (str "1." (apply str (repeat 20000 "1"))))
+        documents (atom [])
+        {:keys [instance]}
+        (publish-events
+         {:output-sink #(swap! documents conj %)}
+         (conj (mapv #(hash-map :metric/name (str "Large" %) :metric/value large-number)
+                     (range 60))
+               {:metric/name "Good" :metric/value 1}))]
+    (is (>= (count @documents) 2))
+    (doseq [document @documents] (assert-valid-emf-document document))
+    (is (= 0 (:invalid (sut/publisher-health instance))))
+    (is (= 61 (:published (sut/publisher-health instance))))))
+
+(deftest oversized-singleton-is-isolated-from-valid-companions
+  (with-redefs-fn
+    {(ns-resolve 'ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface
+                 'max-document-bytes) 1024}
+    (fn []
+      (let [documents (atom [])
+            {:keys [instance]}
+            (publish-events {:output-sink #(swap! documents conj %)}
+                            [{:metric/name "Oversized"
+                              :metric/value (bigdec (str "1." (apply str (repeat 1500 "1"))))}
+                             {:metric/name "Good" :metric/value 1}])]
+        (is (= 1 (count @documents)))
+        (doseq [document @documents] (assert-valid-emf-document document))
+        (is (= 1 (:invalid (sut/publisher-health instance))))
+        (is (= 1 (:published (sut/publisher-health instance))))))))
+
+(deftest dimension-boundaries-and-reserved-targets
+  (doseq [dimension [(keyword "_aws") (keyword (apply str (repeat 251 "d")))]]
+    (let [{:keys [instance records]}
+          (publish-events
+           {:metric-registry {"Invalid" {:metric/type :counter :metric/unit :count
+                                         :metric/dimensions {dimension #{"value"}}}}}
+           [{:metric/name "Invalid" :metric/value 1 :metric/dimensions {dimension "value"}}
+            {:metric/name "Good" :metric/value 1}])]
+      (is (= 1 (count records)))
+      (is (= 1 (:Good (first records))))
+      (is (= 1 (:invalid (sut/publisher-health instance)))))))
+
+(deftest deadline-reports-unknown-pending-enqueues-honestly
+  (let [entered (promise) release (promise)
+        instance (sut/cloudwatch-emf-publisher {:final-drain-timeout 30})
+        ab (publisher/agent-buffer instance)]
+    (try
+      (send-off ab (fn [batch] (deliver entered true) (deref release 2000 nil) batch))
+      (is (true? (deref entered 1000 nil)))
+      (send ab buffer/enqueue {:metric/name "Queued" :metric/value 1})
+      (let [result (sut/final-drain instance)]
+        (is (true? (:timed-out? result)))
+        (is (nil? (:retained-count result)))
+        (is (= 0 (:dropped (sut/publisher-health instance)))))
+      (finally (deliver release true)))
+    (is (await-for 2000 ab))
+    (is (= 1 (:dropped (sut/publisher-health instance))))
+    (is (= 0 (:published (sut/publisher-health instance))))))
+
+(deftest delayed-source-watch-callbacks-preserve-events-and-source-order
+  (let [logger (atom (buffer/ring-buffer 1000))
+        entered (promise) release (promise) accepted (atom [])]
+    (binding [mulog-core/*default-logger* logger]
+      (let [stop (sut/start-cloudwatch-emf-publisher!
+                  {:flush-interval 60000
+                   :metric-registry {"Depth" {:metric/type :gauge :metric/unit :count}}
+                   :output-sink #(swap! accepted conj %)})
+            [watch-key original-watch] (first (.getWatches ^clojure.lang.Atom logger))]
+        (try
+          (add-watch logger watch-key
+                     (fn [k a old new]
+                       (when (= 1 (ffirst (buffer/items new)))
+                         (deliver entered true)
+                         (deref release 2000 nil))
+                       (original-watch k a old new)))
+          (let [first-log (future (u/log ::first :metric/name "Depth" :metric/value 1))]
+            (is (true? (deref entered 1000 nil)))
+            ;; Model ordinary μ/log dispatch dequeuing the first event while
+            ;; that event's watch callback is delayed before its handoff.
+            (swap! logger buffer/clear)
+            (u/log ::second :metric/name "Depth" :metric/value 2)
+            (deliver release true)
+            (is (nil? (deref first-log 1000 ::timeout)))
+            (let [result (stop)]
+              (is (= 2 (:published-count result)))
+              (is (= 2 (:Depth (json/read-str (first @accepted) :key-fn keyword))))))
+          (finally (deliver release true) (stop)))))))
+
+(deftest shared-source-lifecycle-publishers-and-ordinary-mulog-are-independent
+  (let [logger (atom (buffer/ring-buffer 1000))
+        first-docs (atom []) second-docs (atom []) ordinary-docs (atom [])
+        ordinary (sut/cloudwatch-emf-publisher {:output-sink #(swap! ordinary-docs conj %)})]
+    (binding [mulog-core/*default-logger* logger]
+      (let [ordinary-stop (u/start-publisher! {:type :inline :publisher ordinary})
+            first-stop (sut/start-cloudwatch-emf-publisher! {:output-sink #(swap! first-docs conj %)})
+            second-stop (sut/start-cloudwatch-emf-publisher! {:output-sink #(swap! second-docs conj %)})]
+        (try
+          (u/log ::shared :metric/name "Shared" :metric/value 1)
+          (let [first-result (first-stop)]
+            (is (= 1 (:published-count first-result)))
+            (is (= first-result (first-stop)))
+            (is (= 1 (count (.getWatches ^clojure.lang.Atom logger)))))
+          (is (= 1 (:published-count (second-stop))))
+          (is (empty? (.getWatches ^clojure.lang.Atom logger)))
+          ;; The ordinary μ/log publisher must still receive the source event.
+          (let [deadline (+ (System/nanoTime) 2000000000)]
+            (loop []
+              (when (and (empty? @ordinary-docs) (< (System/nanoTime) deadline))
+                (Thread/sleep 10)
+                (recur))))
+          (is (= 1 (count @ordinary-docs)))
+          (is (= 1 (count @first-docs)))
+          (is (= 1 (count @second-docs)))
+          (is (= 1 (:Shared (json/read-str (first @ordinary-docs) :key-fn keyword))))
+          (finally (ordinary-stop) (first-stop) (second-stop)))))))
+
+(deftest unchanged-custom-factory-configuration-starts-publishes-and-stops
+  (let [logger (atom (buffer/ring-buffer 1000))
+        writer (java.io.StringWriter.)
+        sink-var (ns-resolve 'ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface
+                             'default-output-sink)
+        original-sink @sink-var]
+    ;; Scheduled μ/log tasks do not inherit test thread bindings. Bind stdout
+    ;; at the output boundary while invoking the actual default sink.
+    (with-redefs-fn {sink-var (fn [document]
+                               (binding [*out* writer] (original-sink document)))}
+      (fn []
+        (binding [mulog-core/*default-logger* logger]
+          ;; The pre-enhancement deployment configuration, unchanged.
+          (let [stop (u/start-publisher!
+                      {:type :custom :fqn-function #'sut/cloudwatch-emf-publisher})]
+            (try
+              (u/log ::legacy-counter :metric/name "OldCounter" :metric/value 1)
+              (u/log ::legacy-timer :metric/name "OldTimer" :mulog/duration 2500000)
+              (let [deadline (+ (System/nanoTime) 2000000000)
+                    result
+                    (loop []
+                      (let [values (try
+                                     (apply merge
+                                            (map #(json/read-str % :key-fn keyword)
+                                                 (str/split-lines (str writer))))
+                                     (catch Exception _ nil))]
+                        (cond
+                          (and (:OldCounter values) (:OldTimer values)) values
+                          (< (System/nanoTime) deadline) (do (Thread/sleep 10) (recur))
+                          :else values)))]
+                (is (= 1 (:OldCounter result)))
+                (is (= [2.5] (:OldTimer result))))
+              (is (= :stopped (stop)))
+              (finally (stop)))))))))
+
+(deftest documented-registry-configuration-publishes-framework-and-custom-events
+  (let [readme (slurp (if (.isFile (java.io.File. "components/mulog-aws-cloudwatch-emf-publisher/README.md"))
+                       "components/mulog-aws-cloudwatch-emf-publisher/README.md"
+                       "README.md"))
+        code (second (re-find #"(?s)```clojure\n(.*?)```" readme))
+        sandbox (create-ns (gensym "publisher-readme-"))]
+    (try
+      (let [config (binding [*ns* sandbox]
+                     (clojure.core/refer 'clojure.core)
+                     (eval (read-string (str "(do " code ")")))
+                     (var-get (ns-resolve sandbox 'publisher-config)))
+            events [{:metric/name "EnrollmentCompleted" :metric/value 1
+                     :metric/dimensions {:service "academy" :outcome "succeeded"}}
+                    {:metric/name "CommandDuration" :mulog/duration 1000000
+                     :metric/dimensions {:service "academy" :command ":academy/enroll"
+                                         :outcome "succeeded"}}
+                    {:metric/name "CommandRejected" :metric/value 1
+                     :metric/dimensions {:service "academy" :command ":academy/enroll"
+                                         :outcome "rejected" :anomaly-category "forbidden"}}
+                    {:metric/name "TodoRetry" :metric/value 1
+                     :metric/dimensions {:service "academy" :processor ":academy/project"
+                                         :outcome "retrying" :failure-class "exception"}}
+                    {:metric/name "PeriodicFailed" :metric/value 1
+                     :metric/dimensions {:service "academy" :periodic ":academy/remind"
+                                         :outcome "failed" :failure-class "exception"}}
+                    {:metric/name "PostgresPoolActive" :metric/value 2
+                     :metric/dimensions {:backend "postgres" :operation "pool" :outcome "sampled"}}
+                    {:metric/name "PostgresPoolSaturated" :metric/value 1
+                     :metric/dimensions {:backend "postgres" :operation "pool" :outcome "saturated"}}]
+            documents (atom [])
+            {:keys [instance]}
+            (publish-events (assoc config :output-sink #(swap! documents conj %))
+                            (mapv #(assoc % :app-name "academy" :env "production") events))]
+        (is (zero? (:invalid (sut/publisher-health instance))))
+        (is (= (count events) (:published (sut/publisher-health instance))))
+        (doseq [document @documents]
+          (assert-valid-emf-document document)
+          (let [record (json/read-str document :key-fn keyword)]
+            (is (= "academy" (:app-name record)))
+            (is (= "production" (:env record))))))
+      (finally (remove-ns (ns-name sandbox))))))
+
+(deftest deadline-stops-new-writes-and-accounts-late-outcomes-once
+  (doseq [fail-late? [false true]]
+    (let [entered (promise) release (promise) writes (atom 0)
+          now (System/currentTimeMillis)
+          instance (sut/cloudwatch-emf-publisher
+                    {:final-drain-timeout 200
+                     :output-sink (fn [_]
+                                    (swap! writes inc)
+                                    (deliver entered true)
+                                    (deref release 2000 nil)
+                                    (when fail-late? (throw (Exception. "late failure"))))})
+          ab (publisher/agent-buffer instance)]
+      (try
+        (send ab buffer/enqueue {:metric/name "InFlight" :metric/value 1 :mulog/timestamp now})
+        (send ab buffer/enqueue {:metric/name "Untouched" :metric/value 1 :mulog/timestamp (inc now)})
+        (is (await-for 1000 ab))
+        (let [draining (future (sut/final-drain instance))]
+          (is (true? (deref entered 1000 nil)))
+          (let [result (deref draining 1000 nil)]
+            (is (true? (:timed-out? result)))
+            (is (nil? (:retained-count result)))))
+        (finally (deliver release true)))
+      (is (await-for 2000 ab))
+      (is (= 1 @writes) "untouched documents must not start a write after expiry")
+      (is (= (if fail-late? 0 1) (:published (sut/publisher-health instance))))
+      (is (= (if fail-late? 2 1) (:dropped (sut/publisher-health instance))))
+      (is (zero? (:buffered (sut/publisher-health instance))))
+      (is (zero? (.size ^java.util.IdentityHashMap (.-attempts instance)))))))
+
+(deftest partial-publication-timeout-never-reports-stale-retained-count
+  (let [entered (promise) release (promise) writes (atom 0)
+        now (System/currentTimeMillis)
+        instance (sut/cloudwatch-emf-publisher
+                  {:final-drain-timeout 200
+                   :output-sink (fn [_]
+                                  (when (= 2 (swap! writes inc))
+                                    (deliver entered true)
+                                    (deref release 2000 nil)))})
+        ab (publisher/agent-buffer instance)]
+    (try
+      (send ab buffer/enqueue {:metric/name "Accepted" :metric/value 1 :mulog/timestamp now})
+      (send ab buffer/enqueue {:metric/name "InFlight" :metric/value 1 :mulog/timestamp (inc now)})
+      (is (await-for 1000 ab))
+      (let [draining (future (sut/final-drain instance))]
+        (is (true? (deref entered 1000 nil)))
+        (let [result (deref draining 1000 nil)]
+          (is (true? (:timed-out? result)))
+          (is (= 1 (:published-count result)))
+          (is (nil? (:retained-count result))
+              "the stale agent batch still contains the already accepted event")
+          (is (zero? (:dropped (sut/publisher-health instance))))))
+      (finally (deliver release true)))
+    (is (await-for 2000 ab))
+    (is (= 2 (:published (sut/publisher-health instance))))
+    (is (zero? (:dropped (sut/publisher-health instance))))))
+
+(deftest lifecycle-includes-buffered-pre-start-events-once
+  (let [logger (atom (buffer/ring-buffer 1000)) accepted (atom [])]
+    (binding [mulog-core/*default-logger* logger]
+      (u/log ::before-start :metric/name "BeforeStart" :metric/value 1)
+      (let [stop (sut/start-cloudwatch-emf-publisher!
+                  {:flush-interval 60000 :output-sink #(swap! accepted conj %)})]
+        (try
+          (is (= 1 (:published-count (stop))))
+          (is (= 1 (count @accepted)))
+          (is (empty? (.getWatches ^clojure.lang.Atom logger)))
+          (finally (stop)))))))
+
+(deftest lifecycle-accounts-for-source-callback-already-running-at-stop
+  (let [logger (atom (buffer/ring-buffer 1000))
+        entered (promise) release (promise) instance (atom nil)]
+    (binding [mulog-core/*default-logger* logger]
+      (with-redefs [u/start-publisher! (fn [config]
+                                       (reset! instance (:publisher config))
+                                       (mulog-core/start-publisher! mulog-core/*default-logger* config))]
+        (let [stop (sut/start-cloudwatch-emf-publisher! {:flush-interval 60000})
+              [watch-key original-watch] (first (.getWatches ^clojure.lang.Atom logger))]
+          (try
+            (add-watch logger watch-key
+                       (fn [k a old new]
+                         (when (seq (buffer/items new))
+                           (deliver entered true)
+                           (deref release 2000 nil))
+                         (original-watch k a old new)))
+            (let [logging (future (u/log ::concurrent-stop :metric/name "Concurrent" :metric/value 1))]
+              (is (true? (deref entered 1000 nil)))
+              (is (false? (:timed-out? (stop))))
+              (deliver release true)
+              (is (nil? (deref logging 1000 ::timeout)))
+              (is (= 1 (:dropped (sut/publisher-health @instance))))
+              (is (zero? (:published (sut/publisher-health @instance))))
+              (is (empty? (.getWatches ^clojure.lang.Atom logger))))
+            (finally (deliver release true) (stop))))))))
