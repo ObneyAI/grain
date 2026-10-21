@@ -224,5 +224,5 @@ The adapter logs warnings for common misconfigurations that would otherwise caus
 | `:datastar/interceptors` | Additional Pedestal interceptors for this query | `[]` |
 | `:datastar/gate` | Context-dependent gate `{:check fn :redirect path-or-fn}` | — |
 | `:datastar/emit-signals?` | Allow the query to push a one-shot `:datastar/signals` patch alongside its hiccup | `false` |
-| `:grain/read-models` | Read models to subscribe to (enables event-driven mode) | — |
+| `:grain/read-models` | `{model-name version}` map of read models to subscribe to (enables event-driven mode). The stream re-renders on any event type those models declare in `:events`. For an `rmp/query` definition, use `(rmp/query-models definition)`. | — |
 | `:authorized?` | Auth predicate `(fn [ctx] boolean)` | — |

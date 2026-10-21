@@ -356,6 +356,12 @@ surface QuerySubmission {
         -- upstream interceptors, and the decoded query — so authorization can be
         -- query-specific and the handler need not re-fetch ambient state.
 
+    @guarantee AuthorizationDenialObserved
+        -- Every deny-by-default authorization outcome records one
+        -- QueryAuthorizationDenied counter. A registered query may contribute
+        -- its bounded service and query labels; an unknown caller-controlled
+        -- name is omitted from metric dimensions.
+
     @guarantee RegistryResolution
         -- A per-call registry, when supplied in the context, is the active
         -- registry and shadows the process-wide fallback registry entirely;

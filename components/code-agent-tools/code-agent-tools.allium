@@ -248,8 +248,10 @@ rule ReadEvents {
     ensures: EventsRead(tenant_id: resolved_tenant_id, filter: filter)
 }
 
--- The agent projects a registered read model. Requires an installation whose
--- context exposes both an event store and a cache, and a resolvable tenant.
+-- The agent projects a registered ordinary read model. Keyed read models
+-- (declared with :key or :route) cannot be projected and the request fails.
+-- Requires an installation whose context exposes both an event store and a
+-- cache, and a resolvable tenant.
 rule ProjectReadModel {
     when: ProjectionRequested(read_model, scope?, tenant_id?)
     let installation = Installations.first

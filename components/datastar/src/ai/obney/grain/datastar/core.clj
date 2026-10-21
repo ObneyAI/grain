@@ -56,6 +56,8 @@
 
    See `ai.obney.grain.datastar.interface` for the public API."
   (:require [hiccup2.core :as h]
+            [hiccup.compiler :as html-compiler]
+            [hiccup.util :as html-util]
             [clojure.data.json :as json]
             [clojure.set :as set]
             [clojure.core.async :as async]
@@ -120,8 +122,65 @@
    datastar-transformer
    (mt/strip-extra-keys-transformer)))
 
+(def ^:private html-void-tags
+  #{"area" "base" "br" "col" "command" "embed" "hr" "img" "input" "keygen" "link"
+    "meta" "param" "source" "track" "wbr"})
+
+(def ^:private appendable-html-implementations
+  ;; An unknown or overridden Hiccup implementation retains upstream dispatch.
+  ;; This conservative source check can only disable the optimization on upgrade.
+  (into {}
+    (keep (fn [type]
+            (let [implementation (get-in html-compiler/HtmlRenderer [:impls type :render-html])]
+              (when (and implementation
+                         (.startsWith (.getName (class implementation)) "hiccup.compiler$eval"))
+                [type implementation]))))
+    [clojure.lang.IPersistentVector clojure.lang.ISeq]))
+
+(defn- appendable-html? [value type dispatch-cache]
+  (and (not (instance? hiccup.compiler.HtmlRenderer value))
+       (some? (get appendable-html-implementations type))
+       (let [protocol html-compiler/HtmlRenderer
+             _ (when-not (identical? protocol (:protocol @dispatch-cache))
+                 (vreset! dispatch-cache {:protocol protocol :classes {}}))
+             value-class (class value)
+             classes (:classes @dispatch-cache)
+             implementation (if (contains? classes value-class)
+                              (get classes value-class)
+                              (let [resolved (:render-html (find-protocol-impl protocol value))]
+                                (when (< (count classes) 64)
+                                  (vswap! dispatch-cache assoc-in [:classes value-class] resolved))
+                                resolved))]
+         (identical? (get appendable-html-implementations type) implementation))))
+
+(defn- append-html! [^StringBuilder out value dispatch-cache empty-falsey?]
+   (cond
+    (and (vector? value) (appendable-html? value clojure.lang.IPersistentVector dispatch-cache))
+    (let [[tag attrs content] (html-compiler/normalize-element value)
+          container? (or content
+                         (and (#{:html :xhtml} html-util/*html-mode*)
+                              (not (html-void-tags tag))))]
+      (.append out "<") (.append out ^String tag)
+      (.append out ^String (html-compiler/render-attr-map attrs))
+      (if container?
+        (do (.append out ">")
+            (append-html! out content dispatch-cache true)
+            (.append out "</") (.append out ^String tag) (.append out ">"))
+        (.append out ^String (if (#{:xml :xhtml} html-util/*html-mode*) " />" ">"))))
+
+    (and (seq? value) (appendable-html? value clojure.lang.ISeq dispatch-cache))
+    (html-compiler/iterate! #(append-html! out % dispatch-cache false) value)
+
+    :else (let [rendered (html-compiler/render-html value)]
+            (.append out ^Object (if empty-falsey? (or rendered "") rendered)))))
+
 (defn render-html [hiccup]
-  (str (h/html hiccup)))
+  ;; Append standard trees once instead of copying every rendered subtree into
+  ;; each ancestor. Attributes, leaves and custom dispatch remain Hiccup's.
+  (let [out (StringBuilder.)
+        dispatch-cache (volatile! {:protocol html-compiler/HtmlRenderer :classes {}})]
+    (append-html! out hiccup dispatch-cache true)
+    (.toString out)))
 
 (defn- url-encode
   [v]
@@ -539,6 +598,9 @@
                        (strip-params raw-query ds-nonce-param grain-connect-param))
         initial-context (merge context additional-context {:query decoded-query})
         context-atom (atom initial-context)
+        refresh-key-fn (get-in (or (:query-registry initial-context) @qp/query-registry*)
+                               [query-name :datastar/refresh-key])
+        refresh-key #(when refresh-key-fn (refresh-key-fn @context-atom))
         signal-ch (async/chan (async/sliding-buffer 1))
         user-id (get-in additional-context [:auth-claims :user-id])
         session-key [user-id query-name nonce]
@@ -552,7 +614,8 @@
       (when (and event-tailer tenant-id)
         (event-tailer/subscribe! event-tailer tenant-id event-types))
       ;; Initial render
-      (let [initial (poll-and-render @context-atom nil)]
+      (let [initial-refresh-key (refresh-key)
+            initial (poll-and-render @context-atom nil)]
         (when initial
           (async/>!! event-ch (:event initial))
           (when-let [se (:signals-event initial)]
@@ -560,19 +623,22 @@
         (when (:stop? initial)
           (throw (ex-info "stop" {:stop true})))
         ;; Event loop — listens to domain events AND signal updates
-        (loop [prev-result (:result initial)]
-          (let [[val _port] (async/alts!! [sub-chan signal-ch (async/timeout 30000)])]
+        (loop [prev-result (:result initial) previous-key initial-refresh-key]
+          (let [[val _port] (async/alts!! [sub-chan signal-ch (async/timeout 30000)])
+                next-key (refresh-key)]
             (cond
               ;; Channel closed (pubsub shutting down or signal-ch closed)
               (and (nil? val) (or (async-protocols/closed? sub-chan)
                                   (async-protocols/closed? signal-ch)))
               nil
 
-              ;; Timeout — liveness check
-              (nil? val)
-              (if (async-protocols/closed? event-ch)
-                nil
-                (recur prev-result))
+              (and (nil? val) (async-protocols/closed? event-ch))
+              nil
+
+              ;; A date (or another explicitly declared query input) can change
+              ;; without an event. Equal keys keep this a cheap liveness check.
+              (and (nil? val) (= previous-key next-key))
+              (recur prev-result previous-key)
 
               ;; Event or signal update received. Debounce then drain BOTH channels
               ;; before re-rendering. Draining both is a correctness requirement, not
@@ -599,11 +665,11 @@
                         (do
                           (when-let [se (:signals-event poll-result)]
                             (async/>!! event-ch se))
-                          (recur (:result poll-result)))
+                          (recur (:result poll-result) next-key))
                         nil))
 
                     :else
-                    (recur prev-result))))))))
+                    (recur prev-result next-key))))))))
       (catch Exception e
         (when-not (= "stop" (.getMessage e))
           (u/log ::stream-view-events-error :error e)))

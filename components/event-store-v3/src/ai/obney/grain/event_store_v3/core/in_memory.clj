@@ -230,6 +230,15 @@
   (compact! [this request]
     (compact! this request)))
 
+(extend-type InMemoryEventStore
+  p/EventStoreHead
+  (head [this tenant-id]
+    (get-in @(:state this) [:tenants tenant-id :tenant/last-event-id])))
+
+(extend-type InMemoryEventStore
+  p/EventStoreStableEmptyIntervals
+  (stable-empty-intervals? [_] true))
+
 (defmethod p/start-event-store :in-memory
   [config]
   (p/start (->InMemoryEventStore config)))

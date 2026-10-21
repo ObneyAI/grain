@@ -52,9 +52,9 @@
    :ui-test/one-shot-page {:handler-fn identity
                            :authorized? (constantly true)
                            :datastar/path "/one-shot"}
-   :ui-test/student-detail-page {:handler-fn identity
+   :ui-test/customer-detail-page {:handler-fn identity
                                  :authorized? (constantly true)
-                                 :datastar/path "/admin/students/:student-id"}})
+                                 :datastar/path "/admin/customers/:customer-id"}})
 
 (defn- hiccup
   [source]
@@ -699,7 +699,7 @@
                             {:filters {:search search
                                        :page page
                                        :empty nil}
-                             :include ["students" "documents" nil]})}}
+                             :include ["customers" "documents" nil]})}}
                 "Refresh"]))
         click (:data-on:click (attrs out))]
     (is (string/includes? click "@post(\"/admin/graduation-pending/__stream\", {payload:"))
@@ -707,8 +707,29 @@
     (is (re-find #"\.\.\(\(\$search__[a-z0-9]+\) == null \? \{\} : \{\"search\": \$search__[a-z0-9]+\}\)" click))
     (is (re-find #"\.\.\(\(\$page__[a-z0-9]+\) == null \? \{\} : \{\"page\": \$page__[a-z0-9]+\}\)" click))
     (is (not (string/includes? click "empty")))
-    (is (string/includes? click "\"include\": [\"students\", \"documents\", null]"))
+    (is (string/includes? click "\"include\": [\"customers\", \"documents\", null]"))
     (is (string/includes? click "\"dsNonce\": $dsNonce"))))
+
+(deftest nested-indexed-bindings-guard-removed-parent-rows
+  (let [out (hiccup
+             (ui/with-signals [rows {:name "rows" :stable? true :init [{"amount" "12"}]}
+                               idx {:name "idx" :stable? true :init 0}]
+               [:div
+                [:input {:bind/value (ui/indexed (ui/indexed rows idx) "amount")}]
+                [:input {:bind/value (ui/indexed (ui/indexed (ui/indexed rows idx) "details") "name")}]]))
+        row-input (attrs (nth out 2))
+        nested-input (attrs (nth out 3))
+        row-guard "if ($rows != null && Object.hasOwn($rows, $idx) && $rows[$idx] != null)"
+        nested-guard (str "if ($rows != null && Object.hasOwn($rows, $idx) && $rows[$idx] != null"
+                          " && $rows[$idx] != null && Object.hasOwn($rows[$idx], \"details\")"
+                          " && $rows[$idx][\"details\"] != null)")]
+    (is (= (str row-guard " { el.value = $rows[$idx][\"amount\"]; } else { el.value = ''; }")
+           (:data-effect row-input)))
+    (is (= (str row-guard " { $rows[$idx][\"amount\"] = el.value; }")
+           (:data-on:input row-input)
+           (:data-on:change row-input)))
+    (is (string/starts-with? (:data-effect nested-input) nested-guard))
+    (is (string/starts-with? (:data-on:change nested-input) nested-guard))))
 
 (deftest indexed-collection-signals-bind-express-and-post
   (let [out (hiccup
@@ -776,25 +797,68 @@
 (deftest checked-route-refs-resolve-from-query-metadata
   (let [out (hiccup
              [:div
-              [:a {:href (ui/href :ui-test/student-detail-page
-                         {:path-params {:student-id #uuid "00000000-0000-0000-0000-000000000099"}
+              [:a {:href (ui/href :ui-test/customer-detail-page
+                         {:path-params {:customer-id #uuid "00000000-0000-0000-0000-000000000099"}
                           :query-params {:tab :finance :page 2}})}
-               "Student"]
+               "Customer"]
               [:button {:on/click
-                        {:effect (ui/refresh :ui-test/student-detail-page
+                        {:effect (ui/refresh :ui-test/customer-detail-page
                                    {:tab :finance}
-                                   {:path-params {:student-id #uuid "00000000-0000-0000-0000-000000000099"}
+                                   {:path-params {:customer-id #uuid "00000000-0000-0000-0000-000000000099"}
                                     :query-params {:tab :finance :page 2}})}}
                "Refresh"]])
         link (nth out 2)
         button (nth out 3)
         click (:data-on:click (attrs button))]
-    (is (= "/admin/students/00000000-0000-0000-0000-000000000099?page=2&tab=finance"
+    (is (= "/admin/customers/00000000-0000-0000-0000-000000000099?page=2&tab=finance"
            (:href (attrs link))))
     (is (string/includes?
          click
-         "@post(\"/admin/students/00000000-0000-0000-0000-000000000099/__stream?page=2&tab=finance\""))
+         "@post(\"/admin/customers/00000000-0000-0000-0000-000000000099/__stream?page=2&tab=finance\""))
     (is (string/includes? click "\"tab\": \"finance\""))))
+
+(deftest lowering-keeps-explicit-options-through-literal-and-lazy-fragments
+  (let [registry {:ui-test/lowering-page {:datastar/path "/lowering"}}
+        opts {:query-registry registry}
+        link (ui/href :ui-test/lowering-page {:query-params {:id 7}})
+        source (list [:div (map (fn [_] [:a {:href link} "Details"]) (range 2))])
+        out (ui/lower-ir (ui/ir source) opts)]
+    (is (= "/lowering?id=7" (ui/lower-ir (ui/ir link) opts)))
+    ;; Fragment and child sequences have completed before the explicit
+    ;; registry's dynamic scope ends; realizing them later needs no registry.
+    (is (= ["/lowering?id=7" "/lowering?id=7"]
+           (mapv #(get (attrs %) :href) (nth (first out) 2))))))
+
+(deftest nested-public-lowering-restores-outer-options
+  (let [outer-opts {:query-registry {:ui-test/outer-lowering {:datastar/path "/outer"}}}
+        inner-opts {:query-registry {:ui-test/inner-lowering {:datastar/path "/inner"}}}
+        original ds/page-path
+        inner-result (atom nil)
+        caller-opts {:query-registry {:ui-test/caller-lowering {:datastar/path "/caller"}}}]
+    (binding [ui/*lower-opts* caller-opts]
+      (with-redefs [ds/page-path
+                    (fn [query params registry]
+                      (when (= query :ui-test/outer-lowering)
+                        (reset! inner-result
+                                (ui/lower-ir (ui/ir (ui/href :ui-test/inner-lowering)) inner-opts))
+                        (is (= outer-opts ui/*lower-opts*)))
+                      (original query params registry))]
+        (is (= "/outer"
+               (ui/lower-ir (ui/ir (ui/href :ui-test/outer-lowering)) outer-opts)))
+        (is (= "/inner" @inner-result))
+        (is (= caller-opts ui/*lower-opts*))))))
+
+(deftest failed-lowering-restores-caller-options
+  (let [caller-opts {:query-registry {:ui-test/caller-lowering {:datastar/path "/caller"}}}]
+    (binding [ui/*lower-opts* caller-opts]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"not registered"
+           (ui/lower-ir
+            (ui/ir (list [:div [:a {:href (ui/href :ui-test/missing-lowering)} "Missing"]]))
+            {:query-registry {}})))
+      (is (= caller-opts ui/*lower-opts*))
+      (is (= "/caller"
+             (ui/lower-ir (ui/ir (ui/href :ui-test/caller-lowering)) caller-opts))))))
 
 (deftest checked-route-refs-reject-literal-and-missing-routes
   (testing "refresh string paths fail"

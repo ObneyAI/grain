@@ -33,7 +33,7 @@
 --     captured only as the Roundtrip guarantee, not the byte layout
 --   - UUID-v7 as the concrete ordered-id scheme; modelled as an abstract
 --     stream position whose total order is independent of append order
---   - logging, tracing and metrics
+--   - notification delivery telemetry (owned by the notifier component)
 --
 -- The conformance points below correspond to the component's test suite
 -- (integration_test.clj). Where each is captured:
@@ -265,6 +265,25 @@ contract WatermarkRegistry {
     @invariant RegistryEnumeratesAllTenants
         -- Every tenant that has ever had events committed appears in the result;
         -- enumerating watermarks crosses no tenant's stream and reads no events.
+}
+
+contract PostgresTelemetry {
+    sample_pool: () -> Any
+    record_transaction_failure: () -> Any
+
+    @invariant CommonMetricParity
+        -- Appends and consumed reads expose the backend-neutral event-store
+        -- duration, outcome, count, conflict, and connection-failure metrics
+        -- with backend = postgres.
+
+    @invariant PoolStateIsSampled
+        -- Operations sample active, idle, and pending Hikari connections.
+        -- Waiting borrowers with every existing connection active additionally
+        -- record PostgresPoolSaturated.
+
+    @invariant TransactionFailureIsAdditive
+        -- A thrown append transaction records PostgresTransactionFailed in
+        -- addition to the common append failure measurement.
 }
 
 ------------------------------------------------------------
@@ -521,6 +540,22 @@ surface EventRead {
         -- Transaction markers are part of the stream and are returned by reads
         -- like any other event; consumers that want only domain facts
         -- distinguish them by kind. Reads do not silently hide them.
+
+    @guarantee StableEmptyIntervals
+        -- A store may explicitly promise that a completed read proving no
+        -- matching events in a finite committed interval stays true for this
+        -- open store. Later appends mint ids strictly beyond the committed
+        -- head, and old event types and tags cannot be rewritten to introduce
+        -- new matches. Authorized deletion preserves empty intervals.
+        -- Unsupported or mutable stores do not supply this optional promise;
+        -- readers keep ordinary catch-up rather than reuse negative evidence.
+
+    @guarantee CommittedHeadWithoutPayload
+        -- Reading only the current committed event identity uses this tenant's
+        -- durable watermark. It returns null for an empty tenant and does not
+        -- read event bodies or other tenants. Failed and uncommitted appends
+        -- cannot advance the observed head. This is a current freshness bound;
+        -- it does not define downstream checkpoint or notification policy.
 }
 
 -- The administrative boundary: a client reads back the durable per-tenant
