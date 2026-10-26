@@ -16,3 +16,8 @@
 (defn sub
   [pubsub args]
   (core/sub pubsub args))
+
+(defn unsub
+  "Immediately removes sub-chan from topic, without closing the channel."
+  [pubsub args]
+  (core/unsub pubsub args))

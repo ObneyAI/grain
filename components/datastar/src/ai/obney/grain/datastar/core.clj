@@ -436,6 +436,27 @@
          (:query-params request)
          (:path-params request)))
 
+(defn- start-view-stream
+  "Gives each view a cancellation channel, closed by Pedestal on disconnect."
+  [callback pedestal-context heartbeat-delay]
+  (let [disconnect-ch (async/chan)]
+    (sse/start-stream
+     (fn [event-ch sse-ctx]
+       (try
+         (callback event-ch (assoc sse-ctx ::disconnect-ch disconnect-ch))
+         (finally
+           ;; Parsing or subscription setup may fail before a view loop's try.
+           (async/close! disconnect-ch)
+           (async/close! event-ch))))
+     pedestal-context heartbeat-delay 10
+     {:on-client-disconnect (fn [_] (async/close! disconnect-ch))})))
+
+(defn- wait-for-render
+  "Waits for the render interval, or returns immediately on disconnect."
+  [disconnect-ch milliseconds]
+  (when (pos? milliseconds)
+    (async/alts!! [disconnect-ch (async/timeout milliseconds)] :priority true)))
+
 (defn- stream-view-loop
   "Polling loop for stream-view. Runs on SSE thread.
    When interval-ms is nil (fps 0), renders once and closes."
@@ -443,49 +464,50 @@
   (let [request (:request sse-ctx)
         raw-query (extract-query-from-request request query-name)
         decoded-query (decode-json-query raw-query)
-        query-context (merge context additional-context {:query decoded-query})]
+        query-context (merge context additional-context {:query decoded-query})
+        disconnect-ch (or (::disconnect-ch sse-ctx) (async/chan))
+        stopped? #(or (async-protocols/closed? event-ch)
+                      (async-protocols/closed? disconnect-ch))]
     (try
       (if-not interval-ms
         ;; One-shot mode: render once and close
-        (let [poll-result (poll-and-render query-context nil)]
-          (when poll-result
+        (let [poll-result (when-not (stopped?) (poll-and-render query-context nil))]
+          (when (and poll-result (not (stopped?)))
             (async/>!! event-ch (:event poll-result))
             (when-let [se (:signals-event poll-result)]
               (async/>!! event-ch se))))
         ;; Polling mode: loop until channel closes or client disconnects
         (loop [prev-result nil]
-          (let [start-time (System/currentTimeMillis)
-                poll-result (poll-and-render query-context prev-result)]
-            (cond
-              (:stop? poll-result)
-              (async/>!! event-ch (:event poll-result))
+          (when-not (stopped?)
+            (let [start-time (System/currentTimeMillis)
+                  poll-result (poll-and-render query-context prev-result)]
+              (cond
+                (stopped?) nil
 
-              poll-result
-              (let [sent? (async/alt!!
-                            [[event-ch (:event poll-result)]] true
-                            :default false)]
-                (when sent?
-                  (when-let [se (:signals-event poll-result)]
-                    (async/>!! event-ch se))
-                  (let [elapsed (- (System/currentTimeMillis) start-time)
-                        sleep-ms (max 0 (- interval-ms elapsed))]
-                    (when (pos? sleep-ms) (Thread/sleep sleep-ms))
-                    (recur (:result poll-result)))))
+                (:stop? poll-result)
+                (async/>!! event-ch (:event poll-result))
 
-              :else
-              (when-not (async-protocols/closed? event-ch)
-                (let [elapsed (- (System/currentTimeMillis) start-time)
-                      sleep-ms (max 0 (- interval-ms elapsed))]
-                  (when (pos? sleep-ms) (Thread/sleep sleep-ms))
-                  (recur prev-result)))))))
+                :else
+                (let [sent? (or (nil? poll-result)
+                                (async/alt!!
+                                  [[event-ch (:event poll-result)]] ([accepted?] accepted?)
+                                  :default false))]
+                  (when sent?
+                    (when-let [se (:signals-event poll-result)]
+                      (async/>!! event-ch se))
+                    (let [elapsed (- (System/currentTimeMillis) start-time)]
+                      (wait-for-render disconnect-ch (max 0 (- interval-ms elapsed))))
+                    (recur (if poll-result (:result poll-result) prev-result)))))))))
       (catch Exception e (u/log ::stream-view-error :error e))
-      (finally (async/close! event-ch)))))
+      (finally
+        (async/close! disconnect-ch)
+        (async/close! event-ch)))))
 
 (defn- stream-view-enter
   "Enter fn for stream-view interceptor (polling mode)."
   [context query-name interval-ms heartbeat-delay pedestal-context]
   (let [additional-context (:grain/additional-context pedestal-context)]
-    (sse/start-stream
+    (start-view-stream
       (fn [event-ch sse-ctx]
         (stream-view-loop event-ch sse-ctx context query-name interval-ms additional-context))
       pedestal-context
@@ -574,15 +596,21 @@
              (comp (filter event-filter-fn) (event-dedupe-xf))
              (event-dedupe-xf))
         sub-chan (async/chan buf xf)]
-    (doseq [event-type event-types]
-      (pubsub/sub event-pubsub {:topic event-type :sub-chan sub-chan}))
-    sub-chan))
+    (try
+      (doseq [event-type event-types]
+        (pubsub/sub event-pubsub {:topic event-type :sub-chan sub-chan}))
+      sub-chan
+      (catch Exception e
+        (doseq [event-type event-types]
+          (pubsub/unsub event-pubsub {:topic event-type :sub-chan sub-chan}))
+        (async/close! sub-chan)
+        (throw e)))))
 
 (defn- drain-channel
-  "Non-blocking drain of all buffered messages on ch. Returns count drained."
-  [ch]
+  "Drains buffered notifications, stopping promptly if the view is canceled."
+  [ch stopped?]
   (loop [n 0]
-    (if-let [_ (async/poll! ch)]
+    (if (and (not (stopped?)) (some? (async/poll! ch)))
       (recur (inc n))
       n)))
 
@@ -602,21 +630,24 @@
                                [query-name :datastar/refresh-key])
         refresh-key #(when refresh-key-fn (refresh-key-fn @context-atom))
         signal-ch (async/chan (async/sliding-buffer 1))
+        disconnect-ch (or (::disconnect-ch sse-ctx) (async/chan))
         user-id (get-in additional-context [:auth-claims :user-id])
         session-key [user-id query-name nonce]
-        _ (swap! active-stream-contexts assoc session-key
-                 {:context-atom context-atom :signal-ch signal-ch :event-ch event-ch})
         tenant-id (resolve-tenant-id initial-context)
         event-tailer (:event-tailer initial-context)
         event-filter-fn (resolve-event-filter tenant-id event-tags @context-atom)
-        sub-chan (subscribe-to-events event-pubsub event-types event-filter-fn)]
+        sub-chan (subscribe-to-events event-pubsub event-types event-filter-fn)
+        stopped? #(some async-protocols/closed? [disconnect-ch signal-ch sub-chan event-ch])]
     (try
+      (swap! active-stream-contexts assoc session-key
+             {:context-atom context-atom :signal-ch signal-ch :event-ch event-ch
+              :disconnect-ch disconnect-ch})
       (when (and event-tailer tenant-id)
         (event-tailer/subscribe! event-tailer tenant-id event-types))
       ;; Initial render
       (let [initial-refresh-key (refresh-key)
-            initial (poll-and-render @context-atom nil)]
-        (when initial
+            initial (when-not (stopped?) (poll-and-render @context-atom nil))]
+        (when (and initial (not (stopped?)))
           (async/>!! event-ch (:event initial))
           (when-let [se (:signals-event initial)]
             (async/>!! event-ch se)))
@@ -624,76 +655,75 @@
           (throw (ex-info "stop" {:stop true})))
         ;; Event loop — listens to domain events AND signal updates
         (loop [prev-result (:result initial) previous-key initial-refresh-key]
-          (let [[val _port] (async/alts!! [sub-chan signal-ch (async/timeout 30000)])
-                next-key (refresh-key)]
-            (cond
-              ;; Channel closed (pubsub shutting down or signal-ch closed)
-              (and (nil? val) (or (async-protocols/closed? sub-chan)
-                                  (async-protocols/closed? signal-ch)))
-              nil
+          (when-not (stopped?)
+            (let [[val _port] (async/alts!! [disconnect-ch signal-ch sub-chan (async/timeout 30000)]
+                                          :priority true)
+                  next-key (when-not (stopped?) (refresh-key))]
+              (cond
+                ;; Disconnect takes priority over queued events, including when
+                ;; a busy dashboard never reaches the idle timeout.
+                (stopped?) nil
 
-              (and (nil? val) (async-protocols/closed? event-ch))
-              nil
+                ;; A date (or another explicitly declared query input) can change
+                ;; without an event. Equal keys keep this a cheap liveness check.
+                (and (nil? val) (= previous-key next-key))
+                (recur prev-result previous-key)
 
-              ;; A date (or another explicitly declared query input) can change
-              ;; without an event. Equal keys keep this a cheap liveness check.
-              (and (nil? val) (= previous-key next-key))
-              (recur prev-result previous-key)
+                ;; Drain both channels so simultaneous domain and signal updates
+                ;; render the latest query context in a single cycle.
+                :else
+                (do
+                  (wait-for-render disconnect-ch debounce-ms)
+                  (when-not (stopped?)
+                    (drain-channel sub-chan stopped?)
+                    (drain-channel signal-ch stopped?)
+                    (let [poll-result (when-not (stopped?)
+                                        (poll-and-render @context-atom prev-result))]
+                      (cond
+                        (stopped?) nil
 
-              ;; Event or signal update received. Debounce then drain BOTH channels
-              ;; before re-rendering. Draining both is a correctness requirement, not
-              ;; just a performance optimization: if a domain event and a signal update
-              ;; arrive near-simultaneously, we must apply the signal change before
-              ;; re-rendering — otherwise the query runs with stale signals and the
-              ;; user sees a flash of old state before the signal update triggers
-              ;; another render cycle.
-              :else
-              (do
-                (when (pos? debounce-ms) (Thread/sleep (long debounce-ms)))
-                (drain-channel sub-chan)
-                (drain-channel signal-ch)
-                (let [poll-result (poll-and-render @context-atom prev-result)]
-                  (cond
-                    (:stop? poll-result)
-                    (async/>!! event-ch (:event poll-result))
+                        (:stop? poll-result)
+                        (async/>!! event-ch (:event poll-result))
 
-                    poll-result
-                    (let [sent? (async/alt!!
-                                  [[event-ch (:event poll-result)]] true
-                                  :default false)]
-                      (if sent?
-                        (do
-                          (when-let [se (:signals-event poll-result)]
-                            (async/>!! event-ch se))
-                          (recur (:result poll-result) next-key))
-                        nil))
+                        poll-result
+                        (let [sent? (async/alt!!
+                                      [[event-ch (:event poll-result)]] ([accepted?] accepted?)
+                                      :default false)]
+                          (when sent?
+                            (when-let [se (:signals-event poll-result)]
+                              (async/>!! event-ch se))
+                            (recur (:result poll-result) next-key)))
 
-                    :else
-                    (recur prev-result next-key))))))))
+                        :else
+                        (recur prev-result next-key))))))))))
       (catch Exception e
         (when-not (= "stop" (.getMessage e))
           (u/log ::stream-view-events-error :error e)))
       (finally
-        (when (and event-tailer tenant-id)
-          (event-tailer/unsubscribe! event-tailer tenant-id event-types))
-        ;; Compare-and-remove: only drop the registry entry if it still points to
-        ;; THIS loop's event-ch. A reconnect (or POST restart) may have already
-        ;; replaced this key with a newer, healthy stream — an unconditional
-        ;; dissoc here would clobber it and break subsequent reuse for that tab.
-        (swap! active-stream-contexts
-               (fn [m]
-                 (if (identical? (:event-ch (get m session-key)) event-ch)
-                   (dissoc m session-key)
-                   m)))
-        (async/close! signal-ch)
-        (async/close! sub-chan)
-        (async/close! event-ch)))))
+        (try
+          (when (and event-tailer tenant-id)
+            (event-tailer/unsubscribe! event-tailer tenant-id event-types))
+          (finally
+            (try
+              (doseq [event-type event-types]
+                (pubsub/unsub event-pubsub {:topic event-type :sub-chan sub-chan}))
+              (finally
+                ;; An old loop must not remove a replacement under the same key.
+                (swap! active-stream-contexts
+                       (fn [m]
+                         (if (identical? (:event-ch (get m session-key)) event-ch)
+                           (dissoc m session-key)
+                           m)))
+                (async/close! disconnect-ch)
+                (async/close! signal-ch)
+                (async/close! sub-chan)
+                (async/close! event-ch)))))))))
 
 (defn- stream-view-enter-events
   "Enter fn for stream-view interceptor (event-driven mode)."
   [context query-name event-pubsub event-types debounce-ms heartbeat-delay event-tags pedestal-context]
   (let [additional-context (:grain/additional-context pedestal-context)]
-    (sse/start-stream
+    (start-view-stream
       (fn [event-ch sse-ctx]
         (stream-view-loop-events event-ch sse-ctx context query-name
                                  event-pubsub event-types debounce-ms additional-context event-tags))
@@ -739,7 +769,9 @@
         ;; signal-ch closes when the event loop's finally block runs.
         existing (when (and existing
                             (not (async-protocols/closed? (:signal-ch existing)))
-                            (not (async-protocols/closed? (:event-ch existing))))
+                            (not (async-protocols/closed? (:event-ch existing)))
+                            (or (nil? (:disconnect-ch existing))
+                                (not (async-protocols/closed? (:disconnect-ch existing)))))
                    existing)]
     (if existing
       ;; Update existing SSE's context with new signals (from :query-params, already parsed by interceptor)
@@ -760,6 +792,8 @@
       (do
         (when (or connect? is-post? nonce)
           (when-let [stale (get @active-stream-contexts session-key)]
+            (when-let [disconnect-ch (:disconnect-ch stale)]
+              (async/close! disconnect-ch))
             (async/close! (:signal-ch stale))))
         (stream-view-enter-events context query-name event-pubsub event-types
                                   debounce-ms heartbeat-delay event-tags pedestal-context)))))

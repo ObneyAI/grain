@@ -151,6 +151,8 @@ When the flag is set and the query result contains `:datastar/signals`, the stre
 
 In event-driven mode, both `@get` and `@post` requests check for an existing SSE connection by `[user-id, query-name, nonce]`. If a match is found, the server updates the existing SSE's query context with the new signals and triggers a re-render — without opening a new connection. The shim page generates a unique nonce per page load and emits it as a Datastar signal, so it's included in every request automatically.
 
+When the server detects a disconnect, the view stops waiting immediately and starts no further query cycles. An already-running query is allowed to finish, then its output is discarded. Cleanup removes the connection's registry entry, explicitly unsubscribes its local event topics, and releases its event-tailer interest. Reconnecting the same session cancels the previous view without letting its cleanup remove the replacement. Detecting a lost network connection still depends on the HTTP transport and heartbeats.
+
 - **GET reuse** requires a nonce (prevents accidental collisions between unrelated requests).
 - **POST reuse** always attempts lookup (backward compatible).
 - Multiple browser tabs are isolated by nonce.

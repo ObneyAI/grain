@@ -168,6 +168,7 @@ contract EventFeed {
         -- Every subscription a live view opens is released when the view
         -- closes, for the same tenant and event-type set it subscribed with.
         -- No subscription outlives its view.
+        -- Releasing interest does not depend on a subsequent event arriving.
 }
 
 ------------------------------------------------------------
@@ -431,6 +432,15 @@ rule ViewCloses {
             ViewUnsubscribed(view: view)
         view.status = closed
         view.last_render = null
+
+    @guidance
+        -- Closure starts when the server detects the disconnect; detecting a
+        -- vanished browser may itself depend on the transport. Once detected,
+        -- pending waits are interrupted and no further render cycles are
+        -- scheduled, even under continuous events. A query already executing
+        -- may finish before its resources are released. Cleanup removes only
+        -- this view's registration, preserving a replacement connection with
+        -- the same principal, query and nonce.
 }
 
 -- A user action submits a command. Authorization is deny-by-default: an
@@ -542,6 +552,14 @@ surface LiveViewBoundary {
         -- Each page load owns a nonce, giving (principal, query, nonce)
         -- identity. Input changes reuse that connection in place; two tabs of
         -- the same page get independent views and never cross-render.
+
+    @guarantee DisconnectStopsRefreshes
+        -- A detected disconnect stops future query refreshes in both event and
+        -- timer driven views. Idle waits and pending refresh delays do not hold
+        -- a disconnected view open. Once any executing query finishes, the view
+        -- releases its registration and all event interests without waiting for
+        -- another event or a liveness tick. Releasing an older connection must
+        -- not remove the registration of a newer connection for the same page.
 
     @guarantee TenantIsolation
         -- A view only ever renders from, and only ever subscribes to, its own
