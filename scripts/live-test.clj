@@ -4,6 +4,7 @@
 ;; Parameterized for arbitrary node count. Manages Docker lifecycle.
 ;;
 ;; Usage: clojure -M:dev scripts/live-test.clj
+;; Read-model scenarios only: clojure -M:dev scripts/live-test.clj read-models
 
 (require '[nrepl.core :as nrepl])
 (require '[clojure.java.shell :refer [sh]])
@@ -801,9 +802,32 @@
              (= (inc processed-before) processed-after)))))
 
 ;; -------------------------------- ;;
+;; Read model scenarios             ;;
+;; -------------------------------- ;;
+
+(defn- read-model-scenario! [operation]
+  (let [result (eval-read primary-port
+                 (format "(do
+                            (require '[ai.obney.grain.control-plane-test-base.read-model-scenarios :as rms])
+                            (rms/%s (:event-store @app/app)))" operation)
+                 180000)]
+    (when (check "Read-model scenario returned assertions"
+                 (and (map? (:checks result)) (seq (:checks result))))
+      (doseq [[description passed?] (:checks result)]
+        (check description (true? passed?))))))
+
+(defn scenario-19 []
+  (header "Scenario 19: Read model cold build, warm reads, and L2 catch-up")
+  (read-model-scenario! "lifecycle"))
+
+(defn scenario-20 []
+  (header "Scenario 20: Concurrent segmented projections and LMDB snapshot race")
+  (read-model-scenario! "segmented"))
+
+;; -------------------------------- ;;
 ;; Main runner                      ;;
 
-(defn run-all []
+(defn run-all [& [read-models-only?]]
   (println "\n╔══════════════════════════════════════════╗")
   (println (str "║  Grain Control Plane Live Test Suite     ║"))
   (println (str "║  " n-nodes " nodes, " n-tenants " tenants                       ║"))
@@ -815,25 +839,28 @@
     (System/exit 1))
 
   (try
-    (scenario-1)
-    (scenario-2)
-    (scenario-3)
-    (scenario-3b)
-    (scenario-4)
-    (scenario-5)
-    (scenario-6)
-    (scenario-7)
-    (scenario-8)
-    (scenario-9)
-    (scenario-10)
-    (scenario-11)
-    (scenario-12)
-    (scenario-13)
-    (scenario-14)
-    (scenario-15)
-    (scenario-16)
-    (scenario-17)
-    (scenario-18)
+    (when-not read-models-only?
+      (scenario-1)
+      (scenario-2)
+      (scenario-3)
+      (scenario-3b)
+      (scenario-4)
+      (scenario-5)
+      (scenario-6)
+      (scenario-7)
+      (scenario-8)
+      (scenario-9)
+      (scenario-10)
+      (scenario-11)
+      (scenario-12)
+      (scenario-13)
+      (scenario-14)
+      (scenario-15)
+      (scenario-16)
+      (scenario-17)
+      (scenario-18))
+    (scenario-19)
+    (scenario-20)
 
     (catch Throwable t
       (swap! results update :error inc)
@@ -854,6 +881,7 @@
 ;; Entry point
 (let [cmd (first *command-line-args*)]
   (case cmd
+    "read-models" (run-all true)
     "check-status" (do (doseq [p all-ports] (setup-node! p))
                        (header "Status check")
                        (doseq [s (all-statuses)]

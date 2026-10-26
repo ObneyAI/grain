@@ -30,7 +30,8 @@
 --   - UUID v7 generation internals and clock source (time component)
 --   - the pubsub transport (core.async topics) — only that appended events
 --     are published carrying the tenant id
---   - threads, connection pools, logging and metrics
+--   - threads, logging and backend-specific connection-pool internals
+--     (common operation metrics are part of this facade's observable contract)
 --   - privileged history compaction, which is a separate capability governed by
 --     event-retention.allium and is never exposed through these append/read
 --     surfaces
@@ -129,6 +130,34 @@ contract EventStream {
     @invariant NoInternalLeakage
         -- ES8: the tenant-scoping marker the store attaches internally is never
         -- present on events returned to a reader.
+}
+
+-- The backend-neutral operational record produced by the facade. Read timing
+-- covers consumption of the returned stream, not merely construction of its
+-- reducible value.
+contract EventStoreTelemetry {
+    record_append: (backend: String, outcome: String, event_count: Integer) -> Any
+    record_read: (backend: String, outcome: String, event_count: Integer) -> Any
+
+    @invariant AppendOutcomeCoverage
+        -- Every append attempt records EventAppendDuration and exactly one of
+        -- EventAppendSucceeded or EventAppendFailed. Successful attempts also
+        -- record EventAppendEventCount; conflicts additionally record
+        -- EventCasConflict.
+
+    @invariant StreamingReadCoverage
+        -- Each consumed read records EventReadDuration and EventReadEventCount
+        -- over the actual reduction. A reduction failure records
+        -- EventReadFailed without forcing the stream into memory.
+
+    @invariant ConnectionFailureIsDiagnostic
+        -- SQLState connection-class failures during start, append, or read
+        -- additionally record EventStoreConnectionFailure.
+
+    @invariant BoundedDimensions
+        -- Common event-store measurements use only the bounded backend,
+        -- operation, and outcome dimensions. Tenant and event identifiers are
+        -- never metric dimensions.
 }
 
 ------------------------------------------------------------
@@ -444,6 +473,23 @@ surface EventRead {
         -- ES4: events stream in event-id order, regardless of append position:
         -- ascending by default or descending when the read is reversed. A
         -- limit is applied only after that ordering is established.
+
+    @guarantee StableEmptyIntervals
+        -- A store may explicitly promise that a completed read proving no
+        -- matching events in a finite committed interval stays true for this
+        -- open store. Later appends mint ids strictly beyond the committed
+        -- head, and old event types and tags cannot be rewritten to introduce
+        -- new matches. Authorized deletion preserves empty intervals.
+        -- Unsupported or mutable stores do not supply this optional promise;
+        -- readers keep ordinary catch-up rather than reuse negative evidence.
+
+    @guarantee CommittedHead
+        -- A caller can read its tenant's current committed event identity,
+        -- including the transaction marker, or null for an empty tenant.
+        -- Invalid tenant identities are rejected. Failed appends do not advance
+        -- the head. Built-in stores read the existing durable watermark without
+        -- decoding events or enumerating other tenants; the cost does not grow
+        -- with the size of the most recently committed batch.
 
     @guarantee NoApplicationDeletion
         -- The ordinary append/read boundary exposes no deletion operation.

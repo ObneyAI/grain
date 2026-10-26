@@ -1,6 +1,7 @@
 (ns ai.obney.grain.event-store-postgres-v3.integration-test
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.event-store-v3.interface.backend :as backend]
             [ai.obney.grain.event-store-postgres-v3.core :as pg-core]
             [ai.obney.grain.event-retention.interface :as retention]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
@@ -868,3 +869,75 @@
         events (read-events {:types #{:test/alpha} :limit 1})]
     (is (= 1 (count events)))
     (is (= (:event/id e1) (:event/id (first events))))))
+
+
+(deftest committed-head-does-not-decode-the-latest-batch
+  (let [other (uuid/v4)]
+    (is (nil? (es/head *event-store* *tenant-id*)))
+    (es/append *event-store*
+               {:tenant-id *tenant-id*
+                :events (mapv (fn [n] (es/->event {:type :test/alpha :body {:value n}})) (range 100))})
+    (let [expected (:event/id (first (into [] (es/read *event-store*
+                                                       {:tenant-id *tenant-id* :reverse? true :limit 1}))))
+          unexpected (fn [& _] (throw (ex-info "Head must not decode events or enumerate tenants" {})))]
+      (with-redefs [fressian/decode unexpected pg-core/read unexpected pg-core/tenants unexpected]
+        (dotimes [_ 3] (is (= expected (es/head *event-store* *tenant-id*))))
+        (is (nil? (es/head *event-store* other))))
+      (is (= ::anom/conflict
+             (::anom/category (es/append *event-store*
+                                {:tenant-id *tenant-id*
+                                 :events [(es/->event {:type :test/beta})]
+                                 :cas {:predicate-fn (constantly false)}}))))
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (es/append *event-store* {:tenant-id other :events [(es/->event {:type :test/beta})]})
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (is (uuid? (es/head *event-store* other)))
+      (append-event! :test/beta #{})
+      (is (pos? (compare (es/head *event-store* *tenant-id*) expected))))))
+
+
+(deftest committed-head-excludes-uncommitted-watermarks
+  (append-event! :test/alpha #{})
+  (let [committed (es/head *event-store* *tenant-id*)]
+    (jdbc/with-transaction [tx (pg-pool) {:rollback-only true}]
+      (jdbc/execute! tx ["UPDATE grain.tenants SET last_event_id = ? WHERE id = ?"
+                         (uuid/v7) *tenant-id*])
+      ;; This lookup uses a separate connection while the writer is uncommitted.
+      (is (= committed (es/head *event-store* *tenant-id*))))
+    (is (= committed (es/head *event-store* *tenant-id*)))))
+
+
+(deftest singleton-tag-batches-preserve-union-semantics
+  (let [a [:member (uuid/v4)] b [:member (uuid/v4)] c [:group (uuid/v4)]
+        ids (mapv :event/id
+                  [(append-event! :test/alpha #{a})
+                   (append-event! :test/beta #{b})
+                   (append-event! :test/alpha #{a b})
+                   (append-event! :test/beta #{a c})
+                   (append-event! :test/gamma #{c})])
+        other-tenant (uuid/v4)
+        _ (es/append *event-store* {:tenant-id other-tenant
+                                    :events [(es/->event {:type :test/alpha :tags #{a b}})]})
+        cases (concat
+                (for [filter [{} {:types #{:test/alpha}} {:types #{:test/alpha :test/beta}}
+                              {:types #{}} {:after (ids 1)} {:as-of (ids 2)}
+                              {:types #{:test/alpha} :after (ids 2)}]]
+                  (mapv #(assoc filter :tags #{%}) [a b a]))
+                [[{:tags #{a b}} {:tags #{c}}]
+                 [{:tags #{a} :types #{:test/alpha}} {:tags #{b} :types #{:test/beta}}]
+                 [{:tags #{a} :after (ids 2)} {:tags #{b}}]
+                 [{:tags #{}} {:tags #{a}}]])]
+    (doseq [queries cases]
+      (let [expected (with-redefs [backend/single-tag-union (constantly nil)]
+                       (read-events queries))]
+        (is (= expected (read-events queries)) (pr-str queries))))
+    (is (= [(ids 2)] (mapv :event/id (read-events {:tags #{a b}})))
+        "A normal multi-tag query remains conjunctive")
+    (is (= (subvec ids 0 4)
+           (mapv :event/id (read-events [{:tags #{a}} {:tags #{b}}]))))
+    (let [queries (into [{:tags #{a}} {:tags #{b}}]
+                        (map (fn [_] {:tags #{[:missing (uuid/v4)]}}) (range 600)))]
+      (is (= (subvec ids 0 4) (mapv :event/id (read-events queries)))
+          "Many alternatives do not require one SQL compound branch per tag"))
+    (is (nil? (backend/single-tag-union [{:tags #{a} :limit 1} {:tags #{b} :limit 1}])))
+    (is (nil? (backend/single-tag-union [{:tags #{a} :reverse? true} {:tags #{b} :reverse? true}])))))

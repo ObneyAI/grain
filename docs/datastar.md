@@ -151,6 +151,8 @@ When the flag is set and the query result contains `:datastar/signals`, the stre
 
 In event-driven mode, both `@get` and `@post` requests check for an existing SSE connection by `[user-id, query-name, nonce]`. If a match is found, the server updates the existing SSE's query context with the new signals and triggers a re-render — without opening a new connection. The shim page generates a unique nonce per page load and emits it as a Datastar signal, so it's included in every request automatically.
 
+When the server detects a disconnect, the view stops waiting immediately and starts no further query cycles. An already-running query is allowed to finish, then its output is discarded. Cleanup removes the connection's registry entry, explicitly unsubscribes its local event topics, and releases its event-tailer interest. Reconnecting the same session cancels the previous view without letting its cleanup remove the replacement. Detecting a lost network connection still depends on the HTTP transport and heartbeats.
+
 - **GET reuse** requires a nonce (prevents accidental collisions between unrelated requests).
 - **POST reuse** always attempts lookup (backward compatible).
 - Multiple browser tabs are isolated by nonce.
@@ -162,6 +164,44 @@ Event-driven Datastar streams subscribe to a node-local `:event-pubsub`. In a si
 For each live SSE stream, Datastar registers the stream's tenant id and event types with the tailer. The tailer polls the shared event store for events after its tenant watermark, scoped to the event types with live subscribers, and republishes matching events onto the local pub/sub. Datastar then re-renders from its local pub/sub exactly as before.
 
 Delivery is treated as at-least-once. Stored events include `:event/id`, so Datastar dedupes duplicate deliveries per SSE stream by `[:grain/tenant-id :event/id]`; manual pub/sub messages without `:event/id` keep their existing behavior.
+
+## Event Subscription Filters
+
+Use `:datastar/exclude-events` to suppress selected event types as refresh triggers.
+Use `:datastar/event-tags` to restrict triggers to matching tags. A map requires
+all its tags; a vector of maps matches any group, with all tags required within
+each group:
+
+```clojure
+{:grain/read-models {:app/items 1 :app/users 1}
+ :datastar/exclude-events #{:app/item-viewed :app/user-seen}
+ :datastar/event-tags
+ [{:org :org-id :user :owner-id}
+  {:org :org-id :user :assignee-id}]}
+```
+
+This view refreshes for a subscribed event matching either `(org AND owner)`
+or `(org AND assignee)`. The event must also belong to the stream's tenant.
+Bare keyword values resolve from the current query, such as `[:query :owner-id]`;
+vector values are full context paths, such as `[:auth-claims :user-id]`.
+Tag values follow query signal changes on the existing stream. Missing or `nil`
+values make their entire group fail; an independent matching group can still pass.
+An event matching several groups is delivered once.
+
+Exclusions apply to the union of every declared read model's event types, so an
+excluded type stays excluded even when several models declare it. They affect
+automatic refresh triggers only: read models still process those events, and a
+later render can display their changes. Excluding every type keeps the live
+stream open for query signal updates and declared refresh-key changes.
+
+An absent or `nil` tag filter, or the legacy empty map `{}`, allows any tags.
+An empty vector `[]` matches no events. Empty maps inside an OR vector and
+malformed filter declarations are rejected.
+
+For manually wired `stream-view`, use the equivalent `:exclude-events` and
+`:event-tags` options alongside `:event-types`. These filters do not change
+projection scopes. Keyed read-model projections already support OR through
+[`rmp/scoped-context` with `{:queries [...]}`](../components/read-model-processor-v2/README.md#event-scopes).
 
 ## SSE Heartbeat & iOS / HTTP-2 latency
 
@@ -219,10 +259,11 @@ The adapter logs warnings for common misconfigurations that would otherwise caus
 | `:datastar/fps` | Polling rate (ignored in event-driven mode; `0` means one-shot) | `0` |
 | `:datastar/debounce-ms` | Debounce before re-render after event | `50` |
 | `:datastar/heartbeat-delay` | SSE heartbeat interval in seconds (also settable in `routes` defaults; lower it for iOS/HTTP-2 — see [above](#sse-heartbeat--ios--http-2-latency)) | `10` |
-| `:datastar/event-tags` | Tag-based event filtering `{:tag-key :query-key}` | — |
+| `:datastar/event-tags` | A map `{:tag-key :query-key-or-context-path}` requires all tags; a vector of maps matches any group. See [event subscription filters](#event-subscription-filters). | — |
+| `:datastar/exclude-events` | Set of event type keywords removed from the union of the subscribed read models' event types. Suppresses refresh triggers without changing projections. | `#{}` |
 | `:datastar/shim-opts` | Per-query override for shim page options | — |
 | `:datastar/interceptors` | Additional Pedestal interceptors for this query | `[]` |
 | `:datastar/gate` | Context-dependent gate `{:check fn :redirect path-or-fn}` | — |
 | `:datastar/emit-signals?` | Allow the query to push a one-shot `:datastar/signals` patch alongside its hiccup | `false` |
-| `:grain/read-models` | Read models to subscribe to (enables event-driven mode) | — |
+| `:grain/read-models` | `{model-name version}` map of read models to subscribe to (enables event-driven mode). The stream re-renders on event types those models declare in `:events`, subject to exclusions and tag filtering. For an `rmp/query` definition, use `(rmp/query-models definition)`. | — |
 | `:authorized?` | Auth predicate `(fn [ctx] boolean)` | — |

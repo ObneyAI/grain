@@ -8,6 +8,30 @@
    [malli.core :as mc]
    [malli.error :as me]))
 
+(def ^:private expected-rejections
+  #{::anom/incorrect ::anom/not-found ::anom/forbidden ::anom/conflict})
+
+(defn- command-dimensions [command-name outcome include-command? & [category]]
+  (cond-> {:outcome outcome}
+    (and include-command? (keyword? command-name))
+    (assoc :service (or (namespace command-name) "unqualified")
+           :command (str command-name))
+    category (assoc :anomaly-category (name category))))
+
+(defn- command-outcome [result]
+  (let [category (::anom/category result)]
+    (cond
+      (nil? category) "succeeded"
+      (contains? expected-rejections category) "rejected"
+      :else "anomaly")))
+
+(defn- emit-command-counter! [metric-name command-name outcome include-command? category]
+  (u/log :metric/metric
+         :metric/name metric-name
+         :metric/value 1
+         :metric/resolution :low
+         :metric/dimensions (command-dimensions command-name outcome include-command? category)))
+
 (defn execute-command
   [handler {:keys [event-store tenant-id] :as context}]
   (let [result (try
@@ -19,6 +43,11 @@
                    (u/log ::command-handler-exception
                           :error e
                           :command (get-in context [:command :command/name]))
+                   (emit-command-counter! "CommandHandlerException"
+                                          (get-in context [:command :command/name])
+                                          "anomaly"
+                                          true
+                                          ::anom/fault)
                    {::anom/category ::anom/fault
                     ::anom/message (format "Error executing command handler: %s" (.getMessage e))}))]
     (when (anomaly? result)
@@ -33,6 +62,17 @@
             result
             (do
               (u/log ::error-storing-events :anomaly event-store-result)
+              (emit-command-counter! "CommandEventAppendFailed"
+                                     (get-in context [:command :command/name])
+                                     (command-outcome event-store-result)
+                                     true
+                                     (::anom/category event-store-result))
+              (when (= ::anom/conflict (::anom/category event-store-result))
+                (emit-command-counter! "CommandCasConflict"
+                                       (get-in context [:command :command/name])
+                                       "rejected"
+                                       true
+                                       ::anom/conflict))
               ;; Pass through the event-store anomaly — includes :error/explain
               ;; with Malli validation details when events fail schema checks.
               event-store-result))))
@@ -42,15 +82,30 @@
   (u/trace
    ::process-command
    [::command command :metric/name "CommandProcessed" :metric/resolution :high]
-   (let [command-name (:command/name command)
+   (let [started-at (System/nanoTime)
+         command-name (:command/name command)
          handler (get-in command-registry [command-name :handler-fn])]
-     (if handler
-       (if-let [_ (and (mc/validate command-name command)
-                       (mc/validate ::command-schema/command command))]
-         (execute-command handler context)
-         {::anom/category ::anom/incorrect
-          ::anom/message "Invalid Command: Failed Schema Validation"
-          :error/explain (me/humanize (or (mc/explain command-name command)
-                                          (mc/explain ::command-schema/command command)))})
-       {::anom/category ::anom/not-found
-        ::anom/message "Unknown Command"}))))
+     (let [result (if handler
+                    (if-let [_ (and (mc/validate command-name command)
+                                    (mc/validate ::command-schema/command command))]
+                      (execute-command handler context)
+                      {::anom/category ::anom/incorrect
+                       ::anom/message "Invalid Command: Failed Schema Validation"
+                       :error/explain (me/humanize (or (mc/explain command-name command)
+                                                       (mc/explain ::command-schema/command command)))})
+                    {::anom/category ::anom/not-found
+                     ::anom/message "Unknown Command"})
+           category (::anom/category result)
+           outcome (command-outcome result)
+           dimensions (command-dimensions command-name outcome (some? handler))]
+       (u/log :metric/metric
+              :metric/name "CommandDuration"
+              :mulog/duration (- (System/nanoTime) started-at)
+              :metric/resolution :high
+              :metric/dimensions dimensions)
+       (emit-command-counter! (case outcome
+                                "succeeded" "CommandSucceeded"
+                                "rejected" "CommandRejected"
+                                "CommandAnomaly")
+                              command-name outcome (some? handler) category)
+       result))))

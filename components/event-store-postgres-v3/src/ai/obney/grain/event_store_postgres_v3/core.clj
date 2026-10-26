@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
-            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
+            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append single-tag-union]]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.event-store-postgres-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
@@ -165,28 +165,56 @@
 ;; Read Queries  ;;
 ;; ------------ ;;
 
+(defn- emit-pool-gauge! [metric-name value]
+  (u/log :metric/metric
+         :metric/name metric-name
+         :metric/value value
+         :metric/resolution :low
+         :metric/dimensions {:backend "postgres"
+                             :operation "pool"
+                             :outcome "sampled"}))
+
+(defn- sample-pool! [pool]
+  (when-let [bean (try (.getHikariPoolMXBean pool) (catch Throwable _ nil))]
+    (let [active (.getActiveConnections bean)
+          idle (.getIdleConnections bean)
+          pending (.getThreadsAwaitingConnection bean)
+          total (.getTotalConnections bean)]
+      (emit-pool-gauge! "PostgresPoolActive" active)
+      (emit-pool-gauge! "PostgresPoolIdle" idle)
+      (emit-pool-gauge! "PostgresPoolPending" pending)
+      (when (and (pos? pending) (>= active total))
+        (u/log :metric/metric
+               :metric/name "PostgresPoolSaturated"
+               :metric/value 1
+               :metric/resolution :low
+               :metric/dimensions {:backend "postgres"
+                                   :operation "pool"
+                                   :outcome "saturated"})))))
+
 (defn- build-single-query-sql
   "Build WHERE clause and params for a single read query.
    Returns {:where-sql \"WHERE ...\" :params [...]}"
-  [{:keys [tenant-id tags types after as-of]}]
-  (let [tenant-clause [["tenant_id = ?" tenant-id]]
-        tag-clauses (when tags
-                      [["tags @> ?::text[]"
-                        (into-array String
-                                    (map #(str (key-fn (first %)) ":" (second %)) tags))]])
-        clauses  (->> (concat tenant-clause
-                              tag-clauses
-                              [(when types
-                                 ["type = ANY(?)"
-                                  (into-array String (mapv #(str ":" (key-fn %)) types))])
-                               (when after ["id > ?" after])
-                               (when as-of  ["id <= ?" as-of])])
-                      (remove nil?))
-        where-sql (if (seq clauses)
-                    (str "WHERE " (string/join " AND " (map first clauses)))
-                    "")]
-    {:where-sql where-sql
-     :params    (mapv second clauses)}))
+  ([query] (build-single-query-sql query false))
+  ([{:keys [tenant-id tags types after as-of]} any-tag?]
+   (let [tenant-clause [["tenant_id = ?" tenant-id]]
+         tag-clauses (when tags
+                       [[(if any-tag? "tags && ?::text[]" "tags @> ?::text[]")
+                         (into-array String
+                                     (map #(str (key-fn (first %)) ":" (second %)) tags))]])
+         clauses  (->> (concat tenant-clause
+                               tag-clauses
+                               [(when types
+                                  ["type = ANY(?)"
+                                   (into-array String (mapv #(str ":" (key-fn %)) types))])
+                                (when after ["id > ?" after])
+                                (when as-of  ["id <= ?" as-of])])
+                       (remove nil?))
+         where-sql (if (seq clauses)
+                     (str "WHERE " (string/join " AND " (map first clauses)))
+                     "")]
+     {:where-sql where-sql
+      :params    (mapv second clauses)})))
 
 (defn- order-limit-clause
   "Build the ` ORDER BY id [DESC] [LIMIT ?]` tail + its trailing param for a
@@ -204,30 +232,36 @@
   (reify
     clojure.lang.IReduceInit
     (reduce [_ f init]
-      (jdbc/with-transaction [tx conn {:read-only true}]
-        (jdbc/execute! tx [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
-        (let [plan (jdbc/plan tx (into [sql] params) {:fetch-size 500})]
-          (reduce
-           (fn [acc row]
-             (f acc (transform-row row)))
-           init
-           plan))))
+      (sample-pool! conn)
+      (try
+        (jdbc/with-transaction [tx conn {:read-only true}]
+          (jdbc/execute! tx [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
+          (let [plan (jdbc/plan tx (into [sql] params) {:fetch-size 500})]
+            (reduce
+             (fn [acc row]
+               (f acc (transform-row row)))
+             init
+             plan)))
+        (finally (sample-pool! conn))))
     clojure.lang.IReduce
     (reduce [_ f]
-      (jdbc/with-transaction [tx conn {:read-only true}]
-        (jdbc/execute! tx [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
-        (let [plan (jdbc/plan tx (into [sql] params) {:fetch-size 500})
-              reduced-result
-              (reduce
-               (fn [acc row]
-                 (if (= acc ::none)
-                   (transform-row row)
-                   (f acc (transform-row row))))
-               ::none
-               plan)]
-          (if (= reduced-result ::none)
-            (f)
-            reduced-result))))))
+      (sample-pool! conn)
+      (try
+        (jdbc/with-transaction [tx conn {:read-only true}]
+          (jdbc/execute! tx [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
+          (let [plan (jdbc/plan tx (into [sql] params) {:fetch-size 500})
+                reduced-result
+                (reduce
+                 (fn [acc row]
+                   (if (= acc ::none)
+                     (transform-row row)
+                     (f acc (transform-row row))))
+                 ::none
+                 plan)]
+            (if (= reduced-result ::none)
+              (f)
+              reduced-result)))
+        (finally (sample-pool! conn))))))
 
 (defn- read-single
   [event-store tenant-id query]
@@ -240,19 +274,24 @@
 
 (defn- read-batch
   [event-store tenant-id queries]
-  (let [sub-queries (map
-                     (fn [query]
-                       (let [{:keys [where-sql params]} (build-single-query-sql query)]
-                         {:sql    (str "(SELECT id, time, type, tags, data FROM grain.events "
-                                       where-sql ")")
-                          :params params}))
-                     queries)
-        union-sql   (str "SELECT DISTINCT ON (id) id, time, type, tags, data FROM ("
-                         (string/join " UNION ALL " (map :sql sub-queries))
-                         ") AS combined ORDER BY id")
-        all-params  (into [] (mapcat :params) sub-queries)
-        conn (get-in event-store [:state ::connection-pool])]
-    (make-reducible conn tenant-id union-sql all-params)))
+  (if-let [combined (single-tag-union queries)]
+    (let [{:keys [where-sql params]} (build-single-query-sql combined true)]
+      (make-reducible (get-in event-store [:state ::connection-pool]) tenant-id
+                      (str "SELECT id, time, type, tags, data FROM grain.events "
+                           where-sql " ORDER BY id") params))
+    (let [sub-queries (map
+                       (fn [query]
+                         (let [{:keys [where-sql params]} (build-single-query-sql query)]
+                           {:sql    (str "(SELECT id, time, type, tags, data FROM grain.events "
+                                         where-sql ")")
+                            :params params}))
+                       queries)
+          union-sql   (str "SELECT DISTINCT ON (id) id, time, type, tags, data FROM ("
+                           (string/join " UNION ALL " (map :sql sub-queries))
+                           ") AS combined ORDER BY id")
+          all-params  (into [] (mapcat :params) sub-queries)
+          conn (get-in event-store [:state ::connection-pool])]
+      (make-reducible conn tenant-id union-sql all-params))))
 
 (defn read
   [event-store args]
@@ -303,8 +342,11 @@
 (defn append
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
-  (jdbc/with-transaction
-    [conn (get-in event-store [:state ::connection-pool])]
+  (let [pool (get-in event-store [:state ::connection-pool])]
+    (sample-pool! pool)
+    (try
+      (jdbc/with-transaction
+       [conn pool]
       ;; Set tenant context for RLS
       (jdbc/execute! conn [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
       ;; Per-tenant advisory lock
@@ -347,7 +389,17 @@
                               ::cas cas}]
                 (u/log ::cas-failed :anomaly anomaly)
                 anomaly)))
-          (persist!)))))
+          (persist!))))
+      (catch Throwable throwable
+        (u/log :metric/metric
+               :metric/name "PostgresTransactionFailed"
+               :metric/value 1
+               :metric/resolution :low
+               :metric/dimensions {:backend "postgres"
+                                   :operation "transaction"
+                                   :outcome "failed"})
+        (throw throwable))
+      (finally (sample-pool! pool)))))
 
 (defn tenants
   [event-store]
@@ -510,6 +562,15 @@
   compaction/EventCompaction
   (estimate [this request] (estimate-compaction this request))
   (compact! [this request] (compact-events! this request)))
+
+(extend-type PostgresEventStore
+  p/EventStoreHead
+  (head [this tenant-id]
+    (committed-last-event-id (get-in this [:state ::connection-pool]) tenant-id)))
+
+(extend-type PostgresEventStore
+  p/EventStoreStableEmptyIntervals
+  (stable-empty-intervals? [_] true))
 
 (defmethod start-event-store :postgres
   [config]

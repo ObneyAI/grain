@@ -7,6 +7,7 @@
             [ai.obney.grain.pubsub.interface :as pubsub]
             [ai.obney.grain.periodic-task.interface :as pt]
             [ai.obney.grain.periodic-task.core :as pt-core]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [cognitect.anomalies :as anom]
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime]))
@@ -64,6 +65,15 @@
    :event-store *event-store*
    :tenant-id test-tenant-id})
 
+(defn capture-metrics [f]
+  (let [events (atom [])]
+    (with-redefs [mulog-core/log*
+                  (fn [_ event-name pairs]
+                    (swap! events conj (assoc (apply hash-map pairs)
+                                              :mulog/event-name event-name)))]
+      (f))
+    (filterv :metric/name @events)))
+
 ;; Sample Handler Functions
 
 (defn successful-handler
@@ -104,6 +114,37 @@
 (defn handler-throwing-exception
   [_context]
   (throw (ex-info "Unexpected error in handler" {:error-type :database-connection})))
+
+(deftest todo-success-emits-duration-and-one-outcome
+  (let [event (make-event :test/trigger-event)
+        context (assoc (make-context event successful-handler)
+                       :processor-name :test/projector)
+        metrics (capture-metrics #(core/process-event context))
+        names (mapv :metric/name metrics)]
+    (is (= 1 (count (filter #{"TodoDuration"} names))))
+    (is (= 1 (count (filter #{"TodoSucceeded"} names))))
+    (is (not-any? #{"TodoFailed" "TodoHandlerException"} names))
+    (is (= {:service "test" :processor ":test/projector" :outcome "succeeded"}
+           (:metric/dimensions
+            (first (filter #(= "TodoSucceeded" (:metric/name %)) metrics)))))))
+
+(deftest todo-exception-emits-failure-diagnostic-and-retry
+  (let [event (make-event :test/trigger-event)
+        context (assoc (make-context event handler-throwing-exception)
+                       :processor-name :test/projector
+                       :retry-on-error? true)
+        names (mapv :metric/name (capture-metrics #(core/process-event context)))]
+    (is (= 1 (count (filter #{"TodoFailed"} names))))
+    (is (= 1 (count (filter #{"TodoHandlerException"} names))))
+    (is (= 1 (count (filter #{"TodoRetry"} names))))))
+
+(deftest todo-lease-skip-is-observed
+  (let [event (make-event :test/trigger-event)
+        context (assoc (make-context event successful-handler)
+                       :processor-name :test/projector
+                       :lease-check-fn (constantly false))
+        names (mapv :metric/name (capture-metrics #(core/process-event context)))]
+    (is (= ["TodoLeaseCheckSkipped"] names))))
 
 ;; Tests
 

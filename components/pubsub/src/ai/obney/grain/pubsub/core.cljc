@@ -27,3 +27,7 @@
 (defn sub
   [pubsub args]
   (p/sub pubsub args))
+
+(defn unsub
+  [pubsub args]
+  (p/unsub pubsub args))
