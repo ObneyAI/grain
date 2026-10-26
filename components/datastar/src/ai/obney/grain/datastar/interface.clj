@@ -15,7 +15,7 @@
   "Interceptor factory. Opens an SSE that streams `:datastar/hiccup` from a query.
 
    Three modes, selected automatically:
-   - **Event-driven**: when `:event-types` is non-empty AND `:event-pubsub` is in
+   - **Event-driven**: when `:event-types` is non-empty before exclusions AND `:event-pubsub` is in
      context — re-renders only when relevant domain events fire. POST requests
      update the existing SSE's signals without opening a new connection.
    - **Polling**: when `:fps` > 0 — re-renders on a timer.
@@ -25,8 +25,14 @@
      :fps            — frames per second for polling mode (default 0, ignored in event-driven)
      :heartbeat-delay — SSE heartbeat interval in seconds (default 10)
      :event-types    — set of event type keywords to subscribe to
+     :exclude-events — event types to subtract from :event-types (default #{})
+                       Excluding all keeps the live stream available for signals.
      :debounce-ms    — ms to wait before re-rendering after an event (default 50)
-     :event-tags     — map of {:tag-key :query-key} for tag-based event filtering"
+     :event-tags     — {:tag-key :query-key-or-context-path} requires all tags;
+                       a vector of nonempty maps matches any map. nil/{} are
+                       unfiltered; [] matches nothing. Missing values never match.
+                       Values follow the latest query signals; tenant filtering
+                       remains mandatory. Exclusions affect refresh triggers only."
   [context query-name opts]
   (core/stream-view context query-name opts))
 

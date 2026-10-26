@@ -33,6 +33,8 @@
    :test/event-counters [:map]
    :test/tagged-counters [:map]
    :test/filterable-counters [:map [:filter {:optional true} :string]]
+   :test/subscription-page [:map]
+   :test/subscription-empty [:map]
    :test/typed-query [:map
                       [:entity-id :uuid]
                       [:page :int]
@@ -2222,6 +2224,65 @@
         (is (false? (pred {:event/tags #{[:counter "abc-123"]}})))
         (is (false? (pred {:event/tags #{[:org "org-456"]}})))))))
 
+(deftest event-tag-alternatives-and-validation-test
+  (let [context {:query {:org "o" :owner "a" :assignee "b" :false-value false}
+                 :auth-claims {:org "o"}}
+        pred (#'ds/resolve-event-tags [{:org [:auth-claims :org] :user :owner}
+                                      {:org :org :user :assignee}] context)]
+    (doseq [user ["a" "b"]]
+      (is (true? (pred {:event/tags #{[:org "o"] [:user user]}}))))
+    (is (true? (pred {:event/tags #{[:org "o"] [:user "a"] [:user "b"]}})))
+    (is (false? (pred {:event/tags #{[:user "a"]}})))
+    (is (false? (pred {:event/tags #{[:org "other"] [:user "b"]}})))
+    (is (false? (pred {})))
+    (is (true? ((#'ds/resolve-event-tags {:flag :false-value} context)
+                {:event/tags #{[:flag false]}})))
+    (doseq [selector [nil {}]]
+      (is (true? ((#'ds/resolve-event-tags selector context) {}))))
+    (is (false? ((#'ds/resolve-event-tags [] context) {})))
+    (is (false? ((#'ds/resolve-event-tags {:user :missing} context)
+                 {:event/tags #{[:user nil]}}))))
+  (doseq [selector [[{}] [nil] [{:user :id} {}] {:user nil} {:user []}
+                    {:user "id"} {"user" :id} '({:user :id})]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (ds/stream-view {} :test/counters {:event-tags selector}))))
+  (doseq [exclusions [[:test/change] {:test/change true} #{"test/change"} false]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (ds/stream-view {} :test/counters {:exclude-events exclusions}))))
+  (doseq [[k invalid] [[:datastar/event-tags false]
+                       [:datastar/event-tags [{:user :id} {}]]
+                       [:datastar/exclude-events false]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (#'ds/query->route-pair {}
+                  :test/counters
+                  (assoc {:datastar/path "/invalid-subscription" :authorized? (constantly true)} k invalid)
+                  {}))))
+  (let [ctx (atom {:query {:owner "a"}})
+        pred (#'ds/resolve-event-filter :tenant [{:user :missing} {:user :owner}] ctx)]
+    (is (true? (pred {:grain/tenant-id :tenant :event/tags #{[:user "a"]}})))
+    (is (false? (pred {:grain/tenant-id :other :event/tags #{[:user "a"]}})))
+    (swap! ctx assoc :query {:owner "b"})
+    (is (false? (pred {:grain/tenant-id :tenant :event/tags #{[:user "a"]}})))
+    (is (true? (pred {:grain/tenant-id :tenant :event/tags #{[:user "b"]}})))))
+
+(deftest event-exclusions-preserve-mode-and-effective-topics-test
+  (let [started (atom [])
+        ps ::pubsub
+        invoke! (fn [opts]
+                  ((:enter (ds/stream-view {:event-pubsub ps} :test/counters opts)) {}))]
+    (with-redefs-fn {#'ds/update-or-start-stream-events
+                    (fn [_ _ _ types & _] (swap! started conj [:events types]))
+                    #'ds/stream-view-enter
+                    (fn [_ _ interval & _] (swap! started conj [:fallback interval]))}
+      #(do
+         (invoke! {:event-types #{:test/a :test/b} :exclude-events #{:test/b :test/unused}})
+         (invoke! {:event-types #{:test/a} :exclude-events #{:test/a} :fps 10})
+         (invoke! {:event-types #{} :fps 10})
+         (invoke! {:event-types #{:test/a} :exclude-events #{}})
+         (invoke! {:event-types #{:test/a}})))
+    (is (= [[:events #{:test/a}] [:events #{}] [:fallback 100]
+            [:events #{:test/a}] [:events #{:test/a}]] @started))))
+
 ;; ====================================== ;;
 ;; query->route-pair with event-tags       ;;
 ;; ====================================== ;;
@@ -3268,3 +3329,178 @@
           response (.send client request (HttpResponse$BodyHandlers/ofString))]
       (is (= 302 (.statusCode response)))
       (is (= "/test-home" (first (.allValues (.headers response) "location")))))))
+
+;; One persistent reader owns each HTTP body so frames buffered across test
+;; phases cannot be lost. Channel waits are bounded even when no patch arrives.
+(defn- subscription-sse-client
+  [url]
+  (let [client (-> (HttpClient/newBuilder)
+                   (.version java.net.http.HttpClient$Version/HTTP_1_1)
+                   .build)
+        request (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create url))
+                    (.timeout (java.time.Duration/ofSeconds 10))
+                    .GET .build)
+        response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
+        body (.body response)
+        frames (async/chan 32)
+        pump (future
+               (try
+                 (with-open [reader (BufferedReader. (InputStreamReader. body))]
+                   (loop [event-name nil data []]
+                     (when-let [line (.readLine reader)]
+                       (cond
+                         (str/starts-with? line "event:")
+                         (recur (str/trim (subs line 6)) data)
+                         (str/starts-with? line "data:")
+                         (recur event-name (conj data (str/trim (subs line 5))))
+                         (str/blank? line)
+                         (when (or (nil? event-name)
+                                   (async/>!! frames {:name event-name :data (str/join "\n" data)}))
+                           (recur nil []))
+                         :else (recur event-name data)))))
+                 (catch java.io.IOException _)
+                 (finally (async/close! frames))))]
+    {:client client :response response :frames frames
+     :close! (fn []
+               (async/close! frames)
+               (.close body)
+               (when (= ::timeout (deref pump 1000 ::timeout))
+                 (future-cancel pump)))}))
+
+(defn- with-subscription-server
+  [f]
+  (let [tenant-id (random-uuid)
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        tailer {:watermarks (atom {tenant-id nil}) :subscriber-counts (atom {})}
+        calls (atom {})
+        clock (atom 0)
+        entry (fn [name]
+                {:authorized? (constantly true)
+                 :grain/read-models {:test/subscription-a 1 :test/subscription-b 1}
+                 :datastar/path (str "/" name)
+                 :datastar/debounce-ms 0
+                 :datastar/heartbeat-delay 1
+                 :handler-fn (fn [ctx]
+                               (let [n (get (swap! calls update name (fnil inc 0)) name)]
+                                 {:query/result n
+                                  :datastar/hiccup
+                                  [:div#app (str name " render=" n " marker="
+                                                (get-in ctx [:query :marker]) " clock=" @clock)]}))})
+        context {:tenant-id tenant-id :event-pubsub ps :event-tailer tailer
+                 :query-registry
+                 {:test/subscription-page
+                  (assoc (entry "subscription-page")
+                         :datastar/exclude-events #{:test/subscription-ignored}
+                         :datastar/event-tags [{:org :org :user :owner}
+                                               {:org :org :user :assignee}])
+                  :test/subscription-empty
+                  (assoc (entry "subscription-empty")
+                         :datastar/fps 20
+                         :datastar/refresh-key (fn [_] @clock)
+                         :datastar/exclude-events #{:test/subscription-change :test/subscription-ignored})}}
+        routes (with-redefs [rmp/read-model-registry*
+                             (atom {:test/subscription-a
+                                    {:events #{:test/subscription-change :test/subscription-ignored}}
+                                    :test/subscription-b {:events #{:test/subscription-ignored}}})]
+                 (ds/routes context))
+        server (ws/start {:http/routes routes :http/port 0 :http/join? false})]
+    (try
+      (f {:tenant-id tenant-id :ps ps :tailer tailer :calls calls :clock clock
+          :base-url (str "http://localhost:" (get-server-port server))})
+      (finally (ws/stop server) (pubsub/stop ps)))))
+
+(defn- subscription-signal-update!
+  [client url payload]
+  (let [request (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create url))
+                    (.header "Content-Type" "application/json")
+                    (.timeout (java.time.Duration/ofSeconds 5))
+                    (.POST (HttpRequest$BodyPublishers/ofString (json/write-str payload)))
+                    .build)]
+    (.send ^HttpClient client request (HttpResponse$BodyHandlers/ofString))))
+
+(deftest e2e-subscription-exclusions-or-and-live-scope-test
+  (with-subscription-server
+    (fn [{:keys [tenant-id ps tailer calls base-url]}]
+      (let [nonce (str (random-uuid))
+            url (str base-url "/subscription-page/__stream")
+            {:keys [client frames close! response]}
+            (subscription-sse-client (str url "?dsNonce=" nonce "&org=o&owner=a&assignee=b"))
+            publish! (fn [type tenant tags & [event-id]]
+                       (pubsub/pub ps {:message (cond-> {:event/type type :grain/tenant-id tenant
+                                                        :event/tags tags}
+                                                 event-id (assoc :event/id event-id))}))
+            matching #{[:org "o"] [:user "a"]}]
+        (try
+          (is (= 200 (.statusCode response)))
+          (is (str/includes? (:data (take-event frames 2000)) "render=1"))
+          (is (= {tenant-id {:test/subscription-change 1}} @(:subscriber-counts tailer)))
+          (is (= 1 (pubsub-topic-subscriber-count ps :test/subscription-change)))
+          (is (zero? (pubsub-topic-subscriber-count ps :test/subscription-ignored)))
+          (doseq [[type tenant tags]
+                  [[:test/subscription-ignored tenant-id matching]
+                   [:test/subscription-change (random-uuid) matching]
+                   [:test/subscription-change tenant-id #{[:user "a"]}]
+                   [:test/subscription-change tenant-id #{[:org "other"] [:user "b"]}]
+                   [:test/subscription-change tenant-id #{[:org "o"] [:user "neither"]}]]]
+            (publish! type tenant tags)
+            (is (nil? (take-event frames 150))))
+          (is (= 1 (get @calls "subscription-page")))
+          (doseq [[user expected] [["a" 2] ["b" 3]]]
+            (publish! :test/subscription-change tenant-id #{[:org "o"] [:user user]})
+            (is (str/includes? (:data (take-event frames 2000)) (str "render=" expected))))
+          (let [id (random-uuid)
+                both #{[:org "o"] [:user "a"] [:user "b"]}]
+            (publish! :test/subscription-change tenant-id both id)
+            (is (str/includes? (:data (take-event frames 2000)) "render=4"))
+            (publish! :test/subscription-change tenant-id both id)
+            (is (nil? (take-event frames 150)))
+            (is (= 4 (get @calls "subscription-page"))))
+          (let [updated (subscription-signal-update! client url
+                          {:dsNonce nonce :org "o" :owner "c" :assignee "d" :marker "new"})]
+            (is (= 200 (.statusCode updated)))
+            (is (= "" (.body updated)))
+            (is (str/includes? (:data (take-event frames 2000)) "marker=new")))
+          (publish! :test/subscription-change tenant-id matching)
+          (is (nil? (take-event frames 150)))
+          (publish! :test/subscription-change tenant-id #{[:org "o"] [:user "c"]})
+          (is (str/includes? (:data (take-event frames 2000)) "render=6"))
+          ;; Closing the actual socket must remove precisely the effective topics.
+          (close!)
+          (is (eventually? #(and (empty? @(:subscriber-counts tailer))
+                                 (zero? (pubsub-topic-subscriber-count ps :test/subscription-change)))
+                           8000))
+          (finally (close!)))))))
+
+(deftest e2e-all-excluded-subscription-keeps-signals-and-clock-test
+  (let [original-timeout async/timeout]
+    (with-redefs [async/timeout (fn [^long ms]
+                                 (original-timeout (if (= ms 30000) 30 ms)))]
+      (with-subscription-server
+        (fn [{:keys [tenant-id ps tailer calls clock base-url]}]
+          (let [nonce (str (random-uuid))
+                url (str base-url "/subscription-empty/__stream")
+                session-key [nil :test/subscription-empty nonce]
+                {:keys [client frames close!]}
+                (subscription-sse-client (str url "?dsNonce=" nonce))]
+            (try
+              (is (str/includes? (:data (take-event frames 2000)) "render=1"))
+              (is (contains? @@#'ds/active-stream-contexts session-key))
+              (is (empty? @(:subscriber-counts tailer)))
+              (doseq [topic [:test/subscription-change :test/subscription-ignored]]
+                (is (zero? (pubsub-topic-subscriber-count ps topic)))
+                (pubsub/pub ps {:message {:event/type topic :grain/tenant-id tenant-id}}))
+              (is (nil? (take-event frames 150)))
+              (is (= 1 (get @calls "subscription-empty")) "Positive fps must not turn into polling")
+              (let [updated (subscription-signal-update! client url {:dsNonce nonce :marker "signals"})]
+                (is (= 200 (.statusCode updated)))
+                (is (= "" (.body updated)))
+                (is (str/includes? (:data (take-event frames 2000)) "marker=signals")))
+              (swap! clock inc)
+              (is (str/includes? (:data (take-event frames 2000)) "clock=1"))
+              (is (= 3 (get @calls "subscription-empty")))
+              (close!)
+              (is (eventually? #(not (contains? @@#'ds/active-stream-contexts session-key)) 8000))
+              (is (empty? @(:subscriber-counts tailer)))
+              (finally (close!)))))))))

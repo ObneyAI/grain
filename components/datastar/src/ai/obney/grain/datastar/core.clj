@@ -528,19 +528,46 @@
                     (:events (get registry rm-name))))
           read-models)))
 
+(defn- event-tag-branches
+  [event-tags]
+  (let [valid-map? (fn [branch]
+                     (and (map? branch)
+                          (every? (fn [[tag path]]
+                                    (and (keyword? tag)
+                                         (or (keyword? path)
+                                             (and (vector? path) (seq path)))))
+                                  branch)))]
+    (when-not (or (nil? event-tags)
+                  (valid-map? event-tags)
+                  (and (vector? event-tags)
+                       (every? #(and (valid-map? %) (seq %)) event-tags)))
+      (throw (ex-info "Event tags require a map or a vector of nonempty tag maps"
+                      {:type ::invalid-event-tags :event-tags event-tags})))
+    (if (vector? event-tags) event-tags [(or event-tags {})])))
+
+(defn- event-tags-match?
+  [branches query-context event]
+  (boolean
+   (some (fn [branch]
+           (every? (fn [[tag path]]
+                     (let [value (get-in query-context (if (vector? path) path [:query path]))]
+                       ;; A missing input disables this conjunction; dropping it
+                       ;; would silently widen the subscription.
+                       (and (some? value)
+                            (contains? (:event/tags event) [tag value]))))
+                   branch))
+         branches)))
+
 (defn- resolve-event-tags
-  "Resolves a {:tag-key :query-key-or-path} map against query-context into
-   a predicate (fn [event] -> boolean) suitable for a channel transducer.
-   Bare keyword values resolve from [:query k]; vectors are full get-in paths."
+  "Maps require all tags; vectors match any map. Bare keywords resolve from
+   [:query k], vectors are full get-in paths. Missing values never match."
   [event-tags query-context]
-  (let [resolved (into #{}
-                       (map (fn [[tag-key path]]
-                              [tag-key (if (vector? path)
-                                         (get-in query-context path)
-                                         (get-in query-context [:query path]))]))
-                       event-tags)]
-    (fn [event]
-      (set/subset? resolved (:event/tags event)))))
+  (let [branches (event-tag-branches event-tags)]
+    #(event-tags-match? branches
+                        (if (instance? clojure.lang.IDeref query-context)
+                          @query-context
+                          query-context)
+                        %)))
 
 (defn- resolve-tenant-id
   [query-context]
@@ -549,14 +576,19 @@
 
 (defn- resolve-event-filter
   [tenant-id event-tags query-context]
-  (let [preds (cond-> []
-                tenant-id
-                (conj #(= tenant-id (:grain/tenant-id %)))
-                event-tags
-                (conj (resolve-event-tags event-tags query-context)))]
-    (when (seq preds)
+  (let [tags-match? (resolve-event-tags event-tags query-context)]
+    (when (or tenant-id (some? event-tags))
       (fn [event]
-        (every? #(% event) preds)))))
+        (and (or (nil? tenant-id) (= tenant-id (:grain/tenant-id event)))
+             (tags-match? event))))))
+
+(defn- validate-exclude-events!
+  [exclude-events]
+  (when-not (or (nil? exclude-events)
+                (and (set? exclude-events) (every? keyword? exclude-events)))
+    (throw (ex-info "Excluded events require a set of event type keywords"
+                    {:type ::invalid-exclude-events :exclude-events exclude-events})))
+  exclude-events)
 
 (def ^:private max-seen-event-ids 1024)
 
@@ -635,7 +667,7 @@
         session-key [user-id query-name nonce]
         tenant-id (resolve-tenant-id initial-context)
         event-tailer (:event-tailer initial-context)
-        event-filter-fn (resolve-event-filter tenant-id event-tags @context-atom)
+        event-filter-fn (resolve-event-filter tenant-id event-tags context-atom)
         sub-chan (subscribe-to-events event-pubsub event-types event-filter-fn)
         stopped? #(some async-protocols/closed? [disconnect-ch signal-ch sub-chan event-ch])]
     (try
@@ -802,17 +834,22 @@
   "Interceptor factory. Streams :datastar/hiccup via SSE.
 
    Modes:
-   - Event-driven: when :event-types is non-empty AND :event-pubsub is in context,
+   - Event-driven: when :event-types is non-empty before :exclude-events AND
+     :event-pubsub is in context,
      re-renders only when relevant events fire. Both GET and POST requests check
      for an existing SSE (by user+query+nonce) and reuse it for signal updates
      without reconnecting. If no existing SSE is found, a fresh one is started.
    - Polling: when :fps is positive, polls at the given FPS.
    - One-shot: when :fps is 0 or nil, renders once and closes."
   [context query-name opts]
-  (let [{:keys [fps heartbeat-delay event-types debounce-ms event-tags]
+  (let [{:keys [fps heartbeat-delay event-types exclude-events debounce-ms event-tags]
          :or {fps 0 heartbeat-delay 10 debounce-ms 50}} opts
+        _ (validate-exclude-events! exclude-events)
+        _ (event-tag-branches event-tags)
+        event-driven? (seq event-types)
+        event-types (set/difference (set event-types) (or exclude-events #{}))
         event-pubsub (:event-pubsub context)]
-    (if (and (seq event-types) event-pubsub)
+    (if (and event-driven? event-pubsub)
       ;; Event-driven mode — both GET and POST check for existing SSE first
       {:name (keyword "ai.obney.grain.datastar.core" (str "stream-" (name query-name)))
        :enter (fn [pedestal-context]
@@ -1088,7 +1125,9 @@
           stream-opts (cond-> {:fps fps}
                         (seq event-types) (assoc :event-types event-types
                                                  :debounce-ms debounce-ms)
-                        event-tags (assoc :event-tags event-tags)
+                        (some? event-tags) (assoc :event-tags event-tags)
+                        (some? (:datastar/exclude-events entry))
+                        (assoc :exclude-events (:datastar/exclude-events entry))
                         heartbeat-delay (assoc :heartbeat-delay heartbeat-delay))]
       (let [with-signals (fn [extra]
                           (into [parse-datastar-signals] (concat interceptors extra)))]

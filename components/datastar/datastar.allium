@@ -52,9 +52,12 @@
 -- view. Governed by the query processor; referenced here as the thing a
 -- LiveView renders and the thing whose registration creates an entry point.
 external entity Query {
-    -- The domain event types whose occurrence should re-render this query.
+    -- The union of the declared read models' event types, before exclusions.
     -- Empty when the query has no event dependency (polling / one-shot only).
     triggering_event_types: Set<EventType>
+    -- Types suppressed as automatic refresh triggers for this query, including
+    -- types shared by several of its read models. Projection inputs are unchanged.
+    excluded_event_types: Set<EventType>
     -- Whether this query is exposed as a live page (the app gave it a path).
     has_page: Boolean
 }
@@ -151,18 +154,39 @@ contract CommandRunner {
 
 -- The event feed the boundary listens to so a live view re-renders when
 -- relevant domain events occur. The boundary subscribes to exactly the event
--- types its query depends on, scoped to the view's tenant.
+-- types its query depends on after exclusions, scoped to the view's tenant.
 contract EventFeed {
     -- Begin / end interest in a tenant's events of the given types for a view.
     subscribe: (view: LiveView) -> Any
     unsubscribe: (view: LiveView) -> Any
     -- Deliver an observed domain event to a view that has subscribed to it.
     deliver: (view: LiveView, event: DomainEvent) -> Any
+    -- Match the query's tag scope using the view's current inputs.
+    matches_scope: (view: LiveView, event: DomainEvent) -> Boolean
 
     @invariant TenantFilteredDelivery
         -- A view is only re-rendered by events of its subscribed types that
         -- belong to its own tenant. Events of other tenants are ignored even
         -- when they share an event type.
+
+    @invariant ExclusionsAffectRefreshOnly
+        -- Interest is the union of the query's read-model event types minus
+        -- its excluded types. The same effective set is used for subscription
+        -- and release. Excluding every type preserves an event-driven view's
+        -- initial render, input updates and declared query refresh-key checks.
+        -- Exclusions never change which events its read models fold; a later
+        -- render may therefore display changes caused by excluded events.
+
+    @invariant TagScopeMatching
+        -- A single group requires every resolved tag; alternative groups match
+        -- when any group matches. Tenant and subscribed-type checks are always
+        -- required independently of those alternatives. An event matching more
+        -- than one group is delivered once. Missing or null input values fail
+        -- their whole group rather than removing a constraint. No scope or a
+        -- legacy empty single group is unrestricted; an empty alternatives
+        -- list matches nothing. Empty groups inside an alternatives list and
+        -- malformed declarations are rejected. Input changes update matching
+        -- without changing the view's tenant or opening another connection.
 
     @invariant SymmetricSubscription
         -- Every subscription a live view opens is released when the view
@@ -330,6 +354,9 @@ rule ViewOpens {
     -- event_driven needs BOTH a declared event dependency AND a live event feed:
     -- a query that declares triggering types but reaches a runtime with no feed
     -- falls back to polling or one_shot, exactly as if it declared none.
+    -- Exclusions do not erase the original dependency: even when every type
+    -- is excluded, an event-driven view remains available for input updates
+    -- and declared query refresh-key checks.
     let mode =
         if query.triggering_event_types.count > 0 and event_feed_available(): event_driven
         else if config.frames_per_second > 0: polling
@@ -364,6 +391,8 @@ rule RelevantEventArrives {
     for view in LiveViews where status = open and mode = event_driven:
         requires: view.tenant = event.tenant
         requires: event.event_type in view.query.triggering_event_types
+        requires: event.event_type not in view.query.excluded_event_types
+        requires: matches_scope(view, event)
         -- De-duplication: a stored event (one bearing an event_id) already
         -- delivered to this view is dropped. Events without an event_id
         -- (legacy / manual messages) carry no de-dupe key and always re-render.
@@ -394,7 +423,8 @@ rule ViewInputsChange {
         -- sees a flash of the view rendered with stale inputs. POST always
         -- attempts connection reuse; GET reuses only when the page's nonce is
         -- present, so an absent nonce always opens a fresh view rather than
-        -- colliding with an unrelated one.
+        -- colliding with an unrelated one. Event tag matching uses these
+        -- updated inputs, while tenant identity remains fixed for the view.
 }
 
 -- Rendering an open view. Authorization is checked first: an unauthorized
