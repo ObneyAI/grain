@@ -29,20 +29,18 @@
   "event-model-validator"             {:col 2 :row 0 :cluster "apps"  :role "guard"        :desc "Structural validator + boot-guard that refuses to start on model↔runtime drift"}
   "example-service"                    {:col 3 :row 0 :cluster "apps"  :role "app"          :desc "Reference counter app — consumes the whole current building-block set"}
   "datastar"                           {:col 5 :row 0 :cluster "apps"  :role "ui"           :desc "SSE hypermedia UI runtime"}
-  "datastar-v2"                        {:col 6 :row 0 :cluster "apps"  :role "ui · wip"     :desc "Next-gen UI runtime — scaffolded, not yet wired"}
   "command-request-handler-v2"        {:col 1 :row 1 :cluster "write" :role "entry"        :desc "Command HTTP entrypoint"}
   "event-model"                        {:col 2 :row 1 :cluster "apps"  :role "spec"         :desc "defeventmodel — the service-area-first spec"}
   "control-plane"                      {:col 4 :row 1 :cluster "log"   :role "coordination" :desc "Multi-tenant coordination & leader election"}
   "query-request-handler"             {:col 5 :row 1 :cluster "read"  :role "entry"        :desc "Query HTTP entrypoint"}
-  "tui-client"                         {:col 7 :row 1 :cluster "ops"   :role "tui"          :desc "Terminal-UI client"}
   "todo-processor-v2"                  {:col 1 :row 2 :cluster "write" :role "defprocessor" :desc "Reactive processor — reacts to events, issues follow-up commands"}
   "command-processor-v2"              {:col 2 :row 2 :cluster "write" :role "defcommand"   :desc "Command → event handler"}
   "read-model-processor-v2"           {:col 4 :row 2 :cluster "read"  :role "defreadmodel" :desc "Projection builder — folds events into read models"}
   "query-processor"                    {:col 5 :row 2 :cluster "read"  :role "defquery"     :desc "Query dispatch — reads projections, never the log"}
   "query-schema"                       {:col 6 :row 2 :cluster "read"  :role "schema"       :desc "Query schema definitions"}
-  "tui-adapter"                        {:col 7 :row 2 :cluster "ops"   :role "tui"          :desc "Terminal-UI adapter"}
   "event-store-v3"                     {:col 3 :row 3 :cluster "log"   :role "the spine"    :desc "Current append-only event log — the heart of the system"}
   "event-tailer"                       {:col 4 :row 3 :cluster "log"   :role "tail"         :desc "Tails the event log into pubsub"}
+  "event-retention"                    {:col 2 :row 3 :cluster "log"   :role "retention"    :desc "Opt-in event definitions & bounded-history compaction via a restricted store capability"}
   "event-notifier-postgres"           {:col 5 :row 3 :cluster "log"   :role "notify"       :desc "Postgres LISTEN/NOTIFY change feed"}
   "periodic-task"                      {:col 0 :row 4 :cluster "found" :role "cron"         :desc "Scheduled / periodic task primitive"}
   "event-store-postgres-v3"           {:col 2 :row 4 :cluster "log"   :role "postgres"     :desc "Postgres backend for the event log"}
@@ -94,6 +92,9 @@
      {:m "defperiodic" :sig "(defperiodic :area/name {opts} [tenant-id time] & body)" :p "Run work on a schedule / interval"
       :keys {:opts [{:k "schedule" :req true} {:k "description"}]
              :result [{:k "result/events"} {:k "result/cas"}]}}
+     {:m "defevent" :sig "(defevent :event/type \"description\" {opts})" :p "Register an event payload schema, docs and history contract"
+      :keys {:opts [{:k "schema" :req true} {:k "history"} {:note "history: complete by default; bounded = {:retain-at-least <ISO duration> :keep-latest-per {:tags #{…}}}"}]
+             :result [{:note "returns the event type; ->event construction is unchanged"}]}}
      {:m "defeventmodel" :sig "(defeventmodel :area {area-map})" :p "Register a service-area event model spec"
       :keys {:opts [{:k "description"} {:k "commands"} {:k "events"} {:k "read-models"} {:k "queries"} {:k "todo-processors"} {:k "periodic-tasks"} {:k "screens"} {:k "flows"}]
              :result [{:note "registers the area model"}]}}]}
