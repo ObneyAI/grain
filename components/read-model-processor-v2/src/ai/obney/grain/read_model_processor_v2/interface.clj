@@ -38,9 +38,11 @@
      :partition-key  read only this partition
      :l1-ttl-ms      serve L1 without checking the event store for this
                      many ms (default 0: always check)
-     :l1-max-entries L1 size limit (default 10000)"
+     :l1-max-entries L1 size limit (default 10000)
+     :start-after    event id; events at or before it are never read
+                     (part of the cache identity)"
   [{:keys [_event-store _cache _tenant-id] :as context}
-   {:keys [_f _query _name _version _scope _partition-fn _entity-id-fn _partition-key] :as args}]
+   {:keys [_f _query _name _version _scope _partition-fn _entity-id-fn _partition-key _start-after] :as args}]
   (telemetry/read! (telemetry/ordinary-context context args) (:name args)
                    (telemetry/ordinary-kind args) "project" #(core/p context args)))
 
@@ -105,7 +107,8 @@
    Without :key or :route the model is ordinary: one state, starting from {},
    read with project. Options: :events, :version (default 1), :schema (Malli
    syntax checked at registration; states are not validated), :partition-fn,
-   :entity-id-fn, :l1-ttl-ms.
+   :entity-id-fn, :l1-ttl-ms. Either kind accepts :start-after <event-id>: events
+   at or before it are never read (part of the model's cache identity).
 
    With exactly one of :key or :route the model is keyed: one state and result
    per instance, read with value, state, values, page or query.
@@ -153,7 +156,7 @@
                       {:description docstring
                        :options (select-keys opts #{:events :version :schema
                                                     :l1-ttl-ms :key :route :initial :result :include?
-                                                    :indexes :searches :filtered-indexes :state-schema :result-schema})}})]
+                                                    :indexes :searches :filtered-indexes :state-schema :result-schema :start-after})}})]
     `(do
        (defn ~var-name
          ~@(when docstring [docstring])
@@ -196,7 +199,8 @@
                     (:partition-fn entry)  (assoc :partition-fn (:partition-fn entry))
                     (:entity-id-fn entry) (assoc :entity-id-fn (:entity-id-fn entry))
                     (:partition-key scope) (assoc :partition-key (:partition-key scope))
-                    (:l1-ttl-ms entry)    (assoc :l1-ttl-ms (:l1-ttl-ms entry)))))))))
+                    (:l1-ttl-ms entry)    (assoc :l1-ttl-ms (:l1-ttl-ms entry))
+                    (:start-after entry)  (assoc :start-after (:start-after entry)))))))))
 
 (defn scoped-context
   "Return context with an event scope: keyed reads through it fold only the

@@ -128,6 +128,7 @@ new declaration takes the name.
 | `:filtered-indexes` | `#{}` | Index names (or `:identity`) that also store membership data for `filtered-key-page`, `joined-page` and some query plans. Experimental. |
 | `:state-schema` | | Malli schema checked against the state after every reducer call. |
 | `:result-schema` | | Malli schema checked against every result before it is stored. |
+| `:start-after` | | Event id (UUID). Events at or before it are never read. Part of the storage identity. Valid for ordinary models too. |
 
 Supply exactly one of `:key` or `:route`. Unknown options, and options that only
 apply to ordinary models (`:schema`, `:partition-fn`, `:entity-id-fn`,
@@ -486,7 +487,8 @@ is removed and later reads build the model in place.
 
 ## Changing a model
 
-Storage is addressed by tenant, model name, version and event scope. Change
+Storage is addressed by tenant, model name, version, `:start-after` and event
+scope; changing `:start-after` rebuilds like a version bump. Change
 `:version` whenever you change what a model stores: events, routing, reducer,
 `:initial`, `:result`, `:include?`, schemas, index or search extractors, or
 `:filtered-indexes`. The new version builds from the event history; the old
@@ -563,7 +565,7 @@ An ordinary model folds all of its events into one state, starting from `{}`:
 
 Options are `:events`, `:version`, `:schema` (a Malli schema checked for valid
 syntax at registration; states are not validated against it),
-`:partition-fn`, `:entity-id-fn` and `:l1-ttl-ms`. `project` throws for keyed
+`:partition-fn`, `:entity-id-fn`, `:l1-ttl-ms` and `:start-after`. `project` throws for keyed
 models, and the keyed read functions throw for ordinary ones.
 
 `project` takes an optional scope:

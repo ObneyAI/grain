@@ -962,13 +962,16 @@ contract ComposedReadQuery {
 -- identity). Partition functions are present only for partitioned read models.
 entity ReadModel {
     -- The qualified name a projection is requested by. Together with the version
-    -- it forms the read model's cache identity.
+    -- and start_after it forms the read model's cache identity.
     name: String
     -- The event types this read model subscribes to. The engine folds exactly
     -- the matching events.
     event_types: Set<String>
     -- Bump to invalidate previously cached state.
     version: Integer
+    -- When present, events at or before it are never folded. Part of the cache
+    -- identity, so changing it rebuilds like a version bump.
+    start_after: EventId?
     state_schema: StateSchema?
     -- Present only for partitioned read models: when true the read model shards
     -- its state by a partition key derived from entity state. When false a single
@@ -1219,14 +1222,15 @@ invariant FreshWhenZeroTtl {
         c.read_model.l1_ttl = 0.seconds implies c.served_after_catch_up
 }
 
--- A read model is identified by its name and version together; that pair is its
--- cache identity. Two distinct registered read models never collide on both, so
--- a version bump yields a fresh identity whose caches are necessarily empty
--- until refolded.
+-- A read model is identified by its name, version and start_after together;
+-- that triple is its cache identity. Two distinct registered read models never
+-- collide on all three, so a version bump or a start_after change yields a fresh
+-- identity whose caches are necessarily empty until refolded.
 invariant ReadModelIdentity {
     for a in ReadModels:
         for b in ReadModels:
-            a != b implies (a.name != b.name or a.version != b.version)
+            a != b implies (a.name != b.name or a.version != b.version
+                            or a.start_after != b.start_after)
 }
 
 -- A cache entry's shape follows its read model: only a partitioned read model's

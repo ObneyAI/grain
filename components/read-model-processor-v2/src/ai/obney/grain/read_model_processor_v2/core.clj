@@ -182,11 +182,22 @@
   ^bytes [^bytes base-key]
   (suffix-key base-key ":eidx"))
 
+(defn- latest-id
+  "The latest of the given event ids, ignoring nils; nil when none."
+  [& ids]
+  (last (sort (remove nil? ids))))
+
+(defn- storage-version
+  "The version slot of a model's storage identity: :start-after is folded in."
+  [d]
+  (if-let [sa (:start-after d)] (str (:version d 1) "-after-" sa) (:version d 1)))
+
 (defn- add-watermark [query watermark]
-  (cond
-    (nil? watermark) query
-    (vector? query) (mapv #(assoc % :after watermark) query)
-    :else (assoc query :after watermark)))
+  (letfn [(after [q] (if-let [a (latest-id (:after q) watermark)] (assoc q :after a) q))]
+    (cond
+      (nil? watermark) query
+      (vector? query) (mapv after query)
+      :else (after query))))
 
 (defn- inject-tenant-id [query tenant-id]
   (if (vector? query)
@@ -579,7 +590,7 @@
   [{:keys [cache tenant-id] :as context}
    {:keys [query name version scope partition-key] :as args}]
   (let [cache-scope (not-empty (dissoc scope :partition-key))
-        cache-key (format-scoped-key name version (if cache-scope [tenant-id cache-scope] tenant-id))
+        cache-key (format-scoped-key name (storage-version args) (if cache-scope [tenant-id cache-scope] tenant-id))
         args (assoc args :query (inject-tenant-id query tenant-id))
         manifest (read-partition-manifest cache cache-key)]
     (if partition-key
@@ -596,10 +607,10 @@
 
 (defn- p-unpartitioned
   [{:keys [event-store cache tenant-id] :as context}
-   {:keys [f query name version scope l1-ttl-ms l1-max-entries]}]
+   {:keys [f query name version scope l1-ttl-ms l1-max-entries] :as args}]
   (u/with-context {:read-model/name name
                    :read-model/version version}
-  (let [cache-key (format-scoped-key name version (if scope [tenant-id scope] tenant-id))
+  (let [cache-key (format-scoped-key name (storage-version args) (if scope [tenant-id scope] tenant-id))
         l1-key (String. ^bytes cache-key)
         query (inject-tenant-id query tenant-id)
         ttl-ms (or l1-ttl-ms default-l1-ttl-ms)
@@ -651,11 +662,12 @@
               (l1-put-entry! context l1-key state new-watermark max-entries)
               state))))))))
 
-(defn p [context {:keys [partition-fn entity-id-fn] :as args}]
+(defn p [context {:keys [partition-fn entity-id-fn start-after] :as args}]
   (u/with-context {:read-model/name (:name args) :read-model/version (:version args)}
+    (let [args (cond-> args start-after (update :query add-watermark start-after))]
     (if (and partition-fn entity-id-fn)
     (p-partitioned context args)
-    (p-unpartitioned context args))))
+    (p-unpartitioned context args)))))
 
 (defn key-join ^bytes [& arrays]
   (let [out (byte-array (reduce (fn [size ^bytes a] (+ size (alength a))) 0 arrays))]
@@ -1145,7 +1157,7 @@
        (contains? #{3 4} (count identity))
        (uuid? (nth identity 0))
        (qualified-keyword? (nth identity 1))
-       (pos-int? (nth identity 2))
+       (or (pos-int? (nth identity 2)) (string? (nth identity 2)))
        (or (= 3 (count identity))
            (event-scope-identity? (nth identity 3)))))
 
@@ -2526,10 +2538,10 @@
 
 (def ^:private keyed-options
   #{:events :version :key :route :initial :result :include? :indexes
-    :searches :filtered-indexes :state-schema :result-schema})
+    :searches :filtered-indexes :state-schema :result-schema :start-after})
 
 (def ^:private ordinary-options
-  #{:events :version :schema :partition-fn :entity-id-fn :l1-ttl-ms})
+  #{:events :version :schema :partition-fn :entity-id-fn :l1-ttl-ms :start-after})
 
 (defn- check-supported-options! [name opts]
   (let [keyed? (boolean (keyed? opts))
@@ -2577,6 +2589,14 @@
   (when-not (map? opts)
     (throw (ex-info "Read model options must be a map" {:model name})))
   (check-supported-options! name opts)
+  (when (and (contains? opts :start-after)
+             (not (and (uuid? (:start-after opts)) (= 7 (.version ^java.util.UUID (:start-after opts))))))
+    (throw (ex-info (str "Read model " name " has an invalid :start-after " (pr-str (:start-after opts))
+                         ". It must be an event id (UUID v7).")
+                    {:type :grain.read-model/invalid
+                     :model name
+                     :options #{:start-after}
+                     :start-after (:start-after opts)})))
   (when (keyed? opts)
     (when-not (valid-keyed-declaration? name opts)
       (throw (ex-info "Invalid keyed-fold declaration" {:model name})))
@@ -2635,7 +2655,7 @@
   ([ctx name d]
    (keyed-namespace-identity ctx name d (keyed-scope-identity (:read-model/scope ctx))))
   ([ctx name d scope-identity]
-   (cond-> [(:tenant-id ctx) name (:version d 1)]
+   (cond-> [(:tenant-id ctx) name (storage-version d)]
      scope-identity (conj scope-identity))))
 
 (defn- scope-queries [scope]
@@ -2646,7 +2666,8 @@
     :else (:queries scope)))
 
 (defn- keyed-event-query [ctx d after]
-  (let [store-queries (into []
+  (let [after (latest-id (:start-after d) after)
+        store-queries (into []
                             (keep (fn [query]
                                     (let [types (if (contains? query :types)
                                                   (into #{} (filter (:events d)) (:types query))
@@ -4152,7 +4173,7 @@
                   (not (::no-deferral ctx))))))
 
 (defn- progress-after [progress]
-  (last (sort (keep #(get progress %) [:checked-through :watermark]))))
+  (latest-id (:checked-through progress) (:watermark progress)))
 
 (defn- behind-head? [after through]
   (and through (or (nil? after) (pos? (compare through after)))))
@@ -4304,7 +4325,7 @@
         validate-result! (keyed-prepare-validation (:result-schema d) name :result)
         staged (when claimed
                  (kv/transact (:cache ctx) :read #(keyed-read-meta % (keyed-progress-key (:prefix claimed)))))
-        read-after (last (sort (remove nil? [after (:checked-through staged) (:watermark staged)])))
+        read-after (latest-id after (:checked-through staged) (:watermark staged))
         staging (volatile! claimed)
         beat (volatile! nil)
         run (assoc step
@@ -4478,7 +4499,7 @@
         identities (volatile! {})
         identity-order (volatile! [])
         identity-for (fn [ctx name d]
-                       (let [k [(:tenant-id ctx) name (:version d 1) (:read-model/scope ctx)]]
+                       (let [k [(:tenant-id ctx) name (storage-version d) (:read-model/scope ctx)]]
                          (or (get @identities k)
                              (let [identity (keyed-namespace-identity ctx name d
                                                                       (get scope-identities (:read-model/scope ctx)))]
