@@ -224,15 +224,55 @@ contract HandlerFunction {
         -- appends or checkpoints itself.
 }
 
+-- An explicit initial boundary for a new, dormant processor identity.
+-- This opt-in boundary excludes earlier history without invoking handlers.
+contract CheckpointInitialization {
+    initialize: (tenant: Tenant, processor_name: String, boundary: Event) -> Any
+
+    @invariant DormantIdentityRequired
+        -- The caller must keep this processor identity inactive for the tenant
+        -- on every node until initialization succeeds. This API does not stop
+        -- pollers, fence running handlers or invalidate cached watermarks.
+
+    @invariant CommittedTenantBoundary
+        -- First initialization requires a UUID tenant, a keyword processor name,
+        -- and a UUIDv7 boundary that still exists in that tenant's committed log.
+        -- A transaction marker is a valid boundary. Invalid or absent boundaries
+        -- are rejected without appending. No handler or external effect runs.
+
+    @invariant InitializeOnlyUnused
+        -- Initialization creates one ordinary durable checkpoint marked initial,
+        -- only if no checkpoint exists for this processor and tenant at commit.
+        -- It never advances or rewinds an existing processing position.
+        -- After success, catch-up starts strictly after the approved boundary;
+        -- earlier events are deliberately excluded, not claimed as handled.
+
+    @invariant IdempotentRetry
+        -- If the latest checkpoint is still an initial checkpoint at the same
+        -- boundary, a retry succeeds without appending, even if that boundary
+        -- has since expired from the log. Any different boundary or checkpoint
+        -- produced by normal processing conflicts, including normal processing
+        -- at the requested boundary. Once processing advances, initialization
+        -- cannot be used to reset it.
+
+    @invariant AtomicAndIsolated
+        -- Concurrent identical requests persist only one initial checkpoint.
+        -- Concurrent different requests admit only one boundary; the loser
+        -- conflicts. Other tenants and processor identities are unaffected.
+        -- Storage anomalies and exceptions remain failures, never success or
+        -- evidence of an empty history. Reads examine only the latest matching
+        -- checkpoint and at most one event at or before the requested boundary.
+}
+
 -- The checkpoint discipline this component itself GUARANTEES to its consumers.
--- These are properties of how the processor advances and reads its position; they
--- are behavioural guarantees the test suite proves, not point-in-time state.
+-- These are behavioural guarantees, not point-in-time state.
 contract Checkpointing {
     @invariant MonotonicGapFreeWatermark
         -- For each (processor, tenant) the watermark advances strictly forward and
         -- gap-free in stream order: it only ever moves to a later event, and it
-        -- never skips an event of the subscribed topics. Because of this a single
-        -- value — the newest checkpoint's position — soundly summarises the entire
+        -- never skips an event of the subscribed topics after its optional
+        -- approved initial boundary (CheckpointInitialization). The newest
+        -- checkpoint's position therefore soundly summarises the entire
         -- processed history.
 
     @invariant ConstantTimeWatermarkRead
@@ -350,18 +390,18 @@ entity Processor {
 }
 
 -- The processing position of one processor for one tenant: a high-watermark
--- naming the last event of the subscribed topics that this processor has
--- processed for this tenant. It advances strictly forward and gap-free. There is
--- at most one watermark per (processor, tenant): the newest checkpoint
+-- naming the last processed event or an explicitly approved initial boundary
+-- before processing begins for this tenant. Subsequent progress is forward and
+-- gap-free. At most one watermark exists per (processor, tenant): the newest checkpoint
 -- summarises all earlier ones.
 entity Checkpoint {
     processor: Processor
     tenant: Tenant
-    -- The last processed event. Everything at or below this position is
-    -- considered processed and is never handled again.
+    -- The last processed event or initial boundary. Everything at or below it is
+    -- excluded from subsequent catch-up.
     watermark: Event
     -- How this checkpoint was produced: a single event, a range of batched pure
-    -- events, or an effect path.
+    -- events, an effect path, or an approved initial boundary.
     kind: CheckpointKind
 }
 
@@ -371,8 +411,8 @@ entity Checkpoint {
 
 -- How a checkpoint was produced. `single` covers one event (effect/CAS paths);
 -- `batch_range` covers a contiguous run of pure-handler events recorded by a
--- single checkpoint at the run's end.
-enum CheckpointKind { single | batch_range }
+-- single checkpoint at the run's end; `initial` excludes approved prior history.
+enum CheckpointKind { single | batch_range | initial }
 
 ------------------------------------------------------------
 -- Config
@@ -684,6 +724,13 @@ actor NodeRuntime {
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
+
+-- Initialize the processing boundary before the identity becomes active.
+surface ProcessorInitialization {
+    facing runtime: NodeRuntime
+    contracts:
+        fulfils CheckpointInitialization
+}
 
 -- The registration boundary: a processor is registered with its topics and
 -- handler so a node can discover and run it. Registration alone does not start

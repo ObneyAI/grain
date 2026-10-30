@@ -1,6 +1,7 @@
 (ns ai.obney.grain.event-store-sqlite-v3.integration-test
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.event-store-v3.interface.backend :as backend]
             [ai.obney.grain.event-store-sqlite-v3.core :as sqlite-core]
             [ai.obney.grain.event-store-sqlite-v3.interface]
@@ -1451,3 +1452,33 @@
                                                          false))})]
       (is (= ::anom/conflict (::anom/category result)))
       (is (= [(:event/id (peek rows))] @observed)))))
+
+(deftest processor-checkpoint-initialization-is-atomic-and-durable
+  (let [processor :test/initialized-processor
+        first-event (first (es/append *event-store*
+                                     {:tenant-id *tenant-id*
+                                      :events [(es/->event {:type :test/alpha})]}))
+        boundary (es/head *event-store* *tenant-id*)
+        release (promise)
+        attempts (mapv (fn [_]
+                         (future
+                           @release
+                           (tp/initialize-checkpoint! *event-store* *tenant-id* processor boundary)))
+                       (range 4))]
+    (deliver release true)
+    (let [results (mapv #(deref % 10000 :timeout) attempts)]
+      (is (= 1 (count (filter #(= :initialized (:checkpoint/status %)) results))))
+      (is (= 3 (count (filter #(= :already-initialized (:checkpoint/status %)) results)))))
+    (let [head (es/head *event-store* *tenant-id*)
+          checkpoints (into [] (es/read *event-store*
+                                       {:tenant-id *tenant-id*
+                                        :types #{:grain/todo-processor-checkpoint}}))]
+      (is (= 1 (count checkpoints)))
+      (is (= boundary (:triggered-by (first checkpoints))))
+      (is (= :initial (:checkpoint/kind (first checkpoints))))
+      (is (= ::anom/conflict
+             (::anom/category (tp/initialize-checkpoint! *event-store* *tenant-id* processor
+                                                        (:event/id first-event)))))
+      (is (= ::anom/conflict
+             (::anom/category (tp/initialize-checkpoint! *event-store* *tenant-id* processor head))))
+      (is (= head (es/head *event-store* *tenant-id*))))))

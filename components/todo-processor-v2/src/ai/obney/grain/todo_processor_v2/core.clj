@@ -73,6 +73,69 @@
                       :triggered-by triggering-event-id}
                extra-body (merge extra-body))}))))
 
+(defn- read-newest
+  [event-store query]
+  (let [events (event-store/read event-store (assoc query :reverse? true :limit 1))]
+    (if (anomaly? events)
+      events
+      (reduce (fn [_ event] (reduced event)) nil events))))
+
+(defn- initialization-result
+  [checkpoint processor-name start-after]
+  (cond
+    (anomaly? checkpoint) checkpoint
+    (and (= :initial (:checkpoint/kind checkpoint))
+         (= processor-name (:processor/name checkpoint))
+         (= start-after (:triggered-by checkpoint)))
+    {:processor/name processor-name
+     :triggered-by start-after
+     :checkpoint/status :already-initialized}
+    :else
+    {::anom/category ::anom/conflict
+     ::anom/message "Processor checkpoint already exists or changed during initialization."
+     :processor/name processor-name}))
+
+(defn initialize-checkpoint!
+  [event-store tenant-id processor-name start-after]
+  (if-not (and (uuid? tenant-id)
+               (keyword? processor-name)
+               (uuid? start-after)
+               (= 7 (uuid/get-version start-after)))
+    {::anom/category ::anom/incorrect
+     ::anom/message "Expected a UUID tenant, keyword processor name and UUIDv7 start-after."}
+    (let [query {:tenant-id tenant-id
+                 :types #{:grain/todo-processor-checkpoint}
+                 :tags #{[:processor (processor-name->uuid processor-name)]}}
+          existing (read-newest event-store query)]
+      (if (some? existing)
+        (initialization-result existing processor-name start-after)
+        (let [boundary (read-newest event-store {:tenant-id tenant-id :as-of start-after})]
+          (cond
+            (anomaly? boundary) boundary
+            (not= start-after (:event/id boundary))
+            {::anom/category ::anom/incorrect
+             ::anom/message "start-after must identify a retained committed event in this tenant."}
+            :else
+            (let [result (event-store/append
+                          event-store
+                          {:tenant-id tenant-id
+                           :events [(make-checkpoint-event processor-name start-after
+                                                           {:checkpoint/kind :initial})]
+                           :cas (assoc (dissoc query :tenant-id)
+                                       :reverse? true
+                                       :limit 1
+                                       :predicate-fn
+                                       (fn [events]
+                                         (not (reduce (fn [_ _] (reduced true)) false events))))})]
+              (cond
+                (= ::anom/conflict (::anom/category result))
+                (initialization-result (read-newest event-store query) processor-name start-after)
+                (anomaly? result) result
+                :else
+                {:processor/name processor-name
+                 :triggered-by start-after
+                 :checkpoint/status :initialized}))))))))
+
 (defn- checkpoint-at-or-after?
   [threshold-id checkpoint]
   (let [checkpoint-id (:triggered-by checkpoint)]

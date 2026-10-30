@@ -3,6 +3,28 @@
 
 (def processor-registry* core/processor-registry*)
 
+(defn initialize-checkpoint!
+  "Initialize an unused processor+tenant at an approved committed boundary.
+
+   Keep this identity inactive on ALL nodes until this call succeeds, before
+   registering it with a running poller or starting it. This does not stop or
+   fence handlers or invalidate poller caches. The caller must establish that
+   events through start-after are intentionally excluded from processing.
+
+   start-after is a retained UUIDv7 event ID in this tenant (including a value
+   returned by event-store/head). Persists an ordinary checkpoint, with no
+   handler invocation. Subsequent catch-up starts strictly after this boundary.
+
+   Returns :checkpoint/status :initialized or :already-initialized, together
+   with :processor/name and :triggered-by. A retry succeeds without writing only
+   while the latest checkpoint is still the initial one at this same boundary;
+   that retry does not require the boundary event to remain retained. Every
+   other existing checkpoint conflicts, even at the same boundary. Invalid
+   input returns an incorrect anomaly. Storage anomalies/exceptions propagate.
+   This operation never resets or advances an existing checkpoint."
+  [event-store tenant-id processor-name start-after]
+  (core/initialize-checkpoint! event-store tenant-id processor-name start-after))
+
 (defn register-processor!
   ([processor-name handler-fn opts]
    (core/register-processor! processor-name handler-fn opts))
