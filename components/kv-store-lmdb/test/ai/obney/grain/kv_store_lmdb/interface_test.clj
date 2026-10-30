@@ -198,8 +198,8 @@
       (doseq [write writes] (is (not= ::timeout (deref write 10000 ::timeout)))))
     (let [before @calls]
       (checked)
-      (is (<= before @calls (inc before))
-          "Racing publication may conservatively lose proof and revalidate once")
+      (is (= before @calls)
+          "Concurrent unrelated writes retain validation across commit publication")
       (let [settled @calls]
         (checked)
         (is (= settled @calls) "Settled evidence is reused")))
@@ -218,6 +218,92 @@
       (doseq [write writes] (is (not= ::timeout (deref write 10000 ::timeout)))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid value" (checked))
         "Racing unrelated publishers cannot restore a proof invalidated by corruption")))
+
+(deftest committed-validation-is-published-before-the-next-writer-uses-it
+  (let [cache *cache* state (:ai.obney.grain.kv-store-lmdb.core/validation-state cache)
+        prefix (byte-array [10]) key (byte-array [10 1]) calls (atom 0)
+        validator (fn [_] (swap! calls inc))
+        checked #(kv/transact cache :write
+                   (fn [tx] ((:with-validation tx) prefix validator (fn [] nil))))
+        committed (promise) release (promise) holder-thread (atom nil)
+        next-thread (promise) original-swap swap!]
+    (kv/put! cache {:k key :v (byte-array [7])})
+    (checked)
+    (with-redefs [swap! (fn [a f & args]
+                         ;; Stop after the native commit, before publishing its
+                         ;; evidence. Readers must still see committed data.
+                         (when (and (identical? a state)
+                                    (identical? (Thread/currentThread) @holder-thread))
+                           (deliver committed true)
+                           (when (= ::timeout (deref release 10000 ::timeout))
+                             (throw (ex-info "Publication was not released" {}))))
+                         (apply original-swap a f args))]
+      (let [holder (future
+                     (reset! holder-thread (Thread/currentThread))
+                     (kv/put! cache {:k (byte-array [20]) :v (byte-array [8])}))
+            next-writer (future
+                          @committed
+                          (deliver next-thread (Thread/currentThread))
+                          (kv/put! cache {:k (byte-array [21]) :v (byte-array [9])}))]
+        (try
+          (is (= true (deref committed 10000 ::timeout)))
+          (is (= [8] (vec (kv/get! cache {:k (byte-array [20])})))
+              "Read snapshots are not blocked by pending proof publication")
+          (let [thread (deref next-thread 10000 nil)
+                deadline (+ (System/nanoTime) 5000000000)]
+            (is (some? thread))
+            (when thread
+              (loop []
+                (when (and (not (realized? next-writer))
+                           (not= Thread$State/BLOCKED (.getState ^Thread thread))
+                           (< (System/nanoTime) deadline))
+                  (Thread/yield)
+                  (recur)))
+              (is (= Thread$State/BLOCKED (.getState ^Thread thread))
+                  "The next writer waits for committed validation evidence")))
+          (finally
+            (deliver release true)
+            (is (not= ::timeout (deref holder 10000 ::timeout)))
+            (is (not= ::timeout (deref next-writer 10000 ::timeout)))))))
+    (checked)
+    (is (= 1 @calls) "Neither unrelated writer forces the invariant to be revalidated")))
+
+(deftest foreign-commit-during-proof-publication-still-invalidates-evidence
+  (let [cache *cache* state (:ai.obney.grain.kv-store-lmdb.core/validation-state cache)
+        prefix (byte-array [10]) key (byte-array [10 1]) calls (atom 0)
+        validator (fn [tx]
+                    (swap! calls inc)
+                    (when-not (= [7] (vec ((:get tx) key)))
+                      (throw (ex-info "Invalid value" {}))))
+        checked #(kv/transact cache :write
+                   (fn [tx] ((:with-validation tx) prefix validator (fn [] nil))))
+        committed (promise) release (promise) holder-thread (atom nil)
+        original-swap swap!]
+    (kv/put! cache {:k key :v (byte-array [7])})
+    (checked)
+    (with-redefs [swap! (fn [a f & args]
+                         (when (and (identical? a state)
+                                    (identical? (Thread/currentThread) @holder-thread))
+                           (deliver committed true)
+                           (when (= ::timeout (deref release 10000 ::timeout))
+                             (throw (ex-info "Publication was not released" {}))))
+                         (apply original-swap a f args))]
+      (let [holder (future
+                     (reset! holder-thread (Thread/currentThread))
+                     (kv/put! cache {:k (byte-array [20]) :v (byte-array [8])}))]
+        (try
+          (is (= true (deref committed 10000 ::timeout)))
+          ;; Native/foreign writers do not participate in the process-local
+          ;; publication lock. Their commits must remain untrusted.
+          (let [env ^org.lmdbjava.Env (:env cache) db ^org.lmdbjava.Dbi (:db cache)
+                k (doto (java.nio.ByteBuffer/allocateDirect (.getMaxKeySize env)) (.put key) (.flip))
+                v (doto (java.nio.ByteBuffer/allocateDirect 1) (.put (byte-array [99])) (.flip))]
+            (.put db k v))
+          (finally
+            (deliver release true)
+            (is (not= ::timeout (deref holder 10000 ::timeout)))))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid value" (checked)))
+    (is (= 2 @calls) "The managed publisher cannot bless a newer foreign commit")))
 
 (deftest scratch-reuse-preserves-lengths-and-detached-values
   (let [entries (mapv (fn [i key-size value-size]

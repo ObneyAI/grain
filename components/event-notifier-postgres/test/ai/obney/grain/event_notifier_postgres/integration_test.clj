@@ -1,5 +1,7 @@
 (ns ai.obney.grain.event-notifier-postgres.integration-test
-  "Integration tests for Postgres LISTEN/NOTIFY event notification.
+  "Integration tests for the optional Postgres LISTEN/NOTIFY bridge.
+   Signals are supplied explicitly: event-store append no longer emits NOTIFY
+   since processors switched to polling (a524e61).
    Requires PG_EVENT_STORE_TESTS=true and a running Postgres instance."
   (:require [clojure.test :refer :all]
             [clojure.core.async :as async]
@@ -13,7 +15,7 @@
   (:import [java.util.concurrent CountDownLatch TimeUnit]))
 
 (defschemas test-schemas
-  {:test/notify-event [:map]})
+  {:test/notify-event [:map [:n :int]]})
 
 ;; -------------------- ;;
 ;; Config & Dynamic Var ;;
@@ -53,12 +55,30 @@
 (use-fixtures :once once-fixture)
 (use-fixtures :each each-fixture)
 
-;; =====================================
-;; NOTIFY is fired on append
-;; =====================================
+(defn- notify! [connection tenant-id]
+  (jdbc/execute! connection ["SELECT pg_notify('grain_events', ?)" (str tenant-id)]))
 
-(deftest pg-notify-fires-on-append
-  (testing "Appending events fires pg_notify on the grain_events channel"
+(defn- append! [tenant-id values]
+  (let [result (es/append *event-store*
+                         {:tenant-id tenant-id
+                          :events (mapv #(es/->event {:type :test/notify-event :body {:n %}}) values)})]
+    (when-not (vector? result)
+      (throw (ex-info "Test append failed" {:result result})))
+    result))
+
+(defn- take-message [ch]
+  (async/alt!! ch ([value] value) (async/timeout 5000) ::timeout))
+
+(defn- eventually? [pred]
+  (let [deadline (+ (System/nanoTime) 5000000000)]
+    (loop []
+      (cond
+        (pred) true
+        (> (System/nanoTime) deadline) false
+        :else (do (Thread/sleep 10) (recur))))))
+
+(deftest listener-receives-notification-only-after-commit
+  (testing "A real Postgres notification is delivered after its transaction commits"
     (let [tenant-id (uuid/v4)
           latch (CountDownLatch. 1)
           received (atom nil)
@@ -68,13 +88,11 @@
                                         (reset! received notification)
                                         (.countDown latch))})]
       (try
-        ;; Give listener time to establish LISTEN
-        (Thread/sleep 200)
-        ;; Append an event
-        (es/append *event-store*
-          {:tenant-id tenant-id
-           :events [(es/->event {:type :test/notify-event :body {}})]})
-        ;; Wait for notification (max 5 seconds)
+        ;; start-listener commits LISTEN before returning; no startup sleep.
+        (jdbc/with-transaction [tx (pg-pool)]
+          (notify! tx tenant-id)
+          (is (false? (.await latch 100 TimeUnit/MILLISECONDS))
+              "An uncommitted signal must not be delivered"))
         (is (.await latch 5 TimeUnit/SECONDS)
             "Should receive notification within 5 seconds")
         ;; Verify payload contains the tenant-id
@@ -82,7 +100,7 @@
         (finally
           (notifier/stop-listener listener))))))
 
-(deftest pg-notify-contains-tenant-id
+(deftest listener-preserves-tenant-payloads
   (testing "Notification payload is the tenant-id string"
     (let [tenant-a (uuid/v4)
           tenant-b (uuid/v4)
@@ -94,14 +112,8 @@
                                         (swap! notifications conj notification)
                                         (.countDown latch))})]
       (try
-        (Thread/sleep 200)
-        ;; Append to two different tenants
-        (es/append *event-store*
-          {:tenant-id tenant-a
-           :events [(es/->event {:type :test/notify-event :body {}})]})
-        (es/append *event-store*
-          {:tenant-id tenant-b
-           :events [(es/->event {:type :test/notify-event :body {}})]})
+        (notify! (pg-pool) tenant-a)
+        (notify! (pg-pool) tenant-b)
         ;; Wait for both notifications
         (is (.await latch 5 TimeUnit/SECONDS))
         (is (= #{(str tenant-a) (str tenant-b)} (set @notifications)))
@@ -113,45 +125,40 @@
     (let [listener (notifier/start-listener
                     {:connection-config (:conn (pg-config))
                      :on-notification (fn [_] nil)})]
-      (Thread/sleep 200)
-      (is (some? listener))
-      (notifier/stop-listener listener))))
+      (try
+        (is (.isAlive ^Thread (:thread listener)))
+        (finally (notifier/stop-listener listener)))
+      (is (.isClosed ^java.sql.Connection (:connection listener)))
+      (is (not (.isAlive ^Thread (:thread listener)))))))
 
 ;; =====================================
 ;; Event notifier bridge: NOTIFY -> read events -> local pubsub
 ;; =====================================
 
-(deftest bridge-publishes-events-to-local-pubsub
-  (testing "On NOTIFY, bridge reads new events from store and publishes to local pubsub"
+(deftest bridge-catches-up-incrementally-on-explicit-signals
+  (testing "Signals catch up committed events once, with tenant identity and without transaction markers"
     (let [tenant-id (uuid/v4)
-          received-events (atom [])
-          latch (CountDownLatch. 1)
+          backlog (append! tenant-id [1 2])
           ps-inst (pubsub/start {:type :core-async :topic-fn :event/type})
           sub-chan (async/chan 10)
-          _ (pubsub/sub ps-inst {:topic :test/notify-event :sub-chan sub-chan})
+          _ (doseq [topic [:test/notify-event :grain/tx]]
+              (pubsub/sub ps-inst {:topic topic :sub-chan sub-chan}))
           bridge (notifier/start-bridge
                   {:connection-config (:conn (pg-config))
                    :event-store *event-store*
                    :event-pubsub ps-inst})]
       (try
-        (Thread/sleep 200)
-        ;; Consumer thread to drain pubsub
-        (future
-          (loop []
-            (when-let [event (async/<!! sub-chan)]
-              (swap! received-events conj event)
-              (.countDown latch)
-              (recur))))
-        ;; Append an event (triggers pg_notify inside the transaction)
-        (es/append *event-store*
-          {:tenant-id tenant-id
-           :events [(es/->event {:type :test/notify-event :body {}})]})
-        ;; Wait for the bridge to pick it up
-        (is (.await latch 5 TimeUnit/SECONDS)
-            "Bridge should publish event to local pubsub within 5 seconds")
-        (is (= 1 (count @received-events)))
-        (is (= :test/notify-event (:event/type (first @received-events))))
-        (is (= tenant-id (:grain/tenant-id (first @received-events))))
+        (notify! (pg-pool) tenant-id)
+        (is (= (mapv #(assoc % :grain/tenant-id tenant-id) backlog)
+               [(take-message sub-chan) (take-message sub-chan)]))
+        (let [[next-event] (append! tenant-id [3])]
+          (notify! (pg-pool) tenant-id)
+          (is (= (assoc next-event :grain/tenant-id tenant-id) (take-message sub-chan)))
+          (is (= (:event/id next-event) (get @(:watermarks bridge) tenant-id))))
+        ;; Await processing of the duplicate signal before checking the channel.
+        (notify! (pg-pool) tenant-id)
+        (is (eventually? #(pos? @(get-in bridge [:stats :empty-read-count]))))
+        (is (nil? (async/poll! sub-chan)) "No duplicate domain events or transaction markers")
         (finally
           (notifier/stop-bridge bridge)
           (async/close! sub-chan)

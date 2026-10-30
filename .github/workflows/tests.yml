@@ -79,6 +79,18 @@ jobs:
       - uses: ./.github/actions/setup-clojure
       - name: Run v3 integration tests
         run: clojure -M:poly test :all project:grain-event-store-postgres-v3 brick:event-store-postgres-v3
+      - name: Run explicit notification bridge integration tests
+        run: clojure -M:poly test :all-bricks :dev project:development brick:event-notifier-postgres
+
+  sqlite-v3-integration:
+    name: SQLite v3 integration (incl. control-plane and processor checkpoints)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-clojure
+      - name: Run SQLite component and project tests
+        run: clojure -M:poly test :all project:grain-event-store-sqlite-v3 brick:event-store-sqlite-v3
 
   live-scenario:
     name: Live scenario (live-test.clj)

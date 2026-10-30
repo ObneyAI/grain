@@ -226,7 +226,9 @@
                 validation-state (when (= mode :write) (::validation-state cache))
                 write-id (when validation-state (.getId txn))
                 base-id (when write-id (dec write-id))
-                before (when validation-state @validation-state)
+                ;; The preceding native commit may already have released the
+                ;; writer lock while its proof is still being published.
+                before (when validation-state (locking validation-state @validation-state))
                 proofs (when validation-state
                          (volatile! (if (= base-id (:revision before)) (:proofs before) [])))
                 modified? (volatile! false)]
@@ -284,16 +286,20 @@
                   ;; LMDB releases them at commit. Sequential scans reuse one
                   ;; idle cursor, and nested scans still have separate loans.
                   (close-spare-cursor! spare)
-                  (.commit txn)
-                  (when validation-state
-                    ;; Use this transaction's ID, never env.info's potentially
-                    ;; newer foreign commit. Empty commits retain the base ID.
-                    ;; A racing older publisher cannot replace newer evidence.
-                    (let [revision (if @modified? write-id base-id)]
-                      (swap! validation-state
-                             (fn [current]
-                               (if (and (:revision current) (> (:revision current) revision)) current
-                                 {:revision revision :proofs @proofs}))))))
+                  (if validation-state
+                    (locking validation-state
+                      ;; Pair commit/publication with the next writer's proof
+                      ;; snapshot. Readers and write callbacks take no such lock.
+                      (.commit txn)
+                      ;; Use this transaction's ID, never env.info's potentially
+                      ;; newer foreign commit. Empty commits retain the base ID.
+                      ;; A racing older publisher cannot replace newer evidence.
+                      (let [revision (if @modified? write-id base-id)]
+                        (swap! validation-state
+                               (fn [current]
+                                 (if (and (:revision current) (> (:revision current) revision)) current
+                                   {:revision revision :proofs @proofs})))))
+                    (.commit txn)))
                 result)
               (finally
                 (vreset! active false)
