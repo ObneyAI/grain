@@ -157,13 +157,26 @@
                                            (:retain-at-least policy))
             eligible (compaction/eligible-events
                       (tenant-events state tenant-id) type policy cutoff-time limit)]
-        {:cutoff cutoff-time :eligible eligible}))))
+        {:cutoff cutoff-time
+         :eligible eligible
+         :transaction-ids
+         (let [events (tenant-events state tenant-id)
+               existing-ids (set (map :event/id events))
+               markers (into (sorted-map)
+                             (keep #(when (= :grain/tx (:event/type %))
+                                      [(:event/id %) %])) events)]
+           (compaction/removable-transaction-ids
+            (set (map :event/id eligible))
+            #(second (first (subseq markers > %)))
+            #(some existing-ids %)))}))))
 
 (defn estimate-compaction
   [event-store request]
-  (if-let [{:keys [cutoff eligible]} (compaction-context @(:state event-store) request)]
+  (if-let [{:keys [cutoff eligible transaction-ids]} (compaction-context @(:state event-store) request)]
     {:eligible-count (count eligible)
      :eligible-event-ids (mapv :event/id eligible)
+     :eligible-transaction-count (count transaction-ids)
+     :eligible-transaction-ids (vec (sort transaction-ids))
      :cutoff cutoff}
     {:eligible-count 0 :authorized? false}))
 
@@ -171,10 +184,11 @@
   [event-store {:keys [activation tenant-id] :as request}]
   (dosync
    (let [state @(:state event-store)]
-     (if-let [{:keys [cutoff eligible]} (compaction-context state request)]
+     (if-let [{:keys [cutoff eligible transaction-ids]} (compaction-context state request)]
        (if (empty? eligible)
          nil
          (let [deleted-ids (set (map :event/id eligible))
+               all-deleted-ids (into deleted-ids transaction-ids)
                last-id (get-in state [:tenants tenant-id :tenant/last-event-id])
                receipt {:event/type compaction/compaction-receipt-type
                         :event/tags #{(compaction/policy-tag (:event/type activation))}
@@ -183,7 +197,8 @@
                         :retention/policy (:policy activation)
                         :retention/tenant-id tenant-id
                         :retention/cutoff cutoff
-                        :retention/deleted-event-ids deleted-ids}
+                        :retention/deleted-event-ids deleted-ids
+                        :retention/deleted-transaction-ids transaction-ids}
                {:keys [events events-with-tx last-event-id]}
                (prepare-append last-id [receipt]
                                {:grain/operation :retention-compaction})]
@@ -193,7 +208,7 @@
                         (update :events
                                 (fn [all-events]
                                   (into [] (remove #(and (= tenant-id (:grain/tenant-id %))
-                                                        (contains? deleted-ids (:event/id %)))
+                                                        (contains? all-deleted-ids (:event/id %)))
                                                    all-events))))
                         (update :events into
                                 (tag-events-with-tenant tenant-id events-with-tx))

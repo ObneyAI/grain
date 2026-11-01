@@ -302,15 +302,21 @@ One backend transaction must:
 2. compute the cutoff from the attempt's fixed evaluation time;
 3. resolve protected newest IDs before deletion;
 4. select a bounded deterministic batch of eligible IDs;
-5. delete those event rows and associated tag rows;
-6. append one eternal `:grain/retention-compacted` event and its `:grain/tx`;
+5. find their transaction markers and delete those with no surviving member
+   events, together with the selected event rows and associated tag rows;
+6. append one eternal `:grain.retention/compacted` event and its `:grain/tx`;
 7. leave `tenant/last-event-id` pointing at the new receipt transaction; and
 8. return the receipt and counts.
 
-The receipt records type, activation event ID, cutoff, and the exact set of
-deleted IDs. The activation ID resolves to the complete normalized policy value.
-The deleted-ID set is bounded by the compaction batch size; ID bounds, count, and
-a hash may also be recorded for efficient inspection. Exact membership is needed
+The receipt records type, activation event ID, cutoff, and the exact sets of
+deleted IDs: `:retention/deleted-event-ids` for selected domain events and
+`:retention/deleted-transaction-ids` for their removed markers. The activation
+ID resolves to the complete normalized policy value. The batch limit bounds
+selected domain events; at most that many transaction markers are also removed.
+Estimates report `:eligible-transaction-ids` and `:eligible-transaction-count`
+separately from the existing event IDs and count. Status reports
+`:deleted-transaction-count` alongside `:deleted-count` in `:latest-compaction`.
+Exact membership is needed
 to prove that a particular missing event was deliberately expired rather than
 lost or corrupted. Empty runs append nothing. Compaction receipts have no
 retention policy and are retained indefinitely. Any future expiry mechanism for
@@ -321,14 +327,26 @@ expired payloads are no longer available.
 
 ### Reified transactions after expiry
 
-Original `:grain/tx` events remain byte-for-byte unchanged. Their `:event-ids`
-sets continue to describe original transaction membership. A referenced event
-may be unavailable because an audited retention transaction expired it.
+A `:grain/tx` marker is deleted when compaction removes its last remaining
+member event. Members may expire in different batches or under different
+policies; the batch removing the last member also removes the marker. Markers
+with surviving members remain byte-for-byte unchanged, including their original
+`:event-ids` and optional metadata. Deleted marker metadata expires with it;
+receipts record the marker ID without copying its payload.
 
-This is preferable to rewriting old transaction entities, which would violate
-their immutability. Tooling can distinguish legitimate expiry from corruption by
-consulting compaction receipts. A later physical receipt index may accelerate
-that check, but the receipts remain its source of truth.
+Transaction markers remain protected from direct age-based retention. Markers
+for empty appends are left alone, and markers for permanent receipts or policy
+lifecycle events survive because their members survive. Empty compaction runs
+delete nothing and append nothing.
+
+Each append places its marker immediately after its members in tenant ID order.
+Backends find affected markers through that ordering, verify membership, and
+check remaining member IDs without decoding unrelated event payloads. Missing or
+inconsistent ownership aborts compaction. PostgreSQL and SQLite use a
+`(tenant_id, type, id)` index to find markers. The receipt and its new marker are
+committed with both deletion sets; the tenant watermark advances to the new
+marker even when the old head is removed. Tooling can distinguish legitimate
+expiry from corruption by consulting the permanent receipts.
 
 ### Read and replay contract
 
@@ -429,7 +447,7 @@ Every backend implementing `EventCompaction` must pass the same tests:
 
 * absent registration, absent policy, disabled store, and unknown type delete
   nothing;
-* protected types cannot be enabled or deleted;
+* protected types cannot be enabled or selected directly by a policy;
 * boundary timestamps are deterministic;
 * when `:keep-latest-per` is declared, the newest event per tenant and composite
   key survives regardless of age;
@@ -439,7 +457,8 @@ Every backend implementing `EventCompaction` must pass the same tests:
 * estimate and apply agree against unchanged state under a fixed backend clock;
 * deletion and receipt append are atomic under injected failure;
 * tenant watermark advances to the receipt transaction and never regresses;
-* original transaction events remain unchanged with auditable missing members;
+* transaction markers remain unchanged while members survive and are removed
+  atomically with the last member, with both deletion sets audited;
 * SQLite tag rows do not orphan; Postgres RLS prevents cross-tenant deletion;
 * read models requiring complete history block enablement;
 * lagging todo processors block expiry of unprocessed triggers;
@@ -451,10 +470,132 @@ Every backend implementing `EventCompaction` must pass the same tests:
 * mixed-version workers cannot apply policies whose normalized values differ
   from the durable activation.
 
+## Million-event scale test
+
+Run `scripts/benchmarks/retention-scale.clj` from the workspace root:
+
+```sh
+clojure -J-Xmx4g -M:dev scripts/benchmarks/retention-scale.clj \
+  sqlite 1000000 artifacts/retention-scale/sqlite-1m.edn 1000
+```
+
+For PostgreSQL, use `postgres` instead of `sqlite` and set `PG_HOST`, `PG_PORT`,
+`PG_DATABASE`, `PG_USER`, and `PG_PASSWORD` to a disposable empty database.
+The script refuses a store with existing tenants and never truncates a store.
+SQLite uses a temporary database and removes it after the run.
+
+The default fixture loads 1,000,000 domain events through the public append API,
+ten events per append, producing another 100,000 transaction markers. It mixes
+expired history, recent history, permanent facts, transactions containing both
+expired and permanent members, and keyed history over 1,000 keys. It should
+remove 749,000 domain events and 69,000 original markers, leaving 251,000 original
+domain events and 31,000 original markers. Compaction uses 1,000-event batches
+while a concurrent caller appends permanent events, pausing 20 ms between writes.
+
+The test checks each deletion against an independently computed manifest and its
+receipt, fingerprints every surviving original event and marker, checks receipt
+and concurrent-write membership, verifies the watermark and unchanged policy
+history, and repeats verification after closing and reopening the store. SQLite
+also checks for orphaned tags. Empty retries must leave the watermark unchanged.
+
+SQLite admits compaction batches through the same bounded write queue as
+appends, so repeated cleanup batches cannot overtake an already queued append.
+Its keyed selector drives tag lookups by event ID even when a freshly loaded
+database has no planner statistics.
+
+The EDN result records load and activation times, estimate times, compaction
+throughput and batch latency percentiles, concurrent append latency, and exact
+verification counts. The [recorded million-event results](../scripts/benchmarks/retention-scale-results.edn)
+include both backends, source hashes, and the SQLite query-plan and writer-starvation
+issues found and corrected during testing. Timing is diagnostic; this is one
+local workload rather than a capacity guarantee for different transaction sizes
+or writer loads. The recorded final backend runs overlapped on the same host.
+
+### PostgreSQL latency profiling
+
+PostgreSQL now selects an ordered page of old, valid-key candidates and uses the
+existing tag GIN index to find the newest events for those candidate keys. It
+continues past protected newest events until it fills the requested deletion
+limit or exhausts history. Newest-event lookup includes recent events, validates
+all components of composite keys, and ignores unrelated tags. This replaces
+ranking the entire keyed history for every batch.
+When a page has more than 64 distinct keys, newest-event lookup instead scans
+from the first candidate's ID onward. Earlier IDs cannot supersede any candidate.
+This avoids a large GIN union over deleted index entries awaiting vacuum, which
+caused latency spikes near the end of cleanup. Both paths use the same key
+validation and exact composite-key comparison.
+
+Transaction ownership is resolved in one SQL query, with each distinct marker
+decoded once. Surviving member IDs are checked in bulk, in chunks of 5,000.
+Missing or inconsistent ownership still aborts compaction. Tenant and policy
+locking, batch size, atomic deletion and receipt creation, and watermark updates
+are unchanged. No schema changes or new indexes are required.
+
+The profiling harness runs both implementations sequentially against clones of
+one seed, preserving the exact original IDs and timestamps. Use a disposable
+PostgreSQL instance and export its `PG_HOST`, `PG_PORT`, `PG_USER`, and
+`PG_PASSWORD`. The following commands also require PostgreSQL client tools:
+
+```sh
+createdb grain_retention_seed
+PG_DATABASE=grain_retention_seed clojure -J-Xmx4g -M:dev \
+  scripts/benchmarks/retention-seed.clj artifacts/retention-scale/fixture.edn 1000000
+createdb -T grain_retention_seed grain_retention_before
+createdb -T grain_retention_seed grain_retention_after
+PG_DATABASE=grain_retention_before clojure -J-Xmx4g -M:dev \
+  scripts/benchmarks/retention-profile.clj artifacts/retention-scale/fixture.edn \
+  artifacts/retention-scale/before.edn scripts/benchmarks/retention-postgres-baseline.clj
+PG_DATABASE=grain_retention_after clojure -J-Xmx4g -M:dev \
+  scripts/benchmarks/retention-profile.clj artifacts/retention-scale/fixture.edn \
+  artifacts/retention-scale/after.edn
+clojure -J-Xmx4g -M:dev scripts/benchmarks/retention-compare.clj \
+  artifacts/retention-scale/fixture.edn grain_retention_before grain_retention_after \
+  artifacts/retention-scale/parity.edn
+```
+
+For `createdb`, provide the corresponding libpq settings (`PGHOST`, `PGPORT`,
+`PGUSER`, and `PGPASSWORD`, without underscores). Do not run other benchmarks
+alongside these processes. The frozen baseline overrides only the keyed selector
+and transaction-marker lookup. Each run checks the full manifest, surviving
+payloads and markers, concurrent writes, receipts, restart, and empty retries.
+The final comparison hashes the ordered receipt batches' event type, cutoff,
+deleted event IDs, and deleted transaction IDs; generated receipt IDs and policy
+activation IDs differ between runs and are excluded.
+
+Profiling separates selection, marker inspection, deletion, receipt insertion,
+and commit return. The reported tenant lock interval runs from the client's
+lock-acquisition acknowledgement through transaction return, including connection
+release. It is a client-observed approximation, not exact server-side lock
+tracing. JDBC counts measure API calls, not necessarily network round trips.
+These measurements do not imply a fixed latency bound: a different key
+distribution, transaction width, writer load, or database state can change costs.
+
+The [recorded PostgreSQL optimization results](../scripts/benchmarks/retention-optimization-results.edn)
+include source hashes, the complete profiles, and the exact batch comparison.
+On the million-event fixture with unchanged 1,000-event batches:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Concurrent append p95 | 1,213 ms | 120 ms |
+| Concurrent append p99 | 1,486 ms | 130 ms |
+| Keyed batch tenant lock interval p95 | 1,471 ms | 118 ms |
+| Keyed batch tenant lock interval maximum | 1,617 ms | 136 ms |
+| Total compaction time, both policies | 217.85 s | 57.85 s |
+
+All 749 deletion batches matched exactly, deleting 749,000 domain events and
+69,000 original transaction markers. The surviving 251,000 original events and
+31,000 original markers had identical fingerprints, including after restart.
+All 750 concurrent writes in the optimized run survived with their markers.
+The PostgreSQL suite passed 77 tests and 265 assertions, including selector
+equivalence for malformed and composite keys across tenants and both query paths,
+paging past protected newest events, missing ownership, and large append batches.
+The highest observed append latency was 346 ms; the highest unkeyed batch lock
+interval was 360 ms. The table's keyed improvement is not a bound on all writes.
+
 ## Explicit non-goals
 
 The first version does not provide arbitrary event deletion, per-event TTL,
 automatic or unproved domain-event retention, user predicates, body-field
-partitions, automatic policy changes on code reload, transaction deletion, or
+partitions, automatic policy changes on code reload, independent transaction expiry, or
 silent best-effort replay. Application domain events remain eternal unless a
 later rollout explicitly proves and activates the same bounded-history contract.

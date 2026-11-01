@@ -176,7 +176,9 @@
                           {:event/id (:event/id latest-receipt)
                            :event/timestamp (:event/timestamp latest-receipt)
                            :deleted-count (count (:retention/deleted-event-ids
-                                                 latest-receipt))})
+                                                 latest-receipt))
+                           :deleted-transaction-count
+                           (count (:retention/deleted-transaction-ids latest-receipt))})
      :history-truncated? (boolean latest-receipt)}))
 
 (defn verify-at-boot!

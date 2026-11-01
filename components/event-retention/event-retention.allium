@@ -19,7 +19,8 @@
 --           deactivation; equality between loaded and active policy values;
 --           boot-time structural validation; activation-time stored-data
 --           preflight; conservative eligibility; bounded compaction batches;
---           atomic deletion and exact receipts; tenant isolation; and monotonic
+--           atomic deletion of events and emptied transaction markers, exact
+--           receipts; tenant isolation; and monotonic
 --           progress.
 --
 -- Excludes (implementation or governed elsewhere):
@@ -28,7 +29,8 @@
 --   - a prescribed activation workflow: an application may invoke activation
 --     from a REPL, deployment, CI, or another operator-controlled process
 --   - storage layout, SQL, scheduling technology, threads and serialization
---   - retention of transaction markers, lifecycle facts, failures, leases, or
+--   - independent age-based retention of transaction markers
+--   - retention of lifecycle facts, failures, leases, or
 --     other infrastructure events unless each is separately registered and
 --     proven eligible under these rules
 --   - guarantees for consumers outside Grain's declared event model
@@ -117,6 +119,7 @@ entity CompactionReceipt {
     activation: PolicyActivation
     tenant: store/Tenant
     deleted_event_ids: Set<String>
+    deleted_transaction_ids: Set<String>
     completed_at: Timestamp
 }
 
@@ -203,8 +206,8 @@ contract RetentionAdministration {
         -- Activation reads and durably records the normalized bounded policy
         -- value currently registered for the named event; callers do not supply
         -- or override it. An absent definition or a complete-history definition
-        -- is rejected. Transaction markers, compaction receipts and any other
-        -- permanently protected type cannot be activated even if misdeclared.
+        -- is rejected. Transaction markers, compaction receipts and other
+        -- protected types cannot be directly activated even if misdeclared.
 
     @invariant StoredDataPreflight
         -- Before first activation or a changed activation, assessment checks
@@ -232,8 +235,9 @@ contract RetentionAdministration {
     @invariant StatusReportsAvailability
         -- Status reports the current active policy value and activation identity,
         -- earliest retained id and timestamp, latest compaction, and whether the
-        -- named tenant/type history has been truncated. It does not claim that
-        -- unknown external consumers can replay safely.
+        -- named tenant/type history has been truncated. Latest compaction counts
+        -- distinguish domain events from deleted transaction markers. It does
+        -- not claim that unknown external consumers can replay safely.
 
     @invariant CompleteReplayConsultsStatus
         -- A caller that promises complete historical replay checks status first
@@ -258,7 +262,8 @@ contract EventCompaction {
     @invariant SelectionIsEquivalentAtOneEvaluation
         -- Estimate and compact apply one eligibility definition. Given the same
         -- activation, tenant state, fixed evaluation time and batch limit, they
-        -- select exactly the same ordered event ids. Separate calls may differ
+        -- select exactly the same ordered domain-event and transaction-marker
+        -- ids, with separate counts. Separate calls may differ
         -- after the clock, activation or relevant tenant state changes.
 
     @invariant EvaluationClockDoesNotAlterPolicy
@@ -278,8 +283,9 @@ contract EventCompaction {
 
     @invariant ProtectedHistoryIsNeverEligible
         -- Transaction markers, compaction receipts, unregistered event types and
-        -- definitions without bounded history are never eligible, even if a
-        -- malformed or stale request names them.
+        -- definitions without bounded history are never directly eligible under
+        -- a policy, even if a malformed or stale request names them. Markers may
+        -- only be removed as a consequence of deleting their last member.
 
     @invariant PolicyMustStillMatch
         -- Immediately before commit, the activation must still be active and
@@ -287,9 +293,10 @@ contract EventCompaction {
         -- definition. Any mismatch aborts without deletion.
 
     @invariant AtomicDeletionAndReceipt
-        -- Deleting the selected events and durably recording a receipt naming
-        -- exactly their ids is one atomic commit. Either both happen or neither
-        -- happens; an empty selection produces no misleading deletion receipt.
+        -- Deleting selected domain events, removing affected transaction markers
+        -- with no surviving members, and recording a receipt naming both exact
+        -- sets of ids is one atomic commit. Either all happen or none happen;
+        -- an empty domain-event selection produces no deletion or receipt.
 
     @invariant ReceiptIsAReifiedTransaction
         -- The receipt is appended as an eternal Grain event with its own new
@@ -302,9 +309,11 @@ contract EventCompaction {
         -- remain durable audit evidence for every committed deletion batch.
 
     @invariant BoundedAndRetrySafe
-        -- Each batch has a finite configured bound and deterministic selection.
-        -- Retrying after interruption never broadens eligibility and never
-        -- reports an event deleted twice.
+        -- Each batch has a finite configured domain-event bound and deterministic
+        -- selection. At most one additional marker per selected event is deleted.
+        -- Transaction cleanup inspects only affected markers and member-existence
+        -- metadata; unrelated payload history is not decoded. Retrying after
+        -- interruption never broadens eligibility or reports an event deleted twice.
 
     @invariant ConcurrentWorkersDoNotDoubleCompact
         -- Selection, deletion, receipt append and the policy recheck are
@@ -316,11 +325,16 @@ contract EventCompaction {
         -- A batch reads and deletes from exactly one tenant. Its receipt names
         -- that tenant, and no event from another tenant can be selected.
 
-    @invariant TransactionHistoryIsUnchanged
-        -- Compaction never rewrites an event or its original transaction marker.
-        -- Transaction markers remain immutable historical facts even when some
-        -- domain-event ids they originally named have been compacted; the
-        -- receipt is the durable explanation for those absent events.
+    @invariant TransactionLifetimeFollowsMembers
+        -- An affected transaction marker is deleted exactly when none of its
+        -- original member events survive the batch, including members expired by
+        -- earlier batches or different policies. Markers with surviving members
+        -- remain byte-for-byte unchanged, including original membership and
+        -- metadata. Empty-append markers are not affected. Missing or inconsistent
+        -- ownership aborts the batch. Receipt and policy-lifecycle markers survive
+        -- because their permanent members survive. Deleted marker metadata expires
+        -- with the marker; the receipt records its id without retaining that
+        -- payload.
 }
 
 ------------------------------------------------------------
@@ -395,14 +409,18 @@ rule CompactEligibleBatch {
         eligible_events(activation, tenant).count > 0
     ensures:
         let removed = bounded_batch(eligible_events(activation, tenant))
+        let removed_markers = markers_emptied_by(removed, tenant)
         CompactionReceipt.created(
             activation: activation,
             tenant: tenant,
             deleted_event_ids: event_ids(removed),
+            deleted_transaction_ids: event_ids(removed_markers),
             completed_at: now
         )
         for event in removed:
             not exists event
+        for marker in removed_markers:
+            not exists marker
 }
 
 ------------------------------------------------------------
@@ -411,7 +429,8 @@ rule CompactEligibleBatch {
 
 invariant ReceiptExplainsEveryDeletion {
     for receipt in CompactionReceipts:
-        receipt.deleted_event_ids.count > 0
+        receipt.deleted_event_ids.count > 0 and
+        receipt.deleted_transaction_ids.count <= receipt.deleted_event_ids.count
 }
 
 invariant AtMostOneActivePolicyPerEventType {

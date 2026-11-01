@@ -525,8 +525,10 @@
                  ::busy-attempts (inc attempt)})
               (throw value))))))))
 
-(defn append
-  [event-store args]
+(defn- submit-write
+  "Serialize appends and compaction through the same bounded FIFO. A compactor
+   must not repeatedly reacquire SQLite's write lock ahead of queued appends."
+  [event-store write-fn]
   (let [^ThreadPoolExecutor coordinator
         (get-in event-store [:state ::write-coordinator])
         queued-at (System/nanoTime)
@@ -543,11 +545,7 @@
                            :metric/name "SQLiteWriteQueueDepth"
                            :metric/value (.size (.getQueue coordinator))
                            :metric/resolution :low)
-                    (u/trace ::append
-                      [:metric/name "SQLiteAppend"
-                       :metric/resolution :high
-                       :queue-wait-ns queue-wait-ns]
-                      (append-with-busy-retry event-store args))))))]
+                    (write-fn queue-wait-ns)))))]
     (try
       (.execute coordinator task)
       (u/log :metric/metric
@@ -568,6 +566,16 @@
                :queue-capacity (or (get-in event-store [:config :write-queue-capacity]) 1024))
         {::anom/category ::anom/busy
          ::anom/message "SQLite event-store write queue is full"}))))
+
+(defn append
+  [event-store args]
+  (submit-write event-store
+                (fn [queue-wait-ns]
+                  (u/trace ::append
+                    [:metric/name "SQLiteAppend"
+                     :metric/resolution :high
+                     :queue-wait-ns queue-wait-ns]
+                    (append-with-busy-retry event-store args)))))
 
 ;; ----------- ;;
 ;; Tenants     ;;
@@ -619,14 +627,19 @@
   [conn tenant-id event-type cutoff-time limit tag-names]
   (let [tag-names (mapv key-fn (sort-by key-fn tag-names))
         aliases (mapv #(str "k" %) (range (count tag-names)))
+        ;; Fresh stores may have no planner statistics. Drive from target-type
+        ;; events and probe tags by event ID; otherwise SQLite can repeatedly
+        ;; scan every tag/event in the tenant for these prefix predicates.
         joins (mapv (fn [alias]
-                      (str "JOIN event_tags " alias " ON "
+                      (str "CROSS JOIN event_tags " alias
+                           " INDEXED BY idx_event_tags_event ON "
                            alias ".tenant_id = e.tenant_id AND "
                            alias ".event_id = e.id AND "
                            "substr(" alias ".tag, 1, instr(" alias ".tag, ':') - 1) = ?"))
                     aliases)
         exact-counts (mapv (fn [idx]
-                             (str "(SELECT COUNT(*) FROM event_tags c" idx " "
+                             (str "(SELECT COUNT(*) FROM event_tags c" idx
+                                  " INDEXED BY idx_event_tags_event "
                                   "WHERE c" idx ".tenant_id = e.tenant_id "
                                   "AND c" idx ".event_id = e.id "
                                   "AND substr(c" idx ".tag, 1, instr(c" idx ".tag, ':') - 1) = ?) = 1"))
@@ -656,6 +669,31 @@
     (keyed-eligible-metadata conn tenant-id event-type cutoff-time limit tag-names)
     (unkeyed-eligible-metadata conn tenant-id event-type cutoff-time limit)))
 
+(defn- removable-transaction-ids [conn tenant-id eligible]
+  (compaction/removable-transaction-ids
+   (set (map :event/id eligible))
+   (fn [event-id]
+     (some-> (jdbc/execute-one!
+              conn
+              ["SELECT id, time, type, data FROM events
+                WHERE tenant_id = ? AND type = ? AND id > ?
+                ORDER BY id LIMIT 1"
+               (str tenant-id) (str :grain/tx) (str event-id)]
+              {:builder-fn rs/as-unqualified-lower-maps})
+             transform-row))
+   (fn [member-ids]
+     ;; Chunk large append batches to stay within SQL parameter limits, and
+     ;; stop at the first surviving member. No member payload is decoded.
+     (some (fn [ids]
+             (jdbc/execute-one!
+              conn
+              (into [(str "SELECT id FROM events WHERE tenant_id = ? AND id IN ("
+                          (placeholders (count ids)) ") LIMIT 1")
+                     (str tenant-id)]
+                    (map str ids))
+              {:builder-fn rs/as-unqualified-lower-maps}))
+           (partition-all 500 member-ids)))))
+
 (defn- sqlite-compaction-context [conn {:keys [activation tenant-id limit evaluated-at]}]
   (let [{:keys [event/type policy]} activation
         lifecycle (when (and (pos-int? limit)
@@ -665,28 +703,33 @@
                (not (contains? compaction/protected-event-types type))
                (compaction/activation-matches? lifecycle activation))
       (let [cutoff (compaction/cutoff (or evaluated-at (time/now))
-                                      (:retain-at-least policy))]
+                                      (:retain-at-least policy))
+            eligible (eligible-event-metadata conn tenant-id type policy cutoff limit)]
         {:cutoff cutoff
-         :eligible (eligible-event-metadata
-                    conn tenant-id type policy cutoff limit)}))))
+         :eligible eligible
+         :transaction-ids (removable-transaction-ids conn tenant-id eligible)}))))
 
 (defn estimate-compaction [event-store request]
-  (with-open [conn (jdbc/get-connection (get-in event-store [:state ::connection-pool]))]
-    (if-let [{:keys [cutoff eligible]} (sqlite-compaction-context conn request)]
+  ;; A deferred read transaction keeps marker lookup in the selection snapshot.
+  (jdbc/with-transaction [conn (get-in event-store [:state ::connection-pool])]
+    (if-let [{:keys [cutoff eligible transaction-ids]} (sqlite-compaction-context conn request)]
       {:eligible-count (count eligible)
        :eligible-event-ids (mapv :event/id eligible)
+       :eligible-transaction-count (count transaction-ids)
+       :eligible-transaction-ids (vec (sort transaction-ids))
        :cutoff cutoff}
       {:eligible-count 0 :authorized? false})))
 
-(defn compact-events! [event-store {:keys [activation tenant-id] :as request}]
+(defn- compact-events-direct! [event-store {:keys [activation tenant-id] :as request}]
   (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
       (long (or (get-in event-store [:config :busy-timeout-ms]) 1000))
       (fn [conn]
-        (if-let [{:keys [cutoff eligible]} (sqlite-compaction-context conn request)]
+        (if-let [{:keys [cutoff eligible transaction-ids]} (sqlite-compaction-context conn request)]
           (when (seq eligible)
             (let [deleted-ids (set (map :event/id eligible))
+                  all-deleted-ids (into deleted-ids transaction-ids)
                   last-id (committed-last-event-id conn tenant-id)
                   receipt {:event/type compaction/compaction-receipt-type
                            :event/tags #{(compaction/policy-tag (:event/type activation))}
@@ -695,20 +738,30 @@
                            :retention/policy (:policy activation)
                            :retention/tenant-id tenant-id
                            :retention/cutoff cutoff
-                           :retention/deleted-event-ids deleted-ids}
+                           :retention/deleted-event-ids deleted-ids
+                           :retention/deleted-transaction-ids transaction-ids}
                   {:keys [events events-with-tx last-event-id]}
                   (prepare-append last-id [receipt]
                                   {:grain/operation :retention-compaction})]
               (jdbc/execute! conn
                              (into [(str "DELETE FROM events WHERE tenant_id = ? AND id IN ("
-                                         (placeholders (count deleted-ids)) ")")
+                                         (placeholders (count all-deleted-ids)) ")")
                                     (str tenant-id)]
-                                   (map str deleted-ids)))
+                                   (map str all-deleted-ids)))
               (upsert-tenant! conn tenant-id last-event-id)
               (insert-events! conn tenant-id events-with-tx)
               (first events)))
           (throw (ex-info "Retention compaction is not authorized by the active policy"
                           {:request request})))))))
+
+(defn compact-events! [event-store request]
+  (submit-write event-store
+                (fn [queue-wait-ns]
+                  (u/trace ::compaction
+                    [:metric/name "SQLiteCompaction"
+                     :metric/resolution :high
+                     :queue-wait-ns queue-wait-ns]
+                    (compact-events-direct! event-store request)))))
 
 ;; ----------------- ;;
 ;; Record Definition ;;

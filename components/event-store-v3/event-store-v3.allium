@@ -383,11 +383,15 @@ invariant TenantScoped {
 }
 
 -- ES2: a transaction marker records the ids of the domain events it closed.
--- Every id it names is the id of a real event in the same tenant's stream.
+-- Every id it names was committed in the same tenant's stream. The privileged
+-- retention capability may later remove a member with exact receipt evidence
+-- (expired_by_retention), and removes the marker when its last member expires.
 invariant TxMarkerNamesRealEvents {
     for m in Events:
         m.kind = transaction_marker implies
-            m.batch_event_ids.all(id => Events.any(e => e.id = id and e.tenant = m.tenant))
+            m.batch_event_ids.all(id =>
+                Events.any(e => e.id = id and e.tenant = m.tenant) or
+                expired_by_retention(id, m.tenant))
 }
 
 -- ES3: once a tenant has any committed event, its high-watermark is set; a

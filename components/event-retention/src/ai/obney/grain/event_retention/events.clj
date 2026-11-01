@@ -23,7 +23,8 @@
             [:retention/policy map?]
             [:retention/tenant-id uuid?]
             [:retention/cutoff [:time/offset-date-time]]
-            [:retention/deleted-event-ids [:set {:min 1} uuid?]]]})
+            [:retention/deleted-event-ids [:set {:min 1} uuid?]]
+            [:retention/deleted-transaction-ids [:set uuid?]]]})
 
 (defn ->activated [event-type policy]
   (event-store/->event

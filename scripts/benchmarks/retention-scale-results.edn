@@ -1,0 +1,197 @@
+{:environment
+ {:cpu "Apple M2 Max",
+  :logical-cpus 12,
+  :host-memory-bytes 34359738368,
+  :postgres "17.6, Docker pgvector/pgvector:0.8.0-pg17",
+  :sqlite-jdbc "3.46.1.3",
+  :note
+  "Single local run per backend; final runs overlapped. Timings are diagnostic, not an isolated backend comparison or production capacity guarantee."},
+ :source-sha256
+ {"scripts/benchmarks/retention-scale.clj"
+  "c3ad0728b6c1e81140e80bbcf270786334a8d7239114662f7b5485107ee2d1ca",
+  "components/event-store-v3/src/ai/obney/grain/event_store_v3/interface/compaction.clj"
+  "1efa62d08699b297bf7cc87f12c1ce5894a80161b22573c4d2dc55449f550add",
+  "components/event-store-sqlite-v3/src/ai/obney/grain/event_store_sqlite_v3/core.clj"
+  "bf0b96151396be6ec307e38b351105037dc8733ca9a65cd13562c77efe57d898",
+  "components/event-store-postgres-v3/src/ai/obney/grain/event_store_postgres_v3/core.clj"
+  "c77f60d0d9a325c558d25ed44f3346cd9842f2852674588139a2287f20985b13"},
+ :issues-found-and-fixed
+ [{:backend :sqlite,
+   :issue
+   "Fresh-store keyed selector repeatedly scanned tenant-wide tag/event ranges without planner statistics; initial run was stopped before compaction.",
+   :fix
+   "Drive from candidate events and use event-ID indexes for tag joins and cardinality checks.",
+   :regression-test
+   keyed-retention-probes-tags-by-event-without-planner-statistics}
+  {:backend :sqlite,
+   :issue
+   "Continuous compaction bypassed write admission and exhausted a concurrent append's four contention attempts.",
+   :fix
+   "Submit compaction batches through the same bounded FIFO as appends.",
+   :regression-test
+   compaction-yields-to-an-append-already-in-the-write-queue}],
+ :runs
+ {:sqlite
+  {:load
+   {:domain-events 1000000,
+    :transactions 100000,
+    :elapsed-ms 57914.892125},
+   :restart-verification
+   {:original-events 251000,
+    :original-markers 31000,
+    :receipts 749,
+    :receipt-markers 749,
+    :live-events 747,
+    :live-markers 747,
+    :survivor-sha256
+    "7b50f560e4f991088d139afb9ad0cc91a957a8f617776484c2d883e26dfef9c2",
+    :passed? true},
+   :max-heap-bytes 4294967296,
+   :started-at "2026-10-31T17:23:45.870546Z",
+   :initial-estimates
+   [{:type :retention-scale/expired,
+     :elapsed-ms 798.29225,
+     :events 1000,
+     :transactions 91}
+    {:type :retention-scale/keyed,
+     :elapsed-ms 684.065667,
+     :events 1000,
+     :transactions 100}],
+   :arch "aarch64",
+   :verification
+   {:original-events 251000,
+    :original-markers 31000,
+    :receipts 749,
+    :receipt-markers 749,
+    :live-events 747,
+    :live-markers 747,
+    :survivor-sha256
+    "7b50f560e4f991088d139afb9ad0cc91a957a8f617776484c2d883e26dfef9c2",
+    :passed? true},
+   :java "21.0.7",
+   :passed? true,
+   :concurrent-appends
+   {:samples 747,
+    :p50-ms 37.59425,
+    :p95-ms 383.36675,
+    :p99-ms 496.92875,
+    :max-ms 756.399875},
+   :storage {:orphaned-tags 0},
+   :completed-at "2026-10-31T17:26:46.556718Z",
+   :os "Mac OS X",
+   :fixture
+   {:domain-events 1000000,
+    :events-per-append 10,
+    :key-count 1000,
+    :payload-characters 64,
+    :batch-size 1000,
+    :writer-pause-ms 20},
+   :backend :sqlite,
+   :compaction
+   [{:type :retention-scale/expired,
+     :batches 550,
+     :deleted-events 550000,
+     :deleted-transactions 50000,
+     :elapsed-ms 29400.268125,
+     :events-per-second 18707.312384417244,
+     :batch-latency
+     {:samples 550,
+      :p50-ms 44.741458,
+      :p95-ms 72.106541,
+      :p99-ms 177.485125,
+      :max-ms 222.165}}
+    {:type :retention-scale/keyed,
+     :batches 199,
+     :deleted-events 199000,
+     :deleted-transactions 19000,
+     :elapsed-ms 52430.916125,
+     :events-per-second 3795.470586963733,
+     :batch-latency
+     {:samples 199,
+      :p50-ms 252.758208,
+      :p95-ms 510.116666,
+      :p99-ms 568.471917,
+      :max-ms 775.812292}}],
+   :activation-ms 10304.534042},
+  :postgres
+  {:load
+   {:domain-events 1000000,
+    :transactions 100000,
+    :elapsed-ms 223973.84525},
+   :restart-verification
+   {:original-events 251000,
+    :original-markers 31000,
+    :receipts 749,
+    :receipt-markers 749,
+    :live-events 786,
+    :live-markers 786,
+    :survivor-sha256
+    "6c8ef5e5a02c341599db1d79cf359d5bab6195876132db556c7f44b5b8e1aae5",
+    :passed? true},
+   :max-heap-bytes 4294967296,
+   :started-at "2026-10-31T17:21:34.311085Z",
+   :initial-estimates
+   [{:type :retention-scale/expired,
+     :elapsed-ms 54.5615,
+     :events 1000,
+     :transactions 91}
+    {:type :retention-scale/keyed,
+     :elapsed-ms 1355.336167,
+     :events 1000,
+     :transactions 100}],
+   :arch "aarch64",
+   :verification
+   {:original-events 251000,
+    :original-markers 31000,
+    :receipts 749,
+    :receipt-markers 749,
+    :live-events 786,
+    :live-markers 786,
+    :survivor-sha256
+    "6c8ef5e5a02c341599db1d79cf359d5bab6195876132db556c7f44b5b8e1aae5",
+    :passed? true},
+   :java "21.0.7",
+   :passed? true,
+   :concurrent-appends
+   {:samples 786,
+    :p50-ms 88.501208,
+    :p95-ms 1058.361417,
+    :p99-ms 1249.273459,
+    :max-ms 1366.915541},
+   :storage {:database-bytes 721235091},
+   :completed-at "2026-10-31T17:29:06.079046Z",
+   :os "Mac OS X",
+   :fixture
+   {:domain-events 1000000,
+    :events-per-append 10,
+    :key-count 1000,
+    :payload-characters 64,
+    :batch-size 1000,
+    :writer-pause-ms 20},
+   :backend :postgres,
+   :compaction
+   [{:type :retention-scale/expired,
+     :batches 550,
+     :deleted-events 550000,
+     :deleted-transactions 50000,
+     :elapsed-ms 53396.069292,
+     :events-per-second 10300.383666675687,
+     :batch-latency
+     {:samples 550,
+      :p50-ms 79.391375,
+      :p95-ms 155.723833,
+      :p99-ms 191.628292,
+      :max-ms 298.200583}}
+    {:type :retention-scale/keyed,
+     :batches 199,
+     :deleted-events 199000,
+     :deleted-transactions 19000,
+     :elapsed-ms 140360.734916,
+     :events-per-second 1417.7754207335347,
+     :batch-latency
+     {:samples 199,
+      :p50-ms 692.94325,
+      :p95-ms 1226.79775,
+      :p99-ms 1335.88575,
+      :max-ms 1386.029875}}],
+   :activation-ms 5394.586958}}}

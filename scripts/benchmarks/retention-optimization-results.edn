@@ -1,0 +1,495 @@
+{:environment
+ {:cpu "Apple M2 Max",
+  :physical-cpus 12,
+  :host-memory-bytes 34359738368,
+  :postgres "17.6, Docker pgvector/pgvector:0.8.0-pg17",
+  :note
+  "Sequential local PostgreSQL runs on clones of the same public-API seed. No other benchmark ran concurrently. One measured full run of each recorded implementation; diagnostic, not a production latency guarantee."},
+ :method
+ {:baseline
+  "Frozen pre-optimization keyed selector and marker lookup; locking and commit logic unchanged.",
+  :concurrent-writer-pause-ms 20,
+  :domain-events 1000000,
+  :baseline-loaded-core-sha256
+  "c77f60d0d9a325c558d25ed44f3346cd9842f2852674588139a2287f20985b13",
+  :seed-fixture
+  {:tenant #uuid "fb7d38bb-db12-462f-9497-b13d5dba55c2",
+   :recorded-at "2026-10-31T17:42:47.732346Z",
+   :load
+   {:domain-events 1000000,
+    :transactions 100000,
+    :elapsed-ms 238671.151834}},
+  :lock-timing
+  "Client-observed tenant lock acquisition acknowledgement through transaction return, including connection release; not exact server-side tracing. Profile percentiles include batches producing receipts. Total compaction includes final empty calls and manifest auditing.",
+  :jdbc-calls
+  "next.jdbc execute!, execute-one! and execute-batch! invocations, not network round trips.",
+  :initial-transaction-markers 100000,
+  :batch-size 1000},
+ :source-sha256
+ {"components/event-store-postgres-v3/src/ai/obney/grain/event_store_postgres_v3/core.clj"
+  "6b49b54d1cfe6b77e04d6fb99a78c998672ace09655978471459748559faf9c6",
+  "components/event-store-postgres-v3/test/ai/obney/grain/event_store_postgres_v3/integration_test.clj"
+  "f498d8b549780455a8dadb368a35af41ec543a41cfce9e443bad6da65720d55a",
+  "components/event-store-v3/src/ai/obney/grain/event_store_v3/interface/compaction.clj"
+  "1efa62d08699b297bf7cc87f12c1ce5894a80161b22573c4d2dc55449f550add",
+  "scripts/benchmarks/retention-compare.clj"
+  "9d8bbcef42b38cd2c697773dc77ace031300750afe9a046419d81cd898d83d46",
+  "scripts/benchmarks/retention-postgres-baseline.clj"
+  "3a83c4f9d632795cb713e8adb966f0a91a991e715e6aa80e69a0fb69747a845a",
+  "scripts/benchmarks/retention-profile.clj"
+  "94f5ce43a550843a0877e84cff4cb0fbfc1c5e61b2c5e7581a58b9907bf4ae20",
+  "scripts/benchmarks/retention-scale.clj"
+  "b3cec66fa2013e073960a543a2258d1529353fdf802033042cd3f326324362dc",
+  "scripts/benchmarks/retention-seed.clj"
+  "0811503766c6e54e13ce32ea39f214d282cb995b6e2a1d3e15a8683cc1050f36"},
+ :changes
+ ["Page old valid-key candidates; find newest only for their exact keys. Continue past protected candidates to preserve the first-N deletion boundary."
+  "Use existing GIN tag index for at most 64 candidate keys; above that, scan the remaining ID suffix to avoid expensive large unions over dead GIN entries."
+  "Resolve ownership and decode distinct markers in bulk; check surviving member IDs in chunks of 5000."
+  "No schema, index, batch-size, locking, receipt, or watermark semantic changes."],
+ :regression-tests
+ {:namespace ai.obney.grain.event-store-postgres-v3.integration-test,
+  :tests 77,
+  :assertions 265,
+  :failures 0,
+  :errors 0,
+  :added
+  [keyed-retention-matches-reference-selection-across-pages-and-tenants
+   keyed-retention-pages-past-protected-newest-events
+   batched-marker-lookup-rejects-missing-ownership
+   marker-membership-checks-span-large-append-batches]},
+ :parity
+ {:before
+  {:batches 749,
+   :deleted-events 749000,
+   :deleted-transactions 69000,
+   :ordered-batches-sha256
+   "05e1cc570d7c7946adf29d0507afb33f4b56d6857a853f4aa924a49b6541a86d"},
+  :after
+  {:batches 749,
+   :deleted-events 749000,
+   :deleted-transactions 69000,
+   :ordered-batches-sha256
+   "05e1cc570d7c7946adf29d0507afb33f4b56d6857a853f4aa924a49b6541a86d"},
+  :passed? true,
+  :survivor-sha256
+  "85794aa38cd1ef28d90b458c7525bfd29bedf2d4e799a8f2fef51cdf223c8428",
+  :receipt-fields
+  [:retention/event-type
+   :retention/cutoff
+   :retention/deleted-event-ids
+   :retention/deleted-transaction-ids]},
+ :comparison
+ {:concurrent-append-max-ms
+  {:before 1602.051125,
+   :after 345.977834,
+   :reduction-percent 78.40407034450914},
+  :concurrent-append-p95-ms
+  {:before 1212.516708,
+   :after 119.76475,
+   :reduction-percent 90.12263095346972},
+  :concurrent-append-p99-ms
+  {:before 1486.380125,
+   :after 129.958083,
+   :reduction-percent 91.25673972531084},
+  :keyed-batch-p95-ms
+  {:before 1473.218833,
+   :after 120.169583,
+   :reduction-percent 91.84305954361906},
+  :keyed-lock-max-ms
+  {:before 1616.861833,
+   :after 135.633083,
+   :reduction-percent 91.61133745433646},
+  :keyed-lock-p95-ms
+  {:before 1471.156917,
+   :after 117.774667,
+   :reduction-percent 91.99441843089264},
+  :keyed-marker-inspection-p95-ms
+  {:before 53.784958,
+   :after 7.195042,
+   :reduction-percent 86.62257577666975},
+  :keyed-selection-p95-ms
+  {:before 1431.117209,
+   :after 103.672583,
+   :reduction-percent 92.75582863877084},
+  :total-compaction-ms
+  {:before 217846.569417,
+   :after 57845.855833,
+   :reduction-percent 73.44651513778398}},
+ :runs
+ {:before
+  {:load
+   {:domain-events 1000000,
+    :transactions 100000,
+    :elapsed-ms 238671.151834},
+   :restart-verification
+   {:original-events 251000,
+    :original-markers 31000,
+    :receipts 749,
+    :receipt-markers 749,
+    :live-events 752,
+    :live-markers 752,
+    :survivor-sha256
+    "85794aa38cd1ef28d90b458c7525bfd29bedf2d4e799a8f2fef51cdf223c8428",
+    :passed? true},
+   :max-heap-bytes 4294967296,
+   :started-at "2026-10-31T17:51:29.827712Z",
+   :initial-estimates
+   [{:type :retention-scale/expired,
+     :elapsed-ms 57.060708,
+     :events 1000,
+     :transactions 91}
+    {:type :retention-scale/keyed,
+     :elapsed-ms 1533.315375,
+     :events 1000,
+     :transactions 100}],
+   :arch "aarch64",
+   :verification
+   {:original-events 251000,
+    :original-markers 31000,
+    :receipts 749,
+    :receipt-markers 749,
+    :live-events 752,
+    :live-markers 752,
+    :survivor-sha256
+    "85794aa38cd1ef28d90b458c7525bfd29bedf2d4e799a8f2fef51cdf223c8428",
+    :passed? true},
+   :java "21.0.7",
+   :passed? true,
+   :concurrent-appends
+   {:samples 752,
+    :p50-ms 111.470959,
+    :p95-ms 1212.516708,
+    :p99-ms 1486.380125,
+    :max-ms 1602.051125},
+   :storage {:database-bytes 721415315},
+   :completed-at "2026-10-31T17:55:44.208284Z",
+   :os "Mac OS X",
+   :fixture
+   {:domain-events 1000000,
+    :preseeded? true,
+    :events-per-append 10,
+    :key-count 1000,
+    :payload-characters 64,
+    :batch-size 1000,
+    :writer-pause-ms 20},
+   :backend :postgres,
+   :compaction
+   [{:type :retention-scale/expired,
+     :batches 550,
+     :deleted-events 550000,
+     :deleted-transactions 50000,
+     :elapsed-ms 58432.792917,
+     :events-per-second 9412.522875318307,
+     :batch-latency
+     {:samples 550,
+      :p50-ms 81.423833,
+      :p95-ms 161.753458,
+      :p99-ms 171.420083,
+      :max-ms 374.587584}}
+    {:type :retention-scale/keyed,
+     :batches 199,
+     :deleted-events 199000,
+     :deleted-transactions 19000,
+     :elapsed-ms 159413.7765,
+     :events-per-second 1248.323729411178,
+     :batch-latency
+     {:samples 199,
+      :p50-ms 788.05725,
+      :p95-ms 1473.218833,
+      :p99-ms 1571.276959,
+      :max-ms 1618.7905}}],
+   :profile
+   #:retention-scale{:expired
+                     {:batches 550,
+                      :jdbc-calls {:min 140, :max 143, :total 77900},
+                      :timings
+                      {:batch-ms
+                       {:samples 550,
+                        :p50-ms 79.795875,
+                        :p95-ms 159.87575,
+                        :p99-ms 169.470833,
+                        :max-ms 372.978},
+                       :selection-ms
+                       {:samples 550,
+                        :p50-ms 38.338125,
+                        :p95-ms 117.454791,
+                        :p99-ms 125.822417,
+                        :max-ms 133.134708},
+                       :marker-check-ms
+                       {:samples 550,
+                        :p50-ms 34.1895,
+                        :p95-ms 41.778334,
+                        :p99-ms 51.084083,
+                        :max-ms 56.088958},
+                       :delete-ms
+                       {:samples 550,
+                        :p50-ms 1.042333,
+                        :p95-ms 2.19325,
+                        :p99-ms 2.602834,
+                        :max-ms 5.07025},
+                       :receipt-insert-ms
+                       {:samples 550,
+                        :p50-ms 2.692167,
+                        :p95-ms 4.808292,
+                        :p99-ms 10.6,
+                        :max-ms 14.694708},
+                       :tenant-lock-wait-ms
+                       {:samples 550,
+                        :p50-ms 0.201209,
+                        :p95-ms 0.335917,
+                        :p99-ms 0.870416,
+                        :max-ms 14.907417},
+                       :tenant-lock-held-ms
+                       {:samples 550,
+                        :p50-ms 79.187667,
+                        :p95-ms 158.766125,
+                        :p99-ms 168.181333,
+                        :max-ms 372.23},
+                       :commit-return-ms
+                       {:samples 550,
+                        :p50-ms 0.831375,
+                        :p95-ms 2.360959,
+                        :p99-ms 6.622083,
+                        :max-ms 313.908625}}},
+                     :keyed
+                     {:batches 199,
+                      :jdbc-calls {:min 113, :max 175, :total 23630},
+                      :timings
+                      {:batch-ms
+                       {:samples 199,
+                        :p50-ms 786.800959,
+                        :p95-ms 1471.782083,
+                        :p99-ms 1569.76575,
+                        :max-ms 1617.457334},
+                       :selection-ms
+                       {:samples 199,
+                        :p50-ms 741.304333,
+                        :p95-ms 1431.117209,
+                        :p99-ms 1535.059041,
+                        :max-ms 1580.036958},
+                       :marker-check-ms
+                       {:samples 199,
+                        :p50-ms 31.40825,
+                        :p95-ms 53.784958,
+                        :p99-ms 165.535042,
+                        :max-ms 174.723},
+                       :delete-ms
+                       {:samples 199,
+                        :p50-ms 1.631875,
+                        :p95-ms 2.688708,
+                        :p99-ms 3.439875,
+                        :max-ms 7.347416},
+                       :receipt-insert-ms
+                       {:samples 199,
+                        :p50-ms 2.790791,
+                        :p95-ms 5.284708,
+                        :p99-ms 6.716082999999999,
+                        :max-ms 11.023667},
+                       :tenant-lock-wait-ms
+                       {:samples 199,
+                        :p50-ms 0.242791,
+                        :p95-ms 0.79325,
+                        :p99-ms 1.606583,
+                        :max-ms 2.681375},
+                       :tenant-lock-held-ms
+                       {:samples 199,
+                        :p50-ms 785.343875,
+                        :p95-ms 1471.156917,
+                        :p99-ms 1569.190792,
+                        :max-ms 1616.861833},
+                       :commit-return-ms
+                       {:samples 199,
+                        :p50-ms 0.8745,
+                        :p95-ms 2.970334,
+                        :p99-ms 87.957333,
+                        :max-ms 115.92575}}}},
+   :activation-ms 5350.016333},
+  :after
+  {:load
+   {:domain-events 1000000,
+    :transactions 100000,
+    :elapsed-ms 238671.151834},
+   :restart-verification
+   {:original-events 251000,
+    :original-markers 31000,
+    :receipts 749,
+    :receipt-markers 749,
+    :live-events 750,
+    :live-markers 750,
+    :survivor-sha256
+    "85794aa38cd1ef28d90b458c7525bfd29bedf2d4e799a8f2fef51cdf223c8428",
+    :passed? true},
+   :max-heap-bytes 4294967296,
+   :started-at "2026-10-31T18:03:22.162115Z",
+   :initial-estimates
+   [{:type :retention-scale/expired,
+     :elapsed-ms 30.823125,
+     :events 1000,
+     :transactions 91}
+    {:type :retention-scale/keyed,
+     :elapsed-ms 78.929292,
+     :events 1000,
+     :transactions 100}],
+   :arch "aarch64",
+   :verification
+   {:original-events 251000,
+    :original-markers 31000,
+    :receipts 749,
+    :receipt-markers 749,
+    :live-events 750,
+    :live-markers 750,
+    :survivor-sha256
+    "85794aa38cd1ef28d90b458c7525bfd29bedf2d4e799a8f2fef51cdf223c8428",
+    :passed? true},
+   :java "21.0.7",
+   :passed? true,
+   :concurrent-appends
+   {:samples 750,
+    :p50-ms 39.768416,
+    :p95-ms 119.76475,
+    :p99-ms 129.958083,
+    :max-ms 345.977834},
+   :storage {:database-bytes 721628307},
+   :completed-at "2026-10-31T18:04:54.095494Z",
+   :os "Mac OS X",
+   :fixture
+   {:domain-events 1000000,
+    :preseeded? true,
+    :events-per-append 10,
+    :key-count 1000,
+    :payload-characters 64,
+    :batch-size 1000,
+    :writer-pause-ms 20},
+   :backend :postgres,
+   :compaction
+   [{:type :retention-scale/expired,
+     :batches 550,
+     :deleted-events 550000,
+     :deleted-transactions 50000,
+     :elapsed-ms 43726.737542,
+     :events-per-second 12578.116523596555,
+     :batch-latency
+     {:samples 550,
+      :p50-ms 54.317375,
+      :p95-ms 139.8965,
+      :p99-ms 149.812208,
+      :max-ms 361.648875}}
+    {:type :retention-scale/keyed,
+     :batches 199,
+     :deleted-events 199000,
+     :deleted-transactions 19000,
+     :elapsed-ms 14119.118291,
+     :events-per-second 14094.364527482518,
+     :batch-latency
+     {:samples 199,
+      :p50-ms 60.020459,
+      :p95-ms 120.169583,
+      :p99-ms 130.644583,
+      :max-ms 137.547791}}],
+   :profile
+   #:retention-scale{:expired
+                     {:batches 550,
+                      :jdbc-calls {:min 15, :max 15, :total 8250},
+                      :timings
+                      {:batch-ms
+                       {:samples 550,
+                        :p50-ms 52.966125,
+                        :p95-ms 138.605334,
+                        :p99-ms 148.503625,
+                        :max-ms 360.205292},
+                       :selection-ms
+                       {:samples 550,
+                        :p50-ms 38.239667,
+                        :p95-ms 124.922583,
+                        :p99-ms 133.941917,
+                        :max-ms 177.984375},
+                       :marker-check-ms
+                       {:samples 550,
+                        :p50-ms 7.121042,
+                        :p95-ms 8.480167,
+                        :p99-ms 12.829208,
+                        :max-ms 62.304917},
+                       :delete-ms
+                       {:samples 550,
+                        :p50-ms 1.016791,
+                        :p95-ms 2.139916,
+                        :p99-ms 2.820958,
+                        :max-ms 4.294458},
+                       :receipt-insert-ms
+                       {:samples 550,
+                        :p50-ms 2.687833,
+                        :p95-ms 4.685501,
+                        :p99-ms 5.156833,
+                        :max-ms 11.044084000000002},
+                       :tenant-lock-wait-ms
+                       {:samples 550,
+                        :p50-ms 0.204583,
+                        :p95-ms 0.401417,
+                        :p99-ms 1.390875,
+                        :max-ms 8.068},
+                       :tenant-lock-held-ms
+                       {:samples 550,
+                        :p50-ms 52.336917,
+                        :p95-ms 138.044042,
+                        :p99-ms 147.877042,
+                        :max-ms 359.567709},
+                       :commit-return-ms
+                       {:samples 550,
+                        :p50-ms 0.773292,
+                        :p95-ms 2.056166,
+                        :p99-ms 4.455791,
+                        :max-ms 123.491916}}},
+                     :keyed
+                     {:batches 199,
+                      :jdbc-calls {:min 14, :max 16, :total 2824},
+                      :timings
+                      {:batch-ms
+                       {:samples 199,
+                        :p50-ms 58.619708,
+                        :p95-ms 118.538334,
+                        :p99-ms 129.416583,
+                        :max-ms 136.231708},
+                       :selection-ms
+                       {:samples 199,
+                        :p50-ms 46.044667,
+                        :p95-ms 103.672583,
+                        :p99-ms 116.17875,
+                        :max-ms 116.306875},
+                       :marker-check-ms
+                       {:samples 199,
+                        :p50-ms 6.22225,
+                        :p95-ms 7.195042,
+                        :p99-ms 12.904125,
+                        :max-ms 16.404583},
+                       :delete-ms
+                       {:samples 199,
+                        :p50-ms 1.145125,
+                        :p95-ms 2.092375,
+                        :p99-ms 2.291416,
+                        :max-ms 7.479958},
+                       :receipt-insert-ms
+                       {:samples 199,
+                        :p50-ms 2.547458,
+                        :p95-ms 4.4512920000000005,
+                        :p99-ms 9.538958000000001,
+                        :max-ms 11.497499999999999},
+                       :tenant-lock-wait-ms
+                       {:samples 199,
+                        :p50-ms 0.203625,
+                        :p95-ms 0.340125,
+                        :p99-ms 1.12325,
+                        :max-ms 1.269666},
+                       :tenant-lock-held-ms
+                       {:samples 199,
+                        :p50-ms 57.9185,
+                        :p95-ms 117.774667,
+                        :p99-ms 128.8315,
+                        :max-ms 135.633083},
+                       :commit-return-ms
+                       {:samples 199,
+                        :p50-ms 0.70775,
+                        :p95-ms 2.719042,
+                        :p99-ms 5.25725,
+                        :max-ms 7.125667}}}},
+   :activation-ms 5452.869083}}}

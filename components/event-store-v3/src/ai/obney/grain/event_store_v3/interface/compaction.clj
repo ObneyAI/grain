@@ -15,6 +15,8 @@
 (def compaction-receipt-type :grain.retention/compacted)
 
 (def protected-event-types
+  ;; Protected from direct policy selection. Transaction markers can only be
+  ;; removed as a consequence of deleting their last remaining member.
   #{:grain/tx
     policy-activated-type
     policy-deactivated-type
@@ -96,14 +98,39 @@
          (take limit)
          vec)))
 
+(defn removable-transaction-ids
+  "Find markers made empty by this batch. Backend callbacks are tenant-scoped:
+   transaction-after returns the next marker in ID order; any-existing? checks
+   member IDs without decoding their payloads. Use one snapshot for estimates
+   or compaction's lock for deletion.
+   Missing or inconsistent membership aborts rather than guessing ownership."
+  [deleted-ids transaction-after any-existing?]
+  (:removable
+   (reduce
+    (fn [{:keys [seen] :as result} event-id]
+      (if (contains? seen event-id)
+        result
+        (let [{:keys [event/id event/type event-ids]} (transaction-after event-id)]
+          (when-not (and id (= :grain/tx type) (set? event-ids)
+                         (contains? event-ids event-id))
+            (throw (ex-info "Retention event has no matching transaction marker"
+                            {:event/id event-id})))
+          (cond-> (update result :seen into event-ids)
+            (not (any-existing? (remove deleted-ids event-ids)))
+            (update :removable conj id)))))
+    {:seen #{} :removable #{}}
+    (sort deleted-ids))))
+
 (defprotocol EventCompaction
   (estimate [this request]
     "Advisory bounded eligibility selection; never authorizes or deletes history.
      Given identical activation, tenant state, evaluated-at and limit, returns
-     the same ordered event IDs compact! would select. Implementations must not
-     materialize unrelated event payloads to answer it.")
+     the same ordered event and transaction IDs compact! would select.
+     Implementations may decode affected markers, but not unrelated payloads.")
   (compact! [this request]
     "Atomically recheck activation, delete one bounded batch, and append its
-     permanent receipt and transaction marker. The request limit bounds selected
-     IDs; keyed policies may inspect target-type metadata needed to preserve each
-     retention group, but not unrelated payload history."))
+     permanent receipt and transaction marker. Also delete affected markers with
+     no surviving members. The request limit bounds selected domain IDs, with at
+     most that many additional markers. Keyed policies may inspect target-type
+     metadata needed to preserve each retention group, but not unrelated payload
+     history."))

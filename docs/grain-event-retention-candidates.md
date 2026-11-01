@@ -100,14 +100,16 @@ soak period.
 
 ## Transactions
 
-`:grain/tx` is not a retention candidate. Every v3 append creates a transaction
+`:grain/tx` is not an independent age-based retention candidate. Every v3 append creates a transaction
 event after its members, and the tenant watermark advances to its ID. The event
 contains original membership and optional transaction metadata.
 
 When a bounded-history member expires, its original transaction remains
-byte-for-byte unchanged. The compaction receipt proves why the member is no
-longer available. Reducing transaction volume should come from reducing needless
-appends, not expiring transaction entities.
+byte-for-byte unchanged as long as any member survives. The batch deleting the
+last member also deletes its transaction marker and metadata. This works across
+multiple batches and policies. The compaction receipt records separate exact
+sets of deleted domain-event and transaction-marker IDs. Empty-append markers
+are unaffected; markers for permanent policy events and receipts survive.
 
 Compaction receipts are retained indefinitely. They are audit facts, not
 candidates for the bounded-history technique assessed here.

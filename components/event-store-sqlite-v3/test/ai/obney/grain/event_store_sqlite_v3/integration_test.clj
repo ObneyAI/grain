@@ -148,8 +148,8 @@
                      (retention/estimate admin :sqlite-test/ephemeral *tenant-id* 1))]
       (is (= [(:event/id (first targets))] (:eligible-event-ids estimate)))
       ;; One lifecycle decode in the administration layer and one independent
-      ;; authorization decode in the backend; no tenant payload is decoded.
-      (is (= 2 @decode-count)))))
+      ;; authorization decode in the backend, plus the affected marker only.
+      (is (= 3 @decode-count)))))
 
 (deftest keyed-estimate-and-compact-share-the-metadata-selector
   (let [now (OffsetDateTime/now ZoneOffset/UTC)
@@ -1482,3 +1482,196 @@
       (is (= ::anom/conflict
              (::anom/category (tp/initialize-checkpoint! *event-store* *tenant-id* processor head))))
       (is (= head (es/head *event-store* *tenant-id*))))))
+
+(deftest retention-removes-transactions-only-after-the-last-member
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        other-tenant (uuid/v4)
+        node (uuid/v4)
+        event (fn [type tags value]
+                (es/->event {:type type :tags tags :body {:value value}}))
+        append! (fn [tenant events]
+                  (with-redefs [time/now (constantly old)]
+                    (es/append *event-store* {:tenant-id tenant :events events
+                                          :tx-metadata {:source "retention-test"}})))
+        read-all (fn [tenant]
+                   (into [] (es/read *event-store* {:tenant-id tenant})))
+        _ (append! *tenant-id* [])
+        _ (append! *tenant-id* [(event :sqlite-test/ephemeral #{} 0)
+                              (event :test/alpha #{} 0)])
+        members (append! *tenant-id* [(event :sqlite-test/ephemeral #{} 1)
+                                   (event :sqlite-test/ephemeral #{} 2)
+                                   (event :sqlite-test/keyed #{[:node node]} 3)])
+        marker (last (read-all *tenant-id*))
+        _ (append! *tenant-id* [(event :sqlite-test/keyed #{[:node node]} 4)])
+        _ (append! other-tenant [(event :sqlite-test/ephemeral #{} 5)])
+        original-markers (filterv #(= :grain/tx (:event/type %)) (read-all *tenant-id*))
+        other-before (read-all other-tenant)]
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (retention/activate! admin :sqlite-test/keyed)
+    (let [system-before (read-all compaction/system-tenant-id)]
+      (testing "partial deletion preserves the original markers and metadata"
+        (dotimes [_ 3]
+          (is (zero? (:eligible-transaction-count
+                      (retention/estimate admin :sqlite-test/ephemeral *tenant-id* 1))))
+          (is (= #{} (:retention/deleted-transaction-ids
+                       (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 1))))
+          (is (every? (set (read-all *tenant-id*)) original-markers))))
+      (testing "another policy removes the last member and its marker together"
+        (let [estimate (retention/estimate admin :sqlite-test/keyed *tenant-id* 1)
+              receipt (retention/compact! admin :sqlite-test/keyed *tenant-id* 1)
+              remaining (read-all *tenant-id*)
+              receipt-tx (last remaining)]
+          (is (= [(:event/id marker)] (:eligible-transaction-ids estimate)))
+          (is (= 1 (:eligible-transaction-count estimate)))
+          (is (= #{(:event/id (last members))} (:retention/deleted-event-ids receipt)))
+          (is (= #{(:event/id marker)} (:retention/deleted-transaction-ids receipt)))
+          (is (not-any? #(= (:event/id marker) (:event/id %)) remaining))
+          (is (every? (set remaining) (remove #{marker} original-markers)))
+          (is (= #{(:event/id receipt)} (:event-ids receipt-tx)))
+          (is (= (:event/id receipt-tx) (es/head *event-store* *tenant-id*)))
+          (is (= 1 (get-in (retention/status admin :sqlite-test/keyed *tenant-id*)
+                           [:latest-compaction :deleted-transaction-count])))
+          (is (nil? (retention/compact! admin :sqlite-test/keyed *tenant-id* 1)))
+          (is (= remaining (read-all *tenant-id*)))
+          ;; Every permanent receipt, including earlier batches, retains its tx.
+          (doseq [r (filter #(= compaction/compaction-receipt-type (:event/type %)) remaining)]
+            (is (some #(contains? (:event-ids %) (:event/id r)) remaining)))))
+      (is (= other-before (read-all other-tenant)))
+      (is (= system-before (read-all compaction/system-tenant-id))))))
+
+(deftest retention-failure-preserves-events-markers-and-watermark
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)]
+    (with-redefs [time/now (constantly old)]
+      (es/append *event-store*
+                   {:tenant-id *tenant-id*
+                    :events [(es/->event {:type :sqlite-test/ephemeral :body {:value 1}})]}))
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (let [before (into [] (es/read *event-store* {:tenant-id *tenant-id*}))
+          head (es/head *event-store* *tenant-id*)]
+      (with-redefs [sqlite-core/insert-events! (fn [& _] (throw (ex-info "injected receipt failure" {})))]
+        (is (thrown-with-msg? Exception #"injected receipt failure"
+              (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10))))
+      (is (= before (into [] (es/read *event-store* {:tenant-id *tenant-id*}))))
+      (is (= head (es/head *event-store* *tenant-id*)))
+      (let [receipt (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10)]
+        (is (= #{(:event/id (last before))} (:retention/deleted-transaction-ids receipt)))
+        (is (= 2 (count (into [] (es/read *event-store* {:tenant-id *tenant-id*})))))))))
+
+(deftest retention-removes-a-shared-marker-once-per-batch
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        members (with-redefs [time/now (constantly old)]
+                  (es/append *event-store*
+                               {:tenant-id *tenant-id*
+                                :events (mapv (fn [n]
+                                                (es/->event {:type :sqlite-test/ephemeral
+                                                                :body {:value n}}))
+                                              (range 3))}))
+        marker-id (es/head *event-store* *tenant-id*)]
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (let [estimate (retention/estimate admin :sqlite-test/ephemeral *tenant-id* 3)
+          receipt (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 3)
+          remaining (into [] (es/read *event-store* {:tenant-id *tenant-id*}))]
+      (is (= 3 (:eligible-count estimate)))
+      (is (= 1 (:eligible-transaction-count estimate)))
+      (is (= [marker-id] (:eligible-transaction-ids estimate)))
+      (is (= (set (map :event/id members)) (:retention/deleted-event-ids receipt)))
+      (is (= #{marker-id} (:retention/deleted-transaction-ids receipt)))
+      (is (= [compaction/compaction-receipt-type :grain/tx] (mapv :event/type remaining)))
+      (is (uuid/> (es/head *event-store* *tenant-id*) marker-id)))))
+
+(deftest retention-estimate-keeps-a-snapshot-during-concurrent-compaction
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        event (with-redefs [time/now (constantly old)]
+                (append-event! :sqlite-test/ephemeral #{} {:value 1}))
+        marker-id (es/head *event-store* *tenant-id*)
+        original @#'sqlite-core/removable-transaction-ids
+        compacted? (atom false)]
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (let [estimate
+          (with-redefs-fn
+            {#'sqlite-core/removable-transaction-ids
+             (fn [conn tenant-id eligible]
+               ;; Commit a competing compaction after the estimate selects its
+               ;; events but before it loads their markers, on another connection.
+               (when (compare-and-set! compacted? false true)
+                 (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10))
+               (original conn tenant-id eligible))}
+            #(retention/estimate admin :sqlite-test/ephemeral *tenant-id* 10))]
+      (is @compacted?)
+      (is (= [(:event/id event)] (:eligible-event-ids estimate)))
+      (is (= [marker-id] (:eligible-transaction-ids estimate)))
+      (is (nil? (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10))))))
+
+(deftest keyed-retention-probes-tags-by-event-without-planner-statistics
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        node (uuid/v4)
+        _ (with-redefs [time/now (constantly old)]
+            (dotimes [n 3]
+              (append-event! :sqlite-test/keyed #{[:node node]} {:value n})))
+        execute! jdbc/execute!
+        plan (atom nil)]
+    (retention/activate! admin :sqlite-test/keyed)
+    ;; The store was initialized empty, as in a fresh million-event load. Do not
+    ;; let ANALYZE hide a plan that scans tenant-wide ranges for each tag lookup.
+    (with-redefs [jdbc/execute!
+                  (fn [conn sql & [opts]]
+                    (when (clojure.string/includes? (first sql) "ROW_NUMBER()")
+                      (reset! plan (execute! conn
+                                             (into [(str "EXPLAIN QUERY PLAN " (first sql))]
+                                                   (rest sql)) opts)))
+                    (execute! conn sql opts))]
+      (is (= 2 (:eligible-count
+                (retention/estimate admin :sqlite-test/keyed *tenant-id* 10)))))
+    (is (seq @plan))
+    (doseq [alias ["k0" "c0"]]
+      (is (some #(and (clojure.string/includes? (:detail %) (str "SEARCH " alias " "))
+                      (clojure.string/includes? (:detail %) "tenant_id=? AND event_id=?"))
+                @plan)
+          (str alias " must probe tags for one event, not scan the tenant")))))
+
+(deftest compaction-yields-to-an-append-already-in-the-write-queue
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        entered (promise) release (promise)
+        order (atom [])
+        first? (atom true)
+        compact-direct @#'sqlite-core/compact-events-direct!
+        append-direct @#'sqlite-core/append-direct
+        coordinator (get-in *event-store* [:state ::sqlite-core/write-coordinator])]
+    (with-redefs [time/now (constantly old)]
+      (dotimes [n 2] (append-event! :sqlite-test/ephemeral #{} {:value n})))
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (with-redefs-fn
+      {#'sqlite-core/compact-events-direct!
+       (fn [store request]
+         (when (compare-and-set! first? true false)
+           (deliver entered true)
+           @release)
+         (swap! order conj :compact)
+         (compact-direct store request))
+       #'sqlite-core/append-direct
+       (fn [store args]
+         (swap! order conj :append)
+         (append-direct store args))}
+      (fn []
+        (let [first-batch (future (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 1))]
+          (try
+            (is (= true (deref entered 5000 ::timeout)))
+            (let [appended (future (append-event! :test/alpha #{} {:live true}))]
+              (loop [remaining 1000]
+                (when (and (zero? (.size (.getQueue coordinator))) (pos? remaining))
+                  (Thread/sleep 5)
+                  (recur (dec remaining))))
+              (is (= 1 (.size (.getQueue coordinator))))
+              (let [second-batch (future (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 1))]
+                (deliver release true)
+                (is (map? (deref first-batch 5000 ::timeout)))
+                (is (= :test/alpha (:event/type (deref appended 5000 ::timeout))))
+                (is (map? (deref second-batch 5000 ::timeout)))
+                (is (= [:compact :append :compact] @order))))
+            (finally (deliver release true))))))))

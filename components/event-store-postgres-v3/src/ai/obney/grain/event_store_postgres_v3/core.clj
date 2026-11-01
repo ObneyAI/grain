@@ -52,6 +52,8 @@
 
                         "CREATE INDEX IF NOT EXISTS idx_events_tenant_type ON grain.events(tenant_id, type);"
 
+                        "CREATE INDEX IF NOT EXISTS idx_events_tenant_type_id ON grain.events(tenant_id, type, id);"
+
                         "CREATE INDEX IF NOT EXISTS idx_events_tenant_type_time_id ON grain.events(tenant_id, type, time, id);"
 
                         "CREATE INDEX IF NOT EXISTS idx_events_tenant_tags_gin ON grain.events USING GIN (tags);"
@@ -444,40 +446,117 @@
           tenant-id (str event-type) cutoff-time limit]
          {:builder-fn rs/as-unqualified-lower-maps})))
 
+(defn- keyed-candidate-page
+  [conn tenant-id event-type cutoff-time limit tag-names after-id]
+  (let [names (into-array String tag-names)
+        key-count (count tag-names)
+        ;; The same extraction validates candidates and possible newest events:
+        ;; exactly one value for every governed name, ignoring unrelated tags.
+        key-query (str "SELECT array_agg(tag ORDER BY tag) AS key_tags "
+                       "FROM unnest(e.tags) tag WHERE split_part(tag, ':', 1) = ANY(?::text[]) "
+                       "HAVING count(*) = " key-count
+                       " AND count(DISTINCT split_part(tag, ':', 1)) = " key-count)
+        ;; One GIN lookup for each name's candidate values, rather than one
+        ;; lookup per key (which repeatedly scans the GIN pending list).
+        key-filters (repeat key-count
+                            (str "e.tags && ARRAY(SELECT DISTINCT tag FROM keys "
+                                 "CROSS JOIN unnest(key_tags) tag "
+                                 "WHERE split_part(tag, ':', 1) = ?)"))
+        ;; Large GIN unions become expensive while deleted index entries await
+        ;; vacuum. Above 64 candidate keys, scan the remaining ID suffix instead.
+        ;; Nothing before the first candidate can be its newest event (or the
+        ;; newest for any later candidate), so both paths produce the same keys.
+        latest-scope (str "FROM grain.events e WHERE e.tenant_id = ? AND e.type = ? "
+                          "AND e.id >= (SELECT id FROM candidates ORDER BY id LIMIT 1) ")
+        sql (str "WITH candidates AS MATERIALIZED ("
+                 "SELECT e.id, e.time, k.key_tags FROM grain.events e "
+                 "CROSS JOIN LATERAL (" key-query ") k "
+                 "WHERE e.tenant_id = ? AND e.type = ? AND e.time < ? "
+                 (when after-id "AND e.id > ? ")
+                 "ORDER BY e.id LIMIT ?), "
+                 "keys AS MATERIALIZED (SELECT DISTINCT key_tags FROM candidates), "
+                 "latest_input AS MATERIALIZED ("
+                 "SELECT e.id, e.tags " latest-scope
+                 "AND (SELECT count(*) FROM keys) <= 64 AND "
+                 (string/join " AND " key-filters)
+                 " UNION ALL SELECT e.id, e.tags " latest-scope
+                 "AND (SELECT count(*) FROM keys) > 64), "
+                 "latest AS MATERIALIZED ("
+                 "SELECT DISTINCT ON (k.key_tags) k.key_tags, e.id FROM latest_input e "
+                 "CROSS JOIN LATERAL (" key-query ") k "
+                 "JOIN keys ON keys.key_tags = k.key_tags "
+                 " ORDER BY k.key_tags, e.id DESC) "
+                 "SELECT c.id, c.time, c.id < l.id AS eligible FROM candidates c "
+                 "JOIN latest l ON l.key_tags = c.key_tags ORDER BY c.id")
+        params (into [sql names tenant-id (str event-type) cutoff-time]
+                     (concat (when after-id [after-id])
+                             [limit tenant-id (str event-type)] tag-names
+                             [tenant-id (str event-type) names]))]
+    (jdbc/execute! conn params {:builder-fn rs/as-unqualified-lower-maps})))
+
 (defn- keyed-eligible-metadata
   [conn tenant-id event-type cutoff-time limit tag-names]
   (set-tenant! conn tenant-id)
-  (let [tag-names (mapv key-fn (sort-by key-fn tag-names))
-        exact-counts (mapv (fn [_]
-                             "(SELECT COUNT(*) FROM unnest(e.tags) tag
-                               WHERE split_part(tag, ':', 1) = ?) = 1")
-                           tag-names)
-        sql (str "WITH keyed AS ("
-                 "SELECT e.id, e.time, "
-                 "ROW_NUMBER() OVER (PARTITION BY "
-                 "ARRAY(SELECT tag FROM unnest(e.tags) tag "
-                 "WHERE split_part(tag, ':', 1) = ANY(?::text[]) ORDER BY tag) "
-                 "ORDER BY e.id DESC) AS retention_rank "
-                 "FROM grain.events e "
-                 "WHERE e.tenant_id = ? AND e.type = ? AND "
-                 (string/join " AND " exact-counts)
-                 ") SELECT id, time FROM keyed "
-                 "WHERE time < ? AND retention_rank > 1 "
-                 "ORDER BY id LIMIT ?")
-        params (into [sql
-                      (into-array String tag-names)
-                      tenant-id
-                      (str event-type)]
-                     (concat tag-names [cutoff-time limit]))]
-    (mapv metadata->event
-          (jdbc/execute! conn params
-                         {:builder-fn rs/as-unqualified-lower-maps}))))
+  (let [tag-names (mapv key-fn (sort-by key-fn tag-names))]
+    ;; A page can contain protected newest events. Keep advancing until the
+    ;; original limit of eligible IDs is filled, or history is exhausted.
+    (loop [after-id nil selected []]
+      (let [page (keyed-candidate-page conn tenant-id event-type cutoff-time
+                                      limit tag-names after-id)
+            selected (into selected (comp (filter :eligible) (map metadata->event)) page)]
+        (if (or (>= (count selected) limit) (< (count page) limit))
+          (vec (take limit selected))
+          (recur (:id (peek page)) selected))))))
 
 (defn- eligible-event-metadata
   [conn tenant-id event-type policy cutoff-time limit]
   (if-let [tag-names (seq (get-in policy [:keep-latest-per :tags]))]
     (keyed-eligible-metadata conn tenant-id event-type cutoff-time limit tag-names)
     (unkeyed-eligible-metadata conn tenant-id event-type cutoff-time limit)))
+
+(defn- removable-transaction-ids [conn tenant-id eligible]
+  (if (empty? eligible)
+    #{}
+    (let [deleted-ids (set (map :event/id eligible))
+          ;; Resolve ownership in one server round trip, then fetch each marker
+          ;; once. LEFT JOIN preserves missing ownership so it fails closed.
+          rows (jdbc/execute!
+                conn
+                [(str "WITH owners AS MATERIALIZED ("
+                      "SELECT selected.id AS event_id, ("
+                      "SELECT id FROM grain.events WHERE tenant_id = ? AND type = ? "
+                      "AND id > selected.id ORDER BY id LIMIT 1) AS tx_id "
+                      "FROM unnest(?::uuid[]) selected(id)), "
+                      "members AS (SELECT tx_id, array_agg(event_id) AS selected_ids "
+                      "FROM owners GROUP BY tx_id) "
+                      "SELECT tx.id, tx.time, tx.type, tx.tags, tx.data, members.selected_ids "
+                      "FROM members LEFT JOIN grain.events tx "
+                      "ON tx.tenant_id = ? AND tx.id = members.tx_id")
+                 tenant-id (str :grain/tx) (into-array java.util.UUID deleted-ids) tenant-id]
+                {:builder-fn rs/as-unqualified-lower-maps})
+          markers (mapv
+                   (fn [row]
+                     (let [selected (vec (.getArray ^java.sql.Array (:selected_ids row)))
+                           marker (when (:id row) (transform-row row))
+                           members (:event-ids marker)]
+                       (when-not (and (= :grain/tx (:event/type marker)) (set? members)
+                                      (every? members selected))
+                         (throw (ex-info "Retention event has no matching transaction marker"
+                                         {:event/id (first (remove #(contains? members %) selected))})))
+                       marker)) rows)
+          other-ids (into #{} (comp (mapcat :event-ids) (remove deleted-ids)) markers)
+          ;; Chunk very wide transactions, independently of the number of
+          ;; affected markers. Existence checks never decode member payloads.
+          existing (into #{}
+                         (mapcat (fn [ids]
+                                   (map :id
+                                        (jdbc/execute!
+                                         conn
+                                         ["SELECT id FROM grain.events WHERE tenant_id = ? AND id = ANY(?::uuid[])"
+                                          tenant-id (into-array java.util.UUID ids)]
+                                         {:builder-fn rs/as-unqualified-lower-maps}))))
+                         (partition-all 5000 other-ids))]
+      (into #{} (comp (remove #(some existing (:event-ids %))) (map :event/id)) markers))))
 
 (defn- postgres-compaction-context [conn {:keys [activation tenant-id limit evaluated-at]}]
   (let [{:keys [event/type policy]} activation
@@ -488,16 +567,22 @@
                (not (contains? compaction/protected-event-types type))
                (compaction/activation-matches? lifecycle activation))
       (let [cutoff (compaction/cutoff (or evaluated-at (time/now))
-                                      (:retain-at-least policy))]
+                                      (:retain-at-least policy))
+            eligible (eligible-event-metadata conn tenant-id type policy cutoff limit)]
         {:cutoff cutoff
-         :eligible (eligible-event-metadata
-                    conn tenant-id type policy cutoff limit)}))))
+         :eligible eligible
+         :transaction-ids (removable-transaction-ids conn tenant-id eligible)}))))
 
 (defn estimate-compaction [event-store request]
-  (jdbc/with-transaction [conn (get-in event-store [:state ::connection-pool])]
-    (if-let [{:keys [cutoff eligible]} (postgres-compaction-context conn request)]
+  ;; Selection and marker/member lookups must see one snapshot even if another
+  ;; worker compacts the selected events while this advisory estimate runs.
+  (jdbc/with-transaction [conn (get-in event-store [:state ::connection-pool])
+                         {:isolation :repeatable-read :read-only true}]
+    (if-let [{:keys [cutoff eligible transaction-ids]} (postgres-compaction-context conn request)]
       {:eligible-count (count eligible)
        :eligible-event-ids (mapv :event/id eligible)
+       :eligible-transaction-count (count transaction-ids)
+       :eligible-transaction-ids (vec (sort transaction-ids))
        :cutoff cutoff}
       {:eligible-count 0 :authorized? false})))
 
@@ -507,9 +592,10 @@
     (doseq [lock-key (sort [(tenant-lock-key compaction/system-tenant-id)
                             (tenant-lock-key tenant-id)])]
       (jdbc/execute! conn ["SELECT pg_advisory_xact_lock(?)" lock-key]))
-    (if-let [{:keys [cutoff eligible]} (postgres-compaction-context conn request)]
+    (if-let [{:keys [cutoff eligible transaction-ids]} (postgres-compaction-context conn request)]
       (when (seq eligible)
         (let [deleted-ids (set (map :event/id eligible))
+              all-deleted-ids (into deleted-ids transaction-ids)
               _ (set-tenant! conn tenant-id)
               last-id (committed-last-event-id conn tenant-id)
               receipt {:event/type compaction/compaction-receipt-type
@@ -519,15 +605,16 @@
                        :retention/policy (:policy activation)
                        :retention/tenant-id tenant-id
                        :retention/cutoff cutoff
-                       :retention/deleted-event-ids deleted-ids}
+                       :retention/deleted-event-ids deleted-ids
+                       :retention/deleted-transaction-ids transaction-ids}
               {:keys [events events-with-tx last-event-id]}
               (prepare-append last-id [receipt]
                               {:grain/operation :retention-compaction})]
           (jdbc/execute! conn
                          (into [(str "DELETE FROM grain.events WHERE tenant_id = ? AND id IN ("
-                                     (placeholders (count deleted-ids)) ")")
+                                     (placeholders (count all-deleted-ids)) ")")
                                 tenant-id]
-                               deleted-ids))
+                               all-deleted-ids))
           (jdbc/execute! conn ["INSERT INTO grain.tenants (id, last_event_id) VALUES (?, ?)
                                 ON CONFLICT (id) DO UPDATE SET last_event_id = ?"
                                tenant-id last-event-id last-event-id])
