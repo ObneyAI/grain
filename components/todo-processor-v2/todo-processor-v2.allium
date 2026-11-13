@@ -135,7 +135,7 @@ value HandlerResult {
     cas: CasPredicate? when outcome = cas
 
     transitions outcome {
-        terminal: empty, pure, effect, cas, failed
+        terminal: empty, pure, effect, cas, failed, busy
     }
 }
 
@@ -160,6 +160,20 @@ value CasPredicate {}
 -- ordered, CAS-capable append; they live as contract invariants, not entity
 -- state.
 contract EventLog {
+    @invariant StorageFailureIsNotCheckpointSuccess
+        -- Storage owns transient contention retries. An exhausted checkpoint
+        -- append preserves the busy anomaly and does not count as completed
+        -- processing; other storage failures retain their fault classification. An
+        -- effect with checkpoint-before runs only after checkpoint commit;
+        -- neither conflict nor busy nor another append failure permits the effect.
+        -- A failed write stops the current tenant's batch before any later event
+        -- can be checkpointed. Pollers resume from the last durable checkpoint
+        -- on their next cycle. Startup catch-up fails before live subscription
+        -- if it cannot persist its progress. A CAS conflict that reflects an
+        -- already committed checkpoint retains its existing replay semantics.
+        -- Busy outcomes returned through a handler (including a command writer)
+        -- remain retryable storage failures, not permanent handler rejections
+        -- that may be checkpointed and skipped.
     -- The domain tenants currently known, each with the position of its newest
     -- event (its high watermark). Used to detect which tenants have new work.
     domain_tenants: () -> Set<Tenant>
@@ -362,9 +376,9 @@ contract TodoTelemetry {
 -- but appends nothing; `pure` appends events and is batch-checkpointed; `effect`
 -- runs an opaque side effect under a delivery mode; `cas` appends events under a
 -- handler-supplied compare-and-swap predicate; `failed` is a handler that returned
--- nothing usable (nil or an anomaly) or threw, routed to the checkpoint-and-skip
--- path rather than to an append.
-enum HandlerOutcome { empty | pure | effect | cas | failed }
+-- nothing usable (nil or a non-busy anomaly) or threw, routed to the checkpoint-and-skip
+-- path rather than to an append. `busy` leaves the event pending for retry.
+enum HandlerOutcome { empty | pure | effect | cas | failed | busy }
 
 -- Whether an effect is recorded after it runs (at-least-once) or before it runs
 -- (at-most-once).
@@ -468,7 +482,7 @@ rule ProcessEvent {
         -- Failure is detected here, in the same funnel, not on a separate stimulus.
         if result.outcome = failed:
             HandlerFailed(processor: processor, tenant: tenant, event: event)
-        else:
+        else if result.outcome != busy:
             ProcessOutcome(processor: processor, tenant: tenant, event: event, result: result)
 
     @guidance
@@ -493,23 +507,24 @@ rule ProcessPure {
     when: ProcessOutcome(processor, tenant, event, result)
     requires: result.outcome in {empty, pure}
     ensures:
-        let _ = EventLog.append_with_checkpoint(
+        let outcome = EventLog.append_with_checkpoint(
             tenant: tenant,
             events: result.events,
             checkpoint_for: event,
             conflict_threshold: event
         )
-        let cp = Checkpoint{processor: processor, tenant: tenant}
-        if exists cp:
-            cp.watermark = event
-            cp.kind = batch_range
-        else:
-            Checkpoint.created(
-                processor: processor,
-                tenant: tenant,
-                watermark: event,
-                kind: batch_range
-            )
+        if append_succeeded(outcome):
+            let cp = Checkpoint{processor: processor, tenant: tenant}
+            if exists cp:
+                cp.watermark = event
+                cp.kind = batch_range
+            else:
+                Checkpoint.created(
+                    processor: processor,
+                    tenant: tenant,
+                    watermark: event,
+                    kind: batch_range
+                )
 
     @guidance
         -- Batch checkpointing groups the pure results of a poll cycle and records
@@ -562,18 +577,19 @@ rule ProcessEffectAtLeastOnce {
             -- atomically; a raised effect still commits a checkpoint so the event
             -- is not retried forever.
             RunEffect(effect: result.effect)
-            let _ = EventLog.append_with_checkpoint(
+            let outcome = EventLog.append_with_checkpoint(
                 tenant: tenant,
                 events: result.events,
                 checkpoint_for: event,
                 conflict_threshold: event
             )
-            Checkpoint.created(
-                processor: processor,
-                tenant: tenant,
-                watermark: event,
-                kind: single
-            )
+            if append_succeeded(outcome):
+                Checkpoint.created(
+                    processor: processor,
+                    tenant: tenant,
+                    watermark: event,
+                    kind: single
+                )
 
     @guidance
         -- The replay guard lives in this path itself: before running the effect it
@@ -587,31 +603,27 @@ rule ProcessEffectAtLeastOnce {
 }
 
 -- At-most-once effect: commit the checkpoint first, then run the effect only if
--- the checkpoint append was not already rejected as a conflict. A replay's
+-- the checkpoint append succeeded. A replay's
 -- checkpoint append conflicts, so the effect is skipped — the effect fires at
 -- most once, trading a possible lost effect on crash for never duplicating it.
 rule ProcessEffectAtMostOnce {
     when: ProcessOutcome(processor, tenant, event, result)
     requires: result.outcome = effect
     requires: result.checkpoint_mode = before
-    let prior = Checkpoint{processor: processor, tenant: tenant}
-    let claimed = not exists prior or prior.watermark.event_id < event.event_id
     ensures:
-        let _ = EventLog.append_with_checkpoint(
+        let outcome = EventLog.append_with_checkpoint(
             tenant: tenant,
             events: result.events,
             checkpoint_for: event,
             conflict_threshold: event
         )
-        Checkpoint.created(
-            processor: processor,
-            tenant: tenant,
-            watermark: event,
-            kind: single
-        )
-        -- The effect runs only when the checkpoint append committed (no prior
-        -- checkpoint already covered this event); a conflicting replay skips it.
-        if claimed:
+        if append_succeeded(outcome):
+            Checkpoint.created(
+                processor: processor,
+                tenant: tenant,
+                watermark: event,
+                kind: single
+            )
             RunEffect(effect: result.effect)
 
     @guidance
@@ -630,21 +642,22 @@ rule SkipFailedEvent {
     when: HandlerFailed(processor, tenant, event)
     requires: not config.retry_on_error
     ensures:
-        let _ = EventLog.append_with_checkpoint(
+        let outcome = EventLog.append_with_checkpoint(
             tenant: tenant,
             events: {},
             checkpoint_for: event,
             conflict_threshold: event
         )
-        Checkpoint.created(
-            processor: processor,
-            tenant: tenant,
-            watermark: event,
-            kind: single
-        )
+        if append_succeeded(outcome):
+            Checkpoint.created(
+                processor: processor,
+                tenant: tenant,
+                watermark: event,
+                kind: single
+            )
 
     @guidance
-        -- A poison event (handler returns nil/anomaly or raises) is checkpointed
+        -- A poison event (handler returns nil/a non-busy anomaly or raises) is checkpointed
         -- with no output so the watermark advances past it and the stream keeps
         -- moving. With retry_on_error true no checkpoint is written and the event
         -- is retried on the next pass — the escape hatch for transient failures

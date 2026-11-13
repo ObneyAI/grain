@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
+            [ai.obney.grain.event-store-v3.interface.write-retry :as retry]
             [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append single-tag-union]]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.event-store-sqlite-v3.interface.datasource :as datasource]
@@ -15,7 +16,7 @@
             [clojure.string :as string])
   (:import [java.time OffsetDateTime]
            [java.util UUID]
-           [java.sql Connection SQLException]
+           [java.sql Connection]
            [java.util.concurrent ArrayBlockingQueue Callable CancellationException
             ExecutionException FutureTask RejectedExecutionException ThreadFactory
             ThreadPoolExecutor ThreadPoolExecutor$AbortPolicy TimeUnit]))
@@ -90,6 +91,7 @@
 
 (defn start
   [config]
+  (retry/policy config :sqlite)
   (u/trace
    ::starting-event-store
    []
@@ -132,11 +134,7 @@
         thread-number (atom 0)]
     (when-not (pos? capacity)
       (throw (IllegalArgumentException. ":write-queue-capacity must be positive")))
-    (doseq [[key default] [[:busy-timeout-ms 1000]
-                           [:busy-max-retries 3]
-                           [:busy-retry-backoff-ms 10]
-                           [:busy-retry-max-backoff-ms 250]
-                           [:write-shutdown-timeout-ms 5000]]]
+    (doseq [[key default] [[:write-shutdown-timeout-ms 5000]]]
       (when (neg? (long (get config key default)))
         (throw (IllegalArgumentException. (str key " must not be negative")))))
     (ThreadPoolExecutor.
@@ -417,7 +415,10 @@
                 result)))
         (catch Throwable t
           (when-not @completed?
-            (try (jdbc/execute! conn ["ROLLBACK"]) (catch Throwable _ nil)))
+            (try (jdbc/execute! conn ["ROLLBACK"])
+                 (catch Throwable rollback-error
+                   (throw (ex-info "Rollback failed"
+                                   {::retry/unsafe true :rollback rollback-error} t)))))
           (throw t))))))
 
 (defn- conn-reducible
@@ -440,33 +441,13 @@
                     (jdbc/plan conn (into [sql] params)))]
         (if (= result ::none) (f) result)))))
 
-(defn- sqlite-contention?
-  [throwable]
-  (loop [cause throwable]
-    (cond
-      (nil? cause) false
-      (and (instance? SQLException cause)
-           (contains? #{5 6} (.getErrorCode ^SQLException cause))) true
-      :else (recur (.getCause ^Throwable cause)))))
-
-(defn- retry-backoff-ms
-  [config retry-number]
-  (let [initial (long (or (:busy-retry-backoff-ms config) 10))
-        maximum (long (or (:busy-retry-max-backoff-ms config) 250))]
-    (loop [remaining (dec retry-number)
-           delay (min initial maximum)]
-      (if (or (zero? remaining) (= delay maximum))
-        delay
-        (recur (dec remaining)
-               (if (> delay (quot maximum 2)) maximum (* 2 delay)))))))
-
 (defn- append-direct
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
   (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
-      (long (or (get-in event-store [:config :busy-timeout-ms]) 1000))
+      (:write-lock-timeout-ms (retry/policy (:config event-store) :sqlite))
       (fn [conn]
         (let [last-id (committed-last-event-id conn tenant-id)
               persist! (fn []
@@ -487,43 +468,21 @@
                   anomaly)))
             (persist!)))))))
 
-(defn- append-with-busy-retry
-  [event-store args]
-  (let [config (:config event-store)
-        max-retries (long (or (:busy-max-retries config) 3))]
-    (loop [attempt 0]
-      (let [[status value]
-            (try
-              [:ok (u/trace ::write-transaction
-                     [:metric/name "SQLiteWriteTransaction"
-                      :metric/resolution :high
-                      :attempt (inc attempt)]
-                     (append-direct event-store args))]
-              (catch Throwable t [:error t]))]
-        (if (= :ok status)
-          value
-          (if (and (sqlite-contention? value) (< attempt max-retries))
-            (let [retry-number (inc attempt)
-                  backoff-ms (retry-backoff-ms config retry-number)]
-              (u/log :metric/metric
-                     :metric/name "SQLiteBusyRetry"
-                     :metric/value 1
+(defn- write-with-busy-retry
+  [event-store operation write-fn]
+  (let [attempt (atom 0)
+        result (retry/transaction
+                 (:config event-store) :sqlite operation
+                 #(retry/sql-contention? :sqlite %)
+                 #(u/trace ::write-transaction
+                    [:metric/name "SQLiteWriteTransaction"
                      :metric/resolution :high
-                     :retry retry-number
-                     :backoff-ms backoff-ms)
-              (Thread/sleep backoff-ms)
-              (recur retry-number))
-            (if (sqlite-contention? value)
-              (do
-                (u/log :metric/metric
-                       :metric/name "SQLiteBusyExhausted"
-                       :metric/value 1
-                       :metric/resolution :high
-                       :attempts (inc attempt))
-                {::anom/category ::anom/busy
-                 ::anom/message "SQLite event-store contention limit exhausted"
-                 ::busy-attempts (inc attempt)})
-              (throw value))))))))
+                     :attempt (swap! attempt inc)]
+                    (write-fn)))]
+    ;; Preserve the legacy diagnostic key as well as the common result shape.
+    (cond-> result
+      (:event-store/attempts result)
+      (assoc ::busy-attempts (:event-store/attempts result)))))
 
 (defn- submit-write
   "Serialize appends and compaction through the same bounded FIFO. A compactor
@@ -554,6 +513,9 @@
              :metric/resolution :low)
       (try
         (.get task)
+        (catch InterruptedException e
+          (.cancel task true)
+          (throw e))
         (catch ExecutionException e
           (throw (.getCause e)))
         (catch CancellationException e
@@ -575,7 +537,8 @@
                     [:metric/name "SQLiteAppend"
                      :metric/resolution :high
                      :queue-wait-ns queue-wait-ns]
-                    (append-with-busy-retry event-store args)))))
+                    (write-with-busy-retry event-store :append
+                                          #(append-direct event-store args))))))
 
 ;; ----------- ;;
 ;; Tenants     ;;
@@ -724,7 +687,7 @@
   (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
-      (long (or (get-in event-store [:config :busy-timeout-ms]) 1000))
+      (:write-lock-timeout-ms (retry/policy (:config event-store) :sqlite))
       (fn [conn]
         (if-let [{:keys [cutoff eligible transaction-ids]} (sqlite-compaction-context conn request)]
           (when (seq eligible)
@@ -761,7 +724,8 @@
                     [:metric/name "SQLiteCompaction"
                      :metric/resolution :high
                      :queue-wait-ns queue-wait-ns]
-                    (compact-events-direct! event-store request)))))
+                    (write-with-busy-retry event-store :compact
+                                          #(compact-events-direct! event-store request))))))
 
 ;; ----------------- ;;
 ;; Record Definition ;;

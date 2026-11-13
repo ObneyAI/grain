@@ -94,6 +94,15 @@ contract ProcessingHandoff {
         -- reprocessing.
 }
 
+contract CoordinationWrites {
+    @invariant FailedWriteIsNotSuccess
+        -- Heartbeats, departures and lease changes are successful only after
+        -- their events commit. Exhausted storage contention is reported as a
+        -- failure, never counted as a successful heartbeat or lease change.
+        -- Periodic coordination tries again on its next scheduled cycle using
+        -- committed state; it adds no immediate retry loop around storage retries.
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -311,6 +320,9 @@ surface NodeLifecycle {
     provides:
         NodeSendsHeartbeat(node)
         NodeStops(node)
+
+    contracts:
+        fulfils CoordinationWrites
 }
 
 -- The cluster-wide coordination boundary this spec fulfils.
@@ -319,6 +331,7 @@ surface ClusterCoordination {
 
     contracts:
         fulfils AssignmentPolicy
+        fulfils CoordinationWrites
 
     @guarantee TenantIsolation
         -- CP8: control-plane coordination state lives under a reserved tenant

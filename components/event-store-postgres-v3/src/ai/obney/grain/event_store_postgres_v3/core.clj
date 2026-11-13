@@ -5,6 +5,7 @@
             [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append single-tag-union]]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.event-store-postgres-v3.interface.datasource :as datasource]
+            [ai.obney.grain.event-store-v3.interface.write-retry :as retry]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
@@ -83,6 +84,7 @@
 
 (defn start
   [config]
+  (retry/policy config)
   (u/trace
    ::starting-event-store
    []
@@ -341,7 +343,7 @@
                               tenant-id])
           :tenants/last_event_id))
 
-(defn append
+(defn- append-once
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
   (let [pool (get-in event-store [:state ::connection-pool])]
@@ -352,7 +354,9 @@
       ;; Set tenant context for RLS
       (jdbc/execute! conn [(str "SET LOCAL app.tenant_id = '" (str tenant-id) "'")])
       ;; Per-tenant advisory lock
-      (jdbc/execute! conn ["SET LOCAL lock_timeout = '5000ms'"])
+      (jdbc/execute! conn [(str "SET LOCAL lock_timeout = '"
+                                (:write-lock-timeout-ms (retry/policy (:config event-store)))
+                                "ms'")])
       (jdbc/execute! conn ["SELECT pg_advisory_xact_lock(?)" (tenant-lock-key tenant-id)])
       (let [last-id (committed-last-event-id conn tenant-id)
             persist! (fn []
@@ -402,6 +406,11 @@
                                    :outcome "failed"})
         (throw throwable))
       (finally (sample-pool! pool)))))
+
+(defn append [event-store args]
+  (retry/transaction (:config event-store) :postgres :append
+                     #(retry/sql-contention? :postgres %)
+                     #(append-once event-store args)))
 
 (defn tenants
   [event-store]
@@ -586,9 +595,11 @@
        :cutoff cutoff}
       {:eligible-count 0 :authorized? false})))
 
-(defn compact-events! [event-store {:keys [activation tenant-id] :as request}]
+(defn- compact-events-once! [event-store {:keys [activation tenant-id] :as request}]
   (jdbc/with-transaction [conn (get-in event-store [:state ::connection-pool])]
-    (jdbc/execute! conn ["SET LOCAL lock_timeout = '5000ms'"])
+    (jdbc/execute! conn [(str "SET LOCAL lock_timeout = '"
+                              (:write-lock-timeout-ms (retry/policy (:config event-store)))
+                              "ms'")])
     (doseq [lock-key (sort [(tenant-lock-key compaction/system-tenant-id)
                             (tenant-lock-key tenant-id)])]
       (jdbc/execute! conn ["SELECT pg_advisory_xact_lock(?)" lock-key]))
@@ -622,6 +633,11 @@
           (first events)))
       (throw (ex-info "Retention compaction is not authorized by the active policy"
                       {:request request})))))
+
+(defn compact-events! [event-store request]
+  (retry/transaction (:config event-store) :postgres :compact
+                     #(retry/sql-contention? :postgres %)
+                     #(compact-events-once! event-store request)))
 
 ;; ----------------- ;;
 ;; Record Definition ;;

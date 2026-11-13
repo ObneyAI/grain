@@ -56,8 +56,15 @@
       (if (:command-processor/skip-event-storage context)
         result
         (let [cas (:command-result/cas result)
-              event-store-result (event-store/append event-store (cond-> {:tenant-id tenant-id :events events}
-                                                                   cas (assoc :cas cas)))]
+              event-store-result
+              (try
+                (event-store/append event-store (cond-> {:tenant-id tenant-id :events events}
+                                                 cas (assoc :cas cas)))
+                (catch Exception e
+                  (u/log ::event-append-exception
+                         :error e :command (get-in context [:command :command/name]))
+                  {::anom/category ::anom/fault
+                   ::anom/message (format "Error storing events: %s" (.getMessage e))}))]
           (if-not (anomaly? event-store-result)
             result
             (do

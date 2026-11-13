@@ -107,21 +107,19 @@ obneyai/grain-event-store-sqlite-v3
  :deps/root "projects/grain-event-store-sqlite-v3"}
 ```
 
-SQLite contention policy is configured inside `:conn`:
+SQLite connection options (`:conn`):
 
 ```clojure
 {:type :sqlite
  :database-file "grain.sqlite"
  :maximum-pool-size 4
  :write-queue-capacity 1024
- :busy-timeout-ms 1000
- :busy-max-retries 3
- :busy-retry-backoff-ms 10
- :busy-retry-max-backoff-ms 250
+ :write-lock-timeout-ms 5000
+ :write-max-retries 3
+ :write-retry-backoff-ms 100
+ :write-retry-max-backoff-ms 400
  :write-shutdown-timeout-ms 5000}
 ```
-
-The queue admits one active write plus `:write-queue-capacity` waiting writes. A full queue returns a `cognitect.anomalies/busy` result immediately. SQLite busy/locked results retry the complete transaction with capped exponential backoff; exhaustion also returns a busy anomaly rather than exposing a raw `SQLITE_BUSY` exception. Keep at least two pooled connections when reads must proceed alongside a writer; the default is four. A larger pool can serve more simultaneous reads, but still cannot create a second SQLite writer. Grain emits μ/log metrics named `SQLiteWriteQueueDepth`, `SQLiteWriteQueueWait`, `SQLiteAppend`, `SQLiteWriteTransaction`, `SQLiteBusyRetry`, `SQLiteBusyExhausted`, and `SQLiteWriteQueueSaturated`.
 
 ## grain-mulog-aws-cloudwatch-emf-publisher
 

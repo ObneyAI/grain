@@ -2,16 +2,31 @@
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
+            [ai.obney.grain.event-store-v3.interface.write-retry :as retry]
             [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
             [ai.obney.grain.time.interface :as time]
             [cognitect.anomalies :as anom]
             [clojure.set :as set]
             [com.brunobonacci.mulog :as u]
-            [clj-uuid :as uuid]))
+            [clj-uuid :as uuid])
+  (:import [java.util.concurrent TimeUnit]
+           [java.util.concurrent.locks ReentrantLock]))
 
 (defn start
-  [_config]
-  (ref {:events [] :tenants {}}))
+  [config]
+  (retry/policy config)
+  (ref {:events [] :tenants {}} :meta {::write-lock (ReentrantLock. true)}))
+
+(defn- write-transaction [event-store operation f]
+  (let [config (:config event-store)
+        timeout (:write-lock-timeout-ms (retry/policy config))
+        ^ReentrantLock lock (::write-lock (meta (:state event-store)))]
+    (retry/transaction
+     config :in-memory operation #(true? (::lock-timeout (ex-data %)))
+     (fn []
+       (if (.tryLock lock timeout TimeUnit/MILLISECONDS)
+         (try (f) (finally (.unlock lock)))
+         (throw (ex-info "In-memory write lock timeout" {::lock-timeout true})))))))
 
 (defn stop
   [state]
@@ -106,7 +121,7 @@
 (defn- tag-events-with-tenant [tenant-id events]
   (mapv #(assoc % :grain/tenant-id tenant-id) events))
 
-(defn append
+(defn- append-once
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
   (u/trace
@@ -138,6 +153,9 @@
               (u/log :grain/cas-failed :anomaly anomaly)
               anomaly)))
         (persist!))))))
+
+(defn append [event-store args]
+  (write-transaction event-store :append #(append-once event-store args)))
 
 (defn tenants
   [event-store]
@@ -180,7 +198,7 @@
      :cutoff cutoff}
     {:eligible-count 0 :authorized? false}))
 
-(defn compact!
+(defn- compact-once!
   [event-store {:keys [activation tenant-id] :as request}]
   (dosync
    (let [state @(:state event-store)]
@@ -217,6 +235,9 @@
            (first events)))
        (throw (ex-info "Retention compaction is not authorized by the active policy"
                        {:request request}))))))
+
+(defn compact! [event-store request]
+  (write-transaction event-store :compact #(compact-once! event-store request)))
 
 (defrecord InMemoryEventStore [config]
   p/EventStore

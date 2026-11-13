@@ -92,6 +92,8 @@
    "PostgresPoolPending" [:gauge :count :standard]
    "PostgresPoolSaturated" [:counter :count :standard]
    "PostgresTransactionFailed" [:counter :count :standard]
+   "EventStoreWriteRetry" [:counter :count :standard]
+   "EventStoreWriteContentionExhausted" [:counter :count :standard]
    "PostgresNotificationFailed" [:counter :count :standard]
    "TodoProcessed" [:timer :milliseconds :high]
    "ReadModelL1Hit" [:timer :milliseconds :high]
@@ -169,6 +171,8 @@
    "EventReadEventCount" #{:backend :operation :outcome}
    "EventCasConflict" #{:backend :operation :outcome}
    "EventStoreConnectionFailure" #{:backend :operation :outcome}
+   "EventStoreWriteRetry" #{:backend :operation}
+   "EventStoreWriteContentionExhausted" #{:backend :operation}
    "PostgresPoolActive" #{:backend :operation :outcome}
    "PostgresPoolIdle" #{:backend :operation :outcome}
    "PostgresPoolPending" #{:backend :operation :outcome}

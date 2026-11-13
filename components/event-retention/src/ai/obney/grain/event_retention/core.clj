@@ -98,9 +98,10 @@
                                       compaction/policy-deactivated-type}
                              :predicate-fn
                              #(nil? (compaction/active-activation % event-type))}})]
-          (if (= ::anom/conflict (::anom/category result))
-            (recur)
-            (let [persisted (first result)]
+          (cond
+            (= ::anom/conflict (::anom/category result)) (recur)
+            (::anom/category result) result
+            :else (let [persisted (first result)]
               {:event/type event-type
                :policy policy
                :activation/id (:event/id persisted)
@@ -122,9 +123,10 @@
                              :predicate-fn
                              #(= active
                                  (compaction/active-activation % event-type))}})]
-          (if (= ::anom/conflict (::anom/category result))
-            (recur)
-            (assoc active :active? false)))
+          (cond
+            (= ::anom/conflict (::anom/category result)) (recur)
+            (::anom/category result) result
+            :else (assoc active :active? false)))
         nil))))
 
 (defn estimate [admin event-type tenant-id limit]

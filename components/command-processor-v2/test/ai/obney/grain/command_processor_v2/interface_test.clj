@@ -56,6 +56,27 @@
 
 (use-fixtures :each event-store-fixture)
 
+(deftest event-append-exception-returns-fault-without-rerunning-handler
+  (let [handler-calls (atom 0)
+        append-calls (atom 0)
+        command {:command/name :test/create-with-events
+                 :command/id (uuid/v4)
+                 :command/timestamp (OffsetDateTime/now)}
+        context {:command command
+                 :tenant-id (random-uuid)
+                 :event-store *event-store*
+                 :command-registry
+                 {:test/create-with-events
+                  {:handler-fn (fn [_]
+                                 (swap! handler-calls inc)
+                                 {:command-result/events []})}}}]
+    (with-redefs [es/append (fn [& _]
+                             (swap! append-calls inc)
+                             (throw (java.sql.SQLException. "lock timeout" "55P03")))]
+      (is (= ::anom/fault (::anom/category (cp/process-command context)))))
+    (is (= 1 @handler-calls))
+    (is (= 1 @append-calls))))
+
 ;; Test Helpers
 
 (defn make-command
@@ -86,6 +107,22 @@
                                               :mulog/event-name event-name)))]
       (f))
     (filterv :metric/name @events)))
+
+;; Allium: EventAppend.StorageFailureContained
+(deftest exhausted-contention-is-returned-and-counted-without-rerunning-handler
+  (let [calls (atom 0)
+        busy {::anom/category ::anom/busy :event-store/attempts 4}
+        context (make-context
+                  (make-command :test/create-with-events)
+                  (make-registry {:test/create-with-events
+                                  (fn [_] (swap! calls inc) {:command-result/events []})}))]
+    (with-redefs [es/append (constantly busy)]
+      (let [metrics (capture-metrics #(is (= busy (cp/process-command context))))]
+        (is (= 1 @calls))
+        (is (some #(= "CommandEventAppendFailed" (:metric/name %)) metrics))
+        (is (some #(and (= "CommandAnomaly" (:metric/name %))
+                        (= "busy" (get-in % [:metric/dimensions :anomaly-category])))
+                  metrics))))))
 
 ;; Sample Command Handlers
 

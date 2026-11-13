@@ -667,6 +667,19 @@
                                 (into [] (es/read *event-store* {:tenant-id test-tenant-id})))]
         (is (= 1 (count checkpoints)) "Checkpoint written before effect")))))
 
+;; Allium: EventLog.StorageFailureIsNotCheckpointSuccess
+(deftest effect-before-does-not-run-when-checkpoint-is-busy
+  (let [effects (atom 0)
+        busy {::anom/category ::anom/busy :event-store/attempts 4}
+        context (assoc (make-context
+                         (make-event :test/event-1 :body {:num 1})
+                         (fn [_] {:result/effect #(swap! effects inc)
+                                  :result/checkpoint :before}))
+                       :processor-name :test/busy-checkpoint)]
+    (with-redefs [es/append (constantly busy)]
+      (is (= busy (core/process-event context))))
+    (is (zero? @effects))))
+
 (deftest effect-before-no-rerun-on-replay
   (testing "At-most-once: replay does not re-run effect (checkpoint already exists)"
     (let [effect-count (atom 0)

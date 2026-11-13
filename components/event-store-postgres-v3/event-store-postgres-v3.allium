@@ -1,4 +1,5 @@
 -- allium: 3
+use "../event-store-v3/event-store-v3.allium" as store
 -- event-store-postgres-v3.allium
 --
 -- Distilled from components/event-store-postgres-v3 (grain).
@@ -360,6 +361,7 @@ rule TenantRegistered {
 -- whole append is atomic: either all of it commits or none of it does.
 rule AppendEvents {
     when: AppendRequested(tenant, events, metadata?)
+    requires: write_commits(tenant, events)
 
     ensures:
         let append_time = now
@@ -396,6 +398,7 @@ rule AppendUnderCasAccepted {
 
     let observed = read(tenant, guard.filter)
     requires: guard.accepts(observed)
+    requires: write_commits(tenant, events)
 
     ensures:
         let marker = TransactionMarker.created(
@@ -485,6 +488,7 @@ surface EventAppend {
         AppendRequestedWithGuard(client, events, guard, metadata?)
 
     contracts:
+        fulfils store/WriteContention
         fulfils AppendWriter
         demands EventCodec
 

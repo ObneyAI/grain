@@ -204,6 +204,13 @@ contract EventAppend {
     @invariant AllOrNothing
         -- An append either stores every event in the batch or none of them;
         -- partial appends are not observable.
+
+    @invariant StorageFailureContained
+        -- Storage owns contention retries; the handler runs once per dispatch.
+        -- Exhausted contention is returned as the store's busy anomaly, and
+        -- other returned anomalies retain their category and details. A thrown
+        -- append exception becomes a fault. Both paths record the normal command
+        -- failure outcome and append-failure diagnostics.
 }
 
 -- The operational record emitted for every command attempt. Command and
@@ -248,6 +255,9 @@ enum RejectionReason {
     -- A CAS guard's precondition did not hold: the events were not stored
     -- because the stream had changed.
     conflict
+    -- The event store refused the write (including exhausted contention).
+    -- Its anomaly category and details are preserved for the caller.
+    storage_rejected
     -- The handler refused for a domain reason it categorised itself
     -- (authorization, not-found, conflict, incorrect, or its own fault). This
     -- enum value marks the outcome class; the handler's specific category and
@@ -395,13 +405,20 @@ rule ResolveDispatch {
             run.status = completed
         else if run.skip_storage:
             run.status = completed
-        else if not append_succeeds(run.command.tenant_scope, run.output.events, run.output.guard):
-            run.status = rejected
-            run.reason = conflict
         else:
-            for emitted in run.output.events:
-                Event.created(tenant_scope: emitted.tenant_scope, run: run)
-            run.status = completed
+            let outcome = append_outcome(run.command.tenant_scope, run.output.events, run.output.guard)
+            if outcome = succeeded:
+                for emitted in run.output.events:
+                    Event.created(tenant_scope: emitted.tenant_scope, run: run)
+                run.status = completed
+            else:
+                run.status = rejected
+                if outcome = conflict:
+                    run.reason = conflict
+                else if outcome = fault:
+                    run.reason = fault
+                else:
+                    run.reason = storage_rejected
 
     @guidance
         -- The handler runs exactly once per accepted command (in
@@ -409,8 +426,8 @@ rule ResolveDispatch {
         -- terminal state.
         --
         -- A handler may attach a CAS guard to its output; the append stores
-        -- the events only if the guard holds at commit time (append_succeeds
-        -- is that predicate, evaluated by the event store). The Event.created
+        -- the events only if the guard holds at commit time (append_outcome
+        -- reports the final storage outcome after recovery). The Event.created
         -- assertions describe the post-append state of the tenant's stream;
         -- durability, ordering and atomicity are the EventAppend contract.
         --

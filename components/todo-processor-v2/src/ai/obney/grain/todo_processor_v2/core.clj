@@ -181,8 +181,10 @@
          (do (u/log ::error-storing-events :anomaly result)
              (emit-todo-counter! "TodoCheckpointFailed" processor-name "failed"
                                  (name (::anom/category result)))
-             {::anom/category ::anom/fault
-              ::anom/message "Error storing events."}))))))
+             (if (= ::anom/busy (::anom/category result))
+               result
+               {::anom/category ::anom/fault
+                ::anom/message "Error storing events."})))))))
 
 (defn- append-batch-with-checkpoint
   [event-store tenant-id processor-name from-event-id events result-events]
@@ -257,8 +259,8 @@
         append-result (append-with-checkpoint
                         event-store tenant-id processor-name
                         triggering-id (or (:result/on-success result) []))]
-    (when-not (and (anomaly? append-result)
-                   (= ::anom/conflict (::anom/category append-result)))
+    (if (anomaly? append-result)
+      append-result
       ((:result/effect result)))))
 
 (defn- process-pure-result
@@ -273,7 +275,7 @@
                                    handler-cas (assoc :cas handler-cas)))]
         (when (anomaly? event-store-result)
           (u/log ::error-storing-events :anomaly event-store-result)
-          (if (= ::anom/conflict (::anom/category event-store-result))
+          (if (contains? #{::anom/conflict ::anom/busy} (::anom/category event-store-result))
             event-store-result
             {::anom/category ::anom/fault
              ::anom/message "Error storing events."})))
@@ -287,8 +289,10 @@
                                  {:tenant-id tenant-id :events events})]
         (when (anomaly? event-store-result)
           (u/log ::error-storing-events :anomaly event-store-result)
-          {::anom/category ::anom/fault
-           ::anom/message "Error storing events."})))))
+          (if (= ::anom/busy (::anom/category event-store-result))
+            event-store-result
+            {::anom/category ::anom/fault
+             ::anom/message "Error storing events."}))))))
 
 (defn process-event
   [{:keys [handler-fn event event-store tenant-id lease-check-fn processor-name
@@ -313,12 +317,14 @@
                (emit-todo-duration! processor-name "failed" started-at)
                (emit-todo-counter! "TodoFailed" processor-name "failed"
                                    (name (::anom/category result)))
-               (if retry-on-error?
+               (cond
+                 (= ::anom/busy (::anom/category result)) result
+                 retry-on-error?
                  (emit-todo-counter! "TodoRetry" processor-name "retrying"
-                                     (name (::anom/category result)))
-                 (when processor-name
-                   (append-with-checkpoint event-store tenant-id processor-name
-                                           (:event/id event) []))))
+                                    (name (::anom/category result)))
+                 processor-name
+                 (append-with-checkpoint event-store tenant-id processor-name
+                                         (:event/id event) [])))
              (let [processing-result
                    (if (:result/effect result)
                      (case (:result/checkpoint result)
@@ -350,6 +356,15 @@
 ;; Catch-up            ;;
 ;; ------------------- ;;
 
+(defn- check-write-result!
+  "Stop this processing cycle on a failed write. Never let a later checkpoint
+   cover its uncommitted prefix. Existing CAS replay conflicts remain benign."
+  [result]
+  (when (and (anomaly? result)
+             (not= ::anom/conflict (::anom/category result)))
+    (throw (ex-info "Todo processing stopped after a failed event-store write" result)))
+  result)
+
 (defn- get-last-processed-id
   "Queries the event store for the most recent checkpoint for this processor+tenant.
 
@@ -378,11 +393,12 @@
     (reduce
      (fn [_ event]
        (when-not (= :grain/tx (:event/type event))
-         (process-event (assoc context
-                          :event event
-                          :handler-fn handler-fn
-                          :tenant-id tenant-id
-                          :processor-name processor-name))))
+         (check-write-result!
+          (process-event (assoc context
+                           :event event
+                           :handler-fn handler-fn
+                           :tenant-id tenant-id
+                           :processor-name processor-name)))))
      nil
      missed)))
 
@@ -554,6 +570,7 @@
                                                           (get-last-processed-id
                                                            event-store tenant-id processor-name))
                                                   (reset! last-id last-batch-event-id))
+                                                (check-write-result! append-result)
                                                 (reset! batch-source-events [])
                                                 (reset! batch-result-events []))))]
                           (u/log :metric/metric
@@ -576,14 +593,17 @@
                                                :tenant-id tenant-id}
                                       result (or (handler-fn context)
                                                  {})]
+                                  (when (= ::anom/busy (::anom/category result))
+                                    (check-write-result! result))
                                   (if (or (:result/effect result)
                                           (:result/cas result))
                                     ;; Effect/CAS handler: preserve per-event processing semantics.
                                     (do
                                       (flush-batch)
-                                      (process-event (cond-> (assoc context
-                                                                :processor-name processor-name)
-                                                        lease-check-fn (assoc :lease-check-fn lease-check-fn)))
+                                      (check-write-result!
+                                       (process-event (cond-> (assoc context
+                                                                 :processor-name processor-name)
+                                                         lease-check-fn (assoc :lease-check-fn lease-check-fn))))
                                       (when-let [processed-id (get-last-processed-id
                                                                event-store tenant-id processor-name)]
                                         (reset! last-id processed-id)))
@@ -746,6 +766,7 @@
                                                                         [tid proc-name]
                                                                         (get-last-processed-id event-store tid proc-name))
                                                                  (swap! watermarks assoc-in [tid proc-name] last-event-id))
+                                                               (check-write-result! append-result)
                                                                (reset! batch-source-events [])
                                                                (reset! batch-result-events []))))]
                                          ;; Process events sequentially within this tenant
@@ -757,11 +778,14 @@
                                                                :event-store event-store
                                                                :tenant-id tid})
                                                    result (or (handler-fn ctx) {})]
+                                               (when (= ::anom/busy (::anom/category result))
+                                                 (check-write-result! result))
                                                (if (or (:result/effect result)
                                                        (:result/cas result))
                                                  (do
                                                    (flush-batch)
-                                                   (process-event (assoc ctx :processor-name proc-name))
+                                                   (check-write-result!
+                                                    (process-event (assoc ctx :processor-name proc-name)))
                                                    (when-let [processed-id (get-last-processed-id
                                                                             event-store tid proc-name)]
                                                      (swap! watermarks assoc-in

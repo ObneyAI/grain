@@ -188,14 +188,20 @@ contract RetentionValidation {
 -- not prescribe when or from which deployment mechanism a user invokes them.
 contract RetentionAdministration {
     assess: (event_name: String) -> ActivationAssessment
-    activate: (event_name: String) -> PolicyActivation
-    deactivate: (event_name: String) -> PolicyActivation
+    activate: (event_name: String) -> Any
+    deactivate: (event_name: String) -> Any
     estimate: (event_name: String, tenant: store/Tenant) -> Any
     status: (event_name: String, tenant: store/Tenant) -> Any
 
     @invariant ExplicitActivation
         -- Registration, application boot and definition changes never activate
         -- a policy. Activation requires an explicit operator-side invocation.
+
+    @invariant FailedAdministrationIsNotAcknowledged
+        -- A busy or other non-conflict append anomaly is returned unchanged.
+        -- Failed activation has no activation identity; failed deactivation
+        -- leaves the active policy active. Only CAS conflicts restart policy
+        -- reconciliation; storage alone owns transient contention retries.
 
     @invariant AdministrationHistoryIsReified
         -- Activation and deactivation are eternal Grain events appended with CAS
@@ -252,7 +258,7 @@ contract RetentionAdministration {
 -- backend. Ordinary event-store callers do not receive this capability.
 contract EventCompaction {
     estimate: (activation: PolicyActivation, tenant: store/Tenant) -> Any
-    compact: (activation: PolicyActivation, tenant: store/Tenant) -> CompactionReceipt
+    compact: (activation: PolicyActivation, tenant: store/Tenant) -> Any
 
     @invariant EstimateIsAdvisory
         -- Estimate predicts eligible count and payload without deleting. It is
@@ -374,6 +380,7 @@ rule ActivateBoundedHistory {
         assessment.safe
         policy != null
         active_activation(event_name) = null
+        activation_append_commits(event_name, policy)
     ensures:
         PolicyActivation.created(
             event_name: event_name,
@@ -398,6 +405,7 @@ rule DeactivateBoundedHistory {
     requires:
         exists activation
         activation.active
+        deactivation_append_commits(activation)
     ensures: activation.active = false
 }
 
@@ -407,6 +415,7 @@ rule CompactEligibleBatch {
         activation.active
         normalized(definition(activation.event_name).history_policy) = normalized(activation.policy)
         eligible_events(activation, tenant).count > 0
+        compaction_commits(activation, tenant)
     ensures:
         let removed = bounded_batch(eligible_events(activation, tenant))
         let removed_markers = markers_emptied_by(removed, tenant)
@@ -499,6 +508,7 @@ surface RetentionExecution {
     contracts:
         demands EventDefinitionRegistry
         demands EventCompaction
+        demands store/WriteContention
 
     @guarantee DestructionIsCapabilityRestricted
         -- Only retention execution receives the compaction capability. Normal

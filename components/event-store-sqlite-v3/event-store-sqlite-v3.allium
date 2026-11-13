@@ -1,4 +1,5 @@
 -- allium: 3
+use "../event-store-v3/event-store-v3.allium" as store
 -- event-store-sqlite-v3.allium
 --
 -- Distilled from components/event-store-sqlite-v3 (grain).
@@ -162,12 +163,17 @@ contract EventLog {
         -- Reads and advisory retention estimates remain outside this boundary.
 
     @invariant BoundedContention
-        -- Appends admitted within the configured queue and contention bounds
+        -- Appends and compactions within the configured queue and contention bounds
         -- absorb transient writer-lock contention. If the queue is already full
         -- or the configured busy attempts are exhausted, the caller receives a
         -- stable busy outcome rather than a raw database-lock exception. Every
         -- retry repeats the entire atomic transaction; no partial attempt is
         -- observable.
+
+    @invariant LegacyImmediateLockAttempt
+        -- A legacy zero busy timeout remains valid and attempts the write lock
+        -- without waiting. Contention still uses the configured retry budget.
+        -- An explicit common lock-wait option takes precedence and must be positive.
 
     @invariant ReadsRemainConcurrent
         -- Read operations are never placed behind the single-writer admission
@@ -337,10 +343,10 @@ entity Transaction {
 config {
     -- Millisecond values are represented as integers because contention policy
     -- is configured directly at the storage-driver boundary.
-    busy_timeout_ms: Integer = 1000
-    busy_max_retries: Integer = 3
-    busy_retry_backoff_ms: Integer = 10
-    busy_retry_max_backoff_ms: Integer = 250
+    busy_timeout_ms: Integer = store/config.write_lock_timeout_ms
+    busy_max_retries: Integer = store/config.write_max_retries
+    busy_retry_backoff_ms: Integer = store/config.write_retry_backoff_ms
+    busy_retry_max_backoff_ms: Integer = store/config.write_retry_max_backoff_ms
     write_queue_capacity: Integer = 1024
     write_shutdown_timeout_ms: Integer = 5000
 }
@@ -355,6 +361,7 @@ config {
 -- the last committed event. Every event in the batch is stamped with the tenant.
 rule AppendTransaction {
     when: AppendEvents(tenant, events, tx_metadata?)
+    requires: write_commits(tenant, events)
 
     ensures:
         let append_time = now
@@ -554,6 +561,7 @@ surface EventAppend {
         AppendEventsChecked(tenant, tenant.events, tenant.events)
 
     contracts:
+        fulfils store/WriteContention
         fulfils EventLog
         demands EventCodec
         demands EventStorePubsub

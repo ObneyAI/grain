@@ -3,6 +3,7 @@
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [ai.obney.grain.event-store-v3.interface.backend :as backend]
+            [ai.obney.grain.event-store-v3.interface.write-retry :as retry]
             [ai.obney.grain.event-store-sqlite-v3.core :as sqlite-core]
             [ai.obney.grain.event-store-sqlite-v3.interface]
             [ai.obney.grain.event-retention.interface :as retention]
@@ -1149,6 +1150,28 @@
         (is (= 1 (count (non-tx-events
                          (into [] (es/read store {:tenant-id tenant-id}))))))))))
 
+;; Allium: EventLog.LegacyImmediateLockAttempt / store/WriteContention.SharedConfiguration.
+(deftest legacy-zero-timeout-preserves-immediate-contention-and-recovery
+  (with-configured-store
+    {:busy-timeout-ms 0 :busy-max-retries 1
+     :busy-retry-backoff-ms 0 :busy-retry-max-backoff-ms 0}
+    (fn [store]
+      (let [pool (get-in store [:state ::sqlite-core/connection-pool])
+            tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :body {:n 1}})]
+        (with-open [lock-conn (jdbc/get-connection pool)]
+          (jdbc/execute! lock-conn ["BEGIN IMMEDIATE"])
+          (try
+            (let [result (deref (future (es/append store {:tenant-id tenant-id :events [event]}))
+                                2000 ::timeout)]
+              (is (not= ::timeout result) "Zero timeout must not wait for the held lock")
+              (is (= ::anom/busy (::anom/category result)))
+              (is (= 2 (:event-store/attempts result)))
+              (is (= 2 (::sqlite-core/busy-attempts result)))
+              (is (empty? (into [] (es/read store {:tenant-id tenant-id})))))
+            (finally (jdbc/execute! lock-conn ["ROLLBACK"]))))
+        (is (= 1 (count (es/append store {:tenant-id tenant-id :events [event]}))))))))
+
 (deftest exhausted-external-writer-contention-is-bounded
   (with-configured-store
     {:busy-timeout-ms 10 :busy-max-retries 1
@@ -1167,6 +1190,72 @@
             (is (< elapsed-ms 1000))
             (jdbc/execute! lock-conn ["ROLLBACK"])))
         (is (empty? (into [] (es/read store {:tenant-id tenant-id}))))))))
+
+;; Allium: store/WriteContention.BoundedRecovery; compaction uses the same budget.
+(deftest compaction-contention-returns-busy-without-changing-history
+  (let [admin (retention/administration *event-store*)
+        activation (retention/activate! admin :sqlite-test/ephemeral)
+        execute! jdbc/execute!
+        attempts (atom 0)
+        head (es/head *event-store* *tenant-id*)]
+    (with-redefs [jdbc/execute!
+                  (fn [conn sql & opts]
+                    (if (= ["BEGIN IMMEDIATE"] sql)
+                      (do (swap! attempts inc)
+                          (throw (java.sql.SQLException. "busy" "" 5)))
+                      (apply execute! conn sql opts)))]
+      (let [result (compaction/compact!
+                     *event-store* {:activation activation :tenant-id *tenant-id*
+                                    :limit 10})]
+        (is (= ::anom/busy (::anom/category result)))
+        (is (= 4 (:event-store/attempts result)))
+        (is (= 4 @attempts))))
+    (is (= head (es/head *event-store* *tenant-id*)))))
+
+;; Allium: WriteContention.FreshAtomicAttempt / RetryScope. Fail after actual
+;; inserts/deletes, then assert the database contains only the committed attempt.
+(deftest retry-rolls-back-partial-appends-and-publishes-only-the-commit
+  (let [insert! @#'sqlite-core/insert-events!
+        attempts (atom 0)
+        published (atom [])
+        store (assoc-in *event-store* [:config :event-pubsub] ::test-bus)]
+    (with-redefs [sqlite-core/insert-events!
+                  (fn [& args]
+                    (apply insert! args)
+                    (when (= 1 (swap! attempts inc))
+                      (throw (java.sql.SQLException. "busy" "" 5))))
+                  retry/pause! (constantly nil)
+                  pubsub/pub (fn [_ message] (swap! published conj message))]
+      (is (= 1 (count (es/append store {:tenant-id *tenant-id*
+                                        :events [(es/->event {:type :test/alpha})]})))))
+    (let [stored (into [] (es/read store {:tenant-id *tenant-id*}))]
+      (is (= 2 @attempts))
+      (is (= 1 (count @published)))
+      (is (= 1 (count (non-tx-events stored))))
+      (is (= 1 (count (tx-events stored))))
+      (is (= (:event/id (last stored)) (es/head store *tenant-id*))))))
+
+(deftest retry-rolls-back-compaction-and-emits-one-receipt
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        event (with-redefs [time/now (constantly old)]
+                (append-event! :sqlite-test/ephemeral #{} {:value 1}))
+        _ (retention/activate! admin :sqlite-test/ephemeral)
+        insert! @#'sqlite-core/insert-events!
+        attempts (atom 0)]
+    (with-redefs [sqlite-core/insert-events!
+                  (fn [& args]
+                    (apply insert! args)
+                    (when (= 1 (swap! attempts inc))
+                      (throw (java.sql.SQLException. "busy" "" 5))))
+                  retry/pause! (constantly nil)]
+      (let [receipt (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10)]
+        (is (= #{(:event/id event)} (:retention/deleted-event-ids receipt)))))
+    (is (= 2 @attempts))
+    (let [stored (into [] (es/read *event-store* {:tenant-id *tenant-id*}))]
+      (is (empty? (filter #(= :sqlite-test/ephemeral (:event/type %)) stored)))
+      (is (= 1 (count (filter #(= compaction/compaction-receipt-type (:event/type %)) stored))))
+      (is (= 1 (count (tx-events stored)))))))
 
 (deftest wal-read-continues-while-writer-lock-is-held
   (with-configured-store

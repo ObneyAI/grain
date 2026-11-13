@@ -47,6 +47,18 @@
 (defn events-of [type]
   (into [] (event-store/read *store* {:tenant-id *tenant* :types #{type}})))
 
+;; Allium: RetentionAdministration.FailedAdministrationIsNotAcknowledged
+(deftest busy-policy-writes-are-not-acknowledged
+  (let [busy {:cognitect.anomalies/category :cognitect.anomalies/busy
+              :event-store/attempts 4}]
+    (with-redefs [event-store/append (constantly busy)]
+      (is (= busy (retention/activate! *admin* :retention-test/ephemeral))))
+    (is (nil? (retention/active-activation *store* :retention-test/ephemeral)))
+    (let [active (retention/activate! *admin* :retention-test/ephemeral)]
+      (with-redefs [event-store/append (constantly busy)]
+        (is (= busy (retention/deactivate! *admin* :retention-test/ephemeral))))
+      (is (= active (retention/active-activation *store* :retention-test/ephemeral))))))
+
 (deftest activation-is-explicit-durable-and-idempotent
   (is (nil? (retention/active-activation *store* :retention-test/ephemeral)))
   (let [first-activation (retention/activate! *admin* :retention-test/ephemeral)

@@ -12,7 +12,8 @@ claim implementation alignment. Two specs (`pubsub`, `command-request-handler`) 
 `externalEntity.missingSourceHint` reminder — a caller-supplied/cross-component type
 with no governing spec to import — which is correct, not a defect.
 
-Regenerate validation status with: `find components -name '*.allium' -exec allium check {} \;`
+Validate the specs together so cross-component imports resolve:
+`allium check components` and `allium analyse components`.
 
 ## Domain (2)
 
@@ -22,7 +23,7 @@ Regenerate validation status with: `find components -name '*.allium' -exec alliu
 
 Cluster coordination for a multi-node, multi-tenant, event-sourced system: nodes prove liveness by heartbeat; the oldest live node is the leaderless coordinator; it leases each domain tenant to exactly one live node (round-robin, rebalanced on join/departure/death); tenant-aware routing serves a request at the lease owner or redirects. Captures CP1-CP9 conformance properties as invariants, contracts and surfaces.
 
-<sub>entities 2 · rules 7 · contracts 2 · invariants 1 · surfaces 4</sub>
+<sub>entities 2 · rules 7 · contracts 3 · invariants 1 · surfaces 4</sub>
 
 ### [`example-service`](../components/example-service/example-service.allium)
 
