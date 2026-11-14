@@ -261,8 +261,10 @@
     (fn [source target]
       (let [tenant (random-uuid)]
         (es/append source {:tenant-id tenant :events []})
-        (let [snapshot (transfer/snapshot source tenant)
-              malformed (update snapshot :events into [nil (peek (:events snapshot))])]
-          (is (thrown? Exception (transfer/validate! malformed)))
-          (is (thrown? Exception (transfer/restore! target malformed)))
-          (is (empty? (es/tenants target))))))))
+        (let [snapshot (transfer/snapshot source tenant)]
+          (doseq [bad [nil false]]
+            (let [malformed (update snapshot :events into [bad (peek (:events snapshot))])]
+              (is (thrown? Exception (transfer/validate! malformed)))
+              (is (thrown? Exception (transfer/restore! target malformed)))
+              (is (empty? (es/tenants target)))
+              (is (empty? (raw target tenant))))))))))
