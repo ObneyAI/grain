@@ -23,7 +23,7 @@ mutable objects. Physical database encoding is not promised byte-identical.
 The caller owns a new SQLite store and its file. Restore validates and inserts
 all original records, tag indexes and watermark in one immediate transaction,
 only if the entire target store is empty. Existing tenants or data refuse,
-including a repeat of the same snapshot. No marker, pubsub notification,
+including a repeat of the same snapshot. SQLite also refuses event types and tags whose keyword encoding would be ambiguous. No marker, pubsub notification,
 application bootstrap or external effect is emitted. On an ambiguous response,
 inspect the owned store and compare the whole history and watermark before
 considering it complete; never silently overwrite or delete it. Subsequent normal

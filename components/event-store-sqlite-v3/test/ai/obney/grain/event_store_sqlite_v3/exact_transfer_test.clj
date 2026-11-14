@@ -277,3 +277,28 @@
 
 (deftest refuses-metadata-that-the-codec-would-drop
   (is (thrown? Exception (transfer/detached {:value (with-meta [1] {:annotation true})}))))
+
+(deftest sqlite-rejects-ambiguous-type-and-tag-encodings
+  (doseq [e [{:event/type (keyword "a/b" "c") :event/tags #{}}
+             {:event/type :transfer/a :event/tags #{[(keyword "a/b" "c") (random-uuid)]}}
+             {:event/type :transfer/a :event/tags #{[(keyword "a:b") (random-uuid)]}}
+             {:event/type (keyword nil "a/b") :event/tags #{}}]]
+    (with-stores
+      (fn [source target]
+        (let [tenant (random-uuid)]
+          (protocol/append source {:tenant-id tenant :events [e]})
+          (let [snapshot (transfer/snapshot source tenant)]
+            (is (thrown? Exception (transfer/restore! target snapshot)))
+            (is (empty? (es/tenants target)))
+            (is (empty? (raw target tenant)))))))))
+
+(deftest sqlite-preserves-valid-keyword-and-indexed-tag
+  (with-stores
+    (fn [source target]
+      (let [tenant (random-uuid) type (keyword "a" "b/c") tag [(keyword "a" "b/c") (random-uuid)]]
+        (protocol/append source {:tenant-id tenant :events [{:event/type type :event/tags #{tag}}]})
+        (transfer/restore! target (transfer/snapshot source tenant))
+        (let [events (into [] (es/read target {:tenant-id tenant :tags #{tag}}))]
+          (is (= 1 (count events)))
+          (is (= type (:event/type (first events))))
+          (is (= #{tag} (:event/tags (first events)))))))))

@@ -711,6 +711,15 @@
   (restore! [this snapshot]
     (let [{:keys [tenant-id watermark events]} (transfer/validate! snapshot)
           pool (get-in this [:state ::connection-pool])]
+      ;; The SQLite type column and tag index use textual keyword encodings.
+      ;; Refuse ambiguous encodings before opening a write transaction.
+      (doseq [event events]
+        (let [type (:event/type event)]
+          (when-not (= type (keyword (subs (str type) 1)))
+            (throw (ex-info "Event type cannot round-trip through SQLite" {:type type}))))
+        (doseq [tag (:event/tags event)]
+          (when-not (try (= tag (str->tag (tag->str tag))) (catch Exception _ false))
+            (throw (ex-info "Event tag cannot round-trip through SQLite" {:tag tag})))))
       (with-immediate-tx pool (long (or (get-in this [:config :busy-timeout-ms]) 1000))
         (fn [conn]
           (when (or (seq (jdbc/execute! conn ["SELECT id FROM tenants LIMIT 1"]))
