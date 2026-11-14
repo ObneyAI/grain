@@ -110,6 +110,8 @@ For multi-instance deployments, an opt-in control plane coordinates tenant assig
 
 `defevent` registers an event's payload schema, description, and history contract while leaving `->event` construction unchanged. History is complete by default. A bounded policy is fail-closed and takes effect only after its exact value is durably activated; retention-capable v3 stores compact bounded batches atomically and append an eternal receipt. Unregistered events, transaction markers, and policies that do not match the loaded definition are never compacted.
 
+For exact point-in-time memory-to-SQLite copies, see [Exact tenant transfer](docs/exact-tenant-transfer.md).
+
 ## Distributed Coordination
 
 > Full documentation: [docs/distributed-coordination.md](docs/distributed-coordination.md)

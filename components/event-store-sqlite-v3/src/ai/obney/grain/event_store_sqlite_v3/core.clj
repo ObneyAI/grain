@@ -1,6 +1,7 @@
 (ns ai.obney.grain.event-store-sqlite-v3.core
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
+            [ai.obney.grain.event-store-v3.interface.exact-transfer :as transfer]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
             [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
             [ai.obney.grain.time.interface :as time]
@@ -705,6 +706,20 @@
 
   (read [this args]
     (read this args))
+
+  transfer/TenantRestore
+  (restore! [this snapshot]
+    (let [{:keys [tenant-id watermark events]} (transfer/validate! snapshot)
+          pool (get-in this [:state ::connection-pool])]
+      (with-immediate-tx pool (long (or (get-in this [:config :busy-timeout-ms]) 1000))
+        (fn [conn]
+          (when (or (seq (jdbc/execute! conn ["SELECT id FROM tenants LIMIT 1"]))
+                    (seq (jdbc/execute! conn ["SELECT id FROM events LIMIT 1"]))
+                    (seq (jdbc/execute! conn ["SELECT event_id FROM event_tags LIMIT 1"])))
+            (throw (ex-info "Restore target is not empty" {})))
+          (upsert-tenant! conn tenant-id watermark)
+          (insert-events! conn tenant-id events)
+          {:tenant-id tenant-id :watermark watermark}))))
 
   compaction/EventCompaction
   (estimate [this request] (estimate-compaction this request))
