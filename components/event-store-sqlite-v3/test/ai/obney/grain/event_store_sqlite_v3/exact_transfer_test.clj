@@ -185,9 +185,12 @@
               proc (-> (ProcessBuilder. ^java.util.List [(str (System/getProperty "java.home") "/bin/java") "-cp" (runtime-classpath) "clojure.main" "-e" expr])
                        (.redirectErrorStream true) (.start))
               output (future (slurp (.getInputStream proc)))]
-          (is (.waitFor proc 45 java.util.concurrent.TimeUnit/SECONDS))
-          (is (= 0 (.exitValue proc)) (deref output 1000 "timeout"))
-          (is (clojure.string/includes? @output ":reopen-ok"))))
+          (let [finished? (.waitFor proc 45 java.util.concurrent.TimeUnit/SECONDS)]
+            (when-not finished? (.destroyForcibly proc) (.waitFor proc))
+            (is finished? "Child JVM timed out")
+            (when finished?
+              (is (= 0 (.exitValue proc)) (deref output 1000 "timeout"))
+              (is (clojure.string/includes? @output ":reopen-ok"))))))
       (finally (es/stop source) (.delete db) (.delete expected)))))
 
 (deftest serialization-failure-rolls-back
@@ -247,3 +250,19 @@
           (is (= #{tag} (:event/tags (first (raw target tenant))))))
         (protocol/append source {:tenant-id tenant :events [{:event/type :historical/unregistered :event/tags #{} :value (java.util.Date.)}]})
         (is (thrown? Exception (transfer/snapshot source tenant)))))))
+
+(deftest numeric-types-must-survive-roundtrip
+  (doseq [v [(int 1) (short 1)]]
+    (is (thrown? Exception (transfer/detached {:value v}))))
+  (is (= {:value (long 1)} (transfer/detached {:value (long 1)}))))
+
+(deftest nil-event-must-not-hide-duplicate-suffix
+  (with-stores
+    (fn [source target]
+      (let [tenant (random-uuid)]
+        (es/append source {:tenant-id tenant :events []})
+        (let [snapshot (transfer/snapshot source tenant)
+              malformed (update snapshot :events into [nil (peek (:events snapshot))])]
+          (is (thrown? Exception (transfer/validate! malformed)))
+          (is (thrown? Exception (transfer/restore! target malformed)))
+          (is (empty? (es/tenants target))))))))

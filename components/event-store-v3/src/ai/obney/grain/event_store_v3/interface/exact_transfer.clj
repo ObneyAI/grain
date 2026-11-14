@@ -27,9 +27,13 @@
 (defn- same-value? [a b]
   (cond
     (instance? bytes-class a) (and (instance? bytes-class b) (Arrays/equals ^bytes a ^bytes b))
-    (and (map? a) (map? b)) (and (= (set (keys a)) (set (keys b)))
-                                  (every? (fn [[k v]] (same-value? v (get b k))) a))
+    (and (map? a) (map? b)) (and (= (count a) (count b))
+                                  (every? (fn [[k v]]
+                                            (some (fn [[k2 v2]] (and (same-value? k k2) (same-value? v v2))) b)) a))
+    (and (set? a) (set? b)) (and (= (count a) (count b))
+                                  (every? (fn [v] (some #(same-value? v %) b)) a))
     (and (vector? a) (vector? b)) (and (= (count a) (count b)) (every? true? (map same-value? a b)))
+    (number? a) (and (number? b) (= (class a) (class b)) (= a b))
     :else (= a b)))
 
 (defn detached [value]
@@ -43,8 +47,8 @@
                  (= 1 version) (uuid? tenant-id) (vector? events) (seq events))
     (fail "Invalid snapshot"))
   (loop [remaining events previous nil batch []]
-    (if-let [event (first remaining)]
-      (let [id (:event/id event) timestamp (:event/timestamp event) tags (:event/tags event)
+    (if (seq remaining)
+      (let [event (first remaining) id (:event/id event) timestamp (:event/timestamp event) tags (:event/tags event)
             tx? (= :grain/tx (:event/type event))]
         (when-not (and (map? event) (uuid? id) (= 7 (uuid/get-version id))
                        (or (nil? previous) (uuid/< previous id))
