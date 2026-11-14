@@ -16,6 +16,7 @@
 (def ^:private bytes-class (Class/forName "[B"))
 (defn- copy-value [v]
   (cond
+    (or (record? v) (sorted? v) (some? (meta v))) (fail "Records, sorted collections and metadata are unsupported snapshot values")
     (instance? bytes-class v) (aclone ^bytes v)
     (or (nil? v) (string? v) (keyword? v) (symbol? v) (boolean? v)
         (number? v) (uuid? v) (instance? OffsetDateTime v) (instance? Instant v)) v

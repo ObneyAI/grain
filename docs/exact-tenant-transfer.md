@@ -15,7 +15,7 @@ registration is not required for an already persisted event: unknown types are
 preserved as opaque facts, never dropped or executed. Snapshot values support
 persistent maps, vectors and sets, scalar Clojure values, UUID, Instant,
 OffsetDateTime and byte arrays when the existing Fressian codec round-trips
-them without loss. Unsupported values fail explicitly. Byte arrays are copied,
+them without loss. Records, sorted collections and values with Clojure metadata are refused because copying would lose their type, comparator or metadata; unsupported values fail explicitly. Byte arrays are copied,
 but callers must not mutate them concurrently during capture; Grain's memory
 backend otherwise retains object aliases and cannot atomically freeze arbitrary
 mutable objects. Physical database encoding is not promised byte-identical.

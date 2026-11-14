@@ -268,3 +268,12 @@
               (is (thrown? Exception (transfer/restore! target malformed)))
               (is (empty? (es/tenants target)))
               (is (empty? (raw target tenant))))))))))
+
+(defrecord DomainValue [x])
+
+(deftest refuses-records-and-sorted-collections
+  (doseq [value [(->DomainValue 1) (sorted-map :a 1) (sorted-set 1 2)]]
+    (is (thrown? Exception (transfer/detached {:value value})))))
+
+(deftest refuses-metadata-that-the-codec-would-drop
+  (is (thrown? Exception (transfer/detached {:value (with-meta [1] {:annotation true})}))))
