@@ -1,18 +1,15 @@
 ---
 name: event-model-elicit
-description: >-
-  Add Grain Event Model topology to an Allium intent-first elicitation. Use after or alongside Allium elicit for a new Grain service area or feature: identify CQRS blocks, schemas, edges, screens, flows, and explicit Allium trace links, then validate against the live runtime when available.
+description: Discover Grain service topology for a new feature or service area.
 ---
 
-# Event Model Elicit
+# Elicit topology
 
-Run Allium `elicit` first for observable behaviour. From the agreed rules and
-surfaces, identify only the Grain topology required to realize them: commands,
-events, projections, queries, processors, schedules, screens, and significant
-flows. Do not restate rule outcomes in Event Model.
+Start from agreed behaviour, using Allium `elicit` for unresolved rules.
+Identify who issues each command, which events it records, and which projections,
+queries, screens or processors consume the result. Include scheduled triggers
+where needed.
 
-Create or extend one `defeventmodel` area. Add command-to-rule and
-screen-to-surface `:grain/allium` links. Validate incrementally, accepting that
-new blocks may remain aspirational until implementation loads their registries.
-Hand behavioural changes back to Allium; hand the finished topology to
-`event-model-propagate` and implementation.
+Capture the agreed blocks and flows in `defeventmodel` using the `event-model`
+skill. Link commands to rules and screens to surfaces. Track planned blocks
+until their definitions can be checked in the running application.

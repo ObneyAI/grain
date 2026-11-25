@@ -1,13 +1,6 @@
 (ns ai.obney.grain.example-service.core.read-models
-  "The core read-models namespace in a grain app is where projections are
-   created from events. A read model is a pure reducer `(state, event) -> state`
-   defined via the `defreadmodel` macro. The read-model-processor-v2 engine handles
-   reading the subscribed events from the event store, two-tier caching, and
-   incremental updates — the reducer never touches the event store directly.
-
-   `defreadmodel` registers the reducer under `:<ns>/<name>`; project it
-   with `(rmp/project context :example/counters)` (see
-   interface.read-models/root). Bump `:version` to invalidate the cache."
+  "The example service maintains :example/counters as a map keyed by counter ID.
+   Its commands and queries access the map through interface.read-models/root."
   (:require [ai.obney.grain.read-model-processor-v2.interface :refer [defreadmodel]]))
 
 (defreadmodel :example counters

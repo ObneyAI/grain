@@ -1,16 +1,8 @@
 # Code Agent Tools
 
-`grain-code-agent-tools` is a dev-only package that exposes a live Grain
-application to a coding agent over nREPL. It turns Grain's registries, schema
-registry, event store, read models, and processors into plain EDN inspection and
-execution tools.
-
-The package is intended for local development and debugging. It is not a
-production API.
-
-It also exposes Grain's Event Model validation APIs. Runtime validation compares
-service topology with the live registries; composition validation additionally
-resolves `:grain/allium` links during development and CI.
+`grain-code-agent-tools` exposes a development nREPL API for inspecting a live
+Grain application, invoking commands and queries, and validating Event Models.
+Results are plain EDN.
 
 ## Setup
 
@@ -19,7 +11,7 @@ Add the package to the application project:
 ```clojure
 obneyai/grain-code-agent-tools
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "d3eb71e4f0afba26401f426237ef7c480892b2e9"
+ :git/sha "0555370637af92daea24132859f53dc44cdba8a5"
  :deps/root "projects/grain-code-agent-tools"}
 ```
 
@@ -89,8 +81,9 @@ Use this first when entering an unfamiliar app:
 
 ### `schemas`, `explain-schema`, and `validate`
 
-These functions expose Grain's schema registry. They are the main safety layer
-for an agent before invoking commands or queries.
+These functions inspect named schemas and validate sample inputs. Every
+`defevent` registers its payload schema under the event type. Keyed projection
+schemas live on the `defreadmodel` declaration.
 
 ```clojure
 (tools/schemas)
@@ -192,20 +185,17 @@ Accepted keys:
 
 ### `projection`
 
-Projects a registered ordinary read model with `rmp/project`. Keyed models
-(declared with `:key` or `:route`) are not supported here; read them with
-`rmp/value`, `rmp/page` or `rmp/query` from the REPL.
+`tools/projection` accepts only ordinary models. To inspect a keyed model at
+the REPL, pass the application's tenant context to a keyed read:
 
 ```clojure
-(tools/projection :example/counters)
+(require '[ai.obney.grain.read-model-processor-v2.interface :as rmp])
+
+(rmp/page context :example/counter-list {:index :name :limit 25})
 ```
 
-Pass a scope map when the read model expects one or when tenant id must be
-supplied explicitly:
-
-```clojure
-(tools/projection :example/counters {:tenant-id tenant-id})
-```
+See the [keyed counter declaration](core-concepts.md#read-models) and
+[keyed read API](../components/read-model-processor-v2/README.md#reading).
 
 ### `diagnostics`
 
@@ -278,9 +268,7 @@ The live tools also serve concise workflow and block-specific instructions:
 When an Event Model block is supplied, its usage card includes `:spec/allium`
 trace references alongside topology edges and live source/schema information.
 
-## Agent Workflow
-
-A useful first pass in a live app is:
+## Inspect a running application
 
 ```clojure
 (def cat (tools/catalog))
@@ -301,12 +289,10 @@ Then inspect one workflow:
 (tools/invoke-command! {:command/name :example/create-counter
                         :name "Counter A"})
 (tools/events {:types #{:example/counter-created} :limit 5})
-(tools/projection :example/counters)
+(tools/invoke-query {:query/name :example/counters})
 ```
 
-Because the tools expose source metadata for registered handlers and reducers,
-an agent can move from runtime discovery to the exact source file/line that owns
-the behavior.
+Use source metadata in the catalog to locate the handler or reducer.
 
 ## Safety Notes
 

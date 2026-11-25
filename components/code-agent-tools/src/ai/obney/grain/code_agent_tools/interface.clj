@@ -90,7 +90,8 @@
   (core/events args))
 
 (defn projection
-  "Projects a registered read model against the installed event store/cache.
+  "Projects a registered ordinary read model against the installed event store/cache.
+  For keyed models, use the read-model processor’s value, page or query API.
 
   With one argument, projects `read-model-name` using the installed context.
   With `scope`, passes scope through to the read-model processor; scope may

@@ -65,12 +65,15 @@
  {:groups
   [{:g "CQRS building blocks"
     :macros
-    [{:m "defcommand" :sig "(defcommand :area/name {opts} [ctx] & body)" :p "Handle a command → append events to the log"
+    [{:m "defevent" :sig "(defevent :area/event description {:schema payload})" :p "Define an event type and register its payload schema"
+      :keys {:opts [{:k "schema" :req true} {:k "history" :tip "Omit for complete history"}]
+             :result [{:note "use ->event to construct an instance"}]}}
+     {:m "defcommand" :sig "(defcommand :area name {opts} [ctx] & body)" :p "Handle a command → append events to the log"
       :keys {:opts [{:k "authorized?"} {:k "grain.event-model/produces"} {:k "grain.event-model/reads"} {:note "open map; no :schema in v2"}]
              :result [{:k "command-result/events"} {:k "command-result/cas"} {:k "command-result/success"} {:k "command/result"} {:note "or anomaly"}]
              :ds-result [{:k "datastar/signals" :tone "ds" :tip "signals patched on success (e.g. a __toast)"}
                          {:note "on failure → :error / :fieldErrors signals"}]}}
-     {:m "defquery" :sig "(defquery :area/name {opts} [ctx] & body)" :p "Answer a read-side query over projections"
+     {:m "defquery" :sig "(defquery :area name {opts} [ctx] & body)" :p "Answer a read-side query over projections"
       :keys {:opts [{:k "authorized?"} {:k "auth"} {:k "cache-ttl"} {:note "open — merged verbatim"}]
              :ds-meta [{:k "datastar/path" :tone "ds" :tip "route path — makes the query datastar-routable"}
                        {:k "datastar/title" :tone "ds" :tip "HTML title element (default: Grain App)"}
@@ -85,8 +88,8 @@
              :result [{:k "query/result"} {:note "or anomaly"}]
              :ds-result [{:k "datastar/hiccup" :tone "ds" :tip "the hiccup view datastar renders"}
                          {:k "datastar/signals" :tone "ds" :tip "signals to patch on the client"}]}}
-     {:m "defreadmodel" :sig "(defreadmodel :area name {opts} \"doc\"? [state event] & body)" :p "Fold events into a read model: one state, or one state per key with :key/:route"
-      :keys {:opts [{:k "events" :req true} {:k "version"} {:k "key"} {:k "route"} {:k "initial"} {:k "result"} {:k "include?"} {:k "indexes"} {:k "searches"} {:k "partition-fn"} {:k "entity-id-fn"} {:k "l1-ttl-ms"}]
+     {:m "defreadmodel" :sig "(defreadmodel :area name {opts} \"doc\"? [state event] & body)" :p "Fold events into per-instance state with :key or :route"
+      :keys {:opts [{:k "events" :req true} {:k "version"} {:k "key"} {:k "route"} {:k "initial"} {:k "result"} {:k "include?"} {:k "indexes"} {:k "searches"} {:k "filtered-indexes"} {:k "state-schema"} {:k "result-schema"} {:k "start-after"} {:k "partition-fn"} {:k "entity-id-fn"} {:k "l1-ttl-ms"}]
              :result [{:note "next state; keyed: per-instance state"}]}}
      {:m "defprocessor" :sig "(defprocessor :area/name {opts} [ctx] & body)" :p "React to events; issue follow-up commands"
       :keys {:opts [{:k "topics" :req true} {:k "grain.event-model/produces"} {:k "grain.event-model/reads"}]
@@ -99,7 +102,7 @@
              :result [{:note "registers the area model"}]}}]}
    {:g "Schema & tooling"
     :macros
-    [{:m "defschemas" :sig "(defschemas sym {schema-map})" :p "Register a set of malli schemas"
+    [{:m "defschemas" :sig "(defschemas sym {schema-map})" :p "Register command and query inputs or shared named Malli types"
       :keys {:opts [{:note "schema-name → malli-form (open)"}]
              :result [{:note "merges into global registry"}]}}
      {:m "defguide" :sig "(defguide :id {guide-map})" :p "Author a dev / agent REPL guide"

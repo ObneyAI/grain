@@ -31,6 +31,11 @@ For multi-instance deployments, the `grain-control-plane` package provides distr
 4. **Reconciliation** — Each node projects the lease-ownership read model and starts/stops its tenant poller to match its assigned tenants.
 5. **Graceful shutdown** — On stop, the node drains in-flight work, then emits a departure event. The coordinator reassigns immediately.
 
+A heartbeat or lease change takes effect only after its append commits. If the
+store exhausts its write retries, the next scheduled coordination cycle uses
+the last committed state. A tenant poller whose checkpoint write fails resumes
+from its last durable checkpoint. See [v3 write contention](event-stores.md#write-contention).
+
 ## Starting the Control Plane
 
 ```clojure
@@ -71,7 +76,15 @@ Grain provides a Pedestal interceptor that implements retry-until-correct-node r
 #{["/api/counters" :get [auth-interceptor routing-interceptor counters-handler]]}
 ```
 
-When a request hits the wrong node, the interceptor returns `503` with `Retry-After`. The load balancer (ALB, HAProxy) retries on another backend. When the correct node serves the request, it sets a sticky cookie — subsequent requests from that client are locked to that node. Self-healing on lease migration: the old node stops setting the cookie, the client bounces, and finds the new owner.
+When another live node owns the lease, the interceptor returns `503` with
+`Retry-After` and, when available, the owner's address in `X-Grain-Owner`.
+Configure the client or load balancer to retry on another backend. An owner
+sets the sticky cookie. If no live owner is known, the node serves locally
+without setting it.
+
+The interceptor counts owner hits under `RoutingLocal`, wrong-node responses
+under `RoutingRemote` and requests served without a live owner under
+`RoutingDegradation`.
 
 For custom routing logic without the interceptor:
 

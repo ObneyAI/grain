@@ -31,7 +31,7 @@ An Event Model is EDN keyed first by service area and then by runtime block name
   :events
   {:example/counter-created
    {:description "A counter was created."
-    :schema [:map [:counter-id :uuid]]}}
+    :schema [:map [:counter-id :uuid] [:name :string]]}}
   :read-models
   {:example/counters
    {:description "Projected counters."
@@ -72,12 +72,18 @@ read model and a query.
 | Kind | Grain definition | Topology fields |
 |---|---|---|
 | command | `defcommand` | `:schema`, `:reads`, `:produces` |
-| event | `->event`/schema registry | `:schema` |
+| event | `defevent` | `:schema` |
 | read model | `defreadmodel` | `:consumes`, optional `:schema`/`:version` |
 | query | `defquery` | `:schema`, `:reads` |
 | todo processor | `defprocessor` | `:subscribes`, `:reads`, `:produces` |
 | periodic task | `defperiodic` | `:schedule`, `:produces` |
 | screen | design-only | `:queries`, `:commands` |
+
+Define each event with `defevent` and use the same payload schema in its topology
+block. A read-model block's `:schema` describes reducer state. For a keyed model
+(`:key` or `:route`), it must match the declaration's per-instance
+`:state-schema`. The keyed `:result-schema` describes the value returned to
+readers. For an ordinary model the validator compares `:schema` in both places.
 
 Event Model deliberately has no Given/When/Then field. Behavioural examples,
 rules, invariants, and their generated tests belong in Allium.

@@ -2,10 +2,9 @@
   "Read models: pure reducers over a tenant's events, materialized in an LMDB
    cache.
 
-   An ordinary model (no :key or :route) folds all its events into one state;
-   read it with project. A keyed model (:key or :route) keeps one state and
-   result per instance, with indexes and text searches; read it with value,
-   state, values, page or query, and combine reads with read-session.
+   A keyed model (:key or :route) keeps one state and result per instance.
+   Read it with value, state, values, page or query. Use read-session for
+   several reads from one cache snapshot.
 
    Every read takes a context with :event-store, :cache and :tenant-id and
    first catches the model up to the event store head (an ordinary model with
@@ -39,7 +38,7 @@
      :l1-ttl-ms      serve L1 without checking the event store for this
                      many ms (default 0: always check)
      :l1-max-entries L1 size limit (default 10000)
-     :start-after    event id; events at or before it are never read
+     :start-after    UUIDv7 event id; events at or before it are never read
                      (part of the cache identity)"
   [{:keys [_event-store _cache _tenant-id] :as context}
    {:keys [_f _query _name _version _scope _partition-fn _entity-id-fn _partition-key _start-after] :as args}]
@@ -104,11 +103,8 @@
   "Define a reducer var named <ns-kw>-<name> and register it as the read model
    :<ns-kw>/<name>.
 
-   Without :key or :route the model is ordinary: one state, starting from {},
-   read with project. Options: :events, :version (default 1), :schema (Malli
-   syntax checked at registration; states are not validated), :partition-fn,
-   :entity-id-fn, :l1-ttl-ms. Either kind accepts :start-after <event-id>: events
-   at or before it are never read (part of the model's cache identity).
+   :start-after accepts a UUIDv7 exclusive replay boundary and is part of
+   the cache identity.
 
    With exactly one of :key or :route the model is keyed: one state and result
    per instance, read with value, state, values, page or query.
@@ -125,10 +121,16 @@
 
        (defreadmodel :crm customers
          {:events #{:crm/customer-registered} :version 1
-          :key :customer-id :indexes {:name (order-key [:last-name :first-name])}}
+          :key :customer-id
+          :state-schema [:map [:customer-id :uuid] [:first-name :string] [:last-name :string]]
+          :indexes {:name (order-key [:last-name :first-name])}}
          \"Optional docstring.\"
          [customer event]
          (merge customer (select-keys event [:customer-id :first-name :last-name])))
+
+   Existing declarations without :key or :route fold into one state and expose
+   it through project. Their options include :schema, :partition-fn,
+   :entity-id-fn and :l1-ttl-ms.
 
    Unknown options, and options of the other kind of model, throw
    :grain.read-model/invalid. Change :version whenever what the model stores

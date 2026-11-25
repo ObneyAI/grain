@@ -1,32 +1,12 @@
-# read-model-processor-v2
+# Read models
 
-A read model is a pure reducer over a tenant's events. This component folds
-events through registered reducers, stores the results in an LMDB cache and
-serves reads from it. Every read first catches the model up to the event
-store's current head, so reads never return stale data. The one exception is
-an ordinary model that opts into `:l1-ttl-ms`.
-
-There are two kinds of read model:
-
-- An ordinary model folds all of its events into one state value. Read it with
-  `project`. See [Ordinary models](#ordinary-models).
-- A keyed model folds each event into the state of one instance (a customer, an
-  account, an order). Instances are stored and indexed separately, so you can
-  read one instance, page through them in index order, search them, and join
-  several keyed models in one query. Read it with `value`, `state`, `values`,
-  `page` and `query`.
-
-Use a keyed model for anything a user lists, sorts, searches or opens by ID.
-An ordinary model returns its whole state on every read, which suits small
-aggregates and coordination state.
-
-All functions live in `ai.obney.grain.read-model-processor-v2.interface`,
-required as `rmp` below. The behavioural contract is in
-[read-model-processor-v2.allium](read-model-processor-v2.allium).
+Define a keyed model with `:key` or `:route` to fold tenant events into
+per-instance state. Look up an instance by ID, page through an index,
+search by text, or join results across models. Results are cached in LMDB.
 
 ## Context
 
-Every read takes a context map with three keys:
+Reads need a started event store, a cache and a tenant UUID:
 
 ```clojure
 (require '[ai.obney.grain.read-model-processor-v2.interface :as rmp :refer [defreadmodel]]
@@ -34,42 +14,35 @@ Every read takes a context map with three keys:
          '[ai.obney.grain.kv-store.interface :as kv]
          '[ai.obney.grain.kv-store-lmdb.interface :as lmdb])
 
+(def tenant-id (random-uuid))
 (def context
   {:event-store (es/start {:conn {:type :in-memory}})
-   :cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir "/var/lib/app/read-models"
+   :cache (kv/start (lmdb/->KV-Store-LMDB {:storage-dir "./data/read-models"
                                            :db-name "read-models"
-                                           :map-size (* 8 1024 1024 1024)}))
+                                           :map-size (* 64 1024 1024)}))
    :tenant-id tenant-id})
 ```
 
-The tenant always comes from the context; model declarations never name a
-tenant. A cache belongs to one event store. The LMDB default map size is 10 MB,
-which keyed models outgrow quickly; size `:map-size` for the data you expect.
-LMDB needs the JVM flags `--add-opens=java.base/java.nio=ALL-UNNAMED` and
+Use one cache directory per event store. Set `:map-size` for the expected
+data and indexes. The default is 10 MiB. Start the JVM with
+`--add-opens=java.base/java.nio=ALL-UNNAMED` and
 `--add-opens=java.base/sun.nio.ch=ALL-UNNAMED`.
 
-Read models fold ordinary Grain events. The event store only accepts event
-types that have a registered schema; `es/append` returns an anomaly for any
-other type. The keys of an event's `:body` appear directly on the event map a
-reducer receives, next to `:event/type`, `:event/id`, `:event/timestamp` and
-`:event/tags`:
+Define each event type with `defevent` before appending instances with `->event`.
 
 ```clojure
-(require '[ai.obney.grain.schema-util.interface :refer [defschemas]])
+(es/defevent :crm/customer-registered
+  "A customer registered."
+  {:schema [:map [:customer-id :uuid] [:first-name :string]
+                 [:last-name :string] [:email :string]]})
 
-(defschemas crm-events
-  {:crm/customer-registered [:map [:customer-id :uuid] [:first-name :string]
-                             [:last-name :string] [:email :string]]})
-
+(def customer-id (random-uuid))
 (es/append (:event-store context)
            {:tenant-id tenant-id
             :events [(es/->event {:type :crm/customer-registered
-                                  :tags #{[:customer customer-id]}
                                   :body {:customer-id customer-id :first-name "Ada"
                                          :last-name "Lovelace" :email "ada@example.com"}})]})
 ```
-
-See [Events](../../docs/core-concepts.md#events) for event definitions.
 
 ## Keyed models
 
@@ -78,6 +51,8 @@ See [Events](../../docs/core-concepts.md#events) for event definitions.
   {:events #{:crm/customer-registered :crm/customer-renamed :crm/customer-closed}
    :version 1
    :key :customer-id
+   :state-schema [:map [:customer-id :uuid] [:first-name :string] [:last-name :string]
+                  [:email :string] [:closed? {:optional true} :boolean]]
    :include? (fn [customer] (not (:closed? customer)))
    :indexes {:name (rmp/order-key [:last-name :first-name])}
    :searches {:text (rmp/search-text [:first-name :last-name :email])}}
@@ -93,24 +68,17 @@ See [Events](../../docs/core-concepts.md#events) for event definitions.
 
 (rmp/page context :crm/customers {:index :name :page 1 :limit 25})
 ;; => {:entries [{:key #uuid "..." :value {...}} ...]
-;;     :total 2 :total-pages 1 :page 1 :page-size 25 ...}
+;;     :total 1 :total-pages 1 :page 1 :page-size 25 ...}
 ```
 
-`:key` maps each event to the ID of the instance it belongs to; a `nil` ID is
-an error. The reducer receives that instance's current state (starting from
-`:initial`, default `{}`) and the event. `defreadmodel` registers the model as
-`:crm/customers` and also defines the reducer as the var `crm-customers`. The
-docstring is optional.
-`register-read-model!` registers a model without the macro, and
-`global-read-model-registry` returns every registered declaration.
+Here `:key` sends each event to a customer, `:include?` hides closed customers
+from results, and `:indexes` orders the list by last and first name. Read
+`state` to inspect a closed customer's reducer state.
 
-Registering a name again replaces its declaration. For a `defreadmodel` with
-a docstring, the replacement must come from the same var: re-evaluating the
-form at the REPL, or reloading its namespace, always succeeds, whatever
-changed. A declaration of the same name from another namespace throws
-`Conflicting read model definition` while the original var still exists; once
-its namespace is removed or the var unmapped, as when a file is renamed, the
-new declaration takes the name.
+`defreadmodel` registers `:crm/customers` and defines the reducer var
+`crm-customers`. Reloading the same var replaces its declaration. Two
+documented declarations in different live vars cannot claim the same name.
+For programmatic registration use `register-read-model!`.
 
 ### Declaration options
 
@@ -128,13 +96,10 @@ new declaration takes the name.
 | `:filtered-indexes` | `#{}` | Index names (or `:identity`) that also store membership data for `filtered-key-page`, `joined-page` and some query plans. Experimental. |
 | `:state-schema` | | Malli schema checked against the state after every reducer call. |
 | `:result-schema` | | Malli schema checked against every result before it is stored. |
-| `:start-after` | | Event id (UUID). Events at or before it are never read. Part of the storage identity. Valid for ordinary models too. |
+| `:start-after` | | Exclusive UUIDv7 replay boundary for ordinary and keyed models. Applies to scoped and partitioned reads too. |
 
-Supply exactly one of `:key` or `:route`. Unknown options, and options that only
-apply to ordinary models (`:schema`, `:partition-fn`, `:entity-id-fn`,
-`:l1-ttl-ms`), fail at registration with `:grain.read-model/invalid`. The
-`ex-data` lists `:unknown-options`, `:inapplicable-options` and
-`:supported-options`.
+Supply exactly one of `:key` or `:route`. Registration rejects unknown options
+and ordinary-only options such as `:schema` and `:l1-ttl-ms`.
 
 Use `:route` when one event affects several instances, or none:
 
@@ -144,7 +109,9 @@ Use `:route` when one event affects several instances, or none:
    :route (fn [{:keys [from to amount-cents]}]
             [[from (- amount-cents)] [to amount-cents]])
    :initial 0
+   :state-schema :int
    :result (fn [cents] {:cents cents})
+   :result-schema [:map [:cents :int]]
    :indexes {:cents :cents}}
   [cents delta]
   (+ cents delta))
@@ -155,16 +122,12 @@ applied in the order returned. An empty sequence skips the event; `nil`, a
 malformed pair or a `nil` ID is an error. All inputs from one event commit
 together.
 
-Routing, reducers, results, inclusion and index and search extractors must be
-pure. They receive only their arguments: no context, other models, clock or
-I/O. Grain may call them more than once for the same events (see
-[Catch-up](#catch-up-and-consistency)).
+Keep routing, reducers and extractors pure. Catch-up may evaluate them more
+than once before a batch commits.
 
-Instance IDs and index values may be `nil` (index values only), booleans,
-strings, integers in the signed 64-bit range, UUIDs, keywords, and vectors of
-these. An encoded index entry must fit in 511 bytes, which holds an indexed
-string of roughly 450 ASCII or 220 CJK characters. A larger entry fails the
-batch with `:grain.read-model/key-too-large`; values are never truncated.
+Instance IDs and index values support booleans, strings, signed 64-bit integers,
+UUIDs, keywords and vectors of those values. Index values can also be `nil`.
+Each encoded index key, including its ID, must fit in 511 bytes.
 
 ### Reading
 
@@ -192,10 +155,6 @@ to the last page.
 
 ```clojure
 (rmp/page context :crm/customers {:index :name :direction :desc :limit 2})
-;; => {:entries [{:key ... :value {...}} {:key ... :value {...}}]
-;;     :total 3 :total-pages 2 :page 1 :page-size 2
-;;     :rows-examined 2 :results-decoded 2 :rank-entries-examined 3
-;;     :progress {:watermark ... :checked-through ...}}
 
 (into [] (map :key) (rmp/values context :bank/balances {:index :cents :equals 300}))
 ```
@@ -230,8 +189,8 @@ scalar sort value, several give a vector. Use a raw keyword extractor such as
 same transaction as results.
 
 ```clojure
-(rmp/search-keys context :crm/customers {:index :text :query "smith"})
-;; => [#uuid "..."]
+(rmp/search-keys context :crm/customers {:index :text :query "love"})
+;; => [customer-id]
 ```
 
 `search-keys` returns the IDs of included instances whose text contains the
@@ -268,8 +227,8 @@ optional search and a named order. It does not create another stored model.
    :orders {:name [:customer/last-name :customer/first-name]
             :balance [:ledger/balance-cents]}})
 
-(rmp/query context customer-list {:order :name :search "smith" :page 1 :limit 25})
-;; => {:rows [{:key customer-id :customer {...} :ledger {:balance-cents 500}}]
+(rmp/query context customer-list {:order :name :search "love" :page 1 :limit 25})
+;; => {:rows [{:key customer-id :customer {...} :ledger {:balance-cents 0}}]
 ;;     :total 1 :total-pages 1 :page 1 :page-size 25
 ;;     :work {:strategy :indexed-matches :sort-keys-read 1}}
 
@@ -333,18 +292,12 @@ What the planner supports, checked when the definition is compiled (by
   Use them when an order has to be calculated; plain field orders never fall
   back to scanning.
 
-In the `customer-list` example, `:name` is served from the root's `:name`
-index. `:balance` orders by a related model. `:billing/ledger` only has
-customers who were charged, so its IDs differ from the root's; the order works
-because the relationship has `:missing [:default {:balance-cents 0}]` and
-`:balance` is in the ledger's `:filtered-indexes`, which lets Grain join the two
-(`:work` reports `:joined`). Uncharged customers sort as balance 0. If every
-customer had a ledger, the IDs would match and `:work` would report `:indexed`.
+In the example, an uncharged customer sorts with a balance of zero. The ledger's
+filtered index and the relationship's default let the query include customers
+without a ledger entry.
 
-Unsupported definitions fail with `:grain.read-query/unsupported`. The
-`ex-data` includes `:path`, a `:hint`, and, where an index is missing,
-`:suggested-extractor`, for example `(rmp/order-key [:name])`. Malformed
-definitions and requests fail with `:grain.read-query/invalid`.
+For an unsupported plan, inspect `:path`, `:hint` and `:suggested-extractor`
+in the exception data.
 
 ### Event scopes
 
@@ -416,41 +369,20 @@ noted.
 
 ## Catch-up and consistency
 
-A read captures the tenant's event store head, folds every event after the
-model's progress up to that head, and then serves. A read never returns data
-older than the head it captured, and a failed catch-up throws instead of
-serving older data. Newer data written by a concurrent reader may be visible.
+A keyed read folds matching events through the tenant head it captured, then
+reads the cache. A concurrent update may already be visible. If catch-up fails,
+the read throws. Each batch commits state, results, indexes, search data and
+progress together. The next read resumes after the last successful batch.
 
-Catch-up folds events in batches. Each batch commits every affected state,
-result, index entry, count, search posting and the model's progress in one
-LMDB write transaction. A failed batch commits nothing; earlier batches stay
-committed, and the next read resumes from them. Grain prepares a batch in a
-read transaction and then writes it. The batch is prepared again inside the
-write transaction if another writer advanced the model in between or if the
-first preparation threw, and again for each half when a batch is split after
-the LMDB map fills. That is why reducers and extractors can run more than once
-for the same event.
-
-Concurrent reads of the same model in one process share a single catch-up.
-Readers in other processes are serialized by LMDB's single writer and skip
-events that were already applied, so no event is applied twice and progress
-never moves backwards.
-
-When the event store guarantees that empty intervals stay empty (the built-in
-stores do), Grain remembers recent intervals in which a model had no matching
-events and skips the event query while the head stays within them.
+Concurrent local readers share catch-up for the same materialization. Separate
+processes recheck progress before committing. Built-in event stores also let
+Grain skip intervals already known to contain no matching events.
 
 ### Batch size
 
-Batch size adapts to the work. A model with no progress starts at 1,024 events
-per batch; others start at 128. The size doubles up to 8,192 while a batch
-writes at most 32 MiB, and halves when a batch writes more than four times that.
-It drops to the minimum when the LMDB map is more than half full or nearly out
-of free space, and a batch that fails with a full map is split in half and
-retried.
-
-To change the policy, put a map under `:read-model/catch-up` in the context
-with any of these keys:
+Use `:read-model/catch-up` in the context to tune keyed catch-up. Batches grow
+for cheap writes and shrink under memory pressure. A map-full batch is split
+and retried.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -468,15 +400,9 @@ fixed size.
 
 ### Cold builds
 
-When a model with no progress has 1,024 or more matching events, Grain builds
-it in a staging area instead of in place. It folds all events into staging
-without maintaining indexes or searches, then builds them from the sorted
-results, and finally swaps staging into place in one transaction. Readers wait
-for the build and then read the finished model. Only one process builds a
-given model; it holds a lease that it renews while it makes progress, and
-another process takes over if the lease lapses. If folding fails, the next
-read resumes the staged build. If building the indexes fails, the staging data
-is removed and later reads build the model in place.
+Large first reads build indexes in staging and publish the completed model
+atomically. Other readers wait. A new builder can take over an expired lease
+and resume replay. If index finalization fails, a later read builds in place.
 
 | Context key | Default | Meaning |
 |---|---|---|
@@ -487,40 +413,44 @@ is removed and later reads build the model in place.
 
 ## Changing a model
 
-Storage is addressed by tenant, model name, version, `:start-after` and event
-scope; changing `:start-after` rebuilds like a version bump. Change
-`:version` whenever you change what a model stores: events, routing, reducer,
-`:initial`, `:result`, `:include?`, schemas, index or search extractors, or
-`:filtered-indexes`. The new version builds from the event history; the old
-version's data is left unused.
+Bump `:version` when changing event types, routing, reducer logic, schemas,
+inclusion, indexes or search extractors. A new version rebuilds from retained
+history. Grain detects changes to stored index and search *names*. Changing
+the logic under an existing name requires an explicit version bump.
 
-Grain detects part of this. If the set of index names, `:filtered-indexes` or
-search names differs from the one the stored data was built with, reads fail
-with `:grain.read-model/invalid-cache` and nothing is written. Changes under the
-same names, such as a new extractor function or a different `:include?`, cannot
-be detected and keep serving the old data until the version changes.
+To intentionally skip a historical prefix, declare a fixed `:start-after`
+UUIDv7. On a cold read the model starts from its initial state and folds events
+strictly after that ID. Later reads resume after the newer of the boundary and
+the cached watermark. Adding, removing or changing the boundary selects a
+separate cache, even with the same version.
 
 ## Storage and operations
 
-The cache holds only derived data. Delete it whenever no process has it open;
-reads rebuild it from the event store. There is no stored format version. When
-a release changes the storage layout, delete the cache directory as part of
-the rollout.
+Each store needs its own cache directory. To rebuild after a storage layout
+change, stop every process using the directory before replacing it. Verify that
+the event store still contains the history needed for replay, especially for
+[bounded event types](../../docs/event-definitions-and-retention.md).
 
-Use one cache per event store. Cache entries are keyed by tenant, model,
-version and scope, not by event store, so two event stores with the same
-tenant IDs reading through one cache directory would see each other's state.
+Use [production metrics](#production-metrics) to monitor reads. In benchmarks,
+`:read-model/observer` accepts a function of `{:operation keyword :bytes n}`.
+An observer disables staged builds and speculative batch preparation.
 
-Index pages, counts and ranks are maintained in the fold transaction, so read
-cost does not depend on the number of skipped pages. Descending pages are read
-from the ascending index. Writing an instance touches only the entries of
-indexes whose value changed.
+### Custom storage backends
 
-Pass `:read-model/observer` in the context to receive
-`{:operation keyword :bytes n}` for each storage read, write and fold step,
-for measurement in tests and benchmarks. It disables staged cold builds and
-batch preparation outside the write transaction, so it is not meant for
-production.
+Ordinary segmented reads use `kv/read-snapshot` so the manifest and all segments
+come from one committed state. A KV store must implement that operation. Its
+callback receives a getter taking `{:k bytes}`. Keyed models additionally
+require `(kv/transact cache mode f)`. In `:read` mode, the callback can use
+`:get` and `:reduce` over byte keys. In `:write` mode it can also `:put` and
+`:delete` atomically. Range scans accept `:prefix`, inclusive `:from`, exclusive
+`:to` and `:reverse?`. Use the operations only on the callback thread before
+it returns. See the
+[KV contracts](../kv-store/kv-store.allium).
+
+For custom event stores, `es/head` falls back to a reverse, limit-one read.
+Implement `EventStoreHead` for a metadata-only lookup. Opt into
+`EventStoreStableEmptyIntervals` only if later writes cannot add matches
+at or below a previously observed head.
 
 ### Errors
 
@@ -539,110 +469,52 @@ Errors are `ex-info` exceptions. These carry a `:type` in their `ex-data`:
 
 `:grain.read-model/invalid-registry`, `invalid-namespace`,
 `namespace-collision`, `namespace-exhausted` and `invalid-levels` mean the
-cache's internal metadata is inconsistent; delete the cache. Other failures,
-such as an invalid keyed declaration, a schema validation failure
+cache's internal metadata is inconsistent. Rebuild from retained history. Other failures,
+such as a schema validation failure
 (`ex-data` has `:model`, `:kind` and `:explanation`) or an exception from a
 reducer, are thrown as they occur and roll back the current batch.
 
 ## Ordinary models
 
-An ordinary model folds all of its events into one state, starting from `{}`:
+Existing declarations without `:key` or `:route` fold into a single state
+starting from `{}`. Their read API is `project`. The optional scope accepts
+`:tags` to filter declared event types, `:queries` to replace the event query,
+or `:partition-key` to return a single partition. Each scope has its own cache.
 
-```clojure
-(defreadmodel :example counters
-  {:events #{:example/counter-created :example/counter-incremented}
-   :version 1}
-  [state event]
-  (case (:event/type event)
-    :example/counter-created
-    (assoc state (:counter-id event) {:name (:name event) :value 0})
-    :example/counter-incremented
-    (update-in state [(:counter-id event) :value] inc)))
+| Option | Behaviour on an ordinary model |
+| --- | --- |
+| `:schema` | Registration checks Malli syntax. The processor does not validate each new state. |
+| `:partition-fn`, `:entity-id-fn` | Map entity state to a partition and events to entity IDs. The first read builds all partitions. A read without a partition key merges them. |
+| `:l1-ttl-ms` | How long an unpartitioned or single-partition read can serve in-process state before checking for new events. Full partition reads bypass L1. |
+| `:start-after` | Exclusive UUIDv7 replay boundary, included in cache identity alongside the model version. |
 
-(rmp/project context :example/counters)
-;; => {#uuid "..." {:name "clicks" :value 1}}
-```
+## Production metrics
 
-Options are `:events`, `:version`, `:schema` (a Malli schema checked for valid
-syntax at registration; states are not validated against it),
-`:partition-fn`, `:entity-id-fn`, `:l1-ttl-ms` and `:start-after`. `project` throws for keyed
-models, and the keyed read functions throw for ordinary ones.
+Grain emits μ/log metrics on ordinary, partitioned and keyed reads. Use these
+to distinguish time spent serving a read from time spent catching up its model.
 
-`project` takes an optional scope:
+| Metric | What it measures |
+| --- | --- |
+| `ReadModelReadDuration`, `ReadModelReadFailed` | Time and failures per logical read. A query or session counts once. Reducibles are timed when consumed, including consumer work. Cancellation and caller callback errors do not increment the failure counter. |
+| `ReadModelCatchUpDuration`, `ReadModelCatchUpFailed` | Time and failures for the local owner of a keyed catch-up. Waiting readers add no catch-up attempts. |
+| `ReadModelWaitDuration` | Time waiting for a catch-up or staged-build owner. |
+| `ReadModelCommittedEvents`, `ReadModelCommittedBatches` | Source events and physical keyed batches committed. Fan-out counts an event once. Checkpoint-only writes add no batches. |
+| `ReadModelEncodedBytesWritten` | Encoded bytes put by committed keyed batches, including rewrites. Measures write volume, including overwrites. |
+| `ReadModelBatchBackoff` | Map-full errors that caused a batch split. |
+| `ReadModelColdBuildDuration`, `ReadModelColdBuildFailed` | Time and failures per owned staged build, including replay and index finalization. Superseded and cancelled builds are excluded from failures. |
 
-```clojure
-(rmp/project context :example/counters {:tags #{[:counter counter-id]}})
-(rmp/project context :example/counters {:queries [{:types #{:example/counter-created}
-                                                   :tags #{[:counter counter-id]}}]})
-(rmp/project context :inventory/items {:partition-key location-id})
-```
-
-`:tags` reads the model's event types restricted to those tags. `:queries`
-replaces the event query entirely; the tenant is added to each query map. Each
-scope is cached separately. `p` is the same projection without the registry:
-pass `:f`, `:query`, `:name` and `:version` directly.
-
-### Caching
-
-State is kept in two tiers. L1 is an in-process map of decoded states, kept
-separately for each event store and cache and evicted least-recently-used
-beyond 10,000 projections. L2 is the LMDB cache: one entry for
-states up to 10,000 keys, 64 hash segments above that. For unpartitioned
-models, L2 is rewritten when a read folds at least 10 new events; below that,
-L1 holds the newer state and a restarted process folds the remainder again.
-The first write-back after a process starts rewrites only the segments that
-changed; later write-backs rewrite the whole state. Partitioned models write
-every change.
-
-By default every `project` call reads the events after the cached watermark, so
-it is as current as a keyed read. `:l1-ttl-ms` lets L1 serve a state without
-checking the event store for that many milliseconds after it was last checked.
-It applies to unpartitioned models and single-partition reads; reading all
-partitions of a partitioned model does not use L1. It is the only read path
-that can return stale data; keyed models have no equivalent. `l1-clear!`
-empties L1 and `l1-stats` returns `{:entries n}`.
-
-Unpartitioned reads emit mulog traces named `ReadModelL1Hit`,
-`ReadModelL1Revalidated`, `ReadModelL1Stale`, `ReadModelL1Miss`,
-`ReadModelL2Hit` and `ReadModelL2Miss`, with `:read-model/cache-tier`.
-Single-partition reads emit the four L1 traces, which also carry
-`:read-model/name`. Full partition projections emit `ReadModelL2Hit` or
-`ReadModelL2Miss`, according to whether a partition manifest was present. All
-ordinary-model paths retain model name/version context.
-
-### Partitioned models
-
-For large ordinary models that split naturally, such as appointments by
-location and day, supply both `:partition-fn` and `:entity-id-fn`:
-
-```clojure
-(defreadmodel :scheduling appointments
-  {:events #{:scheduling/appointment-booked :scheduling/appointment-moved}
-   :version 1
-   :partition-fn (fn [appointment] [(:location-id appointment) (subs (:start-at appointment) 0 10)])
-   :entity-id-fn :appointment-id}
-  [state event]
-  ...)
-
-(rmp/project context :scheduling/appointments {:partition-key [location-id "2025-06-15"]})
-```
-
-`:entity-id-fn` maps an event to the key of the entity it changes in the state
-map. `:partition-fn` maps that entity's state to its partition. Each partition
-is stored separately with a manifest of partition keys. When an event moves an
-entity to another partition, it is removed from the old one and added to the
-new one. Without `:partition-key`, `project` returns all partitions merged. A
-single-partition read folds only the events relevant to that partition; to
-decide whether an unseen entity belongs to it, Grain calls the reducer on an
-empty state and treats an exception as "not relevant". The first
-single-partition read on an empty cache projects every partition once.
+Ordinary cache timings distinguish `ReadModelL1Hit`, `ReadModelL1Revalidated`,
+`ReadModelL1Stale`, `ReadModelL1Miss`, `ReadModelL2Hit` and `ReadModelL2Miss`.
+Use the [CloudWatch publisher](../mulog-aws-cloudwatch-emf-publisher/README.md)
+to configure metric dimensions.
 
 ## Tests and benchmarks
 
 `interface.testing` exposes cache-key and L1 helpers for ordinary-model
-integration tests. CI runs this component's tests with
-`clojure -M:poly test :all-bricks :dev project:development` from the
-repository root. The ranked-membership benchmark is the `-main` of
+integration tests. Run the component suite from the repository root with
+`clojure -M:poly test :all-bricks :dev project:development brick:read-model-processor-v2`.
+For the live lifecycle and segmented-cache scenarios, run
+`clojure -M:dev scripts/live-test.clj read-models`. The ranked-membership benchmark is the `-main` of
 `interface_test.clj`; run it from `projects/grain-core-v2`:
 
 ```sh
@@ -651,48 +523,3 @@ clojure -J--add-opens=java.base/java.nio=ALL-UNNAMED \
   -Sdeps '{:paths ["resources" "../../components/read-model-processor-v2/test"] :deps {bench/sqlite {:local/root "../../components/event-store-sqlite-v3"}}}' \
   -M -m ai.obney.grain.read-model-processor-v2.interface-test 10000 /tmp/ranked-membership.edn
 ```
-
-## Production metrics
-
-Read-model operations emit μ/log metrics automatically, independently of
-`:read-model/observer`. Enabling metrics does not disable speculative preparation,
-optimized index builders, or staged cold builds. The observer remains a diagnostic
-hook with its existing execution-path effects.
-
-| Metric | Meaning |
-| --- | --- |
-| `ReadModelReadDuration` | One completed public logical read, including failures. Reducible reads are timed during consumption, including consumer work; creating an unconsumed reducible emits no duration. Each subsequent reduction is another attempt. |
-| `ReadModelReadFailed` | Read definition, validation, materialization, or storage failure. Caller callback errors and cancellation do not increment this counter. |
-| `ReadModelCatchUpDuration`, `ReadModelCatchUpFailed` | One locally owned keyed catch-up, including internal restarts. Waiting readers do not duplicate catch-up attempts. |
-| `ReadModelCommittedEvents` | Source events accepted by successfully committed physical keyed batches. Routing to multiple owners counts the source event once. Speculative reducer calls and rolled-back writes do not count. |
-| `ReadModelCommittedBatches` | Successful physical keyed batch transactions, including each successful leaf after map-full splitting. Checkpoint-only transactions do not count. |
-| `ReadModelEncodedBytesWritten` | Encoded key/value bytes passed to put operations by committed keyed batches, including repeated writes. This is neither disk growth nor total cold-build/index finalization I/O. |
-| `ReadModelWaitDuration` | Time waiting for another local catch-up owner or a staged-build owner. |
-| `ReadModelBatchBackoff` | Map-full failures that actually trigger a batch split. |
-| `ReadModelColdBuildDuration`, `ReadModelColdBuildFailed` | One owned staged cold-build attempt, including replay, index finalization, and publication. Resumed ownership starts a new attempt. Small builds performed in place are covered by catch-up metrics. Supersession/restart and cancellation are not failures. |
-
-Durations use milliseconds at high resolution. Counters use standard resolution
-and Count, except encoded bytes, which uses Bytes. Read outcomes are `success`,
-`failure`, `consumer-error`, or `cancelled`; a staged build that loses ownership or
-must restart uses `superseded`. Errors retain their original throwable identity.
-A query or read-session owns one read duration; its synchronous internal reads
-and reads made in the session callback do not duplicate that denominator. An
-independent read on another thread owns its own attempt. An internal read failure
-propagated through a callback remains a processor failure.
-
-Bounded optional dimension names are `:read-model-operation`, `:read-model-kind`
-(`ordinary`, `partitioned`, `keyed`), `:read-model-scope` (`tenant`, `scoped`,
-`partition`), `:read-model-outcome`, `:read-model-wait-kind` (`catch-up`,
-`cold-build`), and `:read-model-target` (`live`, `staging`). Scope labels describe
-only the mode. Tenant IDs, keys, selectors, versions, and search text are never
-metric dimensions. `:read-model-name` is an optional allowlist of stringified
-qualified keywords. Unknown top-level model names are omitted while preserving
-the aggregate metric. Explicit `:metric/dimensions` remain strict.
-
-The CloudWatch EMF publisher recognizes the semantics of these eleven metrics
-with unchanged existing factory configuration, including custom registries that
-do not yet contain them. For dimensions, use `grain-metric-registry` with bounded
-values (the example application demonstrates all vocabularies). Without a
-configured definition, legacy app/env dimensions continue to work; configured
-definitions remain authoritative. Existing ordinary cache-tier timers now include
-event reading/folding, and full partition projections emit L2 hit/miss timings.

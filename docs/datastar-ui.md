@@ -8,24 +8,8 @@ attributes from ordinary Hiccup. Application code should usually require it as
 (require '[ai.obney.grain.datastar.ui :as ui])
 ```
 
-The DSL has three jobs:
-
-- Build Datastar attributes from data, not handwritten strings.
-- Keep command/query payloads explicit so ambient page state is not sent by
-  accident.
-- Own signal scoping so developers do not manually name, thread, or isolate
-  component-local Datastar signals.
-
-The normal production boundary is:
-
-```clojure
-(ui/hiccup view)
-;; Hiccup + UI forms -> UI IR -> Hiccup with Datastar attributes
-```
-
-The Datastar UI DSL does not render HTML. It returns Hiccup. Grain's Datastar
-adapter and the application's normal HTML renderer still own HTML strings and
-SSE patch rendering.
+Use `ui/hiccup` to resolve signal names, route references and bindings before
+passing the result to the HTML renderer.
 
 ## Table Of Contents
 
@@ -42,7 +26,6 @@ SSE patch rendering.
 - [IR, Lowering, And Static Output](#ir-lowering-and-static-output)
 - [Raw Escape Hatches](#raw-escape-hatches)
 - [Complete DSL Reference](#complete-dsl-reference)
-- [Code Agent Checklist](#code-agent-checklist)
 
 ## Quick Start
 
@@ -64,52 +47,12 @@ Commands and queries are addressed by keywords, not literal routes:
                   :modifiers {:debounce "250ms"}}}]
      [:div#customer-results]]))
 
-(defn customer-index-screen []
-  (ui/with-signals [selected-id {:init nil}
-                    documents-open? {:init false}
-                    saving? {:init false}]
-    [:main.customers-screen
-     [:header
-      [:h1 "Customers"]
-      [:a {:href (ui/href :customers/new-customer-page)}
-       "New customer"]]
-
-     (customer-typeahead)
-
-     [:section.customer-workspace
-      [:nav
-       [:a {:href (ui/href :customers/profile-page
-                          {:path-params {:customer-id selected-id}})}
-        "Profile"]
-       [:button {:on/click {:effect (ui/effects
-                                      (ui/set-signal documents-open? true)
-                                      (ui/refresh :customers/documents-panel
-                                                  {:customer-id selected-id}))}}
-        "Documents"]]
-
-      [:section {:bind/show documents-open?}
-       [:div#customer-documents]]
-
-      [:button {:bind/attr {:disabled (ui/js "!" selected-id " || " saving?)}
-                :on/click {:effect (ui/effects
-                                     (ui/set-signal saving? true)
-                                     (ui/dispatch :customers/archive
-                                                  {:customer-id selected-id}))}}
-       "Archive customer"]]]))
+(ui/hiccup (customer-typeahead))
 ```
 
-Lower it before rendering:
-
-```clojure
-(ui/hiccup (customer-index-screen))
-```
-
-The checked output contains generated Datastar signal names and Datastar action
-strings. The source keeps local signal handles (`query`, `selected-id`,
-`documents-open?`, `saving?`) and route refs (`:customers/typeahead-page`,
-`:customers/profile-page`, `:customers/documents-panel`, `:customers/archive`).
-The typeahead has its own scoped `query` signal, separate from the screen's
-state.
+Typing updates the local `query` signal. After 250 ms without another input,
+the view sends its value as `:q` to the registered `:customers/typeahead-page`
+query.
 
 ## Mental Model
 
@@ -283,6 +226,10 @@ Indexes may be literals, signal handles, or checked expressions:
 (ui/indexed custom-amounts idx)
 (ui/num-cents (ui/indexed custom-amounts idx))
 ```
+
+Nested bindings such as `(ui/indexed (ui/indexed rows idx) "amount")`
+display an empty input and skip writes while the parent row is missing.
+This lets a render remove a row while an input event is still pending.
 
 ## Bindings
 
@@ -1206,24 +1153,3 @@ lowering; application code should pass options to `hiccup`, `lower-ir`, or
 ```clojure
 (ui/hiccup source {:query-registry registry})
 ```
-
-## Code Agent Checklist
-
-When generating UI with this DSL:
-
-- Require `[ai.obney.grain.datastar.ui :as ui]`.
-- Wrap component-local state with `ui/with-signals`.
-- Use plain signal option maps: `[query {:init ""}]`.
-- Pass signal handles directly in bindings, expressions, and payloads.
-- Use `:bind/value`, `:bind/text`, `:bind/show`, `:bind/class`, and
-  `:bind/attr` for checked bindings.
-- Use `:morph/ignore` instead of raw `:data-ignore-morph`.
-- Use verbose event maps: `{:effect ...}` and optional `:modifiers`.
-- Use `ui/dispatch`, `ui/refresh`, and `ui/href` with keyword route refs.
-- Put every command/query input in the explicit payload map.
-- Use nested payload maps/collections when they match command/query schemas.
-- Call `ui/hiccup` at the render boundary.
-- Pass `{:query-registry registry}` in tests when the default registry is not
-  available.
-- Avoid `ui/action`, `ui/js`, raw `data-*` attrs, low-level signal helpers, and
-  `with-signal-scope` unless the checked DSL cannot express the case.

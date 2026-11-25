@@ -1,59 +1,49 @@
 ---
 name: event-model
-description: >-
-  Read, write, and validate Grain's service-area-first Event Model topology. Use for defeventmodel EDN, Grain CQRS blocks and flows, live registry reconciliation, boot mandates, or :grain/allium trace links. Event Model describes topology only; route observable behavioural rules and test obligations to Allium.
+description: Author and validate Grain service topology, CQRS flows, registry declarations and links to Allium.
 ---
 
 # Event Model
 
-An Event Model is `{area -> service-area}` EDN. Areas contain `:commands`,
-`:events`, `:read-models`, `:queries`, `:todo-processors`, `:periodic-tasks`,
-`:screens`, and `:flows`. Blocks use `:<area>/<name>` keys; identity is
-`[kind name]` because kinds come from structural position.
+Register each service area with `(em/defeventmodel :area area-map)`. Registration
+replaces that area's entry. Blocks live under `:commands`, `:events`, `:read-models`,
+`:queries`, `:todo-processors`, `:periodic-tasks` and `:screens`. In `:flows`,
+each step has `:from` and `:to` endpoints identified by `[kind :area/name]`;
+`nil` marks a boundary.
 
-Legal flow adjacency:
+`emv/connection-grammar` lists legal flow steps. `emv/intent-edges` lists
+dependency targets. A processor's `:subscribes` names trigger events and its
+`:reads` names queries. Match topology to the runtime declarations
+`:grain.event-model/reads` and `:grain.event-model/produces` where applicable.
+Match every event block’s `:schema` to its `defevent` payload schema and every
+keyed read model’s topology `:schema` to its per-instance `:state-schema`.
 
-```text
-command -> event -> read-model -> query -> screen
-                                  query -> todo-processor -> command
-screen -> command
-read-model -> command
-periodic-task -> command | event
-```
-
-Processor `:subscribes` is event trigger wiring, not a flow input. Commands and
-queries `:reads` target read models. Production/read declarations at `def*` sites
-use `:grain.event-model/produces` and `:grain.event-model/reads`.
-
-## Behavioural trace
-
-Commands must link to at least one Allium rule and screens to at least one Allium
-surface for the dev/CI composition gate:
+Commands must link to an Allium rule and screens to a surface. Every supplied
+reference must resolve by kind and name in a repository-relative spec:
 
 ```clojure
-:grain/allium
-[{:spec "components/orders/orders.allium"
-  :kind :rule
-  :name "PlaceOrder"}]
+:grain/allium [{:spec "components/example-service/example-service.allium"
+                :kind :rule :name "CreateCounter"}]
 ```
 
-Paths are safe repository-relative `.allium` paths. Optional references on other
-blocks and flows must also resolve. Never add `:given-when-thens`; behavior lives
-in Allium.
-
-## Oracle
-
-Over the project nREPL, require:
+Load the application’s models, schemas and handlers before checking live coverage.
 
 ```clojure
-[ai.obney.grain.event-model.interface :as em]
-[ai.obney.grain.event-model-validator.interface :as emv]
-[ai.obney.grain.code-agent-tools.interface :as tools]
+(require '[ai.obney.grain.event-model.interface :as em]
+         '[ai.obney.grain.event-model-validator.interface :as emv])
+
+(emv/verify-event-model!) ;; strict verdict with :valid? and :findings
+(emv/event-model-coverage (em/registered-model))
 ```
 
-Use `(em/registered-model)`, `(tools/catalog)`,
-`(emv/validate-event-model model {:strict true})`,
-`(tools/event-model-coverage model)`, and
-`(tools/validate-spec-composition model {:project-root "." :event-model-opts {:strict true}})`.
-The last call requires the Allium CLI and is dev/CI-only. Production boot uses
-`emv/verify-or-throw!` and never requires Allium source or tooling.
+Check draft EDN with `(emv/validate-event-model model)`.
+At boot, `(emv/verify-or-throw!)` raises on failure. Pass `{:event-store store}`
+to also check active retention policies. In development or CI, run the link check
+from the project root with the Allium CLI on PATH:
+
+```clojure
+(require '[ai.obney.grain.code-agent-tools.interface :as tools])
+
+(tools/validate-spec-composition (em/registered-model)
+                                 {:project-root "." :event-model-opts emv/strict-defaults})
+```

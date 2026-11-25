@@ -3,7 +3,6 @@
             [ai.obney.grain.command-processor-v2.interface :as cp]
             [ai.obney.grain.query-processor.interface :as qp]
             [ai.obney.grain.event-store-v3.interface :as es]
-            [ai.obney.grain.example-service.interface.read-models :as rm]
             [ai.obney.grain.time.interface :as time]
             [clj-http.client :as http]))
 
@@ -74,9 +73,6 @@
                     :command/id (random-uuid)
                     :counter-id (:counter/id counter)}))
 
-
-  ;; Projects the :example/counters read model (read-model-processor-v2).
-  (rm/root context)
 
   ;; The :example/calculate-average-counter-value processor reacts to the
   ;; increment above and appends an :example/average-calculated event.

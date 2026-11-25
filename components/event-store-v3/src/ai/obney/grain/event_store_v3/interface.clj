@@ -10,7 +10,9 @@
   (core/->event args))
 
 (defmacro defevent
-  "Register an event definition. Event construction remains unchanged."
+  "Define a qualified event type with a description, required :schema and optional
+   :history. The payload schema is registered under event-type. Use ->event to
+   construct instances."
   [event-type description options]
   `(definitions/defevent ~event-type ~description ~options))
 

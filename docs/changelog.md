@@ -1,24 +1,13 @@
 # Changelog
 
-[Grain](../readme.md) is an opinionated toolkit of composable building blocks for
-AI-native, event-sourced (CQRS) information systems in Clojure, organized as a Polylith
-workspace.
+## Unreleased
 
-Grain does not adhere to semvar and currently carries no release tags, so this changelog is organized
-**chronologically by month**, newest first. It provides narrative coverage of **354
-commits** from **2025-06-13** (workspace created) through **2026-08-22**, authored
-primarily by `cjbarre`, with contributions from Brandon Ringe (`bpringe`) and Cameron
-Barre.
-
-Within each month, changes are grouped into **Added / Changed / Fixed / Removed / Docs /
-Internal**, and every entry cites the short commit hashes it folds in. Backward-
-incompatible changes are marked **Breaking:**. (There were no commits in October 2025,
-so that month does not appear below.)
-
-Hashes are short Git SHAs; resolve any of them with `git show <hash>` or at
-`https://github.com/ObneyAI/grain/commit/<hash>`.
-
----
+- [Keyed read models](../components/read-model-processor-v2/README.md) support per-instance state, indexed pagination, text search, event scopes and joins. Both ordinary and keyed models accept an exclusive `:start-after` boundary. Segmented reads use a consistent snapshot. (`d95e2f8`, `cc452a5`, `281aeb7`, `48071d0`, `a9c8fa1`)
+- [Todo processors](core-concepts.md#start-a-new-processor-after-a-known-event) can initialize an unused tenant checkpoint before startup. Failed checkpoint writes stop the current batch. (`6178954`, `0555370`)
+- All built-in v3 stores apply [bounded retries](event-stores.md#write-contention) to lock contention. [Compaction](event-definitions-and-retention.md#estimate-and-compact-one-batch) removes a transaction marker with its last member and records both deletion sets. (`0555370`, `58e0cc3`)
+- [Datastar streams](datastar.md#event-subscription-filters) support event exclusions, alternative tag groups and refresh keys. Disconnects release subscriptions. Nested input bindings tolerate removed rows. (`651bccd`, `789e0b0`, `cc452a5`, `d3fdb5c`)
+- [CloudWatch EMF](../components/mulog-aws-cloudwatch-emf-publisher/README.md) supports metric registries, buffered delivery and bounded shutdown. Grain emits metrics for commands, queries, processors, stores and read models. (`1abdbdd`, `3eca77d`, `1ab4adc`, `73443a2`)
+- Reduced allocation in Fressian encoding and Datastar rendering, indexed SQLite checkpoint lookups, and reduced LMDB index maintenance and Postgres compaction work. (`432c78f`, `682096a`, `b1c7d26`, `4f58e32`, `e0cb103`, `58e0cc3`)
 
 ## August 2026 — Composed Allium and Event Model specification development
 

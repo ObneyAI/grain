@@ -31,8 +31,8 @@
      :event-tags     — {:tag-key :query-key-or-context-path} requires all tags;
                        a vector of nonempty maps matches any map. nil/{} are
                        unfiltered; [] matches nothing. Missing values never match.
-                       Values follow the latest query signals; tenant filtering
-                       remains mandatory. Exclusions affect refresh triggers only."
+                       Values follow the latest query signals. A stream with a tenant ID
+                       accepts only that tenant’s events. Exclusions affect refresh triggers only."
   [context query-name opts]
   (core/stream-view context query-name opts))
 
