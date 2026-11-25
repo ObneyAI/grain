@@ -16,8 +16,6 @@ procedure, see [Event definitions and retention](event-definitions-and-retention
 ## Sizing a rollout
 
 At the default five-second interval, each continuously running node writes
-17,280 heartbeats and 17,280 transaction markers per day. In one production
-sample of 983,374 rows, 442,641 were transaction markers and 346,480 were todo
-checkpoints. Together they accounted for 80% of rows and about 87 MiB of
-443 MiB of payload. Use a per-tenant estimate for the number of rows the
-heartbeat policy can actually remove.
+17,280 heartbeats per day. Each heartbeat append also creates a transaction
+marker. Run `retention/estimate` for the system tenant and heartbeat type to
+count the eligible events and markers in the next batch.

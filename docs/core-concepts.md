@@ -1,9 +1,10 @@
 # Core Concepts
 
-Code samples in this doc assume the following requires are in scope:
+The examples use these namespaces.
 
 ```clojure
 (require '[ai.obney.grain.command-processor-v2.interface  :refer [defcommand]]
+         '[ai.obney.grain.schema-util.interface :refer [defschemas]]
          '[ai.obney.grain.query-processor.interface       :refer [defquery]]
          '[ai.obney.grain.todo-processor-v2.interface     :as todo :refer [defprocessor]]
          '[ai.obney.grain.periodic-task.interface         :as pt :refer [defperiodic]]
@@ -11,19 +12,42 @@ Code samples in this doc assume the following requires are in scope:
          '[ai.obney.grain.event-store-v3.interface        :as es :refer [->event defevent]])
 ```
 
-## Multi-Tenancy
+## Tenant context
 
-Every event-store operation requires a `:tenant-id`. The processors extract it from the context map and pass it through automatically:
+A v3 append or read operates on one tenant. Pass the authenticated tenant ID in
+the processor context. Keyed reads also need a started LMDB cache.
 
 ```clojure
-;; Tenant ID flows through context — Grain doesn't care where it comes from.
-;; Typically injected by middleware (e.g., from a JWT claim).
-(def context {:event-store event-store
-              :tenant-id  #uuid "..."
-              :command    command})
+(def context {:event-store event-store :tenant-id tenant-id :cache cache})
 ```
 
-The Postgres backend (`grain-event-store-postgres-v3`) enforces tenant isolation at the database level with Row-Level Security policies and per-tenant advisory locks.
+Postgres uses row-level security to isolate tenant data and advisory locks to
+serialize writes per tenant.
+
+## Events
+
+Define every event type with `defevent`. Give it a qualified keyword,
+a description and the Malli schema for its body.
+
+```clojure
+(defevent :example/counter-created
+  "A counter was created."
+  {:schema [:map
+            [:counter-id :uuid]
+            [:name :string]]})
+
+(defevent :example/counter-incremented
+  "A counter was incremented."
+  {:schema [:map [:counter-id :uuid]]})
+```
+
+Construct an instance with `->event`. Consumers read body fields directly from
+the event map. At append the store assigns `:event/id` (UUIDv7) and
+`:event/timestamp` (OffsetDateTime). `(es/head event-store tenant-id)` returns
+the latest committed ID, including transaction markers, or nil for an empty tenant.
+
+Events keep complete history by default. To expire old events, define and activate
+a [bounded history policy](event-definitions-and-retention.md).
 
 ## Commands (Write Side)
 
@@ -32,8 +56,12 @@ look up their input schemas by qualified name. Register those inputs with
 `defschemas`.
 
 ```clojure
+(defschemas inputs
+  {:example/create-counter [:map [:name :string]]
+   :example/counters [:map]})
+
 (defcommand :example create-counter
-  {:authorized? (constantly true)}
+  {:authorized? (fn [ctx] (true? (get-in ctx [:auth-claims :can-create-counters?])))}
   "Creates a new counter."
   [context]
   (let [id (random-uuid)
@@ -47,43 +75,6 @@ look up their input schemas by qualified name. Register those inputs with
 The command handler runs once per dispatch. The event store retries a contended
 append internally. Exhaustion returns the store's busy anomaly. A failed CAS
 precondition returns a conflict. See [v3 write contention](event-stores.md#write-contention).
-
-## Events
-
-Events are immutable facts about what happened:
-
-```clojure
-{:event/type :example/counter-created
- :event/id #uuid "..."           ; UUID v7
- :event/timestamp #inst "..."
- :event/tags #{[:counter #uuid "..."]}  ; for efficient querying
- :counter-id #uuid "..."               ; body fields are merged
- :name "My Counter"}                    ; directly into the event
-```
-
-Construct events with `->event`. The v3 store assigns the final UUIDv7 ID and
-timestamp at append. Use the persisted ID for checkpoints and replay boundaries.
-`(es/head event-store tenant-id)` returns the latest committed ID, including
-transaction markers, or `nil` for an empty tenant.
-
-### Event Definitions
-
-Define every event type with `defevent`. Give it a qualified keyword,
-a description and the Malli schema for its body.
-
-```clojure
-(defevent :example/counter-created
-  "A counter was created."
-  {:schema [:map
-            [:counter-id :uuid]
-            [:name :string]]})
-```
-
-Omitting `:history` means permanent, complete history. A bounded history policy
-is inert until its exact normalized value is durably activated, and it is
-subject to boot validation and stored-data preflight checks. See
-[Event Definitions and Retention](event-definitions-and-retention.md) before
-making an event type eligible for compaction.
 
 ## Queries (Read Side)
 
@@ -99,30 +90,31 @@ Queries read from projections without causing state changes:
 
 ## Authorization
 
-Commands and queries support an `:authorized?` predicate in their registry opts. This function receives the full context (including the `:command` or `:query` map, `:event-store`, and any application-specific keys) and must return `true` to allow execution.
-
-```clojure
-(defcommand :example create-counter
-  {:authorized? (fn [context]
-                  (some? (get-in context [:command :user-id])))}
-  [context]
-  ...)
-```
-
-Authorization is enforced at the adapter level (request handlers, Datastar) before the command or query processor runs. The behavior is **deny by default**: if `:authorized?` is missing or returns a non-`true` value, the request is rejected. Every command and query must have an `:authorized?` predicate to be executable via an adapter.
+HTTP and Datastar adapters call the registered `:authorized?` predicate with
+the request context. Only `true` permits dispatch. Check trusted claims and
+access to the requested resource. Direct processor calls bypass this adapter check.
 
 ## Todo Processors
 
-Todo processors react to events asynchronously. They subscribe to event types and run whenever matching events are appended:
+A todo processor handles stored events matching its `:topics`. For an external
+charge, use the triggering event ID as the provider’s idempotency key.
 
 ```clojure
+(defevent :billing/membership-due
+  "A membership payment came due."
+  {:schema [:map [:member-id :uuid]]})
+
+(defevent :billing/membership-charged
+  "A membership payment was collected."
+  {:schema [:map [:member-id :uuid]]})
+
 (defprocessor :billing charge-membership
   {:topics #{:billing/membership-due}}
   "Charges a member's payment method when their membership is due."
   [context]
   (let [event (:event context)
         member-id (:member-id event)]
-    {:result/effect (fn [] (stripe/charge! member-id))
+    {:result/effect (fn [] ((:charge! context) member-id (:event/id event)))
      :result/checkpoint :after
      :result/on-success [(->event {:type :billing/membership-charged
                                    :body {:member-id member-id}})]}))
@@ -166,6 +158,10 @@ Periodic tasks receive the tenant ID and the scheduled `java.time.Instant`.
 This task emits a daily trigger and uses a CAS guard to prevent duplicates.
 
 ```clojure
+(defevent :billing/membership-check-due
+  "A daily membership check was requested."
+  {:schema [:map [:period :string]]})
+
 (defperiodic :billing daily-membership-check
   {:schedule {:cron "0 0 * * *" :timezone "UTC"}}
   "Requests a daily membership check for each tenant."

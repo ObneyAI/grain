@@ -1,192 +1,74 @@
 # Code Agent Tools
 
-`grain-code-agent-tools` exposes a development nREPL API for inspecting a live
-Grain application, invoking commands and queries, and validating Event Models.
-Results are plain EDN.
+Inspect a Grain application from a development REPL with
+`ai.obney.grain.code-agent-tools.interface`. Load the application’s declaration
+namespaces first. Catalog, schema and Event Model checks read those registries
+directly. [Package coordinates](packages.md#grain-code-agent-tools)
 
-## Setup
-
-Add the package to the application project:
-
-```clojure
-obneyai/grain-code-agent-tools
-{:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "0555370637af92daea24132859f53dc44cdba8a5"
- :deps/root "projects/grain-code-agent-tools"}
-```
-
-Require and install the tools after the Grain system has started:
-
-```clojure
-(ns my-app.core
-  (:require [ai.obney.grain.code-agent-tools.interface :as code-agent-tools]
-            [integrant.core :as ig]))
-
-(defn start
-  []
-  (let [app (ig/init system)]
-    (code-agent-tools/install! {:system app
-                                :context (::context app)
-                                :mode :dev})
-    app))
-```
-
-`install!` stores the runtime that all other tool calls use. The runtime should
-include:
-
-- `:system` - the Integrant system map.
-- `:context` - the Grain request context, usually containing `:event-store`,
-  `:cache`, `:tenant-id`, and application services.
-- `:mode :dev` - required when `:mode` is supplied. Any other mode throws.
-
-From nREPL:
+## Catalog
 
 ```clojure
 (require '[ai.obney.grain.code-agent-tools.interface :as tools])
 
-(tools/runtime)
-;; => {:mode :dev
-;;     :installed-at #inst "..."
-;;     :system/keys #{...}
-;;     :context/keys #{...}}
+(def cat (tools/catalog))
+(get-in cat [:commands :example/create-counter])
+(:missing-schemas cat)
 ```
 
-## Public API
+The catalog groups commands, queries, read models, processors, periodic triggers
+and named schemas. Entries include options, source locations when available,
+and event schemas for subscribed types. `:missing-schemas` groups names by kind.
 
-### `catalog`
+Use `(tools/guides)` for an index of concepts, tools and registered blocks.
+`(tools/guide :example/create-counter {:spec model})` includes the matching
+block’s description, declared dependencies and Allium references.
 
-Returns a sanitized catalog of live Grain registries:
-
-```clojure
-(tools/catalog)
-;; => {:commands {...}
-;;     :queries {...}
-;;     :read-models {...}
-;;     :processors {...}
-;;     :periodic-triggers {...}
-;;     :schemas {...}
-;;     :missing-schemas {...}}
-```
-
-Each command, query, read model, processor, and periodic trigger includes its
-registered options, schema presence, source metadata where available,
-authorization presence, and consumed event schemas where applicable.
-
-Use this first when entering an unfamiliar app:
+## Validate a payload
 
 ```clojure
-(keys (:commands (tools/catalog)))
-(get-in (tools/catalog) [:commands :example/create-counter])
-```
-
-### `schemas`, `explain-schema`, and `validate`
-
-These functions inspect named schemas and validate sample inputs. Every
-`defevent` registers its payload schema under the event type. Keyed projection
-schemas live on the `defreadmodel` declaration.
-
-```clojure
-(tools/schemas)
-;; => {:example/create-counter [:map ...]
-;;     :example/counter-created [:map ...]
-;;     ...}
-
 (tools/explain-schema :example/create-counter)
-;; => {:schema/name :example/create-counter
-;;     :schema [:map ...]}
-
 (tools/validate :example/create-counter {:name "Counter A"})
-;; => {:valid? true, :schema [:map ...]}
+;; :valid? true
 
-(tools/validate :example/create-counter {:name 1})
-;; => {:valid? false
-;;     :schema [:map ...]
-;;     :value {:name 1}
-;;     :explain/data {...}
-;;     :explain/humanized {...}}
-```
-
-`validate` also supports Grain envelope validation. Use this when checking a
-fully materialized command, query, or event map, including Grain metadata such
-as ids and timestamps:
-
-```clojure
-(tools/validate :command
-                :example/create-counter
+(tools/validate :command :example/create-counter
                 {:command/name :example/create-counter
-                 :command/id #uuid "00000000-0000-0000-0000-000000000010"
+                 :command/id (random-uuid)
                  :command/timestamp (java.time.OffsetDateTime/now)
                  :name "Counter A"})
-
-(tools/validate :query
-                :example/counters
-                {:query/name :example/counters
-                 :query/id #uuid "00000000-0000-0000-0000-000000000011"
-                 :query/timestamp (java.time.OffsetDateTime/now)})
-
-(tools/validate :event
-                :example/counter-created
-                {:event/type :example/counter-created
-                 :event/id #uuid "01900000-0000-7000-8000-000000000012"
-                 :event/timestamp (java.time.OffsetDateTime/now)
-                 :event/tags #{}
-                 :counter-id #uuid "00000000-0000-0000-0000-000000000013"
-                 :name "Counter A"})
 ```
 
-An agent should prefer this workflow:
+The two-argument form checks the named schema. The three-argument form also
+checks the `:command`, `:query` or persisted `:event` envelope. On failure,
+inspect `:explain/humanized` or `:error/message`. `(tools/schemas)` lists
+registered schemas, including the payload schema for each `defevent`.
+Keyed state and result schemas live on `defreadmodel`.
 
-1. Use `catalog` to discover the command/query/event name.
-2. Use `explain-schema` to inspect the expected shape.
-3. Use `validate` on the proposed payload.
-4. Invoke only after validation succeeds.
+## Inspect a running application
 
-### `invoke-command!`
-
-Processes a command through the live command processor:
+After starting the development system, install its system map and Grain context:
 
 ```clojure
-(tools/invoke-command! {:command/name :example/create-counter
-                        :name "Counter A"})
+(tools/install! {:system system :context context :mode :dev})
+(tools/runtime)
+(tools/diagnostics {:tenant-id tenant-id})
 ```
 
-The tool adds `:command/id` and `:command/timestamp` when absent. It uses
-`:tenant-id` from the command map or from the installed context.
-
-This call can mutate application state by appending events.
-
-### `invoke-query`
-
-Processes a query through the live query processor:
+Diagnostics include registry counts, store and cache information, and lease
+routing when a control plane is present. `:staleness-threshold-ms` controls
+the active-node check.
 
 ```clojure
+(tools/invoke-command! {:command/name :example/create-counter :name "Counter A"})
 (tools/invoke-query {:query/name :example/counters})
-;; => {:query/result [...] ...}
+(tools/events {:types #{:example/counter-created} :limit 10})
 ```
 
-The tool adds `:query/id` and `:query/timestamp` when absent. It uses
-`:tenant-id` from the query map or from the installed context.
+Invocations fill missing IDs and timestamps. These are direct processor calls.
+They bypass adapter authorization, and a successful command can append events.
+Pass `:tenant-id` explicitly or supply it in the installed context. Event reads
+also accept `:tags`. Set `:limit` to bound the returned vector.
 
-### `events`
-
-Reads events from the installed event store:
-
-```clojure
-(tools/events {:types #{:example/counter-created}
-               :limit 10})
-```
-
-Accepted keys:
-
-- `:tenant-id` - required when the installed context does not include one.
-- `:types` - event type set.
-- `:tags` - event tag set.
-- `:limit` - max number of events returned.
-
-### `projection`
-
-`tools/projection` accepts only ordinary models. To inspect a keyed model at
-the REPL, pass the application's tenant context to a keyed read:
+Use the application’s tenant context for keyed reads at the REPL:
 
 ```clojure
 (require '[ai.obney.grain.read-model-processor-v2.interface :as rmp])
@@ -194,116 +76,24 @@ the REPL, pass the application's tenant context to a keyed read:
 (rmp/page context :example/counter-list {:index :name :limit 25})
 ```
 
-See the [keyed counter declaration](core-concepts.md#read-models) and
-[keyed read API](../components/read-model-processor-v2/README.md#reading).
+`tools/projection` supports existing single-state models. See the [keyed
+counter declaration](core-concepts.md#read-models) and [read API](../components/read-model-processor-v2/README.md#reading).
 
-### `diagnostics`
-
-Returns runtime health and discovery information:
+## Validate an Event Model
 
 ```clojure
-(tools/diagnostics)
-;; => {:runtime {...}
-;;     :registries {:commands 3, :queries 2, ...}
-;;     :event-store {:present? true, :tenants {...}}
-;;     :cache {:present? true, :l1 {...}}
-;;     :control-plane {...}}
-```
+(require '[ai.obney.grain.event-model.interface :as em]
+         '[ai.obney.grain.event-model-validator.interface :as emv])
 
-For apps using the control plane, pass a tenant id to include routing
-diagnostics:
-
-```clojure
-(tools/diagnostics {:tenant-id tenant-id
-                    :staleness-threshold-ms 6000})
-```
-
-### Event Model validation
-
-Validate a service-area Event Model against its own structure and the live Grain
-registries without installing the tool runtime:
-
-```clojure
-(tools/validate-event-model model)
-(tools/validate-event-model model {:strict true})
-(tools/validate-event-model-file "components/example-service/example.event-model.edn")
-(tools/validate-event-model-var 'my-app.event-model/model)
+(def model (em/registered-model))
 (tools/event-model-coverage model)
+(tools/validate-event-model model emv/strict-defaults)
+(tools/validate-spec-composition model {:project-root "."
+                                        :event-model-opts emv/strict-defaults})
 ```
 
-The validator returns `{:valid? ... :summary ... :findings ...}` and does not
-invoke commands. Strict mode requires complete live-block coverage plus declared
-production and read edges. See [Event Model](event-model.md) for the model shape,
-edge grammar, and production boot mandate.
-
-To verify the topology-to-behaviour boundary as well, run the development/CI
-composition gate from the repository root:
-
-```clojure
-(tools/validate-spec-composition
-  model
-  {:project-root "."
-   :allium-bin "allium"
-   :event-model-opts {:strict true}})
-```
-
-This first validates the Event Model, then runs `allium check` and `allium parse`
-for its referenced specifications. Every command must link to an Allium rule,
-every screen must link to an Allium surface, and every supplied reference must
-resolve. Missing tooling, unsafe or missing paths, invalid specifications, and
-unresolved declarations are returned as error findings. The composition gate is
-never used by production boot.
-
-### `guides` and `guide`
-
-The live tools also serve concise workflow and block-specific instructions:
-
-```clojure
-(tools/guides)
-(tools/guide :getting-started)
-(tools/guide :event-model)
-(tools/guide :example/create-counter {:spec model})
-```
-
-When an Event Model block is supplied, its usage card includes `:spec/allium`
-trace references alongside topology edges and live source/schema information.
-
-## Inspect a running application
-
-```clojure
-(def cat (tools/catalog))
-
-(keys (:commands cat))
-(keys (:queries cat))
-(keys (:read-models cat))
-(:missing-schemas cat)
-(tools/diagnostics)
-```
-
-Then inspect one workflow:
-
-```clojure
-(get-in cat [:commands :example/create-counter])
-(tools/explain-schema :example/create-counter)
-(tools/validate :example/create-counter {:name "Counter A"})
-(tools/invoke-command! {:command/name :example/create-counter
-                        :name "Counter A"})
-(tools/events {:types #{:example/counter-created} :limit 5})
-(tools/invoke-query {:query/name :example/counters})
-```
-
-Use source metadata in the catalog to locate the handler or reducer.
-
-## Safety Notes
-
-- `install!` is dev-only. Passing any mode other than `:dev` throws.
-- `catalog`, `schemas`, `explain-schema`, `validate`, `events`, `projection`,
-  `runtime`, `diagnostics`, and the Event Model validators are inspection-oriented.
-- `validate-spec-composition` executes the local Allium CLI and reads only safe,
-  repository-relative `.allium` paths beneath `:project-root`.
-- `invoke-command!` is state-changing and should be treated like any other
-  command execution path.
-- Commands, queries, event reads, and projections require a tenant id either in
-  the installed context or in the call arguments.
-- Returned data is sanitized for nREPL: vars, functions, classes, and nested
-  values are represented as EDN-friendly data.
+Inspect `:valid?`, `:summary` and `:findings` in the validation result.
+Use `validate-event-model-file` for an EDN file or `validate-event-model-var`
+for a fully qualified var holding the model. The composition check also runs
+the Allium CLI to resolve command-to-rule and screen-to-surface links.
+[Event Model validation and boot](event-model.md)

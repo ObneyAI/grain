@@ -1,7 +1,36 @@
 # V3 event stores
 
+Start a store with `es/start` and release it with `es/stop`. The core package
+includes the in-memory backend, which loses its data when stopped.
+
+```clojure
+(require '[ai.obney.grain.event-store-v3.interface :as es])
+
+(def store (es/start {:conn {:type :in-memory}}))
+(es/stop store)
+```
+
+## Postgres
+
+Add the [Postgres package](packages.md#grain-event-store-postgres-v3) and load
+its interface to register the backend. Point it at an existing database.
+
+```clojure
+(require 'ai.obney.grain.event-store-postgres-v3.interface)
+
+(def store
+  (es/start {:conn {:type :postgres
+                    :server-name "localhost"
+                    :port-number "5432"
+                    :database-name "grain"
+                    :username (System/getenv "PG_USER")
+                    :password (System/getenv "PG_PASSWORD")}}))
+```
+
 ## SQLite
 
+Add the [SQLite package](packages.md#grain-event-store-sqlite-v3) and require
+`ai.obney.grain.event-store-sqlite-v3.interface` to register the backend.
 SQLite runs in WAL mode and queues writes from a single process. Reads use the
 connection pool. Set these options in the event store’s `:conn` map.
 
