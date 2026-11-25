@@ -9,8 +9,8 @@
             [ai.obney.grain.event-store-v3.interface :as es]
             [clj-uuid :as uuid]))
 
-(use-fixtures :each (fn [f] (empty-interval/reset-proofs!) (rmp/l1-clear!)
-                      (try (f) (finally (empty-interval/reset-proofs!) (rmp/l1-clear!)))))
+(use-fixtures :each (fn [f] (rmp/l1-clear!)
+                      (try (f) (finally (rmp/l1-clear!)))))
 
 (def ^:private all-types #{:keyed/change :keyed/other})
 
@@ -419,10 +419,10 @@
           (ordinary! total-step {:start-after v4 :l1-ttl-ms 0})))))
 
 ;; ---------------------------------------------------------------------------
-;; 8: empty-interval proofs and deferred builds
+;; 8: scoped checkpoints and deferred builds
 ;; ---------------------------------------------------------------------------
 
-(deftest empty-interval-proofs-hold-with-start-after
+(deftest scoped-checkpoints-respect-start-after
   (scoped/with-stores
     (fn [ctx]
       (let [a (random-uuid) b (random-uuid)
@@ -434,11 +434,11 @@
         (empty-interval/append-user! ctx a 4)
         (is (= {:total 4} (rmp/value own model "a")))
         (empty-interval/append-user! ctx b 100)
-        (is (= {:value {:total 4} :counts {:heads 1 :event-queries 1 :writes 0}}
+        (is (= {:value {:total 4} :counts {:heads 1 :event-queries 1 :writes 1}}
                (empty-interval/counted #(rmp/value own model "a"))))
         (is (= {:value {:total 4} :counts {:heads 1 :event-queries 0 :writes 0}}
                (empty-interval/counted #(rmp/value own model "a")))
-            "unrelated appends are proven empty without re-reading")
+            "idle reads reuse the durable checkpoint")
         (empty-interval/append-user! ctx a 8)
         (is (= {:total 12} (rmp/value own model "a")))))))
 

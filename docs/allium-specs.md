@@ -35,7 +35,7 @@ allium analyse components
 | [event-store-postgres-v3](../components/event-store-postgres-v3/event-store-postgres-v3.allium) | Tenant isolation, ordered reads, bounded lock retries and atomic compaction in Postgres. |
 | [event-store-sqlite-v3](../components/event-store-sqlite-v3/event-store-sqlite-v3.allium) | SQLite write queue, bounded lock retries, indexed reads and atomic compaction. |
 | [event-store-v2](../components/event-store-v2/event-store-v2.allium) | Legacy event-store protocol and in-memory implementation. |
-| [event-store-v3](../components/event-store-v3/event-store-v3.allium) | Tenant-scoped append, CAS, head lookup, stable empty intervals and write contention. |
+| [event-store-v3](../components/event-store-v3/event-store-v3.allium) | Tenant-scoped append, CAS, head lookup and write contention. |
 | [event-tailer](../components/event-tailer/event-tailer.allium) | Tenant and event-type subscriptions, incremental reads and local delivery. |
 | [kv-store](../components/kv-store/kv-store.allium) | Byte-key operations, consistent read snapshots and callback-scoped transactions. |
 | [kv-store-lmdb](../components/kv-store-lmdb/kv-store-lmdb.allium) | Durable key/value storage, atomic writes, snapshot reads and ordered range scans. |

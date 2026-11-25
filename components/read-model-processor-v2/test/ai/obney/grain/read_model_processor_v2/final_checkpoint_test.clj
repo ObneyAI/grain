@@ -26,14 +26,13 @@
             (es/append (:event-store ctx) {:tenant-id (:tenant-id ctx)
                       :events [(es/->event {:type :keyed/other :body {}})]})
             (fixture/keyed-append! (vec (repeat n {:owner "a" :delta 1}))))
-          (with-redefs [es/stable-empty-intervals? (constantly false)]
-            (let [{:keys [value writes]} (counted-writes #(rmp/value ctx model "a"))
-                  progress (rmp/progress ctx model)]
-              (is (= (if (zero? n) nil {:total n}) value))
-              (is (= (inc (quot n 128)) writes)
-                  (str "event count " n))
-              (is (= (es/head (:event-store ctx) (:tenant-id ctx)) (:checked-through progress)))
-              (is (zero? (:writes (counted-writes #(rmp/value ctx model "a"))))))))))))
+          (let [{:keys [value writes]} (counted-writes #(rmp/value ctx model "a"))
+                progress (rmp/progress ctx model)]
+            (is (= (if (zero? n) nil {:total n}) value))
+            (is (= (inc (quot n 128)) writes)
+                (str "event count " n))
+            (is (= (es/head (:event-store ctx) (:tenant-id ctx)) (:checked-through progress)))
+            (is (zero? (:writes (counted-writes #(rmp/value ctx model "a")))))))))))
 
 (deftest final-tail-failure-keeps-full-batches-and-retries-exactly-once
   (fixture/keyed-fixture

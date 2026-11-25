@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Removed the optional `EventStoreStableEmptyIntervals` protocol and `stable-empty-intervals?` predicate. Custom stores that implemented the protocol should drop that implementation. Keyed reads now persist their progress after an empty scan.
 - Added service implementation skills for commands, events, keyed projections, queries, background work and Datastar views. (`1e4d0d4`)
 - [Keyed read models](../components/read-model-processor-v2/README.md) support per-instance state, indexed pagination, text search, event scopes and joins. Both ordinary and keyed models accept an exclusive `:start-after` boundary. Segmented reads use a consistent snapshot. (`d95e2f8`, `cc452a5`, `281aeb7`, `48071d0`, `a9c8fa1`)
 - [Todo processors](core-concepts.md#start-a-new-processor-after-a-known-event) can initialize an unused tenant checkpoint before startup. Failed checkpoint writes stop the current batch. (`6178954`, `0555370`)

@@ -190,40 +190,38 @@
         ;; One event of another type, so the cold namespace is checked through
         ;; a real head H0 with no folded event.
         (es/append (:event-store ctx) {:tenant-id tenant :events [(es/->event {:type :keyed/other :body {}})]})
-        (with-redefs-fn {#'es/stable-empty-intervals? (constantly false)}
-          (fn []
-            (let [h0 (head-fn (:event-store ctx) tenant)]
-              (is (= {} (values ctx model)))
-              (is (= h0 (:checked-through (rmp/progress ctx model))))
-              (append! ctx history)
-              (with-redefs-fn
-                {#'es/head (fn [store t] (if (contains? @readers (Thread/currentThread)) h0 (head-fn store t)))
-                 (cv 'keyed-fresh?) (fn [& args] (let [r (apply fresh? args)]
-                                                   (when (contains? @readers (Thread/currentThread)) (Thread/sleep 5))
-                                                   r))
-                 (cv 'deferred-publish!) (fn [& args] @go (let [r (apply publish args)] (deliver published true) r))}
-                (fn []
-                  (let [builder (future (values ctx model))
-                        read-loop (fn []
-                                    (swap! readers conj (Thread/currentThread))
-                                    (loop [after 0]
-                                      (when (< after 40)
-                                        (swap! observations conj
-                                               (rmp/read-session ctx [model]
-                                                 (fn [s] [(rmp/progress s model) (values s model)])))
-                                        (recur (if (realized? published) (inc after) after)))))
-                        threads (vec (repeatedly 4 #(future (read-loop))))]
-                    (Thread/sleep 300)
-                    (deliver go true)
-                    (is (= (truth history) (deref builder 20000 ::timeout)))
-                    (doseq [t threads] (deref t 20000 nil)))))
-              (let [full (truth history)
-                    old? (fn [[p v]] (and (= {} v) (= h0 (:checked-through p)) (nil? (:watermark p))))
-                    new? (fn [[p v]] (and (= full v) (some? (:watermark p))))
-                    groups (group-by #(cond (old? %) :old (new? %) :new :else :inconsistent) @observations)]
-                (is (pos? (count (:old groups))))
-                (is (pos? (count (:new groups))))
-                (is (empty? (:inconsistent groups)) (pr-str (take 2 (:inconsistent groups))))))))))))
+        (let [h0 (head-fn (:event-store ctx) tenant)]
+          (is (= {} (values ctx model)))
+          (is (= h0 (:checked-through (rmp/progress ctx model))))
+          (append! ctx history)
+          (with-redefs-fn
+            {#'es/head (fn [store t] (if (contains? @readers (Thread/currentThread)) h0 (head-fn store t)))
+             (cv 'keyed-fresh?) (fn [& args] (let [r (apply fresh? args)]
+                                               (when (contains? @readers (Thread/currentThread)) (Thread/sleep 5))
+                                               r))
+             (cv 'deferred-publish!) (fn [& args] @go (let [r (apply publish args)] (deliver published true) r))}
+            (fn []
+              (let [builder (future (values ctx model))
+                    read-loop (fn []
+                                (swap! readers conj (Thread/currentThread))
+                                (loop [after 0]
+                                  (when (< after 40)
+                                    (swap! observations conj
+                                           (rmp/read-session ctx [model]
+                                             (fn [s] [(rmp/progress s model) (values s model)])))
+                                    (recur (if (realized? published) (inc after) after)))))
+                    threads (vec (repeatedly 4 #(future (read-loop))))]
+                (Thread/sleep 300)
+                (deliver go true)
+                (is (= (truth history) (deref builder 20000 ::timeout)))
+                (doseq [t threads] (deref t 20000 nil)))))
+          (let [full (truth history)
+                old? (fn [[p v]] (and (= {} v) (= h0 (:checked-through p)) (nil? (:watermark p))))
+                new? (fn [[p v]] (and (= full v) (some? (:watermark p))))
+                groups (group-by #(cond (old? %) :old (new? %) :new :else :inconsistent) @observations)]
+            (is (pos? (count (:old groups))))
+            (is (pos? (count (:new groups))))
+            (is (empty? (:inconsistent groups)) (pr-str (take 2 (:inconsistent groups))))))))))
 
 ;; (d) Single-flight errors ----------------------------------------------------
 ;; A failure is thrown only in the thread whose own attempt failed (as under the

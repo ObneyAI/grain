@@ -671,10 +671,6 @@
   (head [this tenant-id]
     (committed-last-event-id (get-in this [:state ::connection-pool]) tenant-id)))
 
-(extend-type PostgresEventStore
-  p/EventStoreStableEmptyIntervals
-  (stable-empty-intervals? [_] true))
-
 (defmethod start-event-store :postgres
   [config]
   (p/start

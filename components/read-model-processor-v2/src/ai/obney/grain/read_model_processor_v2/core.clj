@@ -3958,96 +3958,6 @@
       (throw (ex-info "Cannot read the committed event-store head" result)))
     result))
 
-(def ^:private empty-proof-max-entries 256)
-(def ^:private empty-proof-max-bytes (* 16 1024 1024))
-(def ^:private empty-proof-max-entry-bytes (* 256 1024))
-(def ^:private empty-proof-prune-every 256)
-(def ^:private empty-proofs* (atom {:entries {} :bytes 0}))
-
-(defn- empty-proof-key [source identity d]
-  [(System/identityHashCode source) identity (:events d)])
-
-(defn- empty-proof-size [[_ identity types]]
-  (+ 1024
-     (* 2 (count (str (nth identity 1))))
-     (if-let [scope (nth identity 3 nil)] (* 2 (count (second scope))) 0)
-     (* 128 (count types))
-     (reduce + 0 (map #(* 2 (count (str %))) types))))
-
-(defn- empty-proof-forget! [key]
-  (locking empty-proofs*
-    (when-let [proof (get-in @empty-proofs* [:entries key])]
-      (swap! empty-proofs* #(-> %
-                                (update :entries dissoc key)
-                                (update :bytes - (:bytes proof)))))))
-
-(defn- proof-source [proof]
-  (.get ^WeakReference (:source proof)))
-
-(defn- empty-proof-covers? [source key after through]
-  (locking empty-proofs*
-    (when-let [proof (get-in @empty-proofs* [:entries key])]
-      (if-not (identical? source (proof-source proof))
-        (do (empty-proof-forget! key)
-            false)
-        (and (or (nil? (:after proof))
-                 (and after (not (neg? (compare after (:after proof))))))
-             (not (pos? (compare through (:through proof)))))))))
-
-(defn- prune-empty-proofs [state]
-  (reduce-kv (fn [state key proof]
-               (if (proof-source proof)
-                 state
-                 (-> state
-                     (update :entries dissoc key)
-                     (update :bytes - (:bytes proof)))))
-             state
-             (:entries state)))
-
-(defn- make-room-for-proof [state size]
-  (cond
-    (not (or (>= (count (:entries state)) empty-proof-max-entries)
-             (> (+ (:bytes state) size) empty-proof-max-bytes)))
-    state
-
-    (pos? (:prune-countdown state 0))
-    (update state :prune-countdown dec)
-
-    :else
-    (assoc (prune-empty-proofs state) :prune-countdown (dec empty-proof-prune-every))))
-
-(defn- remembered-through [old source after through]
-  (if (and old
-           (identical? source (proof-source old))
-           (= after (:after old))
-           (pos? (compare (:through old) through)))
-    (:through old)
-    through))
-
-(defn- empty-proof-remember! [source key after through]
-  (let [size (empty-proof-size key)]
-    (when (<= size empty-proof-max-entry-bytes)
-      (locking empty-proofs*
-        (let [state @empty-proofs*
-              state (if (nil? (get-in state [:entries key]))
-                      (make-room-for-proof state size)
-                      state)
-              old (get-in state [:entries key])
-              bytes (+ (- (:bytes state) (:bytes old 0)) size)]
-          (if (and (or old (< (count (:entries state)) empty-proof-max-entries))
-                   (<= bytes empty-proof-max-bytes))
-            (do (reset! empty-proofs*
-                        (assoc state
-                               :entries (assoc (:entries state) key
-                                               {:source (WeakReference. source)
-                                                :after after
-                                                :through (remembered-through old source after through)
-                                                :bytes size})
-                               :bytes bytes))
-                true)
-            (do (reset! empty-proofs* state)
-                false)))))))
-
 (defn- keyed-checkpoint! [ctx d b through]
   (kv/transact (:cache ctx) :write
     (fn [tx]
@@ -4247,14 +4157,12 @@
         (own! claim)
         (drain! batch)))))
 
-(defn- fold-source-events! [{:keys [source query through stable? proof-key accepted? decided? staging batcher] :as run}]
+(defn- fold-source-events! [{:keys [source query through accepted? decided? staging batcher] :as run}]
   (let [{:keys [accumulate drain!]} batcher
         remaining (reduce (fn [batch event]
                             (if (pos? (compare (:event/id event) through))
                               (reduced batch)
-                              (do (when (and stable? (not @accepted?))
-                                    (empty-proof-forget! proof-key))
-                                  (vreset! accepted? true)
+                              (do (vreset! accepted? true)
                                   (deferred-progress! @staging)
                                   (if @decided?
                                     (accumulate batch event)
@@ -4279,14 +4187,13 @@
       (do (deferred-abandon! ctx identity staging false)
           (restart (assoc ctx ::no-deferral true)))))
 
-(defn- finish-catch-up! [{:keys [ctx d b identity progress after through source stable? proof-key
+(defn- finish-catch-up! [{:keys [ctx d b identity progress through
                                  accepted? deferrable? staging batcher]} remaining]
   (when (seq remaining)
     ((:apply! batcher) remaining through))
   (if-let [s @staging]
     (keyed-checkpoint! (assoc ctx ::deferred s) d (:prefix s) through)
-    (when-not (or (seq remaining)
-                  (and stable? (not @accepted?) (empty-proof-remember! source proof-key after through)))
+    (when-not (seq remaining)
       (keyed-checkpoint! ctx d b through)))
   (if-let [s @staging]
     (build-and-publish! ctx d identity b s)
@@ -4365,28 +4272,23 @@
         policy (keyed-batch-policy ctx)]
     (if-not (behind-head? after through)
       b
-      (let [source (:event-store ctx)
-            stable? (es/stable-empty-intervals? source)
-            proof-key (when stable? (empty-proof-key source identity d))]
-        (if (and stable? (empty-proof-covers? source proof-key after through))
-          b
-          (let [deferrable? (keyed-deferrable? ctx progress identity)
-                pending? (and deferrable?
-                              (some? (kv/transact (:cache ctx) :read #(deferred-marker % identity))))
-                claimed (when pending? (deferred-claim! ctx identity b))]
-            (case claimed
-              :wait (do (deferred-await! ctx identity)
-                        (restart ctx))
-              :restart (restart ctx)
-              (try
-                (telemetry/cold-owned! (telemetry/dimensions ctx name "keyed") (map? claimed)
-                  (fn []
-                  (catch-up-from-source! {:ctx ctx :name name :d d :b b :identity identity
+      (let [deferrable? (keyed-deferrable? ctx progress identity)
+            pending? (and deferrable?
+                          (some? (kv/transact (:cache ctx) :read #(deferred-marker % identity))))
+            claimed (when pending? (deferred-claim! ctx identity b))]
+        (case claimed
+          :wait (do (deferred-await! ctx identity)
+                    (restart ctx))
+          :restart (restart ctx)
+          (try
+            (telemetry/cold-owned! (telemetry/dimensions ctx name "keyed") (map? claimed)
+              (fn []
+                (catch-up-from-source! {:ctx ctx :name name :d d :b b :identity identity
                                         :progress progress :after after :through through
-                                        :policy policy :source source :stable? stable? :proof-key proof-key
+                                        :policy policy :source (:event-store ctx)
                                         :deferrable? deferrable? :pending? pending? :claimed claimed})))
-                (finally
-                  (some->> claimed :build (deferred-disown! ctx identity)))))))))))
+            (finally
+              (some->> claimed :build (deferred-disown! ctx identity)))))))))
 
 (defn- keyed-catch-up! [ctx name d b through identity]
   (telemetry/owned! "ReadModelCatchUpDuration" "ReadModelCatchUpFailed"
@@ -4423,15 +4325,10 @@
                           {})]
         (merge ordinary scoped)))))
 
-(defn- keyed-fresh? [tx ctx d identity b through]
-  (let [progress (keyed-read-meta tx (keyed-progress-key b))
-        _ (keyed-check-index-layout! progress d)
-        after (progress-after progress)]
-    (boolean
-     (or (not (behind-head? after through))
-         (let [source (:event-store ctx)]
-           (and (es/stable-empty-intervals? source)
-                (empty-proof-covers? source (empty-proof-key source identity d) after through)))))))
+(defn- keyed-fresh? [tx d b through]
+  (let [progress (keyed-read-meta tx (keyed-progress-key b))]
+    (keyed-check-index-layout! progress d)
+    (not (behind-head? (progress-after progress) through))))
 
 (def ^:private keyed-catch-ups* (atom {}))
 
@@ -4444,7 +4341,7 @@
     (fn [tx]
       (let [prefixes (namespace-resolve-in tx [identity shared-identity])
             b (get prefixes identity)]
-        (when-not (and b (keyed-fresh? tx ctx d identity b through))
+        (when-not (and b (keyed-fresh? tx d b through))
           [b (get prefixes shared-identity)])))))
 
 (defn- run-as-single-flight! [flight-key flight catch-up!]
@@ -4539,7 +4436,7 @@
   (let [b (get prefixes identity)]
     (or (when-let [^bytes verified-prefix (get verified identity)]
           (Arrays/equals verified-prefix ^bytes b))
-        (keyed-fresh? tx ctx (get registry name) identity b (get heads (:tenant-id ctx))))))
+        (keyed-fresh? tx (get registry name) b (get heads (:tenant-id ctx))))))
 
 (defn- catch-up-session-models [registry requests heads verified]
   (first

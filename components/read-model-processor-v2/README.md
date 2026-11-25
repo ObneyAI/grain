@@ -448,9 +448,8 @@ it returns. See the
 [KV contracts](../kv-store/kv-store.allium).
 
 For custom event stores, `es/head` falls back to a reverse, limit-one read.
-Implement `EventStoreHead` for a metadata-only lookup. Opt into
-`EventStoreStableEmptyIntervals` only if later writes cannot add matches
-at or below a previously observed head.
+Implement `EventStoreHead` for a metadata-only lookup. Keyed reads record
+the head they checked in the projection checkpoint, including when no events matched.
 
 ### Errors
 
