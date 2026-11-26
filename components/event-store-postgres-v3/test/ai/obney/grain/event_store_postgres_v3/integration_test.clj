@@ -235,6 +235,14 @@
       (finally
         (es/stop store)))))
 
+(deftest initialized-store-can-start-during-an-append
+  (let [starting (jdbc/with-transaction [writer (pg-pool)]
+                   (jdbc/execute! writer ["LOCK TABLE grain.tenants, grain.events IN ROW EXCLUSIVE MODE"])
+                   (let [started (future (es/stop (es/start (pg-config))) :started)]
+                     (is (= :started (deref started 5000 :blocked-on-writer)))
+                     started))]
+    @starting))
+
 (deftest schema-tables-and-indexes-created
   (let [opts {:builder-fn rs/as-unqualified-maps}
         tables (jdbc/execute! (pg-pool)

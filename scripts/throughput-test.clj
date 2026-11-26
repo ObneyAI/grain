@@ -1,6 +1,6 @@
 #!/usr/bin/env clojure -M:dev
 
-;; Throughput test: 3 nodes, 1000 tenants, 100k events, measure processing rate.
+;; Throughput test: 3 nodes, 10,000 tenants, 100k events, measure processing rate.
 ;; Usage: clojure -M:dev scripts/throughput-test.clj
 
 (load-file "scripts/test-helpers.clj")
@@ -85,6 +85,12 @@
                :tenants (get leases nid [])})
             all-ports node-ids))))
 
+(defn- tenant-ids-form [tenant-ids]
+  ;; nREPL compiles the submitted form. Send UUIDs as data in strings small
+  ;; enough for JVM constants, then split them on the receiving node.
+  (let [chunks (mapv #(str/join "\n" %) (partition-all 500 tenant-ids))]
+    (pr-str (list 'mapcat 'clojure.string/split-lines chunks))))
+
 (defn scenario-blast [tenant-ids]
   (header (str "Throughput: Blast " total-events " events (concurrent, 3 nodes)"))
   (info (str "Appending " events-per-tenant " events to each of " n-tenants " tenants..."))
@@ -105,7 +111,7 @@
                                               _ (range %d)]
                                         (app/increment! s (java.util.UUID/fromString tid-str)))
                                       :done)"
-                                    (pr-str tenants) events-per-tenant)
+                                    (tenant-ids-form tenants) events-per-tenant)
                             (max 60000 (* (count tenants) events-per-tenant 10))))))
                     node-tenants)]
       ;; Wait for all appends to finish
@@ -118,7 +124,7 @@
         (info "Waiting for processing to complete...")
         (let [poll-start (System/currentTimeMillis)
               timeout-ms 300000
-              tids-str (pr-str tenant-ids)]
+              tids-str (tenant-ids-form tenant-ids)]
           (loop [i 0]
             (let [check-result (eval-read port-a
                                  (format
@@ -184,6 +190,9 @@
     (metric (str "Total increments: " total-incs))
     (metric (str "Total processed:  " total-procs))
     (metric (str "Total missing:    " total-missing))
+    ;; Tenant creation appends one increment before the measured workload.
+    (check "All expected increments were appended"
+           (= (* (count tenant-ids) (inc events-per-tenant)) total-incs))
     (check "All tenants: zero missing events" (zero? total-missing))
     (check (str "Grand total: " total-incs " == " total-procs)
            (= total-incs total-procs))))

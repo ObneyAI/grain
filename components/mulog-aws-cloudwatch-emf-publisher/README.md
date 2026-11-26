@@ -7,8 +7,35 @@ Configure your log collector to forward that output to CloudWatch Logs.
 (require '[ai.obney.grain.mulog-aws-cloudwatch-emf-publisher.interface :as emf]
          '[com.brunobonacci.mulog :as u])
 
+(def dimension-values
+  {:app-name #{"academy"} :env #{"production"} :service #{"academy"}
+   :command #{":academy/enroll"} :processor #{":academy/project"}
+   :periodic #{":academy/remind"} :backend #{"postgres"}
+   :operation #{"append" "compact" "pool"}
+   :outcome #{"succeeded" "rejected" "retrying" "failed" "sampled" "saturated"}
+   :anomaly-category #{"forbidden"} :failure-class #{"exception"}})
+
+(def application-metrics
+  {"EnrollmentCompleted"
+   {:metric/type :counter
+    :metric/unit :count
+    :metric/resolution :standard
+    :metric/dimensions (select-keys dimension-values [:app-name :env :service :outcome])}})
+
+(def publisher-config
+  {:namespace "Academy/Grain"
+   :metric-registry (emf/extend-grain-metric-registry dimension-values application-metrics)})
+```
+
+Start the publisher before logging metrics.
+
+```clojure
 (u/set-global-context! {:app-name "academy" :env "production"})
-(def stop-metrics (emf/start-cloudwatch-emf-publisher! {:namespace "Academy/Grain"}))
+(def stop-metrics (emf/start-cloudwatch-emf-publisher! publisher-config))
+
+(u/log :metric/metric
+       :metric/name "EnrollmentCompleted" :metric/value 1
+       :metric/dimensions {:service "academy" :outcome "succeeded"})
 
 ;; After stopping application producers:
 (stop-metrics)
@@ -37,28 +64,7 @@ for encoded writes. Use `grain-metric-registry` to publish framework metrics
 with their declared types (including gauges), units and resolution. Use
 `extend-grain-metric-registry` to add your own.
 
-To publish a custom counter, supply its definition at startup:
-
-```clojure
-(def application-metrics
-  {"EnrollmentCompleted"
-   {:metric/type :counter
-    :metric/unit :count
-    :metric/resolution :standard
-    :metric/dimensions {:outcome #{"succeeded"} :env #{"production"}}}})
-
-(def stop-metrics
-  (emf/start-cloudwatch-emf-publisher! {:metric-registry application-metrics}))
-
-(u/log :metric/metric
-       :metric/name "EnrollmentCompleted"
-       :metric/value 1
-       :metric/dimensions {:outcome "succeeded"})
-```
-
-To configure both framework and application metrics, pass
-`(emf/extend-grain-metric-registry dimension-values application-metrics)`
-as `:metric-registry`. Map each dimension to a bounded set of strings. A configured definition rejects
+Map each dimension to a bounded set of strings. A configured definition rejects
 measurements with undeclared explicit dimensions or values outside their sets.
 Include the services, commands, queries, processors and scheduled tasks your
 deployment emits. For store retry counters, allow `"append"` and `"compact"`

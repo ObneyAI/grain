@@ -35,6 +35,9 @@
    ::initializing-event-store-idempotently
    []
    (jdbc/with-transaction [conn connection-pool]
+     ;; Serialize initializers in the two-integer advisory lock space. Appends
+     ;; use bigint keys and never take this lock.
+     (jdbc/execute! conn ["SELECT pg_advisory_xact_lock(hashtext('grain'), hashtext('events-schema'))"])
      (doseq [statement ["CREATE SCHEMA IF NOT EXISTS grain;"
 
                         "CREATE TABLE IF NOT EXISTS grain.tenants (
@@ -51,19 +54,10 @@
                           PRIMARY KEY (tenant_id, id)
                          );"
 
-                        "CREATE INDEX IF NOT EXISTS idx_events_tenant_type ON grain.events(tenant_id, type);"
-
-                        "CREATE INDEX IF NOT EXISTS idx_events_tenant_type_id ON grain.events(tenant_id, type, id);"
-
-                        "CREATE INDEX IF NOT EXISTS idx_events_tenant_type_time_id ON grain.events(tenant_id, type, time, id);"
-
-                        "CREATE INDEX IF NOT EXISTS idx_events_tenant_tags_gin ON grain.events USING GIN (tags);"
-
-                        "CREATE INDEX IF NOT EXISTS idx_events_tenant_id_order ON grain.events(tenant_id, id);"
-
-                        "ALTER TABLE grain.events ENABLE ROW LEVEL SECURITY;"
-
                         "DO $$ BEGIN
+                          IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = 'grain.events'::regclass) THEN
+                            ALTER TABLE grain.events ENABLE ROW LEVEL SECURITY;
+                          END IF;
                           IF NOT EXISTS (
                             SELECT 1 FROM pg_policies
                             WHERE tablename = 'events' AND schemaname = 'grain' AND policyname = 'tenant_isolation'
@@ -72,11 +66,26 @@
                               USING (tenant_id = current_setting('app.tenant_id', true)::uuid)
                               WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
                           END IF;
-                         END $$;"
-
-                        "ALTER TABLE grain.tenants ADD COLUMN IF NOT EXISTS last_event_id UUID;"]]
-
-       (jdbc/execute! conn [statement])))))
+                          IF NOT EXISTS (
+                            SELECT 1 FROM pg_attribute WHERE attrelid = 'grain.tenants'::regclass
+                              AND attname = 'last_event_id' AND NOT attisdropped
+                          ) THEN
+                            ALTER TABLE grain.tenants ADD COLUMN last_event_id UUID;
+                          END IF;
+                         END $$;"]]
+       (jdbc/execute! conn [statement]))
+     ;; CREATE INDEX IF NOT EXISTS still takes a table lock that conflicts with writers.
+     (let [existing (into #{} (map :indexname)
+                          (jdbc/execute! conn ["SELECT indexname FROM pg_indexes
+                                                WHERE schemaname = 'grain' AND tablename = 'events'"]
+                                         {:builder-fn rs/as-unqualified-lower-maps}))]
+       (doseq [[index definition] [["idx_events_tenant_type" "(tenant_id, type)"]
+                                   ["idx_events_tenant_type_id" "(tenant_id, type, id)"]
+                                   ["idx_events_tenant_type_time_id" "(tenant_id, type, time, id)"]
+                                   ["idx_events_tenant_tags_gin" "USING GIN (tags)"]
+                                   ["idx_events_tenant_id_order" "(tenant_id, id)"]]
+               :when (not (contains? existing index))]
+         (jdbc/execute! conn [(str "CREATE INDEX IF NOT EXISTS " index " ON grain.events " definition)]))))))
 
 ;; --------------------------- ;;
 ;; Integrant / Lifecycle Setup ;;
