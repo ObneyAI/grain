@@ -73,16 +73,6 @@ and adds topology, runtime, and trace-link verification.
 
 The app repository includes its own [README](https://github.com/ObneyAI/grain-todo-list/blob/main/README.md), agent notes in [`AGENTS.md`](https://github.com/ObneyAI/grain-todo-list/blob/main/AGENTS.md), and a deeper architecture reference in [`doc/pattern-compendium.md`](https://github.com/ObneyAI/grain-todo-list/blob/main/doc/pattern-compendium.md).
 
-Grain Sessions walks through the app as a teaching series:
-
-- [Episode 1](https://youtu.be/tO--joFrYUE)
-- [Episode 2](https://youtu.be/plMAG4FASdk)
-- [Episode 3](https://youtu.be/weAsNioiEnI)
-- [Episode 4](https://youtu.be/XRo49q6yCeo)
-- [Episode 5](https://youtu.be/JdQtSLHoCQk)
-- [Episode 6](https://www.youtube.com/watch?v=DapS58hBSI0)
-- [Episode 7](https://www.youtube.com/watch?v=kb7Qc_nafng)
-
 ## Packages
 
 > Full package details and deps.edn snippets: [docs/packages.md](docs/packages.md)
@@ -132,10 +122,25 @@ The `grain-code-agent-tools` package provides dev-only nREPL tools for coding ag
 
 Grain is MIT licensed. We use it in production, but it's actively evolving. The core CQRS/Event Sourcing components are stable. The control plane is new and under active development.
 
-## More Information
+## Media and Resources
+
+### Grain Sessions
+
+This seven-part series walks through the Grain Todo List example app.
+
+- [Episode 1](https://youtu.be/tO--joFrYUE)
+- [Episode 2](https://youtu.be/plMAG4FASdk)
+- [Episode 3](https://youtu.be/weAsNioiEnI)
+- [Episode 4](https://youtu.be/XRo49q6yCeo)
+- [Episode 5](https://youtu.be/JdQtSLHoCQk)
+- [Episode 6](https://www.youtube.com/watch?v=DapS58hBSI0)
+- [Episode 7](https://www.youtube.com/watch?v=kb7Qc_nafng)
+
+### More Information
 
 - **Docs**: [Core Concepts](docs/core-concepts.md) | [Event Definitions and Retention](docs/event-definitions-and-retention.md) | [Event Model](docs/event-model.md) | [Allium Specs](docs/allium-specs.md) | [Distributed Coordination](docs/distributed-coordination.md) | [Datastar](docs/datastar.md) | [Datastar UI](docs/datastar-ui.md) | [Code Agent Tools](docs/code-agent-tools.md) | [Packages](docs/packages.md)
 - **Examples**: [`grain-todo-list`](https://github.com/ObneyAI/grain-todo-list), `bases/example-base`, `components/example-service`, `development/src/example_app_demo.clj`
-- **Talks**: [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
+- **Talks**: [*Building Simple Systems in the World of Natural Language Programming*](https://youtu.be/YKFxDDtfJVI?si=RJOkPD156OHZFSX9) (Clojure/Conj 2026) | [*Agentic Workflows with Grain*](https://www.youtube.com/watch?v=hvchFTa5z0I) (Scicloj #11, Sep 2025) | [*Practicing Grain*](https://www.youtube.com/watch?v=IUzXfvOH2t0) (Scicloj #12, Oct 2025)
+- **Interview**: [*Why Lisp Thrives In The Age Of AI*](https://youtu.be/WhXPEmdNRpA?si=ZhZfyWeOCEFxnzt1) (Developer Voices, Nov 2026)
 - **Slack**: [#grain](https://clojurians.slack.com/archives/C099K3D7XRV) on Clojurians
 - **Issues**: [GitHub Issues](https://github.com/ObneyAI/grain/issues)
