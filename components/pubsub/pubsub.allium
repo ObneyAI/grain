@@ -21,7 +21,8 @@
 --           message is dropped to admit the newest when that buffer is full, so a
 --           burst or a lagging fan-out sheds the oldest messages rather than
 --           blocking the publisher); the dropping of empty (absent) publishes; and
---           a stop that ends all further delivery.
+--           explicit per-topic unsubscription; and a stop that ends all further
+--           delivery.
 --
 -- Excludes (implementation / plumbing, governed elsewhere):
 --   - the concrete bus backend (core.async channels, publication, sliding
@@ -80,9 +81,19 @@ contract LocalBus {
     -- fire-and-forget.
     publish: (message: Message) -> Any
 
-    -- Register a subscriber's interest in a topic. From then until stop, messages
-    -- routed under that topic are delivered to this subscriber.
+    -- Register a subscriber's interest in a topic. Until unsubscribe or stop,
+    -- messages routed under that topic are delivered to this subscriber.
     subscribe: (topic: String, subscriber: Subscriber) -> Any
+
+    -- Release only this subscriber's interest in this topic.
+    unsubscribe: (topic: String, subscriber: Subscriber) -> Any
+
+    @invariant UnsubscribeReleasesInterest
+        -- Unsubscribe removes the registration immediately, without waiting for
+        -- another message on the topic. It does not close the subscriber or
+        -- remove its other topic registrations, and does not affect other
+        -- subscribers. Repeating an unsubscribe has no further effect. Delivery
+        -- already in progress, or already handed to the subscriber, may finish.
 
     @invariant RoutedByTopic
         -- A published message is delivered only to subscribers registered for the
@@ -141,12 +152,18 @@ entity Subscriber {
 -- Rules
 ------------------------------------------------------------
 
--- A listener registers interest in a topic. From then until the bus stops, the
--- subscriber receives messages routed under that topic. Registering the same
--- topic again leaves interest unchanged (the topic set is idempotent).
+-- A listener registers interest in a topic until it unsubscribes or the bus
+-- stops. Registering the same topic again leaves interest unchanged.
 rule ListenerSubscribes {
     when: ListenerSubscribes(listener, topic)
     ensures: listener.topics.add(topic)
+}
+
+-- A listener releases one topic without disturbing its remaining interests.
+-- Removing an absent topic is harmless.
+rule ListenerUnsubscribes {
+    when: ListenerUnsubscribes(listener, topic)
+    ensures: listener.topics.remove(topic)
 }
 
 -- A publisher emits a message; the bus routes it by topic and fans it out to the
@@ -224,17 +241,20 @@ surface PublishBoundary {
         -- subscriber, even if a publish is subsequently attempted.
 }
 
--- The boundary where a subscriber registers interest in a topic and thereafter
--- receives matching messages until the bus stops.
+-- The boundary where a subscriber registers and releases per-topic interest.
 surface SubscriptionBoundary {
     facing listener: Listener
 
     provides:
         ListenerSubscribes(listener, topic)
+        ListenerUnsubscribes(listener, topic)
+
+    contracts:
+        fulfils LocalBus
 
     @guarantee DeliveredWhileSubscribed
-        -- From registration until the bus stops, every message routed under a
-        -- registered topic is offered to the subscriber, subject to best-effort
+        -- From registration until unsubscribe or stop, every message routed
+        -- under a registered topic is offered to the subscriber, subject to best-effort
         -- delivery: the bus's single fixed ingress buffer may drop the oldest
         -- as-yet-undelivered message under load before it is fanned out, so a
         -- matching message can be lost without blocking the publisher and without
@@ -253,4 +273,3 @@ surface SubscriptionBoundary {
 
 open question "Delivery is lossy under a fixed buffer bound: the oldest undelivered messages are dropped under backpressure with no signal to publisher or subscriber. Durable consumers (notifier, tailer) tolerate this because they re-derive state from the store; is silent loss the intended contract for every consumer, or should some subscribers be able to detect a dropped message?"
 open question "The bus is message-agnostic and routes only on a derived topic; tenant scoping lives entirely in the payload that consumers attach. Should tenant isolation be a property of the bus itself, or is it correct that it stays the consumers' responsibility?"
-open question "Subscriptions live until the bus stops; there is no explicit unsubscribe in the boundary. Is per-subscription teardown out of scope (subscribers simply stop consuming), or should the bus model unsubscribe as a first-class operation?"

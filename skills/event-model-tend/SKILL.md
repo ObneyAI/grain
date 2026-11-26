@@ -1,16 +1,13 @@
 ---
 name: event-model-tend
-description: >-
-  Make targeted changes to an existing Grain Event Model while preserving its topology-only boundary and Allium trace links. Use for blocks, schemas, intent edges, flows, service areas, validator findings, or synchronized def-site produces/reads declarations; use Allium tend for behavioural rules.
+description: Edit an existing Grain Event Model when blocks, schemas, dependencies, flows or trace links change.
 ---
 
-# Event Model Tend
+# Edit topology
 
-Inspect the model, relevant `def*` definitions, live catalog, and linked Allium
-declarations. Change only topology. If the request changes preconditions,
-outcomes, invariants, or examples, invoke Allium `tend` as a separate phase.
+Locate the block by kind and qualified name. Update its area entry, affected
+flow endpoints, dependency references and runtime declarations. When a rule or
+surface moves, update its `:grain/allium` path, kind and name. Use Allium `tend`
+if its behaviour changes.
 
-Keep block namespaces, kind-typed references, flow grammar, registered schemas,
-and def-site produces/reads declarations synchronized. Commands retain rule links
-and screens surface links after renames or moves. Run lenient validation while
-editing, then strict runtime and composition validation before finishing.
+Run the runtime and composition checks in the `event-model` skill.

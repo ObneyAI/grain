@@ -96,6 +96,19 @@
   (swap! periodic-trigger-registry* assoc trigger-name
          (merge {:handler-fn handler-fn} opts)))
 
+(defn- periodic-dimensions [trigger-name & [outcome failure-class]]
+  (cond-> {:service (or (namespace trigger-name) "unqualified")
+           :periodic (str trigger-name)}
+    outcome (assoc :outcome outcome)
+    failure-class (assoc :failure-class failure-class)))
+
+(defn- emit-periodic-counter! [metric-name trigger-name outcome & [failure-class]]
+  (u/log :metric/metric
+         :metric/name metric-name
+         :metric/value 1
+         :metric/resolution :low
+         :metric/dimensions (periodic-dimensions trigger-name outcome failure-class)))
+
 (defn start-periodic-triggers!
   "Start all registered periodic triggers. Each trigger runs on a chime schedule.
    On each tick, the handler is called for each tenant with (tenant-id, time).
@@ -118,16 +131,50 @@
             (let [task (chime/chime-at (tracked-schedule trigger-name sseq)
                          (fn [time]
                            (update-trigger-runtime! trigger-name {:next-fire-at nil})
+                           (let [started-at (System/nanoTime)
+                                 last-success-at (:last-success-at
+                                                  (get @periodic-trigger-registry* trigger-name))]
+                             (emit-periodic-counter! "PeriodicTriggered" trigger-name "triggered")
+                             (when last-success-at
+                               (u/log :metric/metric
+                                      :metric/name "PeriodicLastSuccessAge"
+                                      :metric/value (/ (double (- (System/currentTimeMillis)
+                                                                  last-success-at))
+                                                       1000.0)
+                                      :metric/resolution :low
+                                      :metric/dimensions (periodic-dimensions trigger-name)))
                            (try
                              (let [domain-tenants (disj (tenant-ids-fn) control-plane-tid)]
+                               (u/log :metric/metric
+                                      :metric/name "PeriodicTenantCount"
+                                      :metric/value (count domain-tenants)
+                                      :metric/resolution :low
+                                      :metric/dimensions (periodic-dimensions trigger-name))
                                (doseq [tid domain-tenants]
                                  (let [result (handler-fn tid time)]
                                    (when-let [events (:result/events result)]
                                      (append-fn
                                        (cond-> {:tenant-id tid :events events}
-                                         (:result/cas result) (assoc :cas (:result/cas result))))))))
+                                         (:result/cas result) (assoc :cas (:result/cas result)))))))
+                               (update-trigger-runtime! trigger-name
+                                                        {:last-success-at (System/currentTimeMillis)})
+                               (u/log :metric/metric
+                                      :metric/name "PeriodicDuration"
+                                      :mulog/duration (- (System/nanoTime) started-at)
+                                      :metric/resolution :high
+                                      :metric/dimensions
+                                      (periodic-dimensions trigger-name "succeeded"))
+                               (emit-periodic-counter! "PeriodicSucceeded" trigger-name "succeeded"))
                              (catch Throwable t
-                               (u/log ::periodic-trigger-error :trigger trigger-name :exception t)))))]
+                               (u/log ::periodic-trigger-error :trigger trigger-name :exception t)
+                               (u/log :metric/metric
+                                      :metric/name "PeriodicDuration"
+                                      :mulog/duration (- (System/nanoTime) started-at)
+                                      :metric/resolution :high
+                                      :metric/dimensions
+                                      (periodic-dimensions trigger-name "failed"))
+                               (emit-periodic-counter! "PeriodicFailed" trigger-name
+                                                       "failed" "exception"))))))]
               [trigger-name task])
             (catch Throwable t
               (update-trigger-runtime! trigger-name {:running? false :next-fire-at nil})

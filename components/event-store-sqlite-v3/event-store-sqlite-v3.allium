@@ -1,4 +1,5 @@
 -- allium: 3
+use "../event-store-v3/event-store-v3.allium" as store
 -- event-store-sqlite-v3.allium
 --
 -- Distilled from components/event-store-sqlite-v3 (grain).
@@ -154,13 +155,25 @@ contract EventLog {
         -- This is what makes a compare-and-swap append a sound concurrency
         -- fence — two writers racing on the same pre-state cannot both succeed.
 
+    @invariant CompactionSharesWriteAdmission
+        -- Within one open store, admitted appends and retention compaction
+        -- batches share one bounded first-in-first-out write boundary. A later
+        -- compaction batch cannot overtake an already queued append. A full
+        -- admission queue returns a stable busy outcome for either operation.
+        -- Reads and advisory retention estimates remain outside this boundary.
+
     @invariant BoundedContention
-        -- Appends admitted within the configured queue and contention bounds
+        -- Appends and compactions within the configured queue and contention bounds
         -- absorb transient writer-lock contention. If the queue is already full
         -- or the configured busy attempts are exhausted, the caller receives a
         -- stable busy outcome rather than a raw database-lock exception. Every
         -- retry repeats the entire atomic transaction; no partial attempt is
         -- observable.
+
+    @invariant LegacyImmediateLockAttempt
+        -- A legacy zero busy timeout remains valid and attempts the write lock
+        -- without waiting. Contention still uses the configured retry budget.
+        -- An explicit common lock-wait option takes precedence and must be positive.
 
     @invariant ReadsRemainConcurrent
         -- Read operations are never placed behind the single-writer admission
@@ -168,8 +181,8 @@ contract EventLog {
         -- a writer, a queued or active append does not prevent those reads.
 
     @invariant ContentionIsObservable
-        -- Queue depth and saturation, append and transaction latency, busy
-        -- retries, and exhausted contention are emitted as operational
+        -- Queue depth and saturation, append, compaction and transaction latency,
+        -- busy retries, and exhausted contention are emitted as operational
         -- measurements so load and overload can be distinguished.
 
     @invariant NewestRetrievedDirectly
@@ -195,12 +208,17 @@ contract EventLog {
         -- Retention eligibility reads only policy lifecycle records and
         -- relational metadata for the requested tenant and event type. Payloads
         -- from unrelated event types or unrelated system-tenant lifecycle are
-        -- never decoded or materialized. An unkeyed batch materializes at most
-        -- its requested limit. A keyed batch may inspect metadata for all events
-        -- of the requested type to preserve the newest member of every complete
+        -- never decoded or materialized. Affected transaction-marker payloads
+        -- may additionally be read to verify membership and determine which
+        -- markers lose their last member. An unkeyed batch selects at most its
+        -- requested domain-event limit. A keyed batch may inspect metadata for
+        -- all events of the requested type to preserve the newest member of every complete
         -- composite key, but heap materialization is bounded by the requested
         -- result and the policy's grouping requirements rather than by encoded
-        -- tenant payload history.
+        -- tenant payload history. Tag-key and cardinality lookups are scoped to
+        -- individual candidate events; they must not repeatedly scan a tenant's
+        -- unrelated tag history, including on a freshly populated store without
+        -- planner statistics.
 
     @invariant CompactionSelectionParity
         -- Estimate and destructive compaction use the same ordered metadata
@@ -229,6 +247,20 @@ contract EventStorePubsub {
         -- after the append commits. Only the caller's domain events are
         -- published; the store's synthesized transaction marker is committed to
         -- the stream but never fanned out to subscribers.
+}
+
+contract CommonEventStoreTelemetry {
+    record_append: (outcome: String, event_count: Integer) -> Any
+    record_read: (outcome: String, event_count: Integer) -> Any
+
+    @invariant BackendParity
+        -- Alongside SQLite contention diagnostics, appends and consumed reads
+        -- expose the common duration, outcome, count, conflict, and connection
+        -- failure metrics with backend = sqlite.
+
+    @invariant SafeDimensions
+        -- These common measurements use only backend, operation, and outcome;
+        -- tenant and event identifiers remain outside metric dimensions.
 }
 
 ------------------------------------------------------------
@@ -311,10 +343,10 @@ entity Transaction {
 config {
     -- Millisecond values are represented as integers because contention policy
     -- is configured directly at the storage-driver boundary.
-    busy_timeout_ms: Integer = 1000
-    busy_max_retries: Integer = 3
-    busy_retry_backoff_ms: Integer = 10
-    busy_retry_max_backoff_ms: Integer = 250
+    busy_timeout_ms: Integer = store/config.write_lock_timeout_ms
+    busy_max_retries: Integer = store/config.write_max_retries
+    busy_retry_backoff_ms: Integer = store/config.write_retry_backoff_ms
+    busy_retry_max_backoff_ms: Integer = store/config.write_retry_max_backoff_ms
     write_queue_capacity: Integer = 1024
     write_shutdown_timeout_ms: Integer = 5000
 }
@@ -329,6 +361,7 @@ config {
 -- the last committed event. Every event in the batch is stamped with the tenant.
 rule AppendTransaction {
     when: AppendEvents(tenant, events, tx_metadata?)
+    requires: write_commits(tenant, events)
 
     ensures:
         let append_time = now
@@ -528,6 +561,7 @@ surface EventAppend {
         AppendEventsChecked(tenant, tenant.events, tenant.events)
 
     contracts:
+        fulfils store/WriteContention
         fulfils EventLog
         demands EventCodec
         demands EventStorePubsub
@@ -580,6 +614,12 @@ surface EventRead {
         -- to the tag's own stream), never to the size of the tenant's whole
         -- stream. This is the read shape a processor checkpoint lookup
         -- depends on, and it stays cheap as the stream grows.
+
+    @guarantee CommittedHeadWithoutPayload
+        -- Reading only the current committed event identity uses this tenant's
+        -- durable watermark. It returns null for an empty tenant and does not
+        -- read event bodies or other tenants. Failed and uncommitted appends
+        -- cannot advance the observed head.
 
     @guarantee TagReadsStayFlat
         -- A tag-scoped read costs in proportion to the events bearing the

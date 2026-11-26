@@ -34,7 +34,7 @@
 --   - cron-expression grammar, the scheduling library, threads and timers
 --   - serialization, wire formats, storage backends
 --   - the separate event processor that consumes the emitted events
---   - logging and metrics
+--   - logging implementation details
 --
 -- Conformance notes correspond to the periodic-task test suite (core_test.clj).
 -- Where each guarantee is captured:
@@ -177,6 +177,24 @@ contract TriggerHandler {
         -- appends itself — it returns its output and the framework records it —
         -- so two nodes computing the same fire produce identical CAS-guarded
         -- appends, which the CAS dedup then collapses to one.
+}
+
+contract PeriodicTelemetry {
+    record_duration: (trigger: PeriodicTrigger, outcome: String) -> Any
+    record_outcome: (trigger: PeriodicTrigger, outcome: String) -> Any
+
+    @invariant FireOutcome
+        -- Every fire records PeriodicTriggered, PeriodicDuration and exactly one
+        -- of PeriodicSucceeded or PeriodicFailed. A failure retains the existing
+        -- fire-level containment semantics.
+
+    @invariant ScheduleHealth
+        -- Each fire samples its domain tenant count and, after the first
+        -- successful fire, the age of the last success.
+
+    @invariant BoundedTriggerDimensions
+        -- Service and periodic labels come only from the registered trigger
+        -- vocabulary; tenant identifiers are never metric dimensions.
 }
 
 ------------------------------------------------------------
@@ -437,6 +455,7 @@ surface PeriodicProcessing {
         demands Schedule
         demands EventAppend
         demands TriggerHandler
+        demands PeriodicTelemetry
 
     @guarantee TenantIsolation
         -- Each fire fans out over exactly the domain tenants and the reserved

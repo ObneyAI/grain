@@ -2,7 +2,8 @@
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p :refer [EventStore start-event-store]]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
-            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
+            [ai.obney.grain.event-store-v3.interface.write-retry :as retry]
+            [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append single-tag-union]]
             [ai.obney.grain.time.interface :as time]
             [ai.obney.grain.event-store-sqlite-v3.interface.datasource :as datasource]
             [ai.obney.grain.fressian-util.interface :as fressian-util]
@@ -15,7 +16,7 @@
             [clojure.string :as string])
   (:import [java.time OffsetDateTime]
            [java.util UUID]
-           [java.sql Connection SQLException]
+           [java.sql Connection]
            [java.util.concurrent ArrayBlockingQueue Callable CancellationException
             ExecutionException FutureTask RejectedExecutionException ThreadFactory
             ThreadPoolExecutor ThreadPoolExecutor$AbortPolicy TimeUnit]))
@@ -90,6 +91,7 @@
 
 (defn start
   [config]
+  (retry/policy config :sqlite)
   (u/trace
    ::starting-event-store
    []
@@ -132,11 +134,7 @@
         thread-number (atom 0)]
     (when-not (pos? capacity)
       (throw (IllegalArgumentException. ":write-queue-capacity must be positive")))
-    (doseq [[key default] [[:busy-timeout-ms 1000]
-                           [:busy-max-retries 3]
-                           [:busy-retry-backoff-ms 10]
-                           [:busy-retry-max-backoff-ms 250]
-                           [:write-shutdown-timeout-ms 5000]]]
+    (doseq [[key default] [[:write-shutdown-timeout-ms 5000]]]
       (when (neg? (long (get config key default)))
         (throw (IllegalArgumentException. (str key " must not be negative")))))
     (ThreadPoolExecutor.
@@ -207,65 +205,87 @@
                   ORDER BY e.id
 
    Returns {:sql \"...\" :params [...]}."
-  [{:keys [tenant-id tags types after as-of reverse? limit]}]
-  (let [tenant-str (str tenant-id)
-        order-dir  (if reverse? " DESC" "")]
-    (if (seq tags)
-      (let [tag-strs (mapv tag->str tags)
-            type-strs (when types (mapv #(str ":" (key-fn %)) types))
-            where-parts (cond-> ["e.tenant_id = ?"
-                                 (str "t.tag IN (" (placeholders (count tag-strs)) ")")]
-                          types  (conj (str "e.type IN (" (placeholders (count type-strs)) ")"))
-                          after  (conj "e.id > ?")
-                          as-of  (conj "e.id <= ?"))
-            ;; :limit must be the LAST positional param — after the HAVING count.
-            params (cond-> (into [tenant-str] tag-strs)
-                     types  (into type-strs)
-                     after  (conj (str after))
-                     as-of  (conj (str as-of))
-                     true   (conj (count tag-strs))
-                     limit  (conj limit))
-            ;; CROSS JOIN is a SQLite planner directive: it pins the join order
-            ;; so the query drives from the event_tags PK (tenant_id, tag,
-            ;; event_id) and probes events per matching tag row. A plain JOIN
-            ;; lets the planner drive from events on a database with no
-            ;; statistics, which scans the tenant's entire stream per read.
-            sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
-                     "FROM event_tags t CROSS JOIN events e "
-                     "ON e.tenant_id = t.tenant_id AND e.id = t.event_id "
-                     "WHERE " (string/join " AND " where-parts) " "
-                     "GROUP BY e.id "
-                     "HAVING COUNT(DISTINCT t.tag) = ? "
-                     "ORDER BY e.id" order-dir
-                     (when limit " LIMIT ?"))]
-        {:sql sql :params params})
-      (let [type-strs (when types (vec (distinct (map #(str ":" (key-fn %)) types))))
-            ;; Each equality branch can stream an id range from the composite
-            ;; index; SQLite merges these streams without sorting dense results.
-            ;; Keep the IN form for empty/unfiltered queries and above SQLite's
-            ;; default 500-term compound-select limit, preserving large filters.
-            union? (<= 2 (count type-strs) 500)
-            where-parts (cond-> ["tenant_id = ?"]
-                          types (conj (if union? "type = ?"
-                                          (str "type IN (" (placeholders (count type-strs)) ")")))
-                          after (conj "id > ?")
-                          as-of (conj "id <= ?"))
-            branch-params (fn [selected-types]
-                            (cond-> (into [tenant-str] selected-types)
-                              after (conj (str after))
-                              as-of (conj (str as-of))))
-            params (cond-> (if union?
-                             (into [] (mapcat #(branch-params [%])) type-strs)
-                             (branch-params type-strs))
-                     limit (conj limit))
-            branch (str "SELECT id, time, type, data FROM events "
-                        "WHERE " (string/join " AND " where-parts))
-            sql (str (if union?
-                       (string/join " UNION ALL " (repeat (count type-strs) branch))
-                       branch) " "
-                     "ORDER BY id" order-dir
-                     (when limit " LIMIT ?"))]
-        {:sql sql :params params}))))
+  ([query] (build-single-query query false))
+  ([{:keys [tenant-id tags types after as-of reverse? limit]} any-tag?]
+   (let [tenant-str (str tenant-id)
+         order-dir  (if reverse? " DESC" "")]
+     (cond
+       (= 1 (count tags))
+       (let [type-strs (when types (mapv #(str ":" (key-fn %)) types))
+             where-parts (cond-> ["t.tenant_id = ?" "t.tag = ?"]
+                           types (conj (str "e.type IN (" (placeholders (count type-strs)) ")"))
+                           after (conj "t.event_id > ?")
+                           as-of (conj "t.event_id <= ?"))
+             params (cond-> [tenant-str (tag->str (first tags))]
+                      types (into type-strs)
+                      after (conj (str after))
+                      as-of (conj (str as-of))
+                      limit (conj limit))
+             sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
+                      "FROM event_tags t CROSS JOIN events e "
+                      "ON e.tenant_id = t.tenant_id AND e.id = t.event_id "
+                      "WHERE " (string/join " AND " where-parts) " "
+                      "ORDER BY t.event_id" order-dir
+                      (when limit " LIMIT ?"))]
+         {:sql sql :params params})
+
+       (seq tags)
+       (let [tag-strs (mapv tag->str tags)
+             type-strs (when types (mapv #(str ":" (key-fn %)) types))
+             where-parts (cond-> ["e.tenant_id = ?"
+                                  (str "t.tag IN (" (placeholders (count tag-strs)) ")")]
+                           types  (conj (str "e.type IN (" (placeholders (count type-strs)) ")"))
+                           after  (conj "e.id > ?")
+                           as-of  (conj "e.id <= ?"))
+             ;; :limit must be the LAST positional param — after the HAVING count.
+             params (cond-> (into [tenant-str] tag-strs)
+                      types  (into type-strs)
+                      after  (conj (str after))
+                      as-of  (conj (str as-of))
+                      (not any-tag?) (conj (count tag-strs))
+                      limit  (conj limit))
+             ;; CROSS JOIN is a SQLite planner directive: it pins the join order
+             ;; so the query drives from the event_tags PK (tenant_id, tag,
+             ;; event_id) and probes events per matching tag row. A plain JOIN
+             ;; lets the planner drive from events on a database with no
+             ;; statistics, which scans the tenant's entire stream per read.
+             sql (str "SELECT e.id AS id, e.time AS time, e.type AS type, e.data AS data "
+                      "FROM event_tags t CROSS JOIN events e "
+                      "ON e.tenant_id = t.tenant_id AND e.id = t.event_id "
+                      "WHERE " (string/join " AND " where-parts) " "
+                      "GROUP BY e.id "
+                      (when-not any-tag? "HAVING COUNT(DISTINCT t.tag) = ? ")
+                      "ORDER BY e.id" order-dir
+                      (when limit " LIMIT ?"))]
+         {:sql sql :params params})
+       :else
+       (let [type-strs (when types (vec (distinct (map #(str ":" (key-fn %)) types))))
+             ;; Each equality branch can stream an id range from the composite
+             ;; index; SQLite merges these streams without sorting dense results.
+             ;; Keep the IN form for empty/unfiltered queries and above SQLite's
+             ;; default 500-term compound-select limit, preserving large filters.
+             union? (<= 2 (count type-strs) 500)
+             where-parts (cond-> ["tenant_id = ?"]
+                           types (conj (if union? "type = ?"
+                                           (str "type IN (" (placeholders (count type-strs)) ")")))
+                           after (conj "id > ?")
+                           as-of (conj "id <= ?"))
+             branch-params (fn [selected-types]
+                             (cond-> (into [tenant-str] selected-types)
+                               after (conj (str after))
+                               as-of (conj (str as-of))))
+             params (cond-> (if union?
+                              (into [] (mapcat #(branch-params [%])) type-strs)
+                              (branch-params type-strs))
+                      limit (conj limit))
+             branch (str "SELECT id, time, type, data FROM events "
+                         "WHERE " (string/join " AND " where-parts))
+             sql (str (if union?
+                        (string/join " UNION ALL " (repeat (count type-strs) branch))
+                        branch) " "
+                      "ORDER BY id" order-dir
+                      (when limit " LIMIT ?"))]
+         {:sql sql :params params})))))
 
 (defn- make-reducible
   "Create a reducible that opens a read-only transaction, runs `sql` with `params`,
@@ -299,21 +319,26 @@
     (make-reducible pool sql params)))
 
 (defn- read-batch
-  "Build a UNION ALL of sub-queries and dedupe by id. Each sub-query produces
+  "Combine compatible singleton-tag filters; otherwise union and dedupe by id.
+   Each sub-query produces
    rows with byte-identical (id, time, type, data) columns for the same event,
    so picking any representative per id (via GROUP BY id) is correct."
   [event-store queries]
-  (let [sub (mapv build-single-query queries)
-        union-sql (str "SELECT id, time, type, data FROM ("
-                       (string/join " UNION ALL "
-                                    (map #(str "SELECT id, time, type, data FROM ("
-                                               (:sql %)
-                                               ")")
-                                         sub))
-                       ") GROUP BY id ORDER BY id")
-        all-params (into [] (mapcat :params) sub)
-        pool (get-in event-store [:state ::connection-pool])]
-    (make-reducible pool union-sql all-params)))
+  (if-let [combined (single-tag-union queries)]
+    ;; Internal batch union; ordinary single-query tags remain conjunctive.
+    (let [{:keys [sql params]} (build-single-query combined true)]
+      (make-reducible (get-in event-store [:state ::connection-pool]) sql params))
+    (let [sub (mapv build-single-query queries)
+          union-sql (str "SELECT id, time, type, data FROM ("
+                         (string/join " UNION ALL "
+                                      (map #(str "SELECT id, time, type, data FROM ("
+                                                 (:sql %)
+                                                 ")")
+                                           sub))
+                         ") GROUP BY id ORDER BY id")
+          all-params (into [] (mapcat :params) sub)
+          pool (get-in event-store [:state ::connection-pool])]
+      (make-reducible pool union-sql all-params))))
 
 (defn read
   [event-store args]
@@ -390,7 +415,10 @@
                 result)))
         (catch Throwable t
           (when-not @completed?
-            (try (jdbc/execute! conn ["ROLLBACK"]) (catch Throwable _ nil)))
+            (try (jdbc/execute! conn ["ROLLBACK"])
+                 (catch Throwable rollback-error
+                   (throw (ex-info "Rollback failed"
+                                   {::retry/unsafe true :rollback rollback-error} t)))))
           (throw t))))))
 
 (defn- conn-reducible
@@ -413,33 +441,13 @@
                     (jdbc/plan conn (into [sql] params)))]
         (if (= result ::none) (f) result)))))
 
-(defn- sqlite-contention?
-  [throwable]
-  (loop [cause throwable]
-    (cond
-      (nil? cause) false
-      (and (instance? SQLException cause)
-           (contains? #{5 6} (.getErrorCode ^SQLException cause))) true
-      :else (recur (.getCause ^Throwable cause)))))
-
-(defn- retry-backoff-ms
-  [config retry-number]
-  (let [initial (long (or (:busy-retry-backoff-ms config) 10))
-        maximum (long (or (:busy-retry-max-backoff-ms config) 250))]
-    (loop [remaining (dec retry-number)
-           delay (min initial maximum)]
-      (if (or (zero? remaining) (= delay maximum))
-        delay
-        (recur (dec remaining)
-               (if (> delay (quot maximum 2)) maximum (* 2 delay)))))))
-
 (defn- append-direct
   [event-store {{:keys [predicate-fn] :as cas} :cas
                 :keys [tenant-id events tx-metadata]}]
   (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
-      (long (or (get-in event-store [:config :busy-timeout-ms]) 1000))
+      (:write-lock-timeout-ms (retry/policy (:config event-store) :sqlite))
       (fn [conn]
         (let [last-id (committed-last-event-id conn tenant-id)
               persist! (fn []
@@ -460,46 +468,26 @@
                   anomaly)))
             (persist!)))))))
 
-(defn- append-with-busy-retry
-  [event-store args]
-  (let [config (:config event-store)
-        max-retries (long (or (:busy-max-retries config) 3))]
-    (loop [attempt 0]
-      (let [[status value]
-            (try
-              [:ok (u/trace ::write-transaction
-                     [:metric/name "SQLiteWriteTransaction"
-                      :metric/resolution :high
-                      :attempt (inc attempt)]
-                     (append-direct event-store args))]
-              (catch Throwable t [:error t]))]
-        (if (= :ok status)
-          value
-          (if (and (sqlite-contention? value) (< attempt max-retries))
-            (let [retry-number (inc attempt)
-                  backoff-ms (retry-backoff-ms config retry-number)]
-              (u/log :metric/metric
-                     :metric/name "SQLiteBusyRetry"
-                     :metric/value 1
+(defn- write-with-busy-retry
+  [event-store operation write-fn]
+  (let [attempt (atom 0)
+        result (retry/transaction
+                 (:config event-store) :sqlite operation
+                 #(retry/sql-contention? :sqlite %)
+                 #(u/trace ::write-transaction
+                    [:metric/name "SQLiteWriteTransaction"
                      :metric/resolution :high
-                     :retry retry-number
-                     :backoff-ms backoff-ms)
-              (Thread/sleep backoff-ms)
-              (recur retry-number))
-            (if (sqlite-contention? value)
-              (do
-                (u/log :metric/metric
-                       :metric/name "SQLiteBusyExhausted"
-                       :metric/value 1
-                       :metric/resolution :high
-                       :attempts (inc attempt))
-                {::anom/category ::anom/busy
-                 ::anom/message "SQLite event-store contention limit exhausted"
-                 ::busy-attempts (inc attempt)})
-              (throw value))))))))
+                     :attempt (swap! attempt inc)]
+                    (write-fn)))]
+    ;; Preserve the legacy diagnostic key as well as the common result shape.
+    (cond-> result
+      (:event-store/attempts result)
+      (assoc ::busy-attempts (:event-store/attempts result)))))
 
-(defn append
-  [event-store args]
+(defn- submit-write
+  "Serialize appends and compaction through the same bounded FIFO. A compactor
+   must not repeatedly reacquire SQLite's write lock ahead of queued appends."
+  [event-store write-fn]
   (let [^ThreadPoolExecutor coordinator
         (get-in event-store [:state ::write-coordinator])
         queued-at (System/nanoTime)
@@ -510,25 +498,24 @@
                   (let [queue-wait-ns (- (System/nanoTime) queued-at)]
                     (u/log :metric/metric
                            :metric/name "SQLiteWriteQueueWait"
-                           :metric/value queue-wait-ns
+                           :mulog/duration queue-wait-ns
                            :metric/resolution :high)
                     (u/log :metric/metric
                            :metric/name "SQLiteWriteQueueDepth"
                            :metric/value (.size (.getQueue coordinator))
-                           :metric/resolution :high)
-                    (u/trace ::append
-                      [:metric/name "SQLiteAppend"
-                       :metric/resolution :high
-                       :queue-wait-ns queue-wait-ns]
-                      (append-with-busy-retry event-store args))))))]
+                           :metric/resolution :low)
+                    (write-fn queue-wait-ns)))))]
     (try
       (.execute coordinator task)
       (u/log :metric/metric
              :metric/name "SQLiteWriteQueueDepth"
              :metric/value (.size (.getQueue coordinator))
-             :metric/resolution :high)
+             :metric/resolution :low)
       (try
         (.get task)
+        (catch InterruptedException e
+          (.cancel task true)
+          (throw e))
         (catch ExecutionException e
           (throw (.getCause e)))
         (catch CancellationException e
@@ -541,6 +528,17 @@
                :queue-capacity (or (get-in event-store [:config :write-queue-capacity]) 1024))
         {::anom/category ::anom/busy
          ::anom/message "SQLite event-store write queue is full"}))))
+
+(defn append
+  [event-store args]
+  (submit-write event-store
+                (fn [queue-wait-ns]
+                  (u/trace ::append
+                    [:metric/name "SQLiteAppend"
+                     :metric/resolution :high
+                     :queue-wait-ns queue-wait-ns]
+                    (write-with-busy-retry event-store :append
+                                          #(append-direct event-store args))))))
 
 ;; ----------- ;;
 ;; Tenants     ;;
@@ -592,14 +590,19 @@
   [conn tenant-id event-type cutoff-time limit tag-names]
   (let [tag-names (mapv key-fn (sort-by key-fn tag-names))
         aliases (mapv #(str "k" %) (range (count tag-names)))
+        ;; Fresh stores may have no planner statistics. Drive from target-type
+        ;; events and probe tags by event ID; otherwise SQLite can repeatedly
+        ;; scan every tag/event in the tenant for these prefix predicates.
         joins (mapv (fn [alias]
-                      (str "JOIN event_tags " alias " ON "
+                      (str "CROSS JOIN event_tags " alias
+                           " INDEXED BY idx_event_tags_event ON "
                            alias ".tenant_id = e.tenant_id AND "
                            alias ".event_id = e.id AND "
                            "substr(" alias ".tag, 1, instr(" alias ".tag, ':') - 1) = ?"))
                     aliases)
         exact-counts (mapv (fn [idx]
-                             (str "(SELECT COUNT(*) FROM event_tags c" idx " "
+                             (str "(SELECT COUNT(*) FROM event_tags c" idx
+                                  " INDEXED BY idx_event_tags_event "
                                   "WHERE c" idx ".tenant_id = e.tenant_id "
                                   "AND c" idx ".event_id = e.id "
                                   "AND substr(c" idx ".tag, 1, instr(c" idx ".tag, ':') - 1) = ?) = 1"))
@@ -629,6 +632,31 @@
     (keyed-eligible-metadata conn tenant-id event-type cutoff-time limit tag-names)
     (unkeyed-eligible-metadata conn tenant-id event-type cutoff-time limit)))
 
+(defn- removable-transaction-ids [conn tenant-id eligible]
+  (compaction/removable-transaction-ids
+   (set (map :event/id eligible))
+   (fn [event-id]
+     (some-> (jdbc/execute-one!
+              conn
+              ["SELECT id, time, type, data FROM events
+                WHERE tenant_id = ? AND type = ? AND id > ?
+                ORDER BY id LIMIT 1"
+               (str tenant-id) (str :grain/tx) (str event-id)]
+              {:builder-fn rs/as-unqualified-lower-maps})
+             transform-row))
+   (fn [member-ids]
+     ;; Chunk large append batches to stay within SQL parameter limits, and
+     ;; stop at the first surviving member. No member payload is decoded.
+     (some (fn [ids]
+             (jdbc/execute-one!
+              conn
+              (into [(str "SELECT id FROM events WHERE tenant_id = ? AND id IN ("
+                          (placeholders (count ids)) ") LIMIT 1")
+                     (str tenant-id)]
+                    (map str ids))
+              {:builder-fn rs/as-unqualified-lower-maps}))
+           (partition-all 500 member-ids)))))
+
 (defn- sqlite-compaction-context [conn {:keys [activation tenant-id limit evaluated-at]}]
   (let [{:keys [event/type policy]} activation
         lifecycle (when (and (pos-int? limit)
@@ -638,28 +666,33 @@
                (not (contains? compaction/protected-event-types type))
                (compaction/activation-matches? lifecycle activation))
       (let [cutoff (compaction/cutoff (or evaluated-at (time/now))
-                                      (:retain-at-least policy))]
+                                      (:retain-at-least policy))
+            eligible (eligible-event-metadata conn tenant-id type policy cutoff limit)]
         {:cutoff cutoff
-         :eligible (eligible-event-metadata
-                    conn tenant-id type policy cutoff limit)}))))
+         :eligible eligible
+         :transaction-ids (removable-transaction-ids conn tenant-id eligible)}))))
 
 (defn estimate-compaction [event-store request]
-  (with-open [conn (jdbc/get-connection (get-in event-store [:state ::connection-pool]))]
-    (if-let [{:keys [cutoff eligible]} (sqlite-compaction-context conn request)]
+  ;; A deferred read transaction keeps marker lookup in the selection snapshot.
+  (jdbc/with-transaction [conn (get-in event-store [:state ::connection-pool])]
+    (if-let [{:keys [cutoff eligible transaction-ids]} (sqlite-compaction-context conn request)]
       {:eligible-count (count eligible)
        :eligible-event-ids (mapv :event/id eligible)
+       :eligible-transaction-count (count transaction-ids)
+       :eligible-transaction-ids (vec (sort transaction-ids))
        :cutoff cutoff}
       {:eligible-count 0 :authorized? false})))
 
-(defn compact-events! [event-store {:keys [activation tenant-id] :as request}]
+(defn- compact-events-direct! [event-store {:keys [activation tenant-id] :as request}]
   (let [pool (get-in event-store [:state ::connection-pool])]
     (with-immediate-tx
       pool
-      (long (or (get-in event-store [:config :busy-timeout-ms]) 1000))
+      (:write-lock-timeout-ms (retry/policy (:config event-store) :sqlite))
       (fn [conn]
-        (if-let [{:keys [cutoff eligible]} (sqlite-compaction-context conn request)]
+        (if-let [{:keys [cutoff eligible transaction-ids]} (sqlite-compaction-context conn request)]
           (when (seq eligible)
             (let [deleted-ids (set (map :event/id eligible))
+                  all-deleted-ids (into deleted-ids transaction-ids)
                   last-id (committed-last-event-id conn tenant-id)
                   receipt {:event/type compaction/compaction-receipt-type
                            :event/tags #{(compaction/policy-tag (:event/type activation))}
@@ -668,20 +701,31 @@
                            :retention/policy (:policy activation)
                            :retention/tenant-id tenant-id
                            :retention/cutoff cutoff
-                           :retention/deleted-event-ids deleted-ids}
+                           :retention/deleted-event-ids deleted-ids
+                           :retention/deleted-transaction-ids transaction-ids}
                   {:keys [events events-with-tx last-event-id]}
                   (prepare-append last-id [receipt]
                                   {:grain/operation :retention-compaction})]
               (jdbc/execute! conn
                              (into [(str "DELETE FROM events WHERE tenant_id = ? AND id IN ("
-                                         (placeholders (count deleted-ids)) ")")
+                                         (placeholders (count all-deleted-ids)) ")")
                                     (str tenant-id)]
-                                   (map str deleted-ids)))
+                                   (map str all-deleted-ids)))
               (upsert-tenant! conn tenant-id last-event-id)
               (insert-events! conn tenant-id events-with-tx)
               (first events)))
           (throw (ex-info "Retention compaction is not authorized by the active policy"
                           {:request request})))))))
+
+(defn compact-events! [event-store request]
+  (submit-write event-store
+                (fn [queue-wait-ns]
+                  (u/trace ::compaction
+                    [:metric/name "SQLiteCompaction"
+                     :metric/resolution :high
+                     :queue-wait-ns queue-wait-ns]
+                    (write-with-busy-retry event-store :compact
+                                          #(compact-events-direct! event-store request))))))
 
 ;; ----------------- ;;
 ;; Record Definition ;;
@@ -709,6 +753,11 @@
   compaction/EventCompaction
   (estimate [this request] (estimate-compaction this request))
   (compact! [this request] (compact-events! this request)))
+
+(extend-type SqliteEventStore
+  p/EventStoreHead
+  (head [this tenant-id]
+    (committed-last-event-id (get-in this [:state ::connection-pool]) tenant-id)))
 
 (defmethod start-event-store :sqlite
   [config]

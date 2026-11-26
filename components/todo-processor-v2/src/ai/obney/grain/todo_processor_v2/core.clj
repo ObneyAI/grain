@@ -40,6 +40,27 @@
   [processor-name]
   (uuid/v5 uuid/+namespace-url+ (str processor-name)))
 
+(defn- todo-dimensions [processor-name outcome & [failure-class]]
+  (cond-> {:outcome outcome}
+    (keyword? processor-name)
+    (assoc :service (or (namespace processor-name) "unqualified")
+           :processor (str processor-name))
+    failure-class (assoc :failure-class failure-class)))
+
+(defn- emit-todo-counter! [metric-name processor-name outcome & [failure-class]]
+  (u/log :metric/metric
+         :metric/name metric-name
+         :metric/value 1
+         :metric/resolution :low
+         :metric/dimensions (todo-dimensions processor-name outcome failure-class)))
+
+(defn- emit-todo-duration! [processor-name outcome started-at]
+  (u/log :metric/metric
+         :metric/name "TodoDuration"
+         :mulog/duration (- (System/nanoTime) started-at)
+         :metric/resolution :high
+         :metric/dimensions (todo-dimensions processor-name outcome)))
+
 (defn- make-checkpoint-event
   ([processor-name triggering-event-id]
    (make-checkpoint-event processor-name triggering-event-id nil))
@@ -51,6 +72,69 @@
        :body (cond-> {:processor/name processor-name
                       :triggered-by triggering-event-id}
                extra-body (merge extra-body))}))))
+
+(defn- read-newest
+  [event-store query]
+  (let [events (event-store/read event-store (assoc query :reverse? true :limit 1))]
+    (if (anomaly? events)
+      events
+      (reduce (fn [_ event] (reduced event)) nil events))))
+
+(defn- initialization-result
+  [checkpoint processor-name start-after]
+  (cond
+    (anomaly? checkpoint) checkpoint
+    (and (= :initial (:checkpoint/kind checkpoint))
+         (= processor-name (:processor/name checkpoint))
+         (= start-after (:triggered-by checkpoint)))
+    {:processor/name processor-name
+     :triggered-by start-after
+     :checkpoint/status :already-initialized}
+    :else
+    {::anom/category ::anom/conflict
+     ::anom/message "Processor checkpoint already exists or changed during initialization."
+     :processor/name processor-name}))
+
+(defn initialize-checkpoint!
+  [event-store tenant-id processor-name start-after]
+  (if-not (and (uuid? tenant-id)
+               (keyword? processor-name)
+               (uuid? start-after)
+               (= 7 (uuid/get-version start-after)))
+    {::anom/category ::anom/incorrect
+     ::anom/message "Expected a UUID tenant, keyword processor name and UUIDv7 start-after."}
+    (let [query {:tenant-id tenant-id
+                 :types #{:grain/todo-processor-checkpoint}
+                 :tags #{[:processor (processor-name->uuid processor-name)]}}
+          existing (read-newest event-store query)]
+      (if (some? existing)
+        (initialization-result existing processor-name start-after)
+        (let [boundary (read-newest event-store {:tenant-id tenant-id :as-of start-after})]
+          (cond
+            (anomaly? boundary) boundary
+            (not= start-after (:event/id boundary))
+            {::anom/category ::anom/incorrect
+             ::anom/message "start-after must identify a retained committed event in this tenant."}
+            :else
+            (let [result (event-store/append
+                          event-store
+                          {:tenant-id tenant-id
+                           :events [(make-checkpoint-event processor-name start-after
+                                                           {:checkpoint/kind :initial})]
+                           :cas (assoc (dissoc query :tenant-id)
+                                       :reverse? true
+                                       :limit 1
+                                       :predicate-fn
+                                       (fn [events]
+                                         (not (reduce (fn [_ _] (reduced true)) false events))))})]
+              (cond
+                (= ::anom/conflict (::anom/category result))
+                (initialization-result (read-newest event-store query) processor-name start-after)
+                (anomaly? result) result
+                :else
+                {:processor/name processor-name
+                 :triggered-by start-after
+                 :checkpoint/status :initialized}))))))))
 
 (defn- checkpoint-at-or-after?
   [threshold-id checkpoint]
@@ -95,8 +179,12 @@
                     :conflict-threshold-id conflict-threshold-id)
              result)
          (do (u/log ::error-storing-events :anomaly result)
-             {::anom/category ::anom/fault
-              ::anom/message "Error storing events."}))))))
+             (emit-todo-counter! "TodoCheckpointFailed" processor-name "failed"
+                                 (name (::anom/category result)))
+             (if (= ::anom/busy (::anom/category result))
+               result
+               {::anom/category ::anom/fault
+                ::anom/message "Error storing events."})))))))
 
 (defn- append-batch-with-checkpoint
   [event-store tenant-id processor-name from-event-id events result-events]
@@ -171,8 +259,8 @@
         append-result (append-with-checkpoint
                         event-store tenant-id processor-name
                         triggering-id (or (:result/on-success result) []))]
-    (when-not (and (anomaly? append-result)
-                   (= ::anom/conflict (::anom/category append-result)))
+    (if (anomaly? append-result)
+      append-result
       ((:result/effect result)))))
 
 (defn- process-pure-result
@@ -187,7 +275,7 @@
                                    handler-cas (assoc :cas handler-cas)))]
         (when (anomaly? event-store-result)
           (u/log ::error-storing-events :anomaly event-store-result)
-          (if (= ::anom/conflict (::anom/category event-store-result))
+          (if (contains? #{::anom/conflict ::anom/busy} (::anom/category event-store-result))
             event-store-result
             {::anom/category ::anom/fault
              ::anom/message "Error storing events."})))
@@ -201,8 +289,10 @@
                                  {:tenant-id tenant-id :events events})]
         (when (anomaly? event-store-result)
           (u/log ::error-storing-events :anomaly event-store-result)
-          {::anom/category ::anom/fault
-           ::anom/message "Error storing events."})))))
+          (if (= ::anom/busy (::anom/category event-store-result))
+            event-store-result
+            {::anom/category ::anom/fault
+             ::anom/message "Error storing events."}))))))
 
 (defn process-event
   [{:keys [handler-fn event event-store tenant-id lease-check-fn processor-name
@@ -210,33 +300,70 @@
   ;; Lease-check guard: skip events for tenants this node doesn't own
   (if (and lease-check-fn
            (not (lease-check-fn tenant-id processor-name)))
-    (u/log ::lease-check-skipped :tenant-id tenant-id :processor-name processor-name)
+    (do
+      (u/log ::lease-check-skipped :tenant-id tenant-id :processor-name processor-name)
+      (emit-todo-counter! "TodoLeaseCheckSkipped" processor-name "skipped"))
     (u/trace
      ::processing-event
      [:event event :metric/name "TodoProcessed" :metric/resolution :high]
-     (try
-       (let [result (or (handler-fn context)
+     (let [started-at (System/nanoTime)]
+       (try
+         (let [result (or (handler-fn context)
                         {::anom/category ::anom/fault
                          ::anom/message  "Todo Processor returned nil: %s"})]
            (if (anomaly? result)
-             (do (u/log ::anomaly-in-todo-processor :anomaly result)
-                 (when (and processor-name (not retry-on-error?))
-                   (append-with-checkpoint event-store tenant-id processor-name
-                                           (:event/id event) [])))
-             (if (:result/effect result)
-               (case (:result/checkpoint result)
-                 :after  (process-effect-after context result)
-                 :before (process-effect-before context result))
-               (process-pure-result context result))))
+             (do
+               (u/log ::anomaly-in-todo-processor :anomaly result)
+               (emit-todo-duration! processor-name "failed" started-at)
+               (emit-todo-counter! "TodoFailed" processor-name "failed"
+                                   (name (::anom/category result)))
+               (cond
+                 (= ::anom/busy (::anom/category result)) result
+                 retry-on-error?
+                 (emit-todo-counter! "TodoRetry" processor-name "retrying"
+                                    (name (::anom/category result)))
+                 processor-name
+                 (append-with-checkpoint event-store tenant-id processor-name
+                                         (:event/id event) [])))
+             (let [processing-result
+                   (if (:result/effect result)
+                     (case (:result/checkpoint result)
+                       :after  (process-effect-after context result)
+                       :before (process-effect-before context result))
+                     (process-pure-result context result))]
+               (if (anomaly? processing-result)
+                 (do
+                   (emit-todo-duration! processor-name "failed" started-at)
+                   (emit-todo-counter! "TodoFailed" processor-name "failed"
+                                       (name (::anom/category processing-result)))
+                   processing-result)
+                 (do
+                   (emit-todo-duration! processor-name "succeeded" started-at)
+                   (emit-todo-counter! "TodoSucceeded" processor-name "succeeded"))))))
          (catch Throwable t
            (u/log ::uncaught-exception-in-todo-processor :exception t)
-           (when (and processor-name (not retry-on-error?))
-             (append-with-checkpoint event-store tenant-id processor-name
-                                     (:event/id event) [])))))))
+           (emit-todo-duration! processor-name "failed" started-at)
+           (emit-todo-counter! "TodoHandlerException" processor-name "failed"
+                               "exception")
+           (emit-todo-counter! "TodoFailed" processor-name "failed" "exception")
+           (if retry-on-error?
+             (emit-todo-counter! "TodoRetry" processor-name "retrying" "exception")
+             (when processor-name
+               (append-with-checkpoint event-store tenant-id processor-name
+                                       (:event/id event) [])))))))))
 
 ;; ------------------- ;;
 ;; Catch-up            ;;
 ;; ------------------- ;;
+
+(defn- check-write-result!
+  "Stop this processing cycle on a failed write. Never let a later checkpoint
+   cover its uncommitted prefix. Existing CAS replay conflicts remain benign."
+  [result]
+  (when (and (anomaly? result)
+             (not= ::anom/conflict (::anom/category result)))
+    (throw (ex-info "Todo processing stopped after a failed event-store write" result)))
+  result)
 
 (defn- get-last-processed-id
   "Queries the event store for the most recent checkpoint for this processor+tenant.
@@ -266,11 +393,12 @@
     (reduce
      (fn [_ event]
        (when-not (= :grain/tx (:event/type event))
-         (process-event (assoc context
-                          :event event
-                          :handler-fn handler-fn
-                          :tenant-id tenant-id
-                          :processor-name processor-name))))
+         (check-write-result!
+          (process-event (assoc context
+                           :event event
+                           :handler-fn handler-fn
+                           :tenant-id tenant-id
+                           :processor-name processor-name)))))
      nil
      missed)))
 
@@ -418,7 +546,8 @@
                          :tenant-id tenant-id :topics topics :batch-size batch-size)
                   (let [last-id (atom (get-last-processed-id event-store tenant-id processor-name))]
                     (while @running
-                      (try
+                      (let [poll-started-at (System/nanoTime)]
+                       (try
                         (let [read-args (cond-> {:tenant-id tenant-id
                                                  :types (set topics)}
                                           @last-id (assoc :after @last-id))
@@ -441,27 +570,40 @@
                                                           (get-last-processed-id
                                                            event-store tenant-id processor-name))
                                                   (reset! last-id last-batch-event-id))
+                                                (check-write-result! append-result)
                                                 (reset! batch-source-events [])
                                                 (reset! batch-result-events []))))]
+                          (u/log :metric/metric
+                                 :metric/name "TodoBatchSize"
+                                 :metric/value (count events)
+                                 :metric/resolution :low
+                                 :metric/dimensions (dissoc (todo-dimensions processor-name "sampled")
+                                                            :outcome))
                           (doseq [event events]
                             (when @running
                               (if (and lease-check-fn
                                        (not (lease-check-fn tenant-id processor-name)))
-                                (u/log ::lease-check-skipped :tenant-id tenant-id)
+                                (do
+                                  (u/log ::lease-check-skipped :tenant-id tenant-id)
+                                  (emit-todo-counter! "TodoLeaseCheckSkipped"
+                                                      processor-name "skipped"))
                                 (let [context {:event event
                                                :handler-fn handler-fn
                                                :event-store event-store
                                                :tenant-id tenant-id}
                                       result (or (handler-fn context)
                                                  {})]
+                                  (when (= ::anom/busy (::anom/category result))
+                                    (check-write-result! result))
                                   (if (or (:result/effect result)
                                           (:result/cas result))
                                     ;; Effect/CAS handler: preserve per-event processing semantics.
                                     (do
                                       (flush-batch)
-                                      (process-event (cond-> (assoc context
-                                                                :processor-name processor-name)
-                                                        lease-check-fn (assoc :lease-check-fn lease-check-fn)))
+                                      (check-write-result!
+                                       (process-event (cond-> (assoc context
+                                                                 :processor-name processor-name)
+                                                         lease-check-fn (assoc :lease-check-fn lease-check-fn))))
                                       (when-let [processed-id (get-last-processed-id
                                                                event-store tenant-id processor-name)]
                                         (reset! last-id processed-id)))
@@ -471,22 +613,48 @@
                                       (when-let [revents (:result/events result)]
                                         (swap! batch-result-events into revents))))))))
                           ;; After batch: one checkpoint for all pure results
-                          (flush-batch))
+                          (flush-batch)
+                          (u/log :metric/metric
+                                 :metric/name "TodoPollDuration"
+                                 :mulog/duration (- (System/nanoTime) poll-started-at)
+                                 :metric/resolution :high
+                                 :metric/dimensions (todo-dimensions processor-name "succeeded")))
                         (catch Throwable t
-                          (u/log ::poll-processor-error :exception t)))
+                          (u/log ::poll-processor-error :exception t)
+                          (emit-todo-counter! "TodoPollError" processor-name "failed" "exception")
+                          (u/log :metric/metric
+                                 :metric/name "TodoPollDuration"
+                                 :mulog/duration (- (System/nanoTime) poll-started-at)
+                                 :metric/resolution :high
+                                 :metric/dimensions (todo-dimensions processor-name "failed"))))
+                       )
                       (Thread/sleep poll-interval-ms)))))]
     (.setDaemon thread true)
     (.setName thread (str "grain-poll-" (name processor-name)))
     (.start thread)
-    {:running running :thread thread}))
+    {:running running :thread thread :processor-name processor-name}))
 
 (defn stop-polling
   "Stop a poll-based processor."
-  [{:keys [running thread]}]
+  [{:keys [running thread processor-name]}]
+  (let [started-at (System/nanoTime)]
   (when running
     (reset! running false))
   (when thread
-    (.join thread 2000)))
+    (.join thread 2000))
+  (let [timed-out? (and thread (.isAlive ^Thread thread))
+        outcome (if timed-out? "timed-out" "succeeded")]
+    (u/log :metric/metric
+           :metric/name "TodoDrainDuration"
+           :mulog/duration (- (System/nanoTime) started-at)
+           :metric/resolution :high
+           :metric/dimensions {:outcome outcome})
+    (when timed-out?
+      (u/log :metric/metric
+             :metric/name "TodoDrainTimedOut"
+             :metric/value 1
+             :metric/resolution :low
+             :metric/dimensions {:outcome outcome})))))
 
 ;; --------------------------------- ;;
 ;; Coalesced tenant poller           ;;
@@ -598,6 +766,7 @@
                                                                         [tid proc-name]
                                                                         (get-last-processed-id event-store tid proc-name))
                                                                  (swap! watermarks assoc-in [tid proc-name] last-event-id))
+                                                               (check-write-result! append-result)
                                                                (reset! batch-source-events [])
                                                                (reset! batch-result-events []))))]
                                          ;; Process events sequentially within this tenant
@@ -609,11 +778,14 @@
                                                                :event-store event-store
                                                                :tenant-id tid})
                                                    result (or (handler-fn ctx) {})]
+                                               (when (= ::anom/busy (::anom/category result))
+                                                 (check-write-result! result))
                                                (if (or (:result/effect result)
                                                        (:result/cas result))
                                                  (do
                                                    (flush-batch)
-                                                   (process-event (assoc ctx :processor-name proc-name))
+                                                   (check-write-result!
+                                                    (process-event (assoc ctx :processor-name proc-name)))
                                                    (when-let [processed-id (get-last-processed-id
                                                                             event-store tid proc-name)]
                                                      (swap! watermarks assoc-in
@@ -647,11 +819,13 @@
     {:running running
      :thread poll-thread
      :pool pool
+     :in-flight in-flight
      :watermarks watermarks}))
 
 (defn stop-tenant-poller
   "Stop the coalesced tenant poller."
   [{:keys [running thread pool]}]
+  (let [started-at (System/nanoTime)]
   (when running
     (reset! running false))
   (when thread
@@ -665,4 +839,18 @@
                         (if (instance? ThreadPoolExecutor pool)
                           {:active-count (.getActiveCount ^ThreadPoolExecutor pool)
                            :queued-count (.size (.getQueue ^ThreadPoolExecutor pool))}
-                          {})))))))
+                          {}))))))
+  (let [timed-out? (or (and thread (.isAlive ^Thread thread))
+                       (and pool (not (.isTerminated pool))))
+        outcome (if timed-out? "timed-out" "succeeded")]
+    (u/log :metric/metric
+           :metric/name "TodoDrainDuration"
+           :mulog/duration (- (System/nanoTime) started-at)
+           :metric/resolution :high
+           :metric/dimensions {:outcome outcome})
+    (when timed-out?
+      (u/log :metric/metric
+             :metric/name "TodoDrainTimedOut"
+             :metric/value 1
+             :metric/resolution :low
+             :metric/dimensions {:outcome outcome})))))

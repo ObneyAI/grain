@@ -1,6 +1,9 @@
 (ns ai.obney.grain.event-store-sqlite-v3.integration-test
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.todo-processor-v2.interface :as tp]
+            [ai.obney.grain.event-store-v3.interface.backend :as backend]
+            [ai.obney.grain.event-store-v3.interface.write-retry :as retry]
             [ai.obney.grain.event-store-sqlite-v3.core :as sqlite-core]
             [ai.obney.grain.event-store-sqlite-v3.interface]
             [ai.obney.grain.event-retention.interface :as retention]
@@ -146,8 +149,8 @@
                      (retention/estimate admin :sqlite-test/ephemeral *tenant-id* 1))]
       (is (= [(:event/id (first targets))] (:eligible-event-ids estimate)))
       ;; One lifecycle decode in the administration layer and one independent
-      ;; authorization decode in the backend; no tenant payload is decoded.
-      (is (= 2 @decode-count)))))
+      ;; authorization decode in the backend, plus the affected marker only.
+      (is (= 3 @decode-count)))))
 
 (deftest keyed-estimate-and-compact-share-the-metadata-selector
   (let [now (OffsetDateTime/now ZoneOffset/UTC)
@@ -1147,6 +1150,28 @@
         (is (= 1 (count (non-tx-events
                          (into [] (es/read store {:tenant-id tenant-id}))))))))))
 
+;; Allium: EventLog.LegacyImmediateLockAttempt / store/WriteContention.SharedConfiguration.
+(deftest legacy-zero-timeout-preserves-immediate-contention-and-recovery
+  (with-configured-store
+    {:busy-timeout-ms 0 :busy-max-retries 1
+     :busy-retry-backoff-ms 0 :busy-retry-max-backoff-ms 0}
+    (fn [store]
+      (let [pool (get-in store [:state ::sqlite-core/connection-pool])
+            tenant-id (uuid/v4)
+            event (es/->event {:type :test/alpha :body {:n 1}})]
+        (with-open [lock-conn (jdbc/get-connection pool)]
+          (jdbc/execute! lock-conn ["BEGIN IMMEDIATE"])
+          (try
+            (let [result (deref (future (es/append store {:tenant-id tenant-id :events [event]}))
+                                2000 ::timeout)]
+              (is (not= ::timeout result) "Zero timeout must not wait for the held lock")
+              (is (= ::anom/busy (::anom/category result)))
+              (is (= 2 (:event-store/attempts result)))
+              (is (= 2 (::sqlite-core/busy-attempts result)))
+              (is (empty? (into [] (es/read store {:tenant-id tenant-id})))))
+            (finally (jdbc/execute! lock-conn ["ROLLBACK"]))))
+        (is (= 1 (count (es/append store {:tenant-id tenant-id :events [event]}))))))))
+
 (deftest exhausted-external-writer-contention-is-bounded
   (with-configured-store
     {:busy-timeout-ms 10 :busy-max-retries 1
@@ -1165,6 +1190,72 @@
             (is (< elapsed-ms 1000))
             (jdbc/execute! lock-conn ["ROLLBACK"])))
         (is (empty? (into [] (es/read store {:tenant-id tenant-id}))))))))
+
+;; Allium: store/WriteContention.BoundedRecovery; compaction uses the same budget.
+(deftest compaction-contention-returns-busy-without-changing-history
+  (let [admin (retention/administration *event-store*)
+        activation (retention/activate! admin :sqlite-test/ephemeral)
+        execute! jdbc/execute!
+        attempts (atom 0)
+        head (es/head *event-store* *tenant-id*)]
+    (with-redefs [jdbc/execute!
+                  (fn [conn sql & opts]
+                    (if (= ["BEGIN IMMEDIATE"] sql)
+                      (do (swap! attempts inc)
+                          (throw (java.sql.SQLException. "busy" "" 5)))
+                      (apply execute! conn sql opts)))]
+      (let [result (compaction/compact!
+                     *event-store* {:activation activation :tenant-id *tenant-id*
+                                    :limit 10})]
+        (is (= ::anom/busy (::anom/category result)))
+        (is (= 4 (:event-store/attempts result)))
+        (is (= 4 @attempts))))
+    (is (= head (es/head *event-store* *tenant-id*)))))
+
+;; Allium: WriteContention.FreshAtomicAttempt / RetryScope. Fail after actual
+;; inserts/deletes, then assert the database contains only the committed attempt.
+(deftest retry-rolls-back-partial-appends-and-publishes-only-the-commit
+  (let [insert! @#'sqlite-core/insert-events!
+        attempts (atom 0)
+        published (atom [])
+        store (assoc-in *event-store* [:config :event-pubsub] ::test-bus)]
+    (with-redefs [sqlite-core/insert-events!
+                  (fn [& args]
+                    (apply insert! args)
+                    (when (= 1 (swap! attempts inc))
+                      (throw (java.sql.SQLException. "busy" "" 5))))
+                  retry/pause! (constantly nil)
+                  pubsub/pub (fn [_ message] (swap! published conj message))]
+      (is (= 1 (count (es/append store {:tenant-id *tenant-id*
+                                        :events [(es/->event {:type :test/alpha})]})))))
+    (let [stored (into [] (es/read store {:tenant-id *tenant-id*}))]
+      (is (= 2 @attempts))
+      (is (= 1 (count @published)))
+      (is (= 1 (count (non-tx-events stored))))
+      (is (= 1 (count (tx-events stored))))
+      (is (= (:event/id (last stored)) (es/head store *tenant-id*))))))
+
+(deftest retry-rolls-back-compaction-and-emits-one-receipt
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        event (with-redefs [time/now (constantly old)]
+                (append-event! :sqlite-test/ephemeral #{} {:value 1}))
+        _ (retention/activate! admin :sqlite-test/ephemeral)
+        insert! @#'sqlite-core/insert-events!
+        attempts (atom 0)]
+    (with-redefs [sqlite-core/insert-events!
+                  (fn [& args]
+                    (apply insert! args)
+                    (when (= 1 (swap! attempts inc))
+                      (throw (java.sql.SQLException. "busy" "" 5))))
+                  retry/pause! (constantly nil)]
+      (let [receipt (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10)]
+        (is (= #{(:event/id event)} (:retention/deleted-event-ids receipt)))))
+    (is (= 2 @attempts))
+    (let [stored (into [] (es/read *event-store* {:tenant-id *tenant-id*}))]
+      (is (empty? (filter #(= :sqlite-test/ephemeral (:event/type %)) stored)))
+      (is (= 1 (count (filter #(= compaction/compaction-receipt-type (:event/type %)) stored))))
+      (is (= 1 (count (tx-events stored)))))))
 
 (deftest wal-read-continues-while-writer-lock-is-held
   (with-configured-store
@@ -1296,3 +1387,380 @@
         ;; on tenant_id alone (which would visit the whole tenant stream).
         (is (some #(re-find #"(?i)SEARCH e\b.*\(tenant_id=\? AND id=\?\)" %) details)
             "events is probed by full (tenant_id, id) key")))))
+
+
+(deftest committed-head-does-not-decode-the-latest-batch
+  (let [other (uuid/v4)]
+    (is (nil? (es/head *event-store* *tenant-id*)))
+    (es/append *event-store*
+               {:tenant-id *tenant-id*
+                :events (mapv (fn [n] (es/->event {:type :test/alpha :body {:value n}})) (range 100))})
+    (let [expected (:event/id (first (into [] (es/read *event-store*
+                                                       {:tenant-id *tenant-id* :reverse? true :limit 1}))))
+          unexpected (fn [& _] (throw (ex-info "Head must not decode events or enumerate tenants" {})))]
+      (with-redefs [fressian/decode unexpected sqlite-core/read unexpected sqlite-core/tenants unexpected]
+        (dotimes [_ 3] (is (= expected (es/head *event-store* *tenant-id*))))
+        (is (nil? (es/head *event-store* other))))
+      (is (= ::anom/conflict
+             (::anom/category (es/append *event-store*
+                                {:tenant-id *tenant-id*
+                                 :events [(es/->event {:type :test/beta})]
+                                 :cas {:predicate-fn (constantly false)}}))))
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (es/append *event-store* {:tenant-id other :events [(es/->event {:type :test/beta})]})
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (is (uuid? (es/head *event-store* other)))
+      (append-event! :test/beta #{})
+      (is (pos? (compare (es/head *event-store* *tenant-id*) expected))))))
+
+
+(deftest committed-head-excludes-uncommitted-watermarks
+  (append-event! :test/alpha #{})
+  (let [committed (es/head *event-store* *tenant-id*)]
+    (jdbc/with-transaction [tx (pool) {:rollback-only true}]
+      (jdbc/execute! tx ["UPDATE tenants SET last_event_id = ? WHERE id = ?"
+                         (str (uuid/v7)) (str *tenant-id*)])
+      ;; This lookup uses a separate connection while the writer is uncommitted.
+      (is (= committed (es/head *event-store* *tenant-id*))))
+    (is (= committed (es/head *event-store* *tenant-id*)))))
+
+
+(deftest singleton-tag-batches-preserve-union-semantics
+  (let [a [:member (uuid/v4)] b [:member (uuid/v4)] c [:group (uuid/v4)]
+        ids (mapv :event/id
+                  [(append-event! :test/alpha #{a})
+                   (append-event! :test/beta #{b})
+                   (append-event! :test/alpha #{a b})
+                   (append-event! :test/beta #{a c})
+                   (append-event! :test/gamma #{c})])
+        other-tenant (uuid/v4)
+        _ (es/append *event-store* {:tenant-id other-tenant
+                                    :events [(es/->event {:type :test/alpha :tags #{a b}})]})
+        cases (concat
+                (for [filter [{} {:types #{:test/alpha}} {:types #{:test/alpha :test/beta}}
+                              {:types #{}} {:after (ids 1)} {:as-of (ids 2)}
+                              {:types #{:test/alpha} :after (ids 2)}]]
+                  (mapv #(assoc filter :tags #{%}) [a b a]))
+                [[{:tags #{a b}} {:tags #{c}}]
+                 [{:tags #{a} :types #{:test/alpha}} {:tags #{b} :types #{:test/beta}}]
+                 [{:tags #{a} :after (ids 2)} {:tags #{b}}]
+                 [{:tags #{}} {:tags #{a}}]])]
+    (doseq [queries cases]
+      (let [expected (with-redefs [backend/single-tag-union (constantly nil)]
+                       (read-events queries))]
+        (is (= expected (read-events queries)) (pr-str queries))))
+    (is (= [(ids 2)] (mapv :event/id (read-events {:tags #{a b}})))
+        "A normal multi-tag query remains conjunctive")
+    (is (= (subvec ids 0 4)
+           (mapv :event/id (read-events [{:tags #{a}} {:tags #{b}}]))))
+    (let [queries (into [{:tags #{a}} {:tags #{b}}]
+                        (map (fn [_] {:tags #{[:missing (uuid/v4)]}}) (range 600)))]
+      (is (= (subvec ids 0 4) (mapv :event/id (read-events queries)))
+          "Many alternatives do not require one SQL compound branch per tag"))
+    (is (nil? (backend/single-tag-union [{:tags #{a} :limit 1} {:tags #{b} :limit 1}])))
+    (is (nil? (backend/single-tag-union [{:tags #{a} :reverse? true} {:tags #{b} :reverse? true}])))))
+
+(deftest singleton-tag-batch-keeps-indexed-tag-access
+  (let [a [:member (uuid/v4)] b [:member (uuid/v4)]
+        _ (append-event! :test/alpha #{a b})
+        query (backend/single-tag-union
+                [{:tenant-id *tenant-id* :tags #{a} :types #{:test/alpha}}
+                 {:tenant-id *tenant-id* :tags #{b} :types #{:test/alpha}}])
+        {:keys [sql params]} (#'sqlite-core/build-single-query query true)
+        details (mapv :detail (jdbc/execute! (pool) (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                           {:builder-fn rs/as-unqualified-lower-maps}))]
+    (is (not (clojure.string/includes? sql "UNION")))
+    (is (some #(re-find #"SEARCH t USING" %) details) (pr-str details))
+    (is (not-any? #(re-find #"SCAN [te](?: |$)" %) details) (pr-str details))))
+
+(deftest singleton-tag-reads-preserve-filter-order-and-bound-semantics
+  (let [processor (uuid/v4)
+        other-tag (uuid/v4)
+        other-tenant (uuid/v4)
+        absent-tenant (uuid/v4)
+        rows (mapv (fn [[type tags]] (append-event! type tags {}))
+                   [[:test/alpha #{[:processor processor]}]
+                    [:test/beta #{[:processor processor] [:other other-tag]}]
+                    [:test/alpha #{[:other other-tag]}]
+                    [:test/alpha #{[:processor processor]}]
+                    [:test/gamma #{[:processor processor]}]
+                    [:test/beta #{[:processor processor]}]])
+        foreign (first (es/append *event-store*
+                                 {:tenant-id other-tenant
+                                  :events [(es/->event {:type :test/alpha
+                                                       :tags #{[:processor processor]}})]}))
+        ids (mapv :event/id rows)]
+    (doseq [tenant [*tenant-id* other-tenant absent-tenant]
+            types [nil #{} #{:test/alpha} #{:test/beta} #{:test/alpha :test/beta}]
+            after [nil (ids 0) (ids 2) (ids 5)]
+            as-of [nil (ids 0) (ids 3) (ids 5)]
+            reverse? [false true]
+            limit [nil 1 3]]
+      (let [query (cond-> {:tenant-id tenant :tags #{[:processor processor]} :reverse? reverse?}
+                    (some? types) (assoc :types types)
+                    after (assoc :after after)
+                    as-of (assoc :as-of as-of)
+                    limit (assoc :limit limit))
+            source (cond (= tenant *tenant-id*) rows (= tenant other-tenant) [foreign] :else [])
+            eligible (filter (fn [event]
+                               (and (contains? (:event/tags event) [:processor processor])
+                                    (or (nil? types) (contains? types (:event/type event)))
+                                    (or (nil? after) (uuid/< after (:event/id event)))
+                                    (or (nil? as-of) (not (uuid/< as-of (:event/id event)))))) source)
+            ordered (if reverse? (reverse eligible) eligible)
+            expected (mapv :event/id (if limit (take limit ordered) ordered))]
+        (let [actual (es/read *event-store* query)]
+          (if (and after as-of)
+            (is (= ::anom/incorrect (::anom/category actual)) (str query))
+            (is (= expected (mapv :event/id (into [] actual))) (str query))))))))
+
+(deftest singleton-tag-checkpoint-cas-streams-newest-without-aggregation
+  (let [processor (uuid/v4)
+        tag [:processor processor]
+        rows (mapv #(append-event! :test/alpha #{tag} {:n %}) (range 50))
+        _other-type (append-event! :test/beta #{tag} {})
+        query {:tenant-id *tenant-id* :types #{:test/alpha}
+               :tags #{tag} :reverse? true :limit 1}
+        observed (atom nil)]
+    (doseq [any-tag? [false true]]
+      (let [{:keys [sql params]} (#'sqlite-core/build-single-query query any-tag?)
+            details (mapv :detail (jdbc/execute! (pool)
+                                                (into [(str "EXPLAIN QUERY PLAN " sql)] params)
+                                                {:builder-fn rs/as-unqualified-maps}))]
+        (is (re-find #"(?i)SEARCH t.*tenant_id=\? AND tag=\?" (first details)) (str details))
+        (is (not-any? #(re-find #"(?i)TEMP B-TREE|SCAN " %) details) (str details))
+        (is (= [(str (:event/id (peek rows)))]
+               (mapv :id (jdbc/execute! (pool) (into [sql] params)
+                                       {:builder-fn rs/as-unqualified-maps}))))))
+    (let [result (es/append *event-store*
+                            {:tenant-id *tenant-id*
+                             :events [(es/->event {:type :test/alpha :tags #{tag}})]
+                             :cas (assoc (dissoc query :tenant-id)
+                                         :predicate-fn (fn [events]
+                                                         (reset! observed (mapv :event/id (into [] events)))
+                                                         false))})]
+      (is (= ::anom/conflict (::anom/category result)))
+      (is (= [(:event/id (peek rows))] @observed)))))
+
+(deftest processor-checkpoint-initialization-is-atomic-and-durable
+  (let [processor :test/initialized-processor
+        first-event (first (es/append *event-store*
+                                     {:tenant-id *tenant-id*
+                                      :events [(es/->event {:type :test/alpha})]}))
+        boundary (es/head *event-store* *tenant-id*)
+        release (promise)
+        attempts (mapv (fn [_]
+                         (future
+                           @release
+                           (tp/initialize-checkpoint! *event-store* *tenant-id* processor boundary)))
+                       (range 4))]
+    (deliver release true)
+    (let [results (mapv #(deref % 10000 :timeout) attempts)]
+      (is (= 1 (count (filter #(= :initialized (:checkpoint/status %)) results))))
+      (is (= 3 (count (filter #(= :already-initialized (:checkpoint/status %)) results)))))
+    (let [head (es/head *event-store* *tenant-id*)
+          checkpoints (into [] (es/read *event-store*
+                                       {:tenant-id *tenant-id*
+                                        :types #{:grain/todo-processor-checkpoint}}))]
+      (is (= 1 (count checkpoints)))
+      (is (= boundary (:triggered-by (first checkpoints))))
+      (is (= :initial (:checkpoint/kind (first checkpoints))))
+      (is (= ::anom/conflict
+             (::anom/category (tp/initialize-checkpoint! *event-store* *tenant-id* processor
+                                                        (:event/id first-event)))))
+      (is (= ::anom/conflict
+             (::anom/category (tp/initialize-checkpoint! *event-store* *tenant-id* processor head))))
+      (is (= head (es/head *event-store* *tenant-id*))))))
+
+(deftest retention-removes-transactions-only-after-the-last-member
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        other-tenant (uuid/v4)
+        node (uuid/v4)
+        event (fn [type tags value]
+                (es/->event {:type type :tags tags :body {:value value}}))
+        append! (fn [tenant events]
+                  (with-redefs [time/now (constantly old)]
+                    (es/append *event-store* {:tenant-id tenant :events events
+                                          :tx-metadata {:source "retention-test"}})))
+        read-all (fn [tenant]
+                   (into [] (es/read *event-store* {:tenant-id tenant})))
+        _ (append! *tenant-id* [])
+        _ (append! *tenant-id* [(event :sqlite-test/ephemeral #{} 0)
+                              (event :test/alpha #{} 0)])
+        members (append! *tenant-id* [(event :sqlite-test/ephemeral #{} 1)
+                                   (event :sqlite-test/ephemeral #{} 2)
+                                   (event :sqlite-test/keyed #{[:node node]} 3)])
+        marker (last (read-all *tenant-id*))
+        _ (append! *tenant-id* [(event :sqlite-test/keyed #{[:node node]} 4)])
+        _ (append! other-tenant [(event :sqlite-test/ephemeral #{} 5)])
+        original-markers (filterv #(= :grain/tx (:event/type %)) (read-all *tenant-id*))
+        other-before (read-all other-tenant)]
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (retention/activate! admin :sqlite-test/keyed)
+    (let [system-before (read-all compaction/system-tenant-id)]
+      (testing "partial deletion preserves the original markers and metadata"
+        (dotimes [_ 3]
+          (is (zero? (:eligible-transaction-count
+                      (retention/estimate admin :sqlite-test/ephemeral *tenant-id* 1))))
+          (is (= #{} (:retention/deleted-transaction-ids
+                       (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 1))))
+          (is (every? (set (read-all *tenant-id*)) original-markers))))
+      (testing "another policy removes the last member and its marker together"
+        (let [estimate (retention/estimate admin :sqlite-test/keyed *tenant-id* 1)
+              receipt (retention/compact! admin :sqlite-test/keyed *tenant-id* 1)
+              remaining (read-all *tenant-id*)
+              receipt-tx (last remaining)]
+          (is (= [(:event/id marker)] (:eligible-transaction-ids estimate)))
+          (is (= 1 (:eligible-transaction-count estimate)))
+          (is (= #{(:event/id (last members))} (:retention/deleted-event-ids receipt)))
+          (is (= #{(:event/id marker)} (:retention/deleted-transaction-ids receipt)))
+          (is (not-any? #(= (:event/id marker) (:event/id %)) remaining))
+          (is (every? (set remaining) (remove #{marker} original-markers)))
+          (is (= #{(:event/id receipt)} (:event-ids receipt-tx)))
+          (is (= (:event/id receipt-tx) (es/head *event-store* *tenant-id*)))
+          (is (= 1 (get-in (retention/status admin :sqlite-test/keyed *tenant-id*)
+                           [:latest-compaction :deleted-transaction-count])))
+          (is (nil? (retention/compact! admin :sqlite-test/keyed *tenant-id* 1)))
+          (is (= remaining (read-all *tenant-id*)))
+          ;; Every permanent receipt, including earlier batches, retains its tx.
+          (doseq [r (filter #(= compaction/compaction-receipt-type (:event/type %)) remaining)]
+            (is (some #(contains? (:event-ids %) (:event/id r)) remaining)))))
+      (is (= other-before (read-all other-tenant)))
+      (is (= system-before (read-all compaction/system-tenant-id))))))
+
+(deftest retention-failure-preserves-events-markers-and-watermark
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)]
+    (with-redefs [time/now (constantly old)]
+      (es/append *event-store*
+                   {:tenant-id *tenant-id*
+                    :events [(es/->event {:type :sqlite-test/ephemeral :body {:value 1}})]}))
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (let [before (into [] (es/read *event-store* {:tenant-id *tenant-id*}))
+          head (es/head *event-store* *tenant-id*)]
+      (with-redefs [sqlite-core/insert-events! (fn [& _] (throw (ex-info "injected receipt failure" {})))]
+        (is (thrown-with-msg? Exception #"injected receipt failure"
+              (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10))))
+      (is (= before (into [] (es/read *event-store* {:tenant-id *tenant-id*}))))
+      (is (= head (es/head *event-store* *tenant-id*)))
+      (let [receipt (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10)]
+        (is (= #{(:event/id (last before))} (:retention/deleted-transaction-ids receipt)))
+        (is (= 2 (count (into [] (es/read *event-store* {:tenant-id *tenant-id*})))))))))
+
+(deftest retention-removes-a-shared-marker-once-per-batch
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        members (with-redefs [time/now (constantly old)]
+                  (es/append *event-store*
+                               {:tenant-id *tenant-id*
+                                :events (mapv (fn [n]
+                                                (es/->event {:type :sqlite-test/ephemeral
+                                                                :body {:value n}}))
+                                              (range 3))}))
+        marker-id (es/head *event-store* *tenant-id*)]
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (let [estimate (retention/estimate admin :sqlite-test/ephemeral *tenant-id* 3)
+          receipt (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 3)
+          remaining (into [] (es/read *event-store* {:tenant-id *tenant-id*}))]
+      (is (= 3 (:eligible-count estimate)))
+      (is (= 1 (:eligible-transaction-count estimate)))
+      (is (= [marker-id] (:eligible-transaction-ids estimate)))
+      (is (= (set (map :event/id members)) (:retention/deleted-event-ids receipt)))
+      (is (= #{marker-id} (:retention/deleted-transaction-ids receipt)))
+      (is (= [compaction/compaction-receipt-type :grain/tx] (mapv :event/type remaining)))
+      (is (uuid/> (es/head *event-store* *tenant-id*) marker-id)))))
+
+(deftest retention-estimate-keeps-a-snapshot-during-concurrent-compaction
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        event (with-redefs [time/now (constantly old)]
+                (append-event! :sqlite-test/ephemeral #{} {:value 1}))
+        marker-id (es/head *event-store* *tenant-id*)
+        original @#'sqlite-core/removable-transaction-ids
+        compacted? (atom false)]
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (let [estimate
+          (with-redefs-fn
+            {#'sqlite-core/removable-transaction-ids
+             (fn [conn tenant-id eligible]
+               ;; Commit a competing compaction after the estimate selects its
+               ;; events but before it loads their markers, on another connection.
+               (when (compare-and-set! compacted? false true)
+                 (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10))
+               (original conn tenant-id eligible))}
+            #(retention/estimate admin :sqlite-test/ephemeral *tenant-id* 10))]
+      (is @compacted?)
+      (is (= [(:event/id event)] (:eligible-event-ids estimate)))
+      (is (= [marker-id] (:eligible-transaction-ids estimate)))
+      (is (nil? (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 10))))))
+
+(deftest keyed-retention-probes-tags-by-event-without-planner-statistics
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        node (uuid/v4)
+        _ (with-redefs [time/now (constantly old)]
+            (dotimes [n 3]
+              (append-event! :sqlite-test/keyed #{[:node node]} {:value n})))
+        execute! jdbc/execute!
+        plan (atom nil)]
+    (retention/activate! admin :sqlite-test/keyed)
+    ;; The store was initialized empty, as in a fresh million-event load. Do not
+    ;; let ANALYZE hide a plan that scans tenant-wide ranges for each tag lookup.
+    (with-redefs [jdbc/execute!
+                  (fn [conn sql & [opts]]
+                    (when (clojure.string/includes? (first sql) "ROW_NUMBER()")
+                      (reset! plan (execute! conn
+                                             (into [(str "EXPLAIN QUERY PLAN " (first sql))]
+                                                   (rest sql)) opts)))
+                    (execute! conn sql opts))]
+      (is (= 2 (:eligible-count
+                (retention/estimate admin :sqlite-test/keyed *tenant-id* 10)))))
+    (is (seq @plan))
+    (doseq [alias ["k0" "c0"]]
+      (is (some #(and (clojure.string/includes? (:detail %) (str "SEARCH " alias " "))
+                      (clojure.string/includes? (:detail %) "tenant_id=? AND event_id=?"))
+                @plan)
+          (str alias " must probe tags for one event, not scan the tenant")))))
+
+(deftest compaction-yields-to-an-append-already-in-the-write-queue
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        entered (promise) release (promise)
+        order (atom [])
+        first? (atom true)
+        compact-direct @#'sqlite-core/compact-events-direct!
+        append-direct @#'sqlite-core/append-direct
+        coordinator (get-in *event-store* [:state ::sqlite-core/write-coordinator])]
+    (with-redefs [time/now (constantly old)]
+      (dotimes [n 2] (append-event! :sqlite-test/ephemeral #{} {:value n})))
+    (retention/activate! admin :sqlite-test/ephemeral)
+    (with-redefs-fn
+      {#'sqlite-core/compact-events-direct!
+       (fn [store request]
+         (when (compare-and-set! first? true false)
+           (deliver entered true)
+           @release)
+         (swap! order conj :compact)
+         (compact-direct store request))
+       #'sqlite-core/append-direct
+       (fn [store args]
+         (swap! order conj :append)
+         (append-direct store args))}
+      (fn []
+        (let [first-batch (future (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 1))]
+          (try
+            (is (= true (deref entered 5000 ::timeout)))
+            (let [appended (future (append-event! :test/alpha #{} {:live true}))]
+              (loop [remaining 1000]
+                (when (and (zero? (.size (.getQueue coordinator))) (pos? remaining))
+                  (Thread/sleep 5)
+                  (recur (dec remaining))))
+              (is (= 1 (.size (.getQueue coordinator))))
+              (let [second-batch (future (retention/compact! admin :sqlite-test/ephemeral *tenant-id* 1))]
+                (deliver release true)
+                (is (map? (deref first-batch 5000 ::timeout)))
+                (is (= :test/alpha (:event/type (deref appended 5000 ::timeout))))
+                (is (map? (deref second-batch 5000 ::timeout)))
+                (is (= [:compact :append :compact] @order))))
+            (finally (deliver release true))))))))

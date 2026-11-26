@@ -7,6 +7,7 @@
             [ai.obney.grain.read-model-processor-v2.interface :as rmp]
             [ai.obney.grain.todo-processor-v2.interface :as tp]
             [chime.core :as chime]
+            [ai.obney.grain.anomalies.interface :refer [anomaly?]]
             [com.brunobonacci.mulog :as u]
             [clojure.set]
             [cognitect.anomalies :as anom]
@@ -31,16 +32,22 @@
 (defn emit-heartbeat!
   "Append a heartbeat event for this node."
   [ctx node-id metadata]
-  (es/append (:event-store ctx)
-    {:tenant-id events/control-plane-tenant-id
-     :events [(events/->heartbeat node-id metadata)]}))
+  (let [result (es/append (:event-store ctx)
+                 {:tenant-id events/control-plane-tenant-id
+                  :events [(events/->heartbeat node-id metadata)]})]
+    (when (anomaly? result)
+      (u/log ::heartbeat-error :anomaly result :node-id node-id))
+    result))
 
 (defn emit-node-departed!
   "Append a departure event for this node."
   [ctx node-id]
-  (es/append (:event-store ctx)
-    {:tenant-id events/control-plane-tenant-id
-     :events [(events/->node-departed node-id)]}))
+  (let [result (es/append (:event-store ctx)
+                 {:tenant-id events/control-plane-tenant-id
+                  :events [(events/->node-departed node-id)]})]
+    (when (anomaly? result)
+      (u/log ::node-departure-error :anomaly result :node-id node-id))
+    result))
 
 (defn compute-lease-diff
   "Given desired assignment and current leases, returns {:acquire [...] :release [...]}."
@@ -69,13 +76,17 @@
                 (map #(events/->lease-acquired (:node-id %) (:tenant-id %))
                      acquisitions))]
     (when (seq events)
-      (es/append (:event-store ctx)
-        {:tenant-id events/control-plane-tenant-id
-         :events (vec events)})
-      (when (seq releases)
-        (u/log :metric/metric :metric/name "LeaseReleased" :metric/value (count releases) :metric/resolution :low))
-      (when (seq acquisitions)
-        (u/log :metric/metric :metric/name "LeaseAcquired" :metric/value (count acquisitions) :metric/resolution :low)))))
+      (let [result (es/append (:event-store ctx)
+                     {:tenant-id events/control-plane-tenant-id
+                      :events (vec events)})]
+        (if (anomaly? result)
+          (do (u/log ::lease-write-error :anomaly result)
+              result)
+          (do
+            (when (seq releases)
+              (u/log :metric/metric :metric/name "LeaseReleased" :metric/value (count releases) :metric/resolution :low))
+            (when (seq acquisitions)
+              (u/log :metric/metric :metric/name "LeaseAcquired" :metric/value (count acquisitions) :metric/resolution :low))))))))
 
 (defn run-assignment!
   "Run one assignment cycle: project state, compute assignment, emit diffs.
@@ -99,8 +110,8 @@
   [{:keys [ctx node-id metadata]}]
   (fn [_time]
     (try
-      (emit-heartbeat! ctx node-id metadata)
-      (u/log :metric/metric :metric/name "HeartbeatEmitted" :metric/value 1 :metric/resolution :low)
+      (when-not (anomaly? (emit-heartbeat! ctx node-id metadata))
+        (u/log :metric/metric :metric/name "HeartbeatEmitted" :metric/value 1 :metric/resolution :low))
       (catch Throwable t
         (u/log ::heartbeat-error :exception t)))))
 

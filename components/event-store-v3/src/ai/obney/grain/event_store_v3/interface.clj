@@ -10,7 +10,9 @@
   (core/->event args))
 
 (defmacro defevent
-  "Register an event definition. Event construction remains unchanged."
+  "Define a qualified event type with a description, required :schema and optional
+   :history. The payload schema is registered under event-type. Use ->event to
+   construct instances."
   [event-type description options]
   `(definitions/defevent ~event-type ~description ~options))
 
@@ -31,6 +33,12 @@
 (defn tenants
   [event-store]
   (core/tenants event-store))
+
+(defn head
+  "Return the tenant's latest committed event ID (including transaction markers),
+   or nil for an empty tenant. Built-in stores read only durable metadata."
+  [event-store tenant-id]
+  (core/head event-store tenant-id))
 
 (defn append
   [event-store args]

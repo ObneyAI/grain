@@ -3,6 +3,11 @@
 
 (defmulti start-event-store #(get-in % [:conn :type]))
 
+(defprotocol EventStoreHead
+  (head [this tenant-id]
+    "Return the tenant's committed event ID, or nil for an empty tenant.
+     Optional capability: read durable metadata without decoding event bodies."))
+
 (defprotocol EventStore
   (start [this])
   (stop [this])

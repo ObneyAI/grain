@@ -1,0 +1,55 @@
+{:date "2026-10-30"
+ :grain-revision "a9c8fa17cecfc3764cf46ce024fefe31e8df1f7d"
+ :environment {:os "macOS" :arch "arm64" :java "Temurin 21.0.7" :lmdb "0.9.29"}
+ :method {:synthetic? true :production-incident-confirmed? false
+          :scope-clauses [1 318] :map-bytes 2147483648
+          :validation-timing "Inside namespace-validate-registry!, excluding allocation writes and commit"
+          :loss-control "Clear in-memory proof between allocations; no registry mutation"
+          :forced-race "Pause writer A after native commit and before proof publication; unrelated writer B commits"
+          :unforced-race "Eight concurrent workers; no injected pause or proof clearing"
+          :queue-control "Eight writers attempt put during validation; a known-namespace reader runs concurrently"
+          :row-count "Derived as 2 * namespace-counter + 1, not instrumented per row"
+          :small-run "Earlier version of same probe; omitted queued-writer records with a misprinted space value"}
+ :verification {:tests 34 :assertions 1905 :failures 0 :errors 0
+                :scope "All kv-store-lmdb tests and read-model-processor-v2 tests whose names contain registry"}
+ :small-registry-run [
+  {:case :forced-publication-race, :proofs-before 1, :proofs-after-unrelated-writer 0, :full-scans-on-next-allocation 1}
+  {:case :proof-retained, :namespaces 128, :scope-clauses 1, :allocation-ms 0.560917, :full-scans 0}
+  {:case :proof-lost, :scope-clauses 1, :iteration 0, :allocation-ms 17.225875, :namespaces 129, :rows 259, :ms 16.730416}
+  {:case :proof-lost, :scope-clauses 1, :iteration 1, :allocation-ms 12.001209, :namespaces 130, :rows 261, :ms 11.49575}
+  {:case :proof-lost, :scope-clauses 1, :iteration 2, :allocation-ms 10.7575, :namespaces 131, :rows 263, :ms 10.254333}
+  {:case :proof-retained, :namespaces 512, :scope-clauses 1, :allocation-ms 0.290792, :full-scans 0}
+  {:case :proof-lost, :scope-clauses 1, :iteration 0, :allocation-ms 41.673334, :namespaces 513, :rows 1027, :ms 41.199708}
+  {:case :proof-lost, :scope-clauses 1, :iteration 1, :allocation-ms 40.612458, :namespaces 514, :rows 1029, :ms 40.115208}
+  {:case :proof-lost, :scope-clauses 1, :iteration 2, :allocation-ms 30.848709, :namespaces 515, :rows 1031, :ms 30.417083}
+  {:case :proof-retained, :namespaces 2048, :scope-clauses 1, :allocation-ms 0.288959, :full-scans 0}
+  {:case :proof-lost, :scope-clauses 1, :iteration 0, :allocation-ms 88.901875, :namespaces 2049, :rows 4099, :ms 88.048917}
+  {:case :proof-lost, :scope-clauses 1, :iteration 1, :allocation-ms 75.254584, :namespaces 2050, :rows 4101, :ms 74.188583}
+  {:case :proof-lost, :scope-clauses 1, :iteration 2, :allocation-ms 66.087416, :namespaces 2051, :rows 4103, :ms 65.150834}
+  {:case :proof-retained, :namespaces 128, :scope-clauses 318, :allocation-ms 1.998417, :full-scans 0}
+  {:case :proof-lost, :scope-clauses 318, :iteration 0, :allocation-ms 130.396958, :namespaces 129, :rows 259, :ms 127.609375}
+  {:case :proof-lost, :scope-clauses 318, :iteration 1, :allocation-ms 132.879542, :namespaces 130, :rows 261, :ms 130.726}
+  {:case :proof-lost, :scope-clauses 318, :iteration 2, :allocation-ms 129.669, :namespaces 131, :rows 263, :ms 126.813541}
+  {:case :proof-retained, :namespaces 512, :scope-clauses 318, :allocation-ms 1.384375, :full-scans 0}
+  {:case :proof-lost, :scope-clauses 318, :iteration 0, :allocation-ms 493.755291, :namespaces 513, :rows 1027, :ms 491.97725}
+  {:case :proof-lost, :scope-clauses 318, :iteration 1, :allocation-ms 489.732333, :namespaces 514, :rows 1029, :ms 487.727583}
+  {:case :proof-lost, :scope-clauses 318, :iteration 2, :allocation-ms 492.959083, :namespaces 515, :rows 1031, :ms 490.840875}
+  {:case :proof-retained, :namespaces 2048, :scope-clauses 318, :allocation-ms 1.535209, :full-scans 0}
+  {:case :proof-lost, :scope-clauses 318, :iteration 0, :allocation-ms 1969.158959, :namespaces 2049, :rows 4099, :ms 1967.149541}
+  {:case :proof-lost, :scope-clauses 318, :iteration 1, :allocation-ms 1921.273709, :namespaces 2050, :rows 4101, :ms 1919.501083}
+  {:case :proof-lost, :scope-clauses 318, :iteration 2, :allocation-ms 1909.300167, :namespaces 2051, :rows 4103, :ms 1907.601917}
+ ]
+ :cluster-run [
+  {:case :forced-publication-race, :proofs-before 1, :proofs-after-unrelated-writer 0, :full-scans-on-next-allocation 1}
+  {:case :unforced-concurrent-writers, :workers 8, :new-namespaces 256, :unrelated-writes 256, :full-scans 4, :total-ms 176.571167}
+  {:case :proof-retained, :namespaces 8192, :scope-clauses 1, :allocation-ms 0.216208, :full-scans 0}
+  {:case :proof-lost, :scope-clauses 1, :iteration 0, :allocation-ms 254.02825, :namespaces 8193, :rows 16387, :ms 253.125125}
+  {:case :proof-lost, :scope-clauses 1, :iteration 1, :allocation-ms 192.991083, :namespaces 8194, :rows 16389, :ms 192.304292}
+  {:case :proof-lost, :scope-clauses 1, :iteration 2, :allocation-ms 184.658667, :namespaces 8195, :rows 16391, :ms 184.015}
+  {:case :queued-writer, :namespaces 8196, :scope-clauses 1, :scan-ms 177.907959, :writer-total-ms [179.444541 179.846083 179.609208 180.269084 180.109125 179.069375 179.285333 180.452458], :known-namespace-reader-ms 0.121292, :space {:map-bytes 2147483648, :high-water-bytes 8945664}}
+  {:case :proof-retained, :namespaces 8192, :scope-clauses 318, :allocation-ms 1.564125, :full-scans 0}
+  {:case :proof-lost, :scope-clauses 318, :iteration 0, :allocation-ms 7934.615417, :namespaces 8193, :rows 16387, :ms 7932.942417}
+  {:case :proof-lost, :scope-clauses 318, :iteration 1, :allocation-ms 7902.544458, :namespaces 8194, :rows 16389, :ms 7900.589958}
+  {:case :proof-lost, :scope-clauses 318, :iteration 2, :allocation-ms 7915.991542, :namespaces 8195, :rows 16391, :ms 7914.033333}
+  {:case :queued-writer, :namespaces 8196, :scope-clauses 318, :scan-ms 7834.355708, :writer-total-ms [7835.89725 7836.311625 7836.077292 7836.627042 7836.45575 7836.777833 7836.9295 7835.677375], :known-namespace-reader-ms 1.040375, :space {:map-bytes 2147483648, :high-water-bytes 539197440}}
+ ]}

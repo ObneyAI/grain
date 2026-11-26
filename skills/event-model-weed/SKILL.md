@@ -1,17 +1,14 @@
 ---
 name: event-model-weed
-description: >-
-  Reconcile Grain Event Model topology with the live runtime and its linked Allium declarations as the topology phase after Allium weed. Use for spec-code drift, strict boot failures, coverage/schema/wiring/edge findings, or broken command-to-rule and screen-to-surface links.
+description: Diagnose drift between a Grain Event Model, the live registries and linked Allium declarations.
 ---
 
-# Event Model Weed
+# Reconcile topology
 
-Run Allium `weed` first to reconcile observable behavior. Then load the Grain app
-and compare `(em/registered-model)` with `(tools/catalog)` using strict Event Model
-validation and coverage. Classify every finding as model drift, implementation
-drift, or an intentional aspirational gap; resolve rather than suppress it.
+Load the affected namespaces. Inspect `:findings` from `(emv/verify-event-model!)`.
+In `emv/event-model-coverage`, `:undeclared` means modeled but missing at runtime;
+`:uncovered` means live but missing from a modeled area.
 
-Run `validate-spec-composition` to check required and optional Allium links. A
-renamed rule or surface must update the Event Model reference; topology must not
-copy the changed behavior. Finish only when tests, Allium verification, strict
-runtime topology, and the composition gate are all clean.
+Compare each discrepancy with the intended design before changing the model or
+implementation. Use Allium `weed` for behavioural drift. Rerun the runtime and
+composition checks in the `event-model` skill after repairs.

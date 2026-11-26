@@ -63,6 +63,18 @@
                         (transit/write (transit/writer out :json) data)
                         (.toString out))))))
 
+(defn- emit-authorization-denied! [query-name registered?]
+  (u/log :metric/metric
+         :metric/name "QueryAuthorizationDenied"
+         :metric/value 1
+         :metric/resolution :low
+         :metric/dimensions
+         (cond-> {:outcome "rejected"
+                  :anomaly-category "forbidden"}
+           (and registered? (keyword? query-name))
+           (assoc :service (or (namespace query-name) "unqualified")
+                  :query (str query-name)))))
+
 (defn handle-query [config {:keys [request] :as context}]
   (async/go
     (u/trace
@@ -88,11 +100,14 @@
                  (when (anomaly? result)
                    (u/log ::anomaly ::anom/anomaly result))
                  (assoc context :response (prep-response (process-query-result result))))
-               (assoc context :response
-                      (prep-response
-                       (process-query-result
-                        {::anom/category ::anom/forbidden
-                         ::anom/message "Unauthorized"})))))))
+               (do
+                 (emit-authorization-denied! (:query/name query)
+                                             (contains? query-registry (:query/name query)))
+                 (assoc context :response
+                        (prep-response
+                         (process-query-result
+                          {::anom/category ::anom/forbidden
+                           ::anom/message "Unauthorized"}))))))))
        (catch Exception e (u/log ::error :error e))))))
 
 (defn interceptor

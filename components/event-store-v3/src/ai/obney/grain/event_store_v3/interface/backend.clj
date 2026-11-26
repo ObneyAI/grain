@@ -1,9 +1,22 @@
 (ns ai.obney.grain.event-store-v3.interface.backend
-  "Shared persistence-envelope preparation for event-store backends."
+  "Shared append and read preparation for event-store backends."
   (:require [ai.obney.grain.time.interface :as time]
             [clj-uuid :as uuid])
   (:import [java.time ZoneOffset]
            [java.time.temporal ChronoUnit]))
+
+(defn single-tag-union
+  "For backend use: combine batch filters differing only by a singleton tag.
+   Returned tags are alternatives, not a normal conjunctive read filter.
+   Return nil when per-filter bounds, limits or tag conjunctions need the
+   general batch path."
+  [queries]
+  (when-let [query (first queries)]
+    (let [common (dissoc query :tags)]
+      (when (and (nil? (:limit query)) (not (:reverse? query))
+                 (every? #(and (= 1 (count (:tags %)))
+                               (= common (dissoc % :tags))) queries))
+        (assoc common :tags (into #{} (mapcat :tags) queries))))))
 
 (defn- next-event-id [previous]
   (loop [candidate (uuid/v7)]

@@ -25,7 +25,7 @@
 --     in the domain specs that register handlers, not here)
 --   - the registry's storage form (a global atom vs. a per-call map) and the
 --     macro that generates handler functions — framework mechanics
---   - logging, tracing and metrics
+--   - logging and tracing implementation details
 --   - the write side (commands, events, event storage)
 --   - the on-the-wire shape of a query and the keyword/anomaly value types
 --
@@ -83,6 +83,29 @@ contract QueryHandler {
         -- treats this anomaly as a legitimate, fully-formed result. (That the
         -- processor surfaces it unchanged is the processor's guarantee, stated
         -- as OutcomePreserved on the QuerySubmission surface.)
+}
+
+-- The operational record emitted for every query attempt. Query and service
+-- labels come only from registered query names; an unknown inbound name is
+-- omitted so caller-controlled data cannot create an unbounded dimension.
+contract QueryTelemetry {
+    record_duration: (query: Query, outcome: ProcessingOutcome) -> Any
+    record_outcome: (query: Query, outcome: ProcessingOutcome) -> Any
+
+    @invariant ExactlyOneOutcome
+        -- Every processing attempt records one QueryDuration and exactly one
+        -- terminal outcome counter: QuerySucceeded, QueryRejected, or
+        -- QueryAnomaly. Expected incorrect, not-found, forbidden and conflict
+        -- outcomes are rejected; technical faults are anomalies.
+
+    @invariant BoundedQueryDimensions
+        -- Service and query dimensions are present only when the name resolved
+        -- through the bounded query registry. Unknown or malformed input is
+        -- never copied into a metric dimension.
+
+    @invariant HandlerExceptionDiagnostic
+        -- A thrown handler additionally records QueryHandlerException without
+        -- replacing QueryAnomaly as the terminal outcome counter.
 }
 
 ------------------------------------------------------------
@@ -255,6 +278,7 @@ surface QuerySubmission {
 
     contracts:
         demands QueryHandler
+        demands QueryTelemetry
 
     @guarantee NoSideEffects
         -- Processing a query never changes system state: no events are

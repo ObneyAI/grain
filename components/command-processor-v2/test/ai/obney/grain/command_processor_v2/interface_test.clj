@@ -3,6 +3,7 @@
             [ai.obney.grain.command-processor-v2.interface :as cp]
             [ai.obney.grain.event-store-v3.interface :as es]
             [ai.obney.grain.schema-util.interface :refer [defschemas]]
+            [com.brunobonacci.mulog.core :as mulog-core]
             [cognitect.anomalies :as anom]
             [clj-uuid :as uuid])
   (:import [java.time OffsetDateTime]))
@@ -55,6 +56,27 @@
 
 (use-fixtures :each event-store-fixture)
 
+(deftest event-append-exception-returns-fault-without-rerunning-handler
+  (let [handler-calls (atom 0)
+        append-calls (atom 0)
+        command {:command/name :test/create-with-events
+                 :command/id (uuid/v4)
+                 :command/timestamp (OffsetDateTime/now)}
+        context {:command command
+                 :tenant-id (random-uuid)
+                 :event-store *event-store*
+                 :command-registry
+                 {:test/create-with-events
+                  {:handler-fn (fn [_]
+                                 (swap! handler-calls inc)
+                                 {:command-result/events []})}}}]
+    (with-redefs [es/append (fn [& _]
+                             (swap! append-calls inc)
+                             (throw (java.sql.SQLException. "lock timeout" "55P03")))]
+      (is (= ::anom/fault (::anom/category (cp/process-command context)))))
+    (is (= 1 @handler-calls))
+    (is (= 1 @append-calls))))
+
 ;; Test Helpers
 
 (defn make-command
@@ -76,6 +98,31 @@
 (defn make-registry
   [command-handlers]
   (into {} (map (fn [[k v]] [k {:handler-fn v}]) command-handlers)))
+
+(defn capture-metrics [f]
+  (let [events (atom [])]
+    (with-redefs [mulog-core/log*
+                  (fn [_ event-name pairs]
+                    (swap! events conj (assoc (apply hash-map pairs)
+                                              :mulog/event-name event-name)))]
+      (f))
+    (filterv :metric/name @events)))
+
+;; Allium: EventAppend.StorageFailureContained
+(deftest exhausted-contention-is-returned-and-counted-without-rerunning-handler
+  (let [calls (atom 0)
+        busy {::anom/category ::anom/busy :event-store/attempts 4}
+        context (make-context
+                  (make-command :test/create-with-events)
+                  (make-registry {:test/create-with-events
+                                  (fn [_] (swap! calls inc) {:command-result/events []})}))]
+    (with-redefs [es/append (constantly busy)]
+      (let [metrics (capture-metrics #(is (= busy (cp/process-command context))))]
+        (is (= 1 @calls))
+        (is (some #(= "CommandEventAppendFailed" (:metric/name %)) metrics))
+        (is (some #(and (= "CommandAnomaly" (:metric/name %))
+                        (= "busy" (get-in % [:metric/dimensions :anomaly-category])))
+                  metrics))))))
 
 ;; Sample Command Handlers
 
@@ -579,3 +626,45 @@
           result (cp/process-command (make-context command registry))]
       (is (= ::anom/conflict (::anom/category result)))
       (is (not= "Error storing events." (::anom/message result))))))
+
+(deftest command-success-emits-duration-and-one-outcome
+  (let [command (make-command :test/create-resource)
+        registry (make-registry {:test/create-resource successful-handler})
+        metrics (capture-metrics #(cp/process-command (make-context command registry)))
+        names (mapv :metric/name metrics)]
+    (is (= 1 (count (filter #{"CommandDuration"} names))))
+    (is (= 1 (count (filter #{"CommandSucceeded"} names))))
+    (is (not-any? #{"CommandRejected" "CommandAnomaly"} names))
+    (is (= {:service "test" :command ":test/create-resource" :outcome "succeeded"}
+           (:metric/dimensions (first (filter #(= "CommandSucceeded" (:metric/name %)) metrics)))))))
+
+(deftest unknown-command-does-not-become-a-dimension
+  (let [command (make-command :caller/unbounded-name)
+        metrics (capture-metrics #(cp/process-command (make-context command {})))
+        rejected (first (filter #(= "CommandRejected" (:metric/name %)) metrics))]
+    (is (= "not-found" (get-in rejected [:metric/dimensions :anomaly-category])))
+    (is (not (contains? (:metric/dimensions rejected) :command)))
+    (is (not (contains? (:metric/dimensions rejected) :service)))))
+
+(deftest thrown-command-handler-emits-anomaly-and-diagnostic
+  (let [command (make-command :test/throwing-handler)
+        registry (make-registry {:test/throwing-handler handler-throwing-exception})
+        names (mapv :metric/name
+                    (capture-metrics #(cp/process-command (make-context command registry))))]
+    (is (= 1 (count (filter #{"CommandAnomaly"} names))))
+    (is (= 1 (count (filter #{"CommandHandlerException"} names))))))
+
+(deftest cas-conflict-emits-append-and-conflict-diagnostics
+  (let [handler (fn [_]
+                  {:command-result/events
+                   [(es/->event {:type :test/cas-event :tags #{} :body {:n 1}})]
+                   :command-result/cas
+                   {:types #{:test/cas-event}
+                    :predicate-fn (constantly false)}})
+        command (make-command :test/cas-command)
+        registry (make-registry {:test/cas-command handler})
+        names (mapv :metric/name
+                    (capture-metrics #(cp/process-command (make-context command registry))))]
+    (is (= 1 (count (filter #{"CommandRejected"} names))))
+    (is (= 1 (count (filter #{"CommandEventAppendFailed"} names))))
+    (is (= 1 (count (filter #{"CommandCasConflict"} names))))))

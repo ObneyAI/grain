@@ -1,6 +1,8 @@
 (ns ai.obney.grain.event-store-postgres-v3.integration-test
   (:require [clojure.test :refer :all]
             [ai.obney.grain.event-store-v3.interface :as es]
+            [ai.obney.grain.todo-processor-v2.interface :as tp]
+            [ai.obney.grain.event-store-v3.interface.backend :as backend]
             [ai.obney.grain.event-store-postgres-v3.core :as pg-core]
             [ai.obney.grain.event-retention.interface :as retention]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
@@ -139,7 +141,7 @@
                                    (original-decode bytes))]
                      (retention/estimate admin :postgres-test/ephemeral *tenant-id* 1))]
       (is (= [(:event/id (first targets))] (:eligible-event-ids estimate)))
-      (is (= 2 @decode-count)))))
+      (is (= 3 @decode-count)))))
 
 (deftest keyed-estimate-and-compact-share-the-metadata-selector
   (let [now (OffsetDateTime/now ZoneOffset/UTC)
@@ -232,6 +234,14 @@
           (is (pos? (count events)))))
       (finally
         (es/stop store)))))
+
+(deftest initialized-store-can-start-during-an-append
+  (let [starting (jdbc/with-transaction [writer (pg-pool)]
+                   (jdbc/execute! writer ["LOCK TABLE grain.tenants, grain.events IN ROW EXCLUSIVE MODE"])
+                   (let [started (future (es/stop (es/start (pg-config))) :started)]
+                     (is (= :started (deref started 5000 :blocked-on-writer)))
+                     started))]
+    @starting))
 
 (deftest schema-tables-and-indexes-created
   (let [opts {:builder-fn rs/as-unqualified-maps}
@@ -868,3 +878,308 @@
         events (read-events {:types #{:test/alpha} :limit 1})]
     (is (= 1 (count events)))
     (is (= (:event/id e1) (:event/id (first events))))))
+
+
+(deftest committed-head-does-not-decode-the-latest-batch
+  (let [other (uuid/v4)]
+    (is (nil? (es/head *event-store* *tenant-id*)))
+    (es/append *event-store*
+               {:tenant-id *tenant-id*
+                :events (mapv (fn [n] (es/->event {:type :test/alpha :body {:value n}})) (range 100))})
+    (let [expected (:event/id (first (into [] (es/read *event-store*
+                                                       {:tenant-id *tenant-id* :reverse? true :limit 1}))))
+          unexpected (fn [& _] (throw (ex-info "Head must not decode events or enumerate tenants" {})))]
+      (with-redefs [fressian/decode unexpected pg-core/read unexpected pg-core/tenants unexpected]
+        (dotimes [_ 3] (is (= expected (es/head *event-store* *tenant-id*))))
+        (is (nil? (es/head *event-store* other))))
+      (is (= ::anom/conflict
+             (::anom/category (es/append *event-store*
+                                {:tenant-id *tenant-id*
+                                 :events [(es/->event {:type :test/beta})]
+                                 :cas {:predicate-fn (constantly false)}}))))
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (es/append *event-store* {:tenant-id other :events [(es/->event {:type :test/beta})]})
+      (is (= expected (es/head *event-store* *tenant-id*)))
+      (is (uuid? (es/head *event-store* other)))
+      (append-event! :test/beta #{})
+      (is (pos? (compare (es/head *event-store* *tenant-id*) expected))))))
+
+
+(deftest committed-head-excludes-uncommitted-watermarks
+  (append-event! :test/alpha #{})
+  (let [committed (es/head *event-store* *tenant-id*)]
+    (jdbc/with-transaction [tx (pg-pool) {:rollback-only true}]
+      (jdbc/execute! tx ["UPDATE grain.tenants SET last_event_id = ? WHERE id = ?"
+                         (uuid/v7) *tenant-id*])
+      ;; This lookup uses a separate connection while the writer is uncommitted.
+      (is (= committed (es/head *event-store* *tenant-id*))))
+    (is (= committed (es/head *event-store* *tenant-id*)))))
+
+
+(deftest singleton-tag-batches-preserve-union-semantics
+  (let [a [:member (uuid/v4)] b [:member (uuid/v4)] c [:group (uuid/v4)]
+        ids (mapv :event/id
+                  [(append-event! :test/alpha #{a})
+                   (append-event! :test/beta #{b})
+                   (append-event! :test/alpha #{a b})
+                   (append-event! :test/beta #{a c})
+                   (append-event! :test/gamma #{c})])
+        other-tenant (uuid/v4)
+        _ (es/append *event-store* {:tenant-id other-tenant
+                                    :events [(es/->event {:type :test/alpha :tags #{a b}})]})
+        cases (concat
+                (for [filter [{} {:types #{:test/alpha}} {:types #{:test/alpha :test/beta}}
+                              {:types #{}} {:after (ids 1)} {:as-of (ids 2)}
+                              {:types #{:test/alpha} :after (ids 2)}]]
+                  (mapv #(assoc filter :tags #{%}) [a b a]))
+                [[{:tags #{a b}} {:tags #{c}}]
+                 [{:tags #{a} :types #{:test/alpha}} {:tags #{b} :types #{:test/beta}}]
+                 [{:tags #{a} :after (ids 2)} {:tags #{b}}]
+                 [{:tags #{}} {:tags #{a}}]])]
+    (doseq [queries cases]
+      (let [expected (with-redefs [backend/single-tag-union (constantly nil)]
+                       (read-events queries))]
+        (is (= expected (read-events queries)) (pr-str queries))))
+    (is (= [(ids 2)] (mapv :event/id (read-events {:tags #{a b}})))
+        "A normal multi-tag query remains conjunctive")
+    (is (= (subvec ids 0 4)
+           (mapv :event/id (read-events [{:tags #{a}} {:tags #{b}}]))))
+    (let [queries (into [{:tags #{a}} {:tags #{b}}]
+                        (map (fn [_] {:tags #{[:missing (uuid/v4)]}}) (range 600)))]
+      (is (= (subvec ids 0 4) (mapv :event/id (read-events queries)))
+          "Many alternatives do not require one SQL compound branch per tag"))
+    (is (nil? (backend/single-tag-union [{:tags #{a} :limit 1} {:tags #{b} :limit 1}])))
+    (is (nil? (backend/single-tag-union [{:tags #{a} :reverse? true} {:tags #{b} :reverse? true}])))))
+
+(deftest processor-checkpoint-initialization-is-atomic-and-durable
+  (let [processor :test/initialized-processor
+        first-event (first (es/append *event-store*
+                                     {:tenant-id *tenant-id*
+                                      :events [(es/->event {:type :test/alpha})]}))
+        boundary (es/head *event-store* *tenant-id*)
+        release (promise)
+        attempts (mapv (fn [_]
+                         (future
+                           @release
+                           (tp/initialize-checkpoint! *event-store* *tenant-id* processor boundary)))
+                       (range 4))]
+    (deliver release true)
+    (let [results (mapv #(deref % 10000 :timeout) attempts)]
+      (is (= 1 (count (filter #(= :initialized (:checkpoint/status %)) results))))
+      (is (= 3 (count (filter #(= :already-initialized (:checkpoint/status %)) results)))))
+    (let [head (es/head *event-store* *tenant-id*)
+          checkpoints (into [] (es/read *event-store*
+                                       {:tenant-id *tenant-id*
+                                        :types #{:grain/todo-processor-checkpoint}}))]
+      (is (= 1 (count checkpoints)))
+      (is (= boundary (:triggered-by (first checkpoints))))
+      (is (= :initial (:checkpoint/kind (first checkpoints))))
+      (is (= ::anom/conflict
+             (::anom/category (tp/initialize-checkpoint! *event-store* *tenant-id* processor
+                                                        (:event/id first-event)))))
+      (is (= ::anom/conflict
+             (::anom/category (tp/initialize-checkpoint! *event-store* *tenant-id* processor head))))
+      (is (= head (es/head *event-store* *tenant-id*))))))
+
+(deftest retention-removes-transactions-only-after-the-last-member
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        other-tenant (uuid/v4)
+        node (uuid/v4)
+        event (fn [type tags value]
+                (es/->event {:type type :tags tags :body {:value value}}))
+        append! (fn [tenant events]
+                  (with-redefs [time/now (constantly old)]
+                    (es/append *event-store* {:tenant-id tenant :events events
+                                          :tx-metadata {:source "retention-test"}})))
+        read-all (fn [tenant]
+                   (into [] (es/read *event-store* {:tenant-id tenant})))
+        _ (append! *tenant-id* [])
+        _ (append! *tenant-id* [(event :postgres-test/ephemeral #{} 0)
+                              (event :test/alpha #{} 0)])
+        members (append! *tenant-id* [(event :postgres-test/ephemeral #{} 1)
+                                   (event :postgres-test/ephemeral #{} 2)
+                                   (event :postgres-test/keyed #{[:node node]} 3)])
+        marker (last (read-all *tenant-id*))
+        _ (append! *tenant-id* [(event :postgres-test/keyed #{[:node node]} 4)])
+        _ (append! other-tenant [(event :postgres-test/ephemeral #{} 5)])
+        original-markers (filterv #(= :grain/tx (:event/type %)) (read-all *tenant-id*))
+        other-before (read-all other-tenant)]
+    (retention/activate! admin :postgres-test/ephemeral)
+    (retention/activate! admin :postgres-test/keyed)
+    (let [system-before (read-all compaction/system-tenant-id)]
+      (testing "partial deletion preserves the original markers and metadata"
+        (dotimes [_ 3]
+          (is (zero? (:eligible-transaction-count
+                      (retention/estimate admin :postgres-test/ephemeral *tenant-id* 1))))
+          (is (= #{} (:retention/deleted-transaction-ids
+                       (retention/compact! admin :postgres-test/ephemeral *tenant-id* 1))))
+          (is (every? (set (read-all *tenant-id*)) original-markers))))
+      (testing "another policy removes the last member and its marker together"
+        (let [estimate (retention/estimate admin :postgres-test/keyed *tenant-id* 1)
+              receipt (retention/compact! admin :postgres-test/keyed *tenant-id* 1)
+              remaining (read-all *tenant-id*)
+              receipt-tx (last remaining)]
+          (is (= [(:event/id marker)] (:eligible-transaction-ids estimate)))
+          (is (= 1 (:eligible-transaction-count estimate)))
+          (is (= #{(:event/id (last members))} (:retention/deleted-event-ids receipt)))
+          (is (= #{(:event/id marker)} (:retention/deleted-transaction-ids receipt)))
+          (is (not-any? #(= (:event/id marker) (:event/id %)) remaining))
+          (is (every? (set remaining) (remove #{marker} original-markers)))
+          (is (= #{(:event/id receipt)} (:event-ids receipt-tx)))
+          (is (= (:event/id receipt-tx) (es/head *event-store* *tenant-id*)))
+          (is (= 1 (get-in (retention/status admin :postgres-test/keyed *tenant-id*)
+                           [:latest-compaction :deleted-transaction-count])))
+          (is (nil? (retention/compact! admin :postgres-test/keyed *tenant-id* 1)))
+          (is (= remaining (read-all *tenant-id*)))
+          ;; Every permanent receipt, including earlier batches, retains its tx.
+          (doseq [r (filter #(= compaction/compaction-receipt-type (:event/type %)) remaining)]
+            (is (some #(contains? (:event-ids %) (:event/id r)) remaining)))))
+      (is (= other-before (read-all other-tenant)))
+      (is (= system-before (read-all compaction/system-tenant-id))))))
+
+(deftest retention-failure-preserves-events-markers-and-watermark
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)]
+    (with-redefs [time/now (constantly old)]
+      (es/append *event-store*
+                   {:tenant-id *tenant-id*
+                    :events [(es/->event {:type :postgres-test/ephemeral :body {:value 1}})]}))
+    (retention/activate! admin :postgres-test/ephemeral)
+    (let [before (into [] (es/read *event-store* {:tenant-id *tenant-id*}))
+          head (es/head *event-store* *tenant-id*)]
+      (with-redefs [pg-core/insert-events (fn [& _] (throw (ex-info "injected receipt failure" {})))]
+        (is (thrown-with-msg? Exception #"injected receipt failure"
+              (retention/compact! admin :postgres-test/ephemeral *tenant-id* 10))))
+      (is (= before (into [] (es/read *event-store* {:tenant-id *tenant-id*}))))
+      (is (= head (es/head *event-store* *tenant-id*)))
+      (let [receipt (retention/compact! admin :postgres-test/ephemeral *tenant-id* 10)]
+        (is (= #{(:event/id (last before))} (:retention/deleted-transaction-ids receipt)))
+        (is (= 2 (count (into [] (es/read *event-store* {:tenant-id *tenant-id*})))))))))
+
+(deftest retention-removes-a-shared-marker-once-per-batch
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        members (with-redefs [time/now (constantly old)]
+                  (es/append *event-store*
+                               {:tenant-id *tenant-id*
+                                :events (mapv (fn [n]
+                                                (es/->event {:type :postgres-test/ephemeral
+                                                                :body {:value n}}))
+                                              (range 3))}))
+        marker-id (es/head *event-store* *tenant-id*)]
+    (retention/activate! admin :postgres-test/ephemeral)
+    (let [estimate (retention/estimate admin :postgres-test/ephemeral *tenant-id* 3)
+          receipt (retention/compact! admin :postgres-test/ephemeral *tenant-id* 3)
+          remaining (into [] (es/read *event-store* {:tenant-id *tenant-id*}))]
+      (is (= 3 (:eligible-count estimate)))
+      (is (= 1 (:eligible-transaction-count estimate)))
+      (is (= [marker-id] (:eligible-transaction-ids estimate)))
+      (is (= (set (map :event/id members)) (:retention/deleted-event-ids receipt)))
+      (is (= #{marker-id} (:retention/deleted-transaction-ids receipt)))
+      (is (= [compaction/compaction-receipt-type :grain/tx] (mapv :event/type remaining)))
+      (is (uuid/> (es/head *event-store* *tenant-id*) marker-id)))))
+
+(deftest retention-estimate-keeps-a-snapshot-during-concurrent-compaction
+  (let [admin (retention/administration *event-store*)
+        old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        event (with-redefs [time/now (constantly old)]
+                (append-event! :postgres-test/ephemeral #{} {:value 1}))
+        marker-id (es/head *event-store* *tenant-id*)
+        original @#'pg-core/removable-transaction-ids
+        compacted? (atom false)]
+    (retention/activate! admin :postgres-test/ephemeral)
+    (let [estimate
+          (with-redefs-fn
+            {#'pg-core/removable-transaction-ids
+             (fn [conn tenant-id eligible]
+               ;; Commit a competing compaction after the estimate selects its
+               ;; events but before it loads their markers, on another connection.
+               (when (compare-and-set! compacted? false true)
+                 (retention/compact! admin :postgres-test/ephemeral *tenant-id* 10))
+               (original conn tenant-id eligible))}
+            #(retention/estimate admin :postgres-test/ephemeral *tenant-id* 10))]
+      (is @compacted?)
+      (is (= [(:event/id event)] (:eligible-event-ids estimate)))
+      (is (= [marker-id] (:eligible-transaction-ids estimate)))
+      (is (nil? (retention/compact! admin :postgres-test/ephemeral *tenant-id* 10))))))
+
+(deftest keyed-retention-matches-reference-selection-across-pages-and-tenants
+  (let [now (OffsetDateTime/now ZoneOffset/UTC)
+        old (.minusDays now 3)
+        cutoff (.minusDays now 1)
+        tenants [*tenant-id* (uuid/v4)]
+        nodes (vec (repeatedly 71 uuid/v4))
+        regions (vec (repeatedly 3 uuid/v4))]
+    (doseq [tenant tenants
+            type [:postgres-test/keyed :postgres-test/composite-keyed]
+            n (range 320)]
+      (let [node (nth nodes (mod n 71))
+            region (nth regions (mod (quot n 7) 3))
+            tags (cond-> #{[:node node] [:region region] [:unrelated (nth nodes (mod (inc n) 71))]}
+                   (zero? (mod n 11)) (disj [:node node])
+                   (zero? (mod n 13)) (conj [:node (nth nodes (mod (inc n) 71))])
+                   (zero? (mod n 17)) (conj [:region (nth regions (mod (inc (quot n 7)) 3))]))]
+        (with-redefs [time/now (constantly (if (zero? (mod n 5)) now old))]
+          (es/append *event-store* {:tenant-id tenant
+                                   :events [(es/->event {:type type :tags tags :body {:value n}})]}))))
+    (doseq [tenant tenants
+            type [:postgres-test/keyed :postgres-test/composite-keyed]
+            limit [1 2 7 31 64 65 1000]]
+      (let [events (into [] (es/read *event-store* {:tenant-id tenant :types #{type}}))
+            policy (:history/normalized (es/event-definition type))
+            expected (mapv :event/id (compaction/eligible-events events type policy cutoff limit))
+            actual (jdbc/with-transaction [conn (pg-pool)]
+                     (#'pg-core/eligible-event-metadata conn tenant type policy cutoff limit))]
+        (is (= expected (mapv :event/id actual)) (str type " limit=" limit " tenant=" tenant))))))
+
+(deftest keyed-retention-pages-past-protected-newest-events
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        shared (uuid/v4)
+        _ (with-redefs [time/now (constantly old)]
+            (dotimes [n 20]
+              (append-event! :postgres-test/keyed #{[:node (uuid/v4)]} {:value n})))
+        targets (with-redefs [time/now (constantly old)]
+                  (mapv #(append-event! :postgres-test/keyed #{[:node shared]} {:value %}) (range 3)))]
+    (retention/activate! admin :postgres-test/keyed)
+    (let [estimate (retention/estimate admin :postgres-test/keyed *tenant-id* 2)
+          receipt (retention/compact! admin :postgres-test/keyed *tenant-id* 2)]
+      (is (= (mapv :event/id (take 2 targets)) (:eligible-event-ids estimate)))
+      (is (= (set (:eligible-event-ids estimate)) (:retention/deleted-event-ids receipt)))
+      (is (= 2 (count (:retention/deleted-transaction-ids receipt))))
+      (is (zero? (:eligible-count (retention/estimate admin :postgres-test/keyed *tenant-id* 2))))
+      (is (nil? (retention/compact! admin :postgres-test/keyed *tenant-id* 2)))
+      (is (= 21 (count (read-events {:types #{:postgres-test/keyed}})))))))
+
+(deftest batched-marker-lookup-rejects-missing-ownership
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        target (with-redefs [time/now (constantly old)]
+                 (append-event! :postgres-test/ephemeral #{} {:value 1}))
+        marker-id (es/head *event-store* *tenant-id*)]
+    ;; There is a following marker, but it does not own the selected event.
+    (append-event! :test/alpha #{} {:value 2})
+    (retention/activate! admin :postgres-test/ephemeral)
+    (jdbc/execute! (pg-pool) ["DELETE FROM grain.events WHERE tenant_id=? AND id=?" *tenant-id* marker-id])
+    (let [before (read-events {}) head (es/head *event-store* *tenant-id*)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no matching transaction marker"
+            (retention/compact! admin :postgres-test/ephemeral *tenant-id* 100)))
+      (is (= before (read-events {})))
+      (is (= head (es/head *event-store* *tenant-id*)))
+      (is (some #(= (:event/id target) (:event/id %)) (read-events {}))))))
+
+(deftest marker-membership-checks-span-large-append-batches
+  (let [old (.minusDays (OffsetDateTime/now ZoneOffset/UTC) 3)
+        admin (retention/administration *event-store*)
+        members (with-redefs [time/now (constantly old)]
+                  (append-events! (into [{:type :postgres-test/ephemeral :body {:value 1}}]
+                                        (map (fn [n] {:type :test/alpha :body {:value n}}))
+                                        (range 5001))))
+        marker (last (read-events {}))]
+    (retention/activate! admin :postgres-test/ephemeral)
+    (let [receipt (retention/compact! admin :postgres-test/ephemeral *tenant-id* 100)]
+      (is (= #{(:event/id (first members))} (:retention/deleted-event-ids receipt)))
+      (is (= #{} (:retention/deleted-transaction-ids receipt)))
+      (is (some #{marker} (read-events {:types #{:grain/tx}})))
+      (is (= 5001 (count (read-events {:types #{:test/alpha}})))))))

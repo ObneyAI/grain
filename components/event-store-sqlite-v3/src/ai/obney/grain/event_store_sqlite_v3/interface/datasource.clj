@@ -9,7 +9,8 @@
 
    Extension point: register additional defmethods (e.g. for custom
    SQLiteConfig setups) in your own namespace."
-  (:require [hikari-cp.core :as hikari]))
+  (:require [hikari-cp.core :as hikari]
+            [ai.obney.grain.event-store-v3.interface.write-retry :as retry]))
 
 (defmulti make-datasource
   "Create a HikariCP datasource from a SQLite config map.
@@ -22,7 +23,7 @@
     (throw (IllegalArgumentException.
             "SQLite datasource requires :database-file (path or \":memory:\")")))
   (hikari/make-datasource
-   (-> config
+   (-> (retry/datasource-options config)
        (dissoc :database-file :type
                :busy-timeout-ms :busy-max-retries
                :busy-retry-backoff-ms :busy-retry-max-backoff-ms

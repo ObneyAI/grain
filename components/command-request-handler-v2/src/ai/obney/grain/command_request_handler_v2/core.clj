@@ -63,6 +63,18 @@
                         (transit/write (transit/writer out :json) data)
                         (.toString out))))))
 
+(defn- emit-authorization-rejected! [command-name registered?]
+  (u/log :metric/metric
+         :metric/name "CommandRejected"
+         :metric/value 1
+         :metric/resolution :low
+         :metric/dimensions
+         (cond-> {:outcome "rejected"
+                  :anomaly-category "forbidden"}
+           (and registered? (keyword? command-name))
+           (assoc :service (or (namespace command-name) "unqualified")
+                  :command (str command-name)))))
+
 (defn handle-command [grain-context {:keys [request] :as http-context}]
   (async/go
     (u/trace
@@ -91,11 +103,14 @@
                         :response (-> result process-command-result prep-response)
                         :grain/command command
                         :grain/command-result result))
-               (assoc http-context :response
-                      (prep-response
-                       (process-command-result
-                        {::anom/category ::anom/forbidden
-                         ::anom/message "Unauthorized"})))))))
+               (do
+                 (emit-authorization-rejected! (:command/name command)
+                                               (contains? command-registry (:command/name command)))
+                 (assoc http-context :response
+                        (prep-response
+                         (process-command-result
+                          {::anom/category ::anom/forbidden
+                           ::anom/message "Unauthorized"}))))))))
        (catch Exception e (u/log ::error :error e))))))
 
 (defn interceptor

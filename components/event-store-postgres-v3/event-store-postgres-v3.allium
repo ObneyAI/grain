@@ -1,4 +1,5 @@
 -- allium: 3
+use "../event-store-v3/event-store-v3.allium" as store
 -- event-store-postgres-v3.allium
 --
 -- Distilled from components/event-store-postgres-v3 (grain).
@@ -33,7 +34,7 @@
 --     captured only as the Roundtrip guarantee, not the byte layout
 --   - UUID-v7 as the concrete ordered-id scheme; modelled as an abstract
 --     stream position whose total order is independent of append order
---   - logging, tracing and metrics
+--   - notification delivery telemetry (owned by the notifier component)
 --
 -- The conformance points below correspond to the component's test suite
 -- (integration_test.clj). Where each is captured:
@@ -267,6 +268,25 @@ contract WatermarkRegistry {
         -- enumerating watermarks crosses no tenant's stream and reads no events.
 }
 
+contract PostgresTelemetry {
+    sample_pool: () -> Any
+    record_transaction_failure: () -> Any
+
+    @invariant CommonMetricParity
+        -- Appends and consumed reads expose the backend-neutral event-store
+        -- duration, outcome, count, conflict, and connection-failure metrics
+        -- with backend = postgres.
+
+    @invariant PoolStateIsSampled
+        -- Operations sample active, idle, and pending Hikari connections.
+        -- Waiting borrowers with every existing connection active additionally
+        -- record PostgresPoolSaturated.
+
+    @invariant TransactionFailureIsAdditive
+        -- A thrown append transaction records PostgresTransactionFailed in
+        -- addition to the common append failure measurement.
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -341,6 +361,7 @@ rule TenantRegistered {
 -- whole append is atomic: either all of it commits or none of it does.
 rule AppendEvents {
     when: AppendRequested(tenant, events, metadata?)
+    requires: write_commits(tenant, events)
 
     ensures:
         let append_time = now
@@ -377,6 +398,7 @@ rule AppendUnderCasAccepted {
 
     let observed = read(tenant, guard.filter)
     requires: guard.accepts(observed)
+    requires: write_commits(tenant, events)
 
     ensures:
         let marker = TransactionMarker.created(
@@ -466,6 +488,7 @@ surface EventAppend {
         AppendRequestedWithGuard(client, events, guard, metadata?)
 
     contracts:
+        fulfils store/WriteContention
         fulfils AppendWriter
         demands EventCodec
 
@@ -521,6 +544,13 @@ surface EventRead {
         -- Transaction markers are part of the stream and are returned by reads
         -- like any other event; consumers that want only domain facts
         -- distinguish them by kind. Reads do not silently hide them.
+
+    @guarantee CommittedHeadWithoutPayload
+        -- Reading only the current committed event identity uses this tenant's
+        -- durable watermark. It returns null for an empty tenant and does not
+        -- read event bodies or other tenants. Failed and uncommitted appends
+        -- cannot advance the observed head. This is a current freshness bound;
+        -- it does not define downstream checkpoint or notification policy.
 }
 
 -- The administrative boundary: a client reads back the durable per-tenant

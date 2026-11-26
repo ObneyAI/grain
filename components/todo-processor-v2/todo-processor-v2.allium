@@ -54,7 +54,7 @@
 --     interchangeable mechanisms behind the same processing guarantees
 --   - threads, thread pools, poll intervals, batch sizes as tuning knobs,
 --     in-flight dispatch bookkeeping
---   - serialization, wire formats, storage backends, logging and metrics
+--   - serialization, wire formats, storage backends and logging details
 --   - the defprocessor macro (a registration convenience over the registry)
 --
 -- Conformance notes correspond to the todo-processor-v2 test suite. Where each
@@ -135,7 +135,7 @@ value HandlerResult {
     cas: CasPredicate? when outcome = cas
 
     transitions outcome {
-        terminal: empty, pure, effect, cas, failed
+        terminal: empty, pure, effect, cas, failed, busy
     }
 }
 
@@ -160,6 +160,20 @@ value CasPredicate {}
 -- ordered, CAS-capable append; they live as contract invariants, not entity
 -- state.
 contract EventLog {
+    @invariant StorageFailureIsNotCheckpointSuccess
+        -- Storage owns transient contention retries. An exhausted checkpoint
+        -- append preserves the busy anomaly and does not count as completed
+        -- processing; other storage failures retain their fault classification. An
+        -- effect with checkpoint-before runs only after checkpoint commit;
+        -- neither conflict nor busy nor another append failure permits the effect.
+        -- A failed write stops the current tenant's batch before any later event
+        -- can be checkpointed. Pollers resume from the last durable checkpoint
+        -- on their next cycle. Startup catch-up fails before live subscription
+        -- if it cannot persist its progress. A CAS conflict that reflects an
+        -- already committed checkpoint retains its existing replay semantics.
+        -- Busy outcomes returned through a handler (including a command writer)
+        -- remain retryable storage failures, not permanent handler rejections
+        -- that may be checkpointed and skipped.
     -- The domain tenants currently known, each with the position of its newest
     -- event (its high watermark). Used to detect which tenants have new work.
     domain_tenants: () -> Set<Tenant>
@@ -224,15 +238,55 @@ contract HandlerFunction {
         -- appends or checkpoints itself.
 }
 
+-- An explicit initial boundary for a new, dormant processor identity.
+-- This opt-in boundary excludes earlier history without invoking handlers.
+contract CheckpointInitialization {
+    initialize: (tenant: Tenant, processor_name: String, boundary: Event) -> Any
+
+    @invariant DormantIdentityRequired
+        -- The caller must keep this processor identity inactive for the tenant
+        -- on every node until initialization succeeds. This API does not stop
+        -- pollers, fence running handlers or invalidate cached watermarks.
+
+    @invariant CommittedTenantBoundary
+        -- First initialization requires a UUID tenant, a keyword processor name,
+        -- and a UUIDv7 boundary that still exists in that tenant's committed log.
+        -- A transaction marker is a valid boundary. Invalid or absent boundaries
+        -- are rejected without appending. No handler or external effect runs.
+
+    @invariant InitializeOnlyUnused
+        -- Initialization creates one ordinary durable checkpoint marked initial,
+        -- only if no checkpoint exists for this processor and tenant at commit.
+        -- It never advances or rewinds an existing processing position.
+        -- After success, catch-up starts strictly after the approved boundary;
+        -- earlier events are deliberately excluded, not claimed as handled.
+
+    @invariant IdempotentRetry
+        -- If the latest checkpoint is still an initial checkpoint at the same
+        -- boundary, a retry succeeds without appending, even if that boundary
+        -- has since expired from the log. Any different boundary or checkpoint
+        -- produced by normal processing conflicts, including normal processing
+        -- at the requested boundary. Once processing advances, initialization
+        -- cannot be used to reset it.
+
+    @invariant AtomicAndIsolated
+        -- Concurrent identical requests persist only one initial checkpoint.
+        -- Concurrent different requests admit only one boundary; the loser
+        -- conflicts. Other tenants and processor identities are unaffected.
+        -- Storage anomalies and exceptions remain failures, never success or
+        -- evidence of an empty history. Reads examine only the latest matching
+        -- checkpoint and at most one event at or before the requested boundary.
+}
+
 -- The checkpoint discipline this component itself GUARANTEES to its consumers.
--- These are properties of how the processor advances and reads its position; they
--- are behavioural guarantees the test suite proves, not point-in-time state.
+-- These are behavioural guarantees, not point-in-time state.
 contract Checkpointing {
     @invariant MonotonicGapFreeWatermark
         -- For each (processor, tenant) the watermark advances strictly forward and
         -- gap-free in stream order: it only ever moves to a later event, and it
-        -- never skips an event of the subscribed topics. Because of this a single
-        -- value — the newest checkpoint's position — soundly summarises the entire
+        -- never skips an event of the subscribed topics after its optional
+        -- approved initial boundary (CheckpointInitialization). The newest
+        -- checkpoint's position therefore soundly summarises the entire
         -- processed history.
 
     @invariant ConstantTimeWatermarkRead
@@ -291,6 +345,29 @@ contract Delivery {
         -- once even across nodes.
 }
 
+contract TodoTelemetry {
+    record_duration: (processor: Processor, outcome: String) -> Any
+    record_outcome: (processor: Processor, outcome: String, failure_class: String) -> Any
+
+    @invariant AttemptOutcome
+        -- Every attempted event records TodoDuration and exactly one of
+        -- TodoSucceeded or TodoFailed. A thrown handler also records
+        -- TodoHandlerException.
+
+    @invariant ReplayRetryObserved
+        -- When retry_on_error deliberately leaves a failed event uncheckpointed,
+        -- TodoRetry is recorded. No exhaustion metric is emitted because this
+        -- component currently has no bounded retry policy.
+
+    @invariant OperationalFailuresObserved
+        -- Failed checkpoint appends, lease-fenced skips and polling failures are
+        -- recorded independently of the terminal event outcome.
+
+    @invariant BoundedProcessorDimensions
+        -- Service and processor labels come only from the registered processor
+        -- vocabulary; tenant and event identifiers are never metric dimensions.
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -299,9 +376,9 @@ contract Delivery {
 -- but appends nothing; `pure` appends events and is batch-checkpointed; `effect`
 -- runs an opaque side effect under a delivery mode; `cas` appends events under a
 -- handler-supplied compare-and-swap predicate; `failed` is a handler that returned
--- nothing usable (nil or an anomaly) or threw, routed to the checkpoint-and-skip
--- path rather than to an append.
-enum HandlerOutcome { empty | pure | effect | cas | failed }
+-- nothing usable (nil or a non-busy anomaly) or threw, routed to the checkpoint-and-skip
+-- path rather than to an append. `busy` leaves the event pending for retry.
+enum HandlerOutcome { empty | pure | effect | cas | failed | busy }
 
 -- Whether an effect is recorded after it runs (at-least-once) or before it runs
 -- (at-most-once).
@@ -327,18 +404,18 @@ entity Processor {
 }
 
 -- The processing position of one processor for one tenant: a high-watermark
--- naming the last event of the subscribed topics that this processor has
--- processed for this tenant. It advances strictly forward and gap-free. There is
--- at most one watermark per (processor, tenant): the newest checkpoint
+-- naming the last processed event or an explicitly approved initial boundary
+-- before processing begins for this tenant. Subsequent progress is forward and
+-- gap-free. At most one watermark exists per (processor, tenant): the newest checkpoint
 -- summarises all earlier ones.
 entity Checkpoint {
     processor: Processor
     tenant: Tenant
-    -- The last processed event. Everything at or below this position is
-    -- considered processed and is never handled again.
+    -- The last processed event or initial boundary. Everything at or below it is
+    -- excluded from subsequent catch-up.
     watermark: Event
     -- How this checkpoint was produced: a single event, a range of batched pure
-    -- events, or an effect path.
+    -- events, an effect path, or an approved initial boundary.
     kind: CheckpointKind
 }
 
@@ -348,8 +425,8 @@ entity Checkpoint {
 
 -- How a checkpoint was produced. `single` covers one event (effect/CAS paths);
 -- `batch_range` covers a contiguous run of pure-handler events recorded by a
--- single checkpoint at the run's end.
-enum CheckpointKind { single | batch_range }
+-- single checkpoint at the run's end; `initial` excludes approved prior history.
+enum CheckpointKind { single | batch_range | initial }
 
 ------------------------------------------------------------
 -- Config
@@ -405,7 +482,7 @@ rule ProcessEvent {
         -- Failure is detected here, in the same funnel, not on a separate stimulus.
         if result.outcome = failed:
             HandlerFailed(processor: processor, tenant: tenant, event: event)
-        else:
+        else if result.outcome != busy:
             ProcessOutcome(processor: processor, tenant: tenant, event: event, result: result)
 
     @guidance
@@ -430,23 +507,24 @@ rule ProcessPure {
     when: ProcessOutcome(processor, tenant, event, result)
     requires: result.outcome in {empty, pure}
     ensures:
-        let _ = EventLog.append_with_checkpoint(
+        let outcome = EventLog.append_with_checkpoint(
             tenant: tenant,
             events: result.events,
             checkpoint_for: event,
             conflict_threshold: event
         )
-        let cp = Checkpoint{processor: processor, tenant: tenant}
-        if exists cp:
-            cp.watermark = event
-            cp.kind = batch_range
-        else:
-            Checkpoint.created(
-                processor: processor,
-                tenant: tenant,
-                watermark: event,
-                kind: batch_range
-            )
+        if append_succeeded(outcome):
+            let cp = Checkpoint{processor: processor, tenant: tenant}
+            if exists cp:
+                cp.watermark = event
+                cp.kind = batch_range
+            else:
+                Checkpoint.created(
+                    processor: processor,
+                    tenant: tenant,
+                    watermark: event,
+                    kind: batch_range
+                )
 
     @guidance
         -- Batch checkpointing groups the pure results of a poll cycle and records
@@ -499,18 +577,19 @@ rule ProcessEffectAtLeastOnce {
             -- atomically; a raised effect still commits a checkpoint so the event
             -- is not retried forever.
             RunEffect(effect: result.effect)
-            let _ = EventLog.append_with_checkpoint(
+            let outcome = EventLog.append_with_checkpoint(
                 tenant: tenant,
                 events: result.events,
                 checkpoint_for: event,
                 conflict_threshold: event
             )
-            Checkpoint.created(
-                processor: processor,
-                tenant: tenant,
-                watermark: event,
-                kind: single
-            )
+            if append_succeeded(outcome):
+                Checkpoint.created(
+                    processor: processor,
+                    tenant: tenant,
+                    watermark: event,
+                    kind: single
+                )
 
     @guidance
         -- The replay guard lives in this path itself: before running the effect it
@@ -524,31 +603,27 @@ rule ProcessEffectAtLeastOnce {
 }
 
 -- At-most-once effect: commit the checkpoint first, then run the effect only if
--- the checkpoint append was not already rejected as a conflict. A replay's
+-- the checkpoint append succeeded. A replay's
 -- checkpoint append conflicts, so the effect is skipped — the effect fires at
 -- most once, trading a possible lost effect on crash for never duplicating it.
 rule ProcessEffectAtMostOnce {
     when: ProcessOutcome(processor, tenant, event, result)
     requires: result.outcome = effect
     requires: result.checkpoint_mode = before
-    let prior = Checkpoint{processor: processor, tenant: tenant}
-    let claimed = not exists prior or prior.watermark.event_id < event.event_id
     ensures:
-        let _ = EventLog.append_with_checkpoint(
+        let outcome = EventLog.append_with_checkpoint(
             tenant: tenant,
             events: result.events,
             checkpoint_for: event,
             conflict_threshold: event
         )
-        Checkpoint.created(
-            processor: processor,
-            tenant: tenant,
-            watermark: event,
-            kind: single
-        )
-        -- The effect runs only when the checkpoint append committed (no prior
-        -- checkpoint already covered this event); a conflicting replay skips it.
-        if claimed:
+        if append_succeeded(outcome):
+            Checkpoint.created(
+                processor: processor,
+                tenant: tenant,
+                watermark: event,
+                kind: single
+            )
             RunEffect(effect: result.effect)
 
     @guidance
@@ -567,21 +642,22 @@ rule SkipFailedEvent {
     when: HandlerFailed(processor, tenant, event)
     requires: not config.retry_on_error
     ensures:
-        let _ = EventLog.append_with_checkpoint(
+        let outcome = EventLog.append_with_checkpoint(
             tenant: tenant,
             events: {},
             checkpoint_for: event,
             conflict_threshold: event
         )
-        Checkpoint.created(
-            processor: processor,
-            tenant: tenant,
-            watermark: event,
-            kind: single
-        )
+        if append_succeeded(outcome):
+            Checkpoint.created(
+                processor: processor,
+                tenant: tenant,
+                watermark: event,
+                kind: single
+            )
 
     @guidance
-        -- A poison event (handler returns nil/anomaly or raises) is checkpointed
+        -- A poison event (handler returns nil/a non-busy anomaly or raises) is checkpointed
         -- with no output so the watermark advances past it and the stream keeps
         -- moving. With retry_on_error true no checkpoint is written and the event
         -- is retried on the next pass — the escape hatch for transient failures
@@ -662,6 +738,13 @@ actor NodeRuntime {
 -- Surfaces
 ------------------------------------------------------------
 
+-- Initialize the processing boundary before the identity becomes active.
+surface ProcessorInitialization {
+    facing runtime: NodeRuntime
+    contracts:
+        fulfils CheckpointInitialization
+}
+
 -- The registration boundary: a processor is registered with its topics and
 -- handler so a node can discover and run it. Registration alone does not start
 -- processing; a node starts a processor for a tenant once it owns the lease.
@@ -696,6 +779,7 @@ surface DomainProcessing {
         demands HandlerFunction
         fulfils Checkpointing
         fulfils Delivery
+        demands TodoTelemetry
 
     @guarantee TenantIsolation
         -- A handler's output is appended to the same tenant the triggering event

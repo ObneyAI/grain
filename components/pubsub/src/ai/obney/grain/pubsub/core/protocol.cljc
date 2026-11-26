@@ -4,4 +4,5 @@
   (start [this])
   (stop [this])
   (pub [this args])
-  (sub [this args]))
+  (sub [this args])
+  (unsub [this args]))

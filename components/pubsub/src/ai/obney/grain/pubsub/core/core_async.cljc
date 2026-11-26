@@ -24,6 +24,9 @@
    {:keys [topic sub-chan] :as _args}]
   (async/sub pub topic sub-chan))
 
+(defn unsub
+  [{{:keys [pub]} :state} {:keys [topic sub-chan]}]
+  (async/unsub pub topic sub-chan))
 
 (defrecord CoreAsyncPubSub [config]
   protocol/PubSub
@@ -34,4 +37,6 @@
   (pub [this args]
     (pub this args))
   (sub [this args]
-    (sub this args)))
+    (sub this args))
+  (unsub [this args]
+    (unsub this args)))

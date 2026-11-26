@@ -1,0 +1,55 @@
+{:date "2026-10-30"
+ :baseline-revision "a9c8fa17cecfc3764cf46ce024fefe31e8df1f7d"
+ :change "Coordinate the write transaction proof snapshot with native commit and proof publication"
+ :environment {:os "macOS" :arch "arm64" :java "Temurin 21.0.7" :lmdb "0.9.29"}
+ :method {:command "clojure -J-Dlmdbjava.native.lib=/path/to/liblmdb.dylib -M:dev scripts/benchmarks/registry-stall-hypothesis.clj --comparison 8192 318"
+          :baseline "Same script with the baseline kv-store-lmdb.core loaded before executing it"
+          :runs 3 :fresh-cache-per-run true :map-bytes 2147483648
+          :timed-work "One new namespace allocation following the controlled publication race; injected scheduling pause excluded"
+          :concurrency-work "Eight workers each allocate 32 namespaces and perform 32 unrelated writes; 128 seed namespaces, one-clause scopes"
+          :caveat "Synthetic local benchmark, not application page latency. Legitimate invalidation still requires a registry scan."}
+ :before [
+  {:case :forced-publication-race, :namespaces 8192, :scope-clauses 318, :proofs-before 1, :waited-for-publication? false, :proofs-after-unrelated-writer 0, :full-scans-on-next-allocation 1, :allocation-ms 8964.8275}
+  {:case :forced-publication-race, :namespaces 8192, :scope-clauses 318, :proofs-before 1, :waited-for-publication? false, :proofs-after-unrelated-writer 0, :full-scans-on-next-allocation 1, :allocation-ms 8897.834916}
+  {:case :forced-publication-race, :namespaces 8192, :scope-clauses 318, :proofs-before 1, :waited-for-publication? false, :proofs-after-unrelated-writer 0, :full-scans-on-next-allocation 1, :allocation-ms 8959.361917}
+  {:case :unforced-concurrent-writers, :workers 8, :new-namespaces 256, :unrelated-writes 256, :full-scans 2, :total-ms 60.567125}
+  {:case :unforced-concurrent-writers, :workers 8, :new-namespaces 256, :unrelated-writes 256, :full-scans 2, :total-ms 55.442458}
+  {:case :unforced-concurrent-writers, :workers 8, :new-namespaces 256, :unrelated-writes 256, :full-scans 0, :total-ms 46.500459}
+ ]
+ :after [
+  {:case :forced-publication-race, :namespaces 8192, :scope-clauses 318, :proofs-before 1, :waited-for-publication? true, :proofs-after-unrelated-writer 1, :full-scans-on-next-allocation 0, :allocation-ms 1.515167}
+  {:case :forced-publication-race, :namespaces 8192, :scope-clauses 318, :proofs-before 1, :waited-for-publication? true, :proofs-after-unrelated-writer 1, :full-scans-on-next-allocation 0, :allocation-ms 1.491375}
+  {:case :forced-publication-race, :namespaces 8192, :scope-clauses 318, :proofs-before 1, :waited-for-publication? true, :proofs-after-unrelated-writer 1, :full-scans-on-next-allocation 0, :allocation-ms 1.393542}
+  {:case :unforced-concurrent-writers, :workers 8, :new-namespaces 256, :unrelated-writes 256, :full-scans 0, :total-ms 50.385459}
+  {:case :unforced-concurrent-writers, :workers 8, :new-namespaces 256, :unrelated-writes 256, :full-scans 0, :total-ms 45.448792}
+  {:case :unforced-concurrent-writers, :workers 8, :new-namespaces 256, :unrelated-writes 256, :full-scans 0, :total-ms 46.018584}
+ ]
+ :patched-core-sha256 "7ea8b14e4a43f2d4d2f1d7de5eab333db4f4eb2e64210580a2e70eb5fc36ecdf"
+ :verification {:baseline {:test 376, :pass 406362, :fail 0, :error 0, :type :summary, :elapsed-ms 89056.761292, :namespace-count 23}
+                :patched {:test 378, :pass 406373, :fail 0, :error 0, :type :summary, :elapsed-ms 90139.730542, :namespace-count 23}
+                :regression-failed-on-baseline true
+                :regression-checks [:publication-race :readers-remain-independent :foreign-commit-invalidates-proof]
+                :namespaces [ai.obney.grain.kv-store-lmdb.interface-test
+                             ai.obney.grain.kv-store.interface-test
+                             ai.obney.grain.read-model-processor-v2.catch-up-batch-policy-test
+                             ai.obney.grain.read-model-processor-v2.cold-ranked-append-test
+                             ai.obney.grain.read-model-processor-v2.count-cache-test
+                             ai.obney.grain.read-model-processor-v2.declaration-reload-test
+                             ai.obney.grain.read-model-processor-v2.deferred-cold-build-test
+                             ai.obney.grain.read-model-processor-v2.desc-from-asc-test
+                             ai.obney.grain.read-model-processor-v2.empty-interval-test
+                             ai.obney.grain.read-model-processor-v2.final-checkpoint-test
+                             ai.obney.grain.read-model-processor-v2.index-layout-test
+                             ai.obney.grain.read-model-processor-v2.index-names-test
+                             ai.obney.grain.read-model-processor-v2.interface-test
+                             ai.obney.grain.read-model-processor-v2.key-cap-bound-test
+                             ai.obney.grain.read-model-processor-v2.key-encoding-test
+                             ai.obney.grain.read-model-processor-v2.l1-isolation-test
+                             ai.obney.grain.read-model-processor-v2.prepared-batch-test
+                             ai.obney.grain.read-model-processor-v2.promotion-hash-test
+                             ai.obney.grain.read-model-processor-v2.rank-levels-test
+                             ai.obney.grain.read-model-processor-v2.scoped-test
+                             ai.obney.grain.read-model-processor-v2.session-concurrency-test
+                             ai.obney.grain.read-model-processor-v2.start-after-test
+                             ai.obney.grain.read-model-processor-v2.telemetry-test]}
+}

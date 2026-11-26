@@ -1,0 +1,18 @@
+Grain's ai.obney.grain.read-model-processor-v2.core.ranked-set is adapted from:
+
+FoundationDB fdb-record-layer, RankedSet.java
+Copyright 2015-2018 Apple Inc. and the FoundationDB project authors
+Commit: 8a20d30f318e529fa30084b265563e64eb3956e1
+https://github.com/FoundationDB/fdb-record-layer/blob/8a20d30f318e529fa30084b265563e64eb3956e1/fdb-extensions/src/main/java/com/apple/foundationdb/async/RankedSet.java
+
+Licensed under Apache License 2.0; see FoundationDB-Apache-2.0.txt.
+
+Grain adaptations: synchronous KV transactions, ordered byte-key packing,
+serialized-writer read/add/write instead of FDB atomic ADD and conflict ranges,
+and unique membership only. Level-zero members store opaque ID payloads with
+implicit count 1; sentinels and upper levels store little-endian span counts.
+Promotion uses the reference's independent-random option, with six levels and
+four promotion bits per level. This is not an FDB-compatible storage format.
+
+The ranked-set tests include cases derived from RankedSetTest.java at the same
+commit, plus byte-prefix, mutation, payload, rollback and snapshot checks.

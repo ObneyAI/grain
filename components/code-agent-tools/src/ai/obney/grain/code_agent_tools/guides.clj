@@ -193,11 +193,13 @@ A system using verify-or-throw! at boot refuses to start while any fatal finding
   "command  (defcommand)  — validates rules, emits events. Spec: :description,
             :schema (params), :reads (read-models), :produces (events), optional
             :grain/allium links. Live: command registry + param schema + :authorized?.
-  event    (->event)      — immutable fact. Spec: :description, :schema (body).
-            Live: schema registry (no handler registry for events).
-  read-model (defreadmodel) — pure (state,event)->state projection. Spec:
-            :description, :consumes (events), optional :schema/:version. Live:
-            read-model registry + :events.
+  event    (defevent)     — define every event type with a description and payload :schema.
+            Match the topology to that schema. Construct instances with ->event.
+  read-model (defreadmodel) — declare :key or :route for per-instance state.
+            Spec: :description, :consumes, optional :schema and :version.
+            Put :state-schema and any :result-schema on the declaration.
+            A keyed model's topology :schema matches its :state-schema.
+            Read it with the read-model processor's value, page or query.
   query    (defquery)     — reads projections. Spec: :description, :schema (params),
             :reads (read-models). Live: query registry + param schema + :authorized?.
   todo-processor (defprocessor) — async reactor. Spec: :description, :subscribes

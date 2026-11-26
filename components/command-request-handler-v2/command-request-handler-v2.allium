@@ -400,6 +400,12 @@ surface CommandSubmission {
         -- decoded command — so authorization can be command-specific and the
         -- handler need not re-fetch ambient state.
 
+    @guarantee AuthorizationRejectionObserved
+        -- Every deny-by-default authorization outcome records one
+        -- CommandRejected counter with the forbidden category. A registered
+        -- command may contribute its bounded service and command labels; an
+        -- unknown caller-controlled name is omitted from metric dimensions.
+
     @guarantee TenantScoped
         -- Every command is handled within the tenant it was submitted for, and
         -- any events it emits are recorded under that tenant. A caller's command

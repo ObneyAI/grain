@@ -1,35 +1,23 @@
 # Distributed Coordination
 
-For multi-instance deployments, the `grain-control-plane` package provides distributed coordination using Grain's own event-sourcing primitives. No external coordination service is required — the control plane is itself event-sourced, storing its state in a dedicated tenant on the shared event store.
+The control plane coordinates tenant polling across nodes sharing a v3 event
+store. It records node liveness and leases in a dedicated system tenant.
 
-## How It Works
+## Tenant assignment
 
-```
-  ┌──────────┐     ┌──────────┐     ┌──────────┐
-  │  Node A  │     │  Node B  │     │  Node C  │
-  │          │     │          │     │          │
-  │ Poller   │     │ Poller   │     │ Poller   │
-  │ T1,T2    │     │ T3,T4    │     │ T5,T6    │
-  └────┬─────┘     └────┬─────┘     └────┬─────┘
-       │                │                │
-       │   heartbeat    │   heartbeat    │   heartbeat
-       ▼                ▼                ▼
-  ┌──────────────────────────────────────────────┐
-  │              Event Store (Postgres)           │
-  │                                              │
-  │  Control plane tenant:                       │
-  │    heartbeats, departures, lease events      │
-  │                                              │
-  │  Domain tenants:                             │
-  │    T1, T2, T3, T4, T5, T6, ...              │
-  └──────────────────────────────────────────────┘
-```
+Nodes append heartbeats. The active node with the lexicographically smallest
+node UUID coordinates assignment. By default it distributes tenants round-robin
+and records lease acquisitions and releases. Each node reconciles its poller
+with the committed leases.
 
-1. **Heartbeats** — Each node periodically appends heartbeat events. Nodes that stop heartbeating are considered stale after a configurable threshold.
-2. **Coordinator election** — The active node with the lexicographically smallest UUID v7 becomes coordinator. Deterministic, no voting protocol.
-3. **Tenant assignment** — The coordinator projects active nodes and domain tenants, computes a round-robin assignment, and emits lease-acquired/lease-released events.
-4. **Reconciliation** — Each node projects the lease-ownership read model and starts/stops its tenant poller to match its assigned tenants.
-5. **Graceful shutdown** — On stop, the node drains in-flight work, then emits a departure event. The coordinator reassigns immediately.
+A missed heartbeat becomes stale after the configured threshold. On graceful
+shutdown a node stops heartbeating, drains its poller and records its departure.
+The coordinator uses the updated membership on its next assignment cycle.
+
+A heartbeat or lease change takes effect only after its append commits. If the
+store exhausts its write retries, the next scheduled coordination cycle uses
+the last committed state. A tenant poller whose checkpoint write fails resumes
+from its last durable checkpoint. See [v3 write contention](event-stores.md#write-contention).
 
 ## Starting the Control Plane
 
@@ -52,11 +40,11 @@ Register processors with `defprocessor` before starting the control plane. The c
 
 ## Tenant-Aware Routing
 
-In a multi-instance deployment behind a load balancer, command/query HTTP requests usually benefit from being served by the node that holds the tenant's lease. That node has the warmest local cache and owns the tenant poller.
+Route command and query requests to the lease owner for cache locality. An SSE
+stream can stay on another node when an [event tailer](datastar.md#multi-node-live-updates)
+republishes committed events there.
 
-SSE live-update streams have a different delivery path. When a node runs Datastar with `:event-pubsub` and `:event-tailer`, the SSE connection can stay on any node: Datastar registers tenant/event-type interest with the tailer, the tailer reads matching events from the shared event store, and the node's local pub/sub wakes the SSE stream. Routing SSE to the lease owner can still improve locality, but it is no longer required for live updates to reach the browser.
-
-Grain provides a Pedestal interceptor that implements retry-until-correct-node routing with sticky cookies:
+Place the tenant-routing interceptor after authentication.
 
 ```clojure
 (def routing-interceptor
@@ -71,7 +59,15 @@ Grain provides a Pedestal interceptor that implements retry-until-correct-node r
 #{["/api/counters" :get [auth-interceptor routing-interceptor counters-handler]]}
 ```
 
-When a request hits the wrong node, the interceptor returns `503` with `Retry-After`. The load balancer (ALB, HAProxy) retries on another backend. When the correct node serves the request, it sets a sticky cookie — subsequent requests from that client are locked to that node. Self-healing on lease migration: the old node stops setting the cookie, the client bounces, and finds the new owner.
+When another live node owns the lease, the interceptor returns `503` with
+`Retry-After` and, when available, the owner's address in `X-Grain-Owner`.
+Configure the client or load balancer to retry on another backend. An owner
+sets the sticky cookie. If no live owner is known, the node serves locally
+without setting it.
+
+The interceptor counts owner hits under `RoutingLocal`, wrong-node responses
+under `RoutingRemote` and requests served without a live owner under
+`RoutingDegradation`.
 
 For custom routing logic without the interceptor:
 

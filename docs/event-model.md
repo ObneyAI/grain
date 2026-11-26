@@ -1,94 +1,46 @@
 # Event Model
 
-Grain projects use two complementary specifications:
-
-- **Allium** describes observable domain behaviour and produces behavioural test
-  obligations.
-- **Event Model** describes the Grain service topology: CQRS blocks, payload
-  schemas, dependency edges, screens, and flows.
-
-The `event-model` component defines the topology format. The shippable
-`event-model-validator` reconciles it with a live Grain runtime; the dev-only
-`code-agent-tools` additionally verifies explicit links to Allium declarations.
+An Event Model describes a Grain application's service areas, blocks and flows.
+Allium specifies the behaviour those blocks implement.
 
 ## Model shape
 
-An Event Model is EDN keyed first by service area and then by runtime block name:
+Register each service area with `defeventmodel`. The area is a simple keyword.
+A block name uses the area's namespace. Its enclosing map supplies its kind,
+so a query and a read model can share a name.
 
 ```clojure
-{:example
- {:description "Counter service area."
-  :commands
-  {:example/create-counter
-   {:description "Create a counter."
-    :schema [:map [:name :string]]
-    :reads #{:example/counters}
-    :produces #{:example/counter-created}
-    :grain/allium
-    [{:spec "components/example-service/example-service.allium"
-      :kind :rule
-      :name "CreateCounter"}]}}
-  :events
-  {:example/counter-created
-   {:description "A counter was created."
-    :schema [:map [:counter-id :uuid]]}}
-  :read-models
-  {:example/counters
-   {:description "Projected counters."
-    :consumes #{:example/counter-created}}}
-  :queries
-  {:example/counters
-   {:description "Return counters."
-    :schema [:map]
-    :reads #{:example/counters}}}
-  :screens
-  {:example/dashboard
-   {:description "Manage counters."
-    :queries #{:example/counters}
-    :commands #{:example/create-counter}
-    :grain/allium
-    [{:spec "components/example-service/example-service.allium"
-      :kind :surface
-      :name "CounterManagement"}]}}
-  :flows
-  {:example/counter-lifecycle
-   {:description "Create and display a counter."
-    :steps [{:from [:screen :example/dashboard]
-             :to [:command :example/create-counter]}
-            {:from [:command :example/create-counter]
-             :to [:event :example/counter-created]}
-            {:from [:event :example/counter-created]
-             :to [:read-model :example/counters]}
-            {:from [:read-model :example/counters]
-             :to [:query :example/counters]}
-            {:from [:query :example/counters]
-             :to [:screen :example/dashboard]}]}}}}
+(require '[ai.obney.grain.event-model.interface :as em :refer [defeventmodel]])
+
+(defeventmodel :billing
+  {:events {:billing/invoice-issued
+            {:description "An invoice was issued."
+             :schema [:map [:invoice-id :uuid]]}}})
 ```
 
-The keyword namespace is the service area. A block's kind comes from structural
-position, so identity is `(kind, :area/name)`: the same keyword may identify a
-read model and a query.
+This registers topology. Define each runtime event type with `defevent` and
+give it the same payload schema. For a complete model with commands, screens
+and flows, see the [counter service](../components/example-service/src/ai/obney/grain/example_service/interface/event_model.clj).
 
 | Kind | Grain definition | Topology fields |
 |---|---|---|
 | command | `defcommand` | `:schema`, `:reads`, `:produces` |
-| event | `->event`/schema registry | `:schema` |
+| event | `defevent` | `:schema` |
 | read model | `defreadmodel` | `:consumes`, optional `:schema`/`:version` |
 | query | `defquery` | `:schema`, `:reads` |
 | todo processor | `defprocessor` | `:subscribes`, `:reads`, `:produces` |
 | periodic task | `defperiodic` | `:schedule`, `:produces` |
 | screen | design-only | `:queries`, `:commands` |
 
-Event Model deliberately has no Given/When/Then field. Behavioural examples,
-rules, invariants, and their generated tests belong in Allium.
+For a keyed projection, model the reducer's per-instance `:state-schema` as
+`:schema`. Declare any `:result-schema` on `defreadmodel`. Register command and
+query input schemas under their qualified names with `defschemas`.
 
 ## Flows and edges
 
-Intent edges are kind checked. For example, command `:reads` targets read models,
-read-model `:consumes` targets events, and screen `:commands` targets commands.
-
-Flow endpoints are `[kind :area/name]`; `nil` marks an entry or terminus. Legal
-adjacency is:
+A flow's `:steps` is an ordered vector of maps such as
+`{:from [:command :billing/issue-invoice] :to [:event :billing/invoice-issued]}`.
+Use `nil` for entry or exit. A step may start at any earlier destination.
 
 ```text
 command        -> event
@@ -100,117 +52,53 @@ todo-processor -> command
 periodic-task  -> command | event
 ```
 
-Read models are internal projections. Screens and automations read through
-queries. Processor `:subscribes` is trigger wiring, not an `event -> processor`
-flow edge.
-
-Production and read edges can be compared with runtime declarations placed on
-the defining macro:
-
-```clojure
-(defcommand :example create-counter
-  {:authorized? (constantly true)
-   :grain.event-model/produces #{:example/counter-created}
-   :grain.event-model/reads #{:example/counters}}
-  ...)
-```
-
-This proves agreement between topology and code declarations. Allium tests prove
-the observable behaviour behind those declarations.
+A processor reads its work list through a query. Its `:subscribes` lists the
+event types that wake it. The validator compares these with runtime `:topics`.
+Declare `:grain.event-model/reads` on commands and queries, and
+`:grain.event-model/produces` on commands, processors and periodic tasks.
+Use `#{}` for an empty set. Tests exercise the handlers' actual behaviour.
 
 ## Allium trace links
 
-Any block or flow may carry `:grain/allium`, a vector of references:
+Use `:grain/allium` to link a block or flow to a declaration. Paths are relative
+to the repository root. For example, the counter creation command includes:
 
 ```clojure
-{:spec "components/orders/orders.allium"
- :kind :rule
- :name "PlaceOrder"}
+{:grain/allium [{:spec "components/example-service/example-service.allium"
+                :kind :rule :name "CreateCounter"}]}
 ```
 
-Paths are repository-relative `.allium` paths. Supported declaration kinds are
-`:actor`, `:contract`, `:entity`, `:enum`, `:invariant`, `:rule`, `:surface`,
-`:value`, and `:variant`.
-
-The composition gate requires:
-
-- every command to reference at least one Allium rule;
-- every screen to reference at least one Allium surface;
-- every supplied reference to resolve to a declaration of the stated kind.
-
-Other blocks and flows may link declarations when useful, but are topology
-concepts and therefore do not require behavioral counterparts.
+Composition validation requires a rule for each command and a surface for
+each screen. Other links are optional. Each supplied reference must resolve
+to an actor, contract, entity, enum, invariant, rule, surface, value or variant
+of the specified kind. In development or CI, run:
 
 ```clojure
-(require '[ai.obney.grain.code-agent-tools.interface :as tools])
+(require '[ai.obney.grain.code-agent-tools.interface :as tools]
+         '[ai.obney.grain.event-model-validator.interface :as emv])
 
-(tools/validate-spec-composition
-  my-model
-  {:project-root "."
-   :event-model-opts {:strict true}})
+(tools/validate-spec-composition (em/registered-model)
+  {:project-root "." :event-model-opts emv/strict-defaults})
 ```
 
-This development/CI API runs `allium check` and `allium parse`. Missing tooling,
-unsafe/missing paths, invalid specs, unresolved declarations, and missing required
-links are fatal findings. It is not part of production startup.
+The composition check runs `allium check` and `allium parse`.
 
 ## Runtime validation and boot mandate
 
-The runtime validator reads Grain's process-wide registries and returns a total
-EDN verdict without executing commands:
+Load the service's model and handler namespaces before validating them.
+`(emv/validate-event-model (em/registered-model))` returns `:valid?`, `:summary`
+and `:findings`. Use `emv/event-model-coverage` to compare block names by kind.
+
+`{:strict true}` requires reads and outputs to be explicitly declared. The boot
+guard also makes uncovered runtime blocks in modeled areas and mismatched wiring,
+reads or outputs fatal. Bounded events must have matching schemas and no todo
+processor subscribers. Pass `:event-store` to also check active retention policies.
 
 ```clojure
-(tools/validate-event-model my-model)
-(tools/validate-event-model my-model {:strict true})
-(tools/event-model-coverage my-model)
+(emv/verify-or-throw!)
+(ig/init system)
 ```
 
-Strict mode requires full live-block coverage and declared production/read edges,
-and makes schema, wiring, production, and read mismatches fatal. Registered
-`defevent` definitions are reconciled with modeled events; a bounded definition
-must be modeled, schema-compatible, and free of todo-processor subscribers before
-boot verification succeeds. Applications may
-register each service area with the `grain-event-model` package:
-
-```clojure
-(require '[ai.obney.grain.event-model.interface :refer [defeventmodel]])
-
-(defeventmodel :example
-  {:commands {...}
-   :events {...}
-   :read-models {...}
-   :queries {...}})
-```
-
-`defeventmodel` shape-checks the area at load time and stores it in the process-wide
-Event Model registry. To mandate the complete registered topology, run the strict
-boot guard before Integrant startup:
-
-```clojure
-(require '[ai.obney.grain.event-model-validator.interface :as event-model-validator])
-
-(defn start []
-  (event-model-validator/verify-or-throw!)
-  (ig/init system))
-```
-
-The guard throws `ex-info` carrying the verdict when fatal findings remain.
-Production boot requires neither Allium source files nor the Allium CLI.
-
-## Composed authoring workflow
-
-Install Allium and the Grain plugin, then use `/grain`. Grain delegates behavioral
-work to Allium and adds the Event Model topology phases:
-
-1. Elicit or distill behavior into `.allium` and topology into `defeventmodel`.
-2. Add command-to-rule and screen-to-surface links.
-3. Generate behavioral tests from Allium and topology/composition contract tests
-   from Grain.
-4. Implement.
-5. Run tests, Allium weed/check/analyse, strict Event Model validation, and the
-   composition gate until all agree.
-
-The individual portable extension skills are `event-model-elicit`,
-`event-model-distill`, `event-model-tend`, `event-model-propagate`, and
-`event-model-weed`. They add Grain-specific work to the corresponding Allium
-phase rather than replacing or copying it.
+On failure the guard throws `ex-info` with the verdict in `:verdict`.
+Production startup needs only the runtime validator. The [Grain skill](../skills/grain/SKILL.md)
+covers authoring the topology and behavioural specification together.

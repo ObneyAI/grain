@@ -33,6 +33,8 @@
    :test/event-counters [:map]
    :test/tagged-counters [:map]
    :test/filterable-counters [:map [:filter {:optional true} :string]]
+   :test/subscription-page [:map]
+   :test/subscription-empty [:map]
    :test/typed-query [:map
                       [:entity-id :uuid]
                       [:page :int]
@@ -1485,7 +1487,7 @@
   (let [[_shim stream-route] (#'ds/query->route-pair {} :test/hb entry defaults)
         stream-interceptor (last (nth stream-route 2))
         captured (atom nil)]
-    (with-redefs [sse/start-stream (fn [_callback _ctx heartbeat-delay]
+    (with-redefs [sse/start-stream (fn [_callback _ctx heartbeat-delay & _]
                                      (reset! captured heartbeat-delay)
                                      {:status 200})]
       ((:enter stream-interceptor) {}))
@@ -1614,6 +1616,388 @@
     (is (= "datastar-patch-elements" (:name (second stream-events))))
     ;; Second render should contain updated value
     (is (str/includes? (:data (second stream-events)) "42"))))
+
+(defn- cleanup-test-context
+  [ps]
+  {:cleanup-test? true
+   :test-state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                  :name "A" :value 0}]})
+   :query-registry @qp/query-registry*
+   :event-pubsub ps})
+
+(defn- start-cleanup-test-view
+  "Runs the real view interceptor while capturing the transport's close callback."
+  [context opts]
+  (let [nonce (or (:cleanup-test/nonce context) (str (random-uuid)))
+        output (async/chan 10)
+        running (atom nil)
+        disconnect (atom nil)]
+    (with-redefs [sse/start-stream
+                  (fn [callback ctx _heartbeat _buffer {:keys [on-client-disconnect]}]
+                    (reset! disconnect #(on-client-disconnect ctx))
+                    (reset! running (future (callback output ctx) ::finished))
+                    ctx)]
+      ((:enter (ds/stream-view context :test/event-counters opts))
+       {:request {:request-method :get
+                  :query-params (cond-> {"dsNonce" nonce}
+                                  (:cleanup-test/connect? context) (assoc "__grainConnect" "1"))}}))
+    {:event-ch output :stream @running :disconnect! @disconnect
+     :session-key [nil :test/event-counters nonce]}))
+
+(defn- stop-cleanup-test-view
+  [{:keys [event-ch stream disconnect!]}]
+  (disconnect!)
+  (async/close! event-ch)
+  (deref stream 1000 ::timeout))
+
+(deftest event-driven-disconnect-releases-idle-stream-test
+  (let [ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        tenant-id (random-uuid)
+        tailer {:watermarks (atom {tenant-id nil}) :subscriber-counts (atom {})}
+        context (assoc (cleanup-test-context ps) :tenant-id tenant-id :event-tailer tailer)
+        event-types #{:test/counter-incremented :test/counter-added}
+        removed (atom [])
+        original-unsub pubsub/unsub]
+    (try
+      (with-redefs [pubsub/unsub (fn [bus args]
+                                  (when (identical? bus ps) (swap! removed conj args))
+                                  (original-unsub bus args))]
+        (let [{:keys [event-ch stream disconnect! session-key] :as view}
+              (start-cleanup-test-view context {:event-types event-types})]
+          (try
+            (is (= "datastar-patch-elements" (:name (take-event event-ch 1000))))
+            (let [entry (get @@#'ds/active-stream-contexts session-key)]
+              (is (some? entry))
+              (is (= {tenant-id (zipmap event-types (repeat 1))} @(:subscriber-counts tailer)))
+              ;; No events or shortened idle timeout: the actual transport callback
+              ;; must wake the view and release every subscription promptly.
+              (disconnect!)
+              (is (= ::finished (deref stream 1000 ::timeout)))
+              (is (not (contains? @@#'ds/active-stream-contexts session-key)))
+              (is (= {} @(:subscriber-counts tailer)))
+              (is (= event-types (set (map :topic @removed))))
+              (is (= (count event-types) (count @removed)))
+              (is (every? #(async-protocols/closed? (:sub-chan %)) @removed))
+              (is (every? async-protocols/closed?
+                          (map entry [:signal-ch :disconnect-ch :event-ch]))))
+            (finally (stop-cleanup-test-view view)))))
+      (finally (pubsub/stop ps)))))
+
+(deftest event-driven-closed-output-does-not-run-queued-refreshes-test
+  (doseq [changed? [false true]]
+    (testing (str "output changes: " changed?)
+      (let [ps (pubsub/start {:type :core-async :topic-fn :event/type})
+            context (cleanup-test-context ps)
+            calls (atom 0)
+            original-render ds/poll-and-render]
+        (try
+          (with-redefs [ds/poll-and-render
+                        (fn [ctx previous]
+                          (when (:cleanup-test? ctx)
+                            (swap! calls inc)
+                            (when changed? (swap! (:test-state ctx) update-in [:counters 0 :value] inc)))
+                          (original-render ctx previous))]
+            (let [{:keys [event-ch stream session-key] :as view}
+                  (start-cleanup-test-view context {:event-types #{:test/counter-incremented}
+                                                    :debounce-ms 0})]
+              (try
+                (is (some? (take-event event-ch 1000)))
+                (async/close! event-ch)
+                (dotimes [_ 20]
+                  (pubsub/pub ps {:message {:event/type :test/counter-incremented}}))
+                (is (= ::finished (deref stream 1000 ::timeout)))
+                (is (= 1 @calls) "Queued events cannot start queries after output closure")
+                (is (not (contains? @@#'ds/active-stream-contexts session-key)))
+                (finally (stop-cleanup-test-view view)))))
+          (finally (pubsub/stop ps)))))))
+
+(deftest disconnect-interrupts-pending-render-waits-test
+  (doseq [mode [:events :polling]]
+    (testing (name mode)
+      (let [ps (pubsub/start {:type :core-async :topic-fn :event/type})
+            waiting (promise)
+            original-timeout async/timeout
+            calls (atom 0)
+            original-render ds/poll-and-render]
+        (try
+          (with-redefs [async/timeout (fn [^long milliseconds]
+                                       (when (< 9000 milliseconds 11000) (deliver waiting true))
+                                       (original-timeout milliseconds))
+                        ds/poll-and-render (fn [ctx previous]
+                                             (when (:cleanup-test? ctx) (swap! calls inc))
+                                             (original-render ctx previous))]
+            (let [opts (if (= mode :events)
+                         {:event-types #{:test/counter-incremented} :debounce-ms 10000}
+                         {:fps 0.1})
+                  {:keys [event-ch stream disconnect!] :as view}
+                  (start-cleanup-test-view (cleanup-test-context ps) opts)]
+              (try
+                (is (some? (take-event event-ch 1000)))
+                (when (= mode :events)
+                  (pubsub/pub ps {:message {:event/type :test/counter-incremented}}))
+                (is (= true (deref waiting 1000 ::timeout)))
+                (disconnect!)
+                (is (= ::finished (deref stream 1000 ::timeout))
+                    "Disconnect interrupts the long render wait")
+                (is (= 1 @calls))
+                (finally (stop-cleanup-test-view view)))))
+          (finally (pubsub/stop ps)))))))
+
+(deftest disconnect-during-query-does-not-start-another-cycle-test
+  (let [ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        entered (promise)
+        release (promise)
+        calls (atom 0)
+        original-render ds/poll-and-render]
+    (try
+      (with-redefs [ds/poll-and-render
+                    (fn [ctx previous]
+                      (when (and (:cleanup-test? ctx) (= 2 (swap! calls inc)))
+                        (deliver entered true)
+                        (deref release 5000 nil))
+                      (original-render ctx previous))]
+        (let [context (cleanup-test-context ps)
+              {:keys [event-ch stream disconnect! session-key] :as view}
+              (start-cleanup-test-view context {:event-types #{:test/counter-incremented}
+                                                :debounce-ms 0})]
+          (try
+            (is (some? (take-event event-ch 1000)))
+            (swap! (:test-state context) assoc-in [:counters 0 :value] 42)
+            (pubsub/pub ps {:message {:event/type :test/counter-incremented}})
+            (is (= true (deref entered 1000 ::timeout)))
+            (disconnect!)
+            (dotimes [_ 20]
+              (pubsub/pub ps {:message {:event/type :test/counter-incremented}}))
+            (deliver release true)
+            (is (= ::finished (deref stream 1000 ::timeout)))
+            (is (= 2 @calls) "Only the already-running query may finish")
+            (is (nil? (async/poll! event-ch)) "Canceled query output is discarded")
+            (is (not (contains? @@#'ds/active-stream-contexts session-key)))
+            (finally
+              (deliver release true)
+              (stop-cleanup-test-view view)))))
+      (finally (pubsub/stop ps)))))
+
+(deftest reconnect-interrupts-old-wait-and-preserves-replacement-test
+  (let [ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        waiting (promise)
+        original-timeout async/timeout
+        context (assoc (cleanup-test-context ps) :cleanup-test/nonce (str (random-uuid)))
+        opts {:event-types #{:test/counter-incremented} :debounce-ms 10000}]
+    (try
+      (with-redefs [async/timeout (fn [^long milliseconds]
+                                   (when (= milliseconds 10000) (deliver waiting true))
+                                   (original-timeout milliseconds))]
+        (let [old-view (start-cleanup-test-view context opts)]
+          (try
+            (is (some? (take-event (:event-ch old-view) 1000)))
+            (pubsub/pub ps {:message {:event/type :test/counter-incremented}})
+            (is (= true (deref waiting 1000 ::timeout)))
+            (let [replacement (start-cleanup-test-view (assoc context :cleanup-test/connect? true) opts)]
+              (try
+                (is (some? (take-event (:event-ch replacement) 1000)))
+                (is (= ::finished (deref (:stream old-view) 1000 ::timeout)))
+                (is (identical? (:event-ch replacement)
+                                (:event-ch (get @@#'ds/active-stream-contexts (:session-key replacement))))
+                    "Old cleanup must preserve the replacement's registry entry")
+                (finally (stop-cleanup-test-view replacement))))
+            (finally (stop-cleanup-test-view old-view)))))
+      (finally (pubsub/stop ps)))))
+
+(deftest subscription-setup-failure-closes-stream-and-detaches-topics-test
+  (let [ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        original-sub pubsub/sub
+        original-unsub pubsub/unsub
+        removed (atom [])]
+    (try
+      (with-redefs [pubsub/sub (fn [bus args]
+                               (original-sub bus args)
+                               (when (identical? ps bus)
+                                 (throw (ex-info "subscription setup failed" {}))))
+                    pubsub/unsub (fn [bus args]
+                                   (when (identical? ps bus) (swap! removed conj args))
+                                   (original-unsub bus args))]
+        (let [{:keys [event-ch stream session-key]}
+              (start-cleanup-test-view (cleanup-test-context ps)
+                                      {:event-types #{:test/counter-incremented}})]
+          (is (thrown-with-msg? java.util.concurrent.ExecutionException #"subscription setup failed"
+                               (deref stream 1000 ::timeout)))
+          (is (async-protocols/closed? event-ch))
+          (is (not (contains? @@#'ds/active-stream-contexts session-key)))
+          (is (= [:test/counter-incremented] (mapv :topic @removed)))
+          (is (every? #(async-protocols/closed? (:sub-chan %)) @removed))))
+      (finally (pubsub/stop ps)))))
+
+(deftest polling-closed-output-stops-changing-and-unchanged-results-test
+  (doseq [changed? [false true]]
+    (testing (str "output changes: " changed?)
+      (let [event-ch (async/chan 10)
+            calls (atom 0)
+            original-render ds/poll-and-render]
+        (with-redefs [ds/poll-and-render
+                      (fn [ctx previous]
+                        (if (:cleanup-test? ctx)
+                          (let [n (swap! calls inc)]
+                            (when (= n 2) (async/close! event-ch))
+                            (when (or changed? (= n 1))
+                              {:result n :event {:name "test" :data (str n)}}))
+                          (original-render ctx previous)))]
+          (let [stream (future (#'ds/stream-view-loop event-ch {:request {}}
+                                {:cleanup-test? true} :test/event-counters 1 {}) ::finished)]
+            (try
+              (is (= ::finished (deref stream 1000 ::timeout)))
+              (is (= 2 @calls))
+              (finally (async/close! event-ch)))))))))
+
+(deftest pubsub-unsubscribe-preserves-other-subscriptions-test
+  (let [ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        subscriber (async/chan 10)
+        other (async/chan 10)]
+    (try
+      (doseq [topic [:test/a :test/b]]
+        (pubsub/sub ps {:topic topic :sub-chan subscriber}))
+      (pubsub/sub ps {:topic :test/a :sub-chan other})
+      (dotimes [_ 2] (pubsub/unsub ps {:topic :test/a :sub-chan subscriber}))
+      (is (not (async-protocols/closed? subscriber)))
+      (pubsub/pub ps {:message {:event/type :test/a}})
+      (is (= :test/a (:event/type (take-event other 1000))))
+      (is (nil? (async/poll! subscriber)))
+      (pubsub/pub ps {:message {:event/type :test/b}})
+      (is (= :test/b (:event/type (take-event subscriber 1000))))
+      (finally
+        (pubsub/stop ps)
+        (async/close! subscriber)
+        (async/close! other)))))
+
+(defn- pubsub-topic-subscriber-count
+  "Inspects actual retained subscriptions; core.async has no public inspection API."
+  [ps topic]
+  (letfn [(field-value [instance field-name]
+            (let [field (.getDeclaredField (class instance) field-name)]
+              (.setAccessible field true)
+              (.get field instance)))]
+    (let [publication (get-in ps [:state :pub])]
+      (if-let [topic-mult (get @(field-value publication "mults") topic)]
+        (count @(field-value topic-mult "cs"))
+        0))))
+
+(deftest e2e-client-disconnect-releases-idle-and-busy-streams-test
+  (doseq [mode [:idle :busy]]
+    (testing (name mode)
+      (let [ps (pubsub/start {:type :core-async :topic-fn :event/type})
+            tenant-id (random-uuid)
+            nonce (str (random-uuid))
+            topic :test/cleanup-event
+            tailer {:watermarks (atom {tenant-id nil}) :subscriber-counts (atom {})}
+            queries (atom 0)
+            context {:tenant-id tenant-id :event-pubsub ps :event-tailer tailer
+                     :query-registry
+                     {:test/event-counters
+                      {:authorized? (constantly true)
+                       :handler-fn (fn [_]
+                                     (let [n (swap! queries inc)]
+                                       {:query/result n
+                                        :datastar/hiccup [:div#app (str "Query " n)]}))}}}
+            server (ws/start {:http/routes
+                              #{["/cleanup/__stream" :get
+                                 [(ds/stream-view context :test/event-counters
+                                                  {:event-types #{topic}
+                                                   :debounce-ms 0 :heartbeat-delay 1})]
+                                 :route-name ::cleanup-stream]}
+                              :http/port 0 :http/join? false})
+            session-key [nil :test/event-counters nonce]
+            client (-> (HttpClient/newBuilder)
+                       (.version java.net.http.HttpClient$Version/HTTP_1_1)
+                       .build)
+            request (-> (HttpRequest/newBuilder)
+                        (.uri (URI/create (str "http://localhost:" (get-server-port server)
+                                               "/cleanup/__stream?dsNonce=" nonce)))
+                        (.timeout (java.time.Duration/ofSeconds 10))
+                        (.GET)
+                        .build)
+            response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
+            input-stream (.body response)
+            publishing (atom true)
+            publisher (atom nil)
+            publish! #(pubsub/pub ps {:message {:event/type topic :grain/tenant-id tenant-id}})]
+        (try
+          (is (= 200 (.statusCode response)))
+          (let [first-frame (future (parse-sse-events input-stream 1 3000))]
+            (is (= "datastar-patch-elements"
+                   (:name (first (deref first-frame 4000 []))))))
+          (is (contains? @@#'ds/active-stream-contexts session-key))
+          (is (= {tenant-id {topic 1}} @(:subscriber-counts tailer)))
+          (is (= 1 (pubsub-topic-subscriber-count ps topic)))
+          (when (= mode :busy)
+            (reset! publisher
+                    (future
+                      (while @publishing
+                        (publish!)
+                        (Thread/sleep 25))))
+            (is (eventually? #(>= @queries 3) 2000)
+                "Busy case must execute changing queries before disconnect"))
+          (let [queries-before-close @queries
+                closed-at (System/nanoTime)]
+            ;; This is the only disconnect action: close the real HTTP response
+            ;; body. Pedestal must discover the failed socket itself, invoke its
+            ;; installed callback, and drive all server-side cleanup.
+            (.close input-stream)
+            (is (eventually? #(and (not (contains? @@#'ds/active-stream-contexts session-key))
+                                   (empty? @(:subscriber-counts tailer))
+                                   (zero? (pubsub-topic-subscriber-count ps topic)))
+                             8000)
+                "Real socket disconnect must release registry, tailer, and local topics")
+            (let [cleanup-ms (/ (- (System/nanoTime) closed-at) 1e6)
+                  queries-after-cleanup @queries]
+              (dotimes [_ 10] (publish!))
+              (Thread/sleep 150)
+              (is (= queries-after-cleanup @queries)
+                  "Events after actual transport teardown cannot execute queries")
+              (println "SSE socket-disconnect cleanup"
+                       {:mode mode :cleanup-ms cleanup-ms
+                        :queries-before-close queries-before-close
+                        :queries-at-cleanup queries-after-cleanup})))
+          (finally
+            (reset! publishing false)
+            (.close input-stream)
+            (when @publisher (deref @publisher 1000 nil))
+            (ws/stop server)
+            (pubsub/stop ps)))))))
+
+(deftest event-driven-query-clock-refreshes-only-on-change
+  (let [clock (atom "2026-09-26") allowed? (atom true) calls (atom 0)
+        state (atom {:counters [{:id #uuid "00000000-0000-0000-0000-000000000001"
+                                 :name "A" :value 0}]})
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        event-ch (async/chan 10)
+        context {:test-state state :event-pubsub ps :tenant-id (random-uuid)
+                 :query-registry (-> @qp/query-registry*
+                                     (assoc-in [:test/event-counters :authorized?] (fn [_] @allowed?))
+                                     (assoc-in [:test/event-counters :datastar/refresh-key] (fn [_] @clock)))}
+        original-timeout async/timeout original-poll ds/poll-and-render]
+    (try
+      (with-redefs [async/timeout (fn [^long milliseconds]
+                                   (original-timeout (if (= 30000 milliseconds) 20 milliseconds)))
+                    ds/poll-and-render (fn [query-context previous-result]
+                                         (when (= (:tenant-id context) (:tenant-id query-context))
+                                           (swap! calls inc))
+                                         (original-poll query-context previous-result))]
+        (let [stream (future (#'ds/stream-view-loop-events
+                              event-ch {:request {:query-params {} :path-params {}}}
+                              context :test/event-counters ps #{:test/counter-incremented} 0 {} nil))]
+          (is (= "datastar-patch-elements" (:name (take-event event-ch 1000))))
+          (swap! state assoc-in [:counters 0 :value] 42)
+          (Thread/sleep 80)
+          (is (= 1 @calls) "Equal clock keys do not run the query")
+          (reset! clock "2026-09-27")
+          (is (str/includes? (:data (take-event event-ch 1000)) "42"))
+          (is (= 2 @calls))
+          (reset! allowed? false)
+          (reset! clock "2026-09-28")
+          (is (= "datastar-patch-signals" (:name (take-event event-ch 1000))))
+          (is (eventually? #(realized? stream) 1000))
+          (is (= 3 @calls) "Refresh uses the normal authorization gate")))
+      (finally (async/close! event-ch) (pubsub/stop ps)))))
 
 (deftest event-driven-stream-registers-with-event-tailer-test
   (let [tenant-id (random-uuid)
@@ -1839,6 +2223,65 @@
         (is (true? (pred {:event/tags #{[:counter "abc-123"] [:org "org-456"] [:extra "x"]}})))
         (is (false? (pred {:event/tags #{[:counter "abc-123"]}})))
         (is (false? (pred {:event/tags #{[:org "org-456"]}})))))))
+
+(deftest event-tag-alternatives-and-validation-test
+  (let [context {:query {:org "o" :owner "a" :assignee "b" :false-value false}
+                 :auth-claims {:org "o"}}
+        pred (#'ds/resolve-event-tags [{:org [:auth-claims :org] :user :owner}
+                                      {:org :org :user :assignee}] context)]
+    (doseq [user ["a" "b"]]
+      (is (true? (pred {:event/tags #{[:org "o"] [:user user]}}))))
+    (is (true? (pred {:event/tags #{[:org "o"] [:user "a"] [:user "b"]}})))
+    (is (false? (pred {:event/tags #{[:user "a"]}})))
+    (is (false? (pred {:event/tags #{[:org "other"] [:user "b"]}})))
+    (is (false? (pred {})))
+    (is (true? ((#'ds/resolve-event-tags {:flag :false-value} context)
+                {:event/tags #{[:flag false]}})))
+    (doseq [selector [nil {}]]
+      (is (true? ((#'ds/resolve-event-tags selector context) {}))))
+    (is (false? ((#'ds/resolve-event-tags [] context) {})))
+    (is (false? ((#'ds/resolve-event-tags {:user :missing} context)
+                 {:event/tags #{[:user nil]}}))))
+  (doseq [selector [[{}] [nil] [{:user :id} {}] {:user nil} {:user []}
+                    {:user "id"} {"user" :id} '({:user :id})]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (ds/stream-view {} :test/counters {:event-tags selector}))))
+  (doseq [exclusions [[:test/change] {:test/change true} #{"test/change"} false]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (ds/stream-view {} :test/counters {:exclude-events exclusions}))))
+  (doseq [[k invalid] [[:datastar/event-tags false]
+                       [:datastar/event-tags [{:user :id} {}]]
+                       [:datastar/exclude-events false]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (#'ds/query->route-pair {}
+                  :test/counters
+                  (assoc {:datastar/path "/invalid-subscription" :authorized? (constantly true)} k invalid)
+                  {}))))
+  (let [ctx (atom {:query {:owner "a"}})
+        pred (#'ds/resolve-event-filter :tenant [{:user :missing} {:user :owner}] ctx)]
+    (is (true? (pred {:grain/tenant-id :tenant :event/tags #{[:user "a"]}})))
+    (is (false? (pred {:grain/tenant-id :other :event/tags #{[:user "a"]}})))
+    (swap! ctx assoc :query {:owner "b"})
+    (is (false? (pred {:grain/tenant-id :tenant :event/tags #{[:user "a"]}})))
+    (is (true? (pred {:grain/tenant-id :tenant :event/tags #{[:user "b"]}})))))
+
+(deftest event-exclusions-preserve-mode-and-effective-topics-test
+  (let [started (atom [])
+        ps ::pubsub
+        invoke! (fn [opts]
+                  ((:enter (ds/stream-view {:event-pubsub ps} :test/counters opts)) {}))]
+    (with-redefs-fn {#'ds/update-or-start-stream-events
+                    (fn [_ _ _ types & _] (swap! started conj [:events types]))
+                    #'ds/stream-view-enter
+                    (fn [_ _ interval & _] (swap! started conj [:fallback interval]))}
+      #(do
+         (invoke! {:event-types #{:test/a :test/b} :exclude-events #{:test/b :test/unused}})
+         (invoke! {:event-types #{:test/a} :exclude-events #{:test/a} :fps 10})
+         (invoke! {:event-types #{} :fps 10})
+         (invoke! {:event-types #{:test/a} :exclude-events #{}})
+         (invoke! {:event-types #{:test/a}})))
+    (is (= [[:events #{:test/a}] [:events #{}] [:fallback 100]
+            [:events #{:test/a}] [:events #{:test/a}]] @started))))
 
 ;; ====================================== ;;
 ;; query->route-pair with event-tags       ;;
@@ -2886,3 +3329,178 @@
           response (.send client request (HttpResponse$BodyHandlers/ofString))]
       (is (= 302 (.statusCode response)))
       (is (= "/test-home" (first (.allValues (.headers response) "location")))))))
+
+;; One persistent reader owns each HTTP body so frames buffered across test
+;; phases cannot be lost. Channel waits are bounded even when no patch arrives.
+(defn- subscription-sse-client
+  [url]
+  (let [client (-> (HttpClient/newBuilder)
+                   (.version java.net.http.HttpClient$Version/HTTP_1_1)
+                   .build)
+        request (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create url))
+                    (.timeout (java.time.Duration/ofSeconds 10))
+                    .GET .build)
+        response (.send client request (HttpResponse$BodyHandlers/ofInputStream))
+        body (.body response)
+        frames (async/chan 32)
+        pump (future
+               (try
+                 (with-open [reader (BufferedReader. (InputStreamReader. body))]
+                   (loop [event-name nil data []]
+                     (when-let [line (.readLine reader)]
+                       (cond
+                         (str/starts-with? line "event:")
+                         (recur (str/trim (subs line 6)) data)
+                         (str/starts-with? line "data:")
+                         (recur event-name (conj data (str/trim (subs line 5))))
+                         (str/blank? line)
+                         (when (or (nil? event-name)
+                                   (async/>!! frames {:name event-name :data (str/join "\n" data)}))
+                           (recur nil []))
+                         :else (recur event-name data)))))
+                 (catch java.io.IOException _)
+                 (finally (async/close! frames))))]
+    {:client client :response response :frames frames
+     :close! (fn []
+               (async/close! frames)
+               (.close body)
+               (when (= ::timeout (deref pump 1000 ::timeout))
+                 (future-cancel pump)))}))
+
+(defn- with-subscription-server
+  [f]
+  (let [tenant-id (random-uuid)
+        ps (pubsub/start {:type :core-async :topic-fn :event/type})
+        tailer {:watermarks (atom {tenant-id nil}) :subscriber-counts (atom {})}
+        calls (atom {})
+        clock (atom 0)
+        entry (fn [name]
+                {:authorized? (constantly true)
+                 :grain/read-models {:test/subscription-a 1 :test/subscription-b 1}
+                 :datastar/path (str "/" name)
+                 :datastar/debounce-ms 0
+                 :datastar/heartbeat-delay 1
+                 :handler-fn (fn [ctx]
+                               (let [n (get (swap! calls update name (fnil inc 0)) name)]
+                                 {:query/result n
+                                  :datastar/hiccup
+                                  [:div#app (str name " render=" n " marker="
+                                                (get-in ctx [:query :marker]) " clock=" @clock)]}))})
+        context {:tenant-id tenant-id :event-pubsub ps :event-tailer tailer
+                 :query-registry
+                 {:test/subscription-page
+                  (assoc (entry "subscription-page")
+                         :datastar/exclude-events #{:test/subscription-ignored}
+                         :datastar/event-tags [{:org :org :user :owner}
+                                               {:org :org :user :assignee}])
+                  :test/subscription-empty
+                  (assoc (entry "subscription-empty")
+                         :datastar/fps 20
+                         :datastar/refresh-key (fn [_] @clock)
+                         :datastar/exclude-events #{:test/subscription-change :test/subscription-ignored})}}
+        routes (with-redefs [rmp/read-model-registry*
+                             (atom {:test/subscription-a
+                                    {:events #{:test/subscription-change :test/subscription-ignored}}
+                                    :test/subscription-b {:events #{:test/subscription-ignored}}})]
+                 (ds/routes context))
+        server (ws/start {:http/routes routes :http/port 0 :http/join? false})]
+    (try
+      (f {:tenant-id tenant-id :ps ps :tailer tailer :calls calls :clock clock
+          :base-url (str "http://localhost:" (get-server-port server))})
+      (finally (ws/stop server) (pubsub/stop ps)))))
+
+(defn- subscription-signal-update!
+  [client url payload]
+  (let [request (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create url))
+                    (.header "Content-Type" "application/json")
+                    (.timeout (java.time.Duration/ofSeconds 5))
+                    (.POST (HttpRequest$BodyPublishers/ofString (json/write-str payload)))
+                    .build)]
+    (.send ^HttpClient client request (HttpResponse$BodyHandlers/ofString))))
+
+(deftest e2e-subscription-exclusions-or-and-live-scope-test
+  (with-subscription-server
+    (fn [{:keys [tenant-id ps tailer calls base-url]}]
+      (let [nonce (str (random-uuid))
+            url (str base-url "/subscription-page/__stream")
+            {:keys [client frames close! response]}
+            (subscription-sse-client (str url "?dsNonce=" nonce "&org=o&owner=a&assignee=b"))
+            publish! (fn [type tenant tags & [event-id]]
+                       (pubsub/pub ps {:message (cond-> {:event/type type :grain/tenant-id tenant
+                                                        :event/tags tags}
+                                                 event-id (assoc :event/id event-id))}))
+            matching #{[:org "o"] [:user "a"]}]
+        (try
+          (is (= 200 (.statusCode response)))
+          (is (str/includes? (:data (take-event frames 2000)) "render=1"))
+          (is (= {tenant-id {:test/subscription-change 1}} @(:subscriber-counts tailer)))
+          (is (= 1 (pubsub-topic-subscriber-count ps :test/subscription-change)))
+          (is (zero? (pubsub-topic-subscriber-count ps :test/subscription-ignored)))
+          (doseq [[type tenant tags]
+                  [[:test/subscription-ignored tenant-id matching]
+                   [:test/subscription-change (random-uuid) matching]
+                   [:test/subscription-change tenant-id #{[:user "a"]}]
+                   [:test/subscription-change tenant-id #{[:org "other"] [:user "b"]}]
+                   [:test/subscription-change tenant-id #{[:org "o"] [:user "neither"]}]]]
+            (publish! type tenant tags)
+            (is (nil? (take-event frames 150))))
+          (is (= 1 (get @calls "subscription-page")))
+          (doseq [[user expected] [["a" 2] ["b" 3]]]
+            (publish! :test/subscription-change tenant-id #{[:org "o"] [:user user]})
+            (is (str/includes? (:data (take-event frames 2000)) (str "render=" expected))))
+          (let [id (random-uuid)
+                both #{[:org "o"] [:user "a"] [:user "b"]}]
+            (publish! :test/subscription-change tenant-id both id)
+            (is (str/includes? (:data (take-event frames 2000)) "render=4"))
+            (publish! :test/subscription-change tenant-id both id)
+            (is (nil? (take-event frames 150)))
+            (is (= 4 (get @calls "subscription-page"))))
+          (let [updated (subscription-signal-update! client url
+                          {:dsNonce nonce :org "o" :owner "c" :assignee "d" :marker "new"})]
+            (is (= 200 (.statusCode updated)))
+            (is (= "" (.body updated)))
+            (is (str/includes? (:data (take-event frames 2000)) "marker=new")))
+          (publish! :test/subscription-change tenant-id matching)
+          (is (nil? (take-event frames 150)))
+          (publish! :test/subscription-change tenant-id #{[:org "o"] [:user "c"]})
+          (is (str/includes? (:data (take-event frames 2000)) "render=6"))
+          ;; Closing the actual socket must remove precisely the effective topics.
+          (close!)
+          (is (eventually? #(and (empty? @(:subscriber-counts tailer))
+                                 (zero? (pubsub-topic-subscriber-count ps :test/subscription-change)))
+                           8000))
+          (finally (close!)))))))
+
+(deftest e2e-all-excluded-subscription-keeps-signals-and-clock-test
+  (let [original-timeout async/timeout]
+    (with-redefs [async/timeout (fn [^long ms]
+                                 (original-timeout (if (= ms 30000) 30 ms)))]
+      (with-subscription-server
+        (fn [{:keys [tenant-id ps tailer calls clock base-url]}]
+          (let [nonce (str (random-uuid))
+                url (str base-url "/subscription-empty/__stream")
+                session-key [nil :test/subscription-empty nonce]
+                {:keys [client frames close!]}
+                (subscription-sse-client (str url "?dsNonce=" nonce))]
+            (try
+              (is (str/includes? (:data (take-event frames 2000)) "render=1"))
+              (is (contains? @@#'ds/active-stream-contexts session-key))
+              (is (empty? @(:subscriber-counts tailer)))
+              (doseq [topic [:test/subscription-change :test/subscription-ignored]]
+                (is (zero? (pubsub-topic-subscriber-count ps topic)))
+                (pubsub/pub ps {:message {:event/type topic :grain/tenant-id tenant-id}}))
+              (is (nil? (take-event frames 150)))
+              (is (= 1 (get @calls "subscription-empty")) "Positive fps must not turn into polling")
+              (let [updated (subscription-signal-update! client url {:dsNonce nonce :marker "signals"})]
+                (is (= 200 (.statusCode updated)))
+                (is (= "" (.body updated)))
+                (is (str/includes? (:data (take-event frames 2000)) "marker=signals")))
+              (swap! clock inc)
+              (is (str/includes? (:data (take-event frames 2000)) "clock=1"))
+              (is (= 3 (get @calls "subscription-empty")))
+              (close!)
+              (is (eventually? #(not (contains? @@#'ds/active-stream-contexts session-key)) 8000))
+              (is (empty? @(:subscriber-counts tailer)))
+              (finally (close!)))))))))

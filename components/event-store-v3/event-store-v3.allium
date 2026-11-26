@@ -30,7 +30,8 @@
 --   - UUID v7 generation internals and clock source (time component)
 --   - the pubsub transport (core.async topics) — only that appended events
 --     are published carrying the tenant id
---   - threads, connection pools, logging and metrics
+--   - threads, logging and backend-specific connection-pool internals
+--     (common operation metrics are part of this facade's observable contract)
 --   - privileged history compaction, which is a separate capability governed by
 --     event-retention.allium and is never exposed through these append/read
 --     surfaces
@@ -90,6 +91,51 @@ contract EventCodec {
         -- to the store.
 }
 
+-- One contention-recovery boundary for every current backend and write operation.
+contract WriteContention {
+    @invariant BoundedRecovery
+        -- Every built-in backend applies the same policy to append and privileged
+        -- compaction. Each attempt waits at most config.write_lock_timeout_ms for
+        -- each lock acquisition; this does not limit lock holding or total request
+        -- duration. After confirmed transient contention, retry at most
+        -- config.write_max_retries times, then return a busy anomaly containing
+        -- the total number of attempts. Never report a failed write as success.
+        -- The in-memory backend obeys this boundary as well as durable backends.
+
+    @invariant FreshAtomicAttempt
+        -- Before another attempt, discard all changes and release the failed
+        -- attempt's resources. Re-evaluate CAS and retention authorization against
+        -- current committed state. Only one successful attempt's events, marker,
+        -- watermark and receipt become visible. Append publication uses only
+        -- the successful result.
+
+    @invariant RetryScope
+        -- Retry only confirmed contention with no committed changes. Do not retry
+        -- validation failures, CAS conflicts, cancellation, unrelated failures,
+        -- failed rollback or uncertain commit outcomes. Never re-run the calling
+        -- command handler or external effect as part of a storage retry.
+
+    @invariant BackoffAndCancellation
+        -- Between attempts, release write locks and connections and wait for
+        -- exponential backoff with jitter. The initial delay base is
+        -- config.write_retry_backoff_ms, doubles per retry, and is capped by
+        -- config.write_retry_max_backoff_ms. Jitter adds less than one base
+        -- interval; a zero base has no delay. Cancellation stops further attempts.
+
+    @invariant SharedConfiguration
+        -- All built-in backends accept the same positive lock-wait bound and
+        -- non-negative retry count and backoff bounds. Invalid options fail before
+        -- opening a store. SQLite's existing busy options remain aliases; explicit
+        -- common options take precedence. SQLite alone also preserves its legacy
+        -- zero busy timeout as an immediate lock attempt, without waiting; it
+        -- still obeys the retry budget. Admission queue saturation may return
+        -- busy immediately, before any transaction attempt.
+
+    @invariant RecoveryIsObservable
+        -- Record each scheduled retry and exhausted retry budget with backend
+        -- and operation labels, without tenant or event identifiers as dimensions.
+}
+
 -- The read side of the store: an ordered, filtered, streaming view over a
 -- tenant's committed events. These are properties of the function that returns
 -- the stream, not of stored entity state, so they live as contract invariants.
@@ -131,6 +177,34 @@ contract EventStream {
         -- present on events returned to a reader.
 }
 
+-- The backend-neutral operational record produced by the facade. Read timing
+-- covers consumption of the returned stream, not merely construction of its
+-- reducible value.
+contract EventStoreTelemetry {
+    record_append: (backend: String, outcome: String, event_count: Integer) -> Any
+    record_read: (backend: String, outcome: String, event_count: Integer) -> Any
+
+    @invariant AppendOutcomeCoverage
+        -- Every append attempt records EventAppendDuration and exactly one of
+        -- EventAppendSucceeded or EventAppendFailed. Successful attempts also
+        -- record EventAppendEventCount; conflicts additionally record
+        -- EventCasConflict.
+
+    @invariant StreamingReadCoverage
+        -- Each consumed read records EventReadDuration and EventReadEventCount
+        -- over the actual reduction. A reduction failure records
+        -- EventReadFailed without forcing the stream into memory.
+
+    @invariant ConnectionFailureIsDiagnostic
+        -- SQLState connection-class failures during start, append, or read
+        -- additionally record EventStoreConnectionFailure.
+
+    @invariant BoundedDimensions
+        -- Common event-store measurements use only the bounded backend,
+        -- operation, and outcome dimensions. Tenant and event identifiers are
+        -- never metric dimensions.
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -149,6 +223,10 @@ config {
     -- When publication is enabled, each event is announced carrying its
     -- tenant id; the stored copy never carries it (see AppendBatch).
     publish_on_append: Boolean = true
+    write_lock_timeout_ms: Integer = 5000
+    write_max_retries: Integer = 3
+    write_retry_backoff_ms: Integer = 100
+    write_retry_max_backoff_ms: Integer = 400
 }
 
 ------------------------------------------------------------
@@ -251,6 +329,7 @@ rule AppendBatch {
         -- An unrecognised type or a malformed event fails the batch as a whole.
         events.all(e => has_registered_schema(e.event_type) and conforms_to_schema(e))
         events.all(e => e.id = null and e.timestamp = null)
+        write_commits(tenant, events)
 
     ensures:
         let append_time = now -- canonical UTC, truncated to microseconds
@@ -354,11 +433,15 @@ invariant TenantScoped {
 }
 
 -- ES2: a transaction marker records the ids of the domain events it closed.
--- Every id it names is the id of a real event in the same tenant's stream.
+-- Every id it names was committed in the same tenant's stream. The privileged
+-- retention capability may later remove a member with exact receipt evidence
+-- (expired_by_retention), and removes the marker when its last member expires.
 invariant TxMarkerNamesRealEvents {
     for m in Events:
         m.kind = transaction_marker implies
-            m.batch_event_ids.all(id => Events.any(e => e.id = id and e.tenant = m.tenant))
+            m.batch_event_ids.all(id =>
+                Events.any(e => e.id = id and e.tenant = m.tenant) or
+                expired_by_retention(id, m.tenant))
 }
 
 -- ES3: once a tenant has any committed event, its high-watermark is set; a
@@ -403,6 +486,7 @@ surface EventAppend {
 
     contracts:
         demands EventCodec
+        fulfils WriteContention
 
     @guarantee AtomicBatchCommit
         -- A batch of events and its transaction marker commit together or not
@@ -444,6 +528,14 @@ surface EventRead {
         -- ES4: events stream in event-id order, regardless of append position:
         -- ascending by default or descending when the read is reversed. A
         -- limit is applied only after that ordering is established.
+
+    @guarantee CommittedHead
+        -- A caller can read its tenant's current committed event identity,
+        -- including the transaction marker, or null for an empty tenant.
+        -- Invalid tenant identities are rejected. Failed appends do not advance
+        -- the head. Built-in stores read the existing durable watermark without
+        -- decoding events or enumerating other tenants; the cost does not grow
+        -- with the size of the most recently committed batch.
 
     @guarantee NoApplicationDeletion
         -- The ordinary append/read boundary exposes no deletion operation.

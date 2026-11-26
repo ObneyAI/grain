@@ -134,10 +134,22 @@ contract DefinitionRegistration {
         -- declarations without docstrings retain legacy registration behavior.
 
     @invariant ReloadsCompareOnlyDeclarations
-        -- Re-registering an equal declarative value is accepted and refreshes
-        -- the executable handler. A different declarative value for the same
-        -- qualified name is rejected. Handler identity and function-valued
-        -- runtime options are excluded from value comparison.
+        -- For defcommand, defquery, defprocessor and defperiodic, and for
+        -- read-model registrations whose reducer is not a Var: re-registering
+        -- an equal declarative value is accepted and refreshes the executable
+        -- handler. A different declarative value for the same qualified name
+        -- is rejected. Handler identity is excluded from value comparison.
+
+    @invariant ReadModelReloadsFollowDeclaringVar
+        -- When both the registered and the new defreadmodel declaration carry
+        -- a docstring, the reducer Var that defreadmodel defines identifies
+        -- the declaration. Re-registration from the same qualified Var symbol
+        -- is accepted whatever changed (body, docstring, options), including
+        -- after the namespace is removed and recreated. A different Var symbol
+        -- is rejected while the registered Var is still interned in its
+        -- namespace; once that namespace is removed or the Var unmapped, the
+        -- new declaration takes the name. Two declarations of the same name
+        -- in one namespace share a Var, so the later one wins, as with defn.
 }
 
 -- The connection grammar. A flow strings building blocks together, and only
