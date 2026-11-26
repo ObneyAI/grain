@@ -1,15 +1,18 @@
 # Changelog
 
-## Unreleased
+## November 2026
 
-- Removed the optional `EventStoreStableEmptyIntervals` protocol and `stable-empty-intervals?` predicate. Custom stores that implemented the protocol should drop that implementation. Keyed reads now persist their progress after an empty scan.
-- Added service implementation skills for commands, events, keyed projections, queries, background work and Datastar views. (`1e4d0d4`)
-- [Keyed read models](../components/read-model-processor-v2/README.md) support per-instance state, indexed pagination, text search, event scopes and joins. Both ordinary and keyed models accept an exclusive `:start-after` boundary. Segmented reads use a consistent snapshot. (`d95e2f8`, `cc452a5`, `281aeb7`, `48071d0`, `a9c8fa1`)
-- [Todo processors](core-concepts.md#start-a-new-processor-after-a-known-event) can initialize an unused tenant checkpoint before startup. Failed checkpoint writes stop the current batch. (`6178954`, `0555370`)
-- All built-in v3 stores apply [bounded retries](event-stores.md#write-contention) to lock contention. [Compaction](event-definitions-and-retention.md#estimate-and-compact-one-batch) removes a transaction marker with its last member and records both deletion sets. (`0555370`, `58e0cc3`)
-- [Datastar streams](datastar.md#event-subscription-filters) support event exclusions, alternative tag groups and refresh keys. Disconnects release subscriptions. Nested input bindings tolerate removed rows. (`651bccd`, `789e0b0`, `cc452a5`, `d3fdb5c`)
-- [CloudWatch EMF](../components/mulog-aws-cloudwatch-emf-publisher/README.md) supports metric registries, buffered delivery and bounded shutdown. Grain emits metrics for commands, queries, processors, stores and read models. (`1abdbdd`, `3eca77d`, `1ab4adc`, `73443a2`)
-- Reduced allocation in Fressian encoding and Datastar rendering, indexed SQLite checkpoint lookups, and reduced LMDB index maintenance and Postgres compaction work. (`432c78f`, `682096a`, `b1c7d26`, `4f58e32`, `e0cb103`, `58e0cc3`)
+- [Keyed read models](../components/read-model-processor-v2/README.md) fold events into per-instance state. Applications can look up an instance by ID, page through an index, search by text, join models and restrict reads to an event scope. Both ordinary and keyed models accept an exclusive `:start-after` replay boundary.
+- Segmented read models now read the manifest and its segments from one snapshot. **Breaking for custom cache backends.** Implement `KVStore/read-snapshot`. Backends serving keyed models also need `TransactionalStore/transact`.
+- [Todo processors](core-concepts.md#start-a-new-processor-after-a-known-event) can initialize an unused tenant checkpoint before startup. A failed checkpoint write stops the current batch.
+- All built-in v3 stores support [bounded retries](event-stores.md#write-contention) for appends and compaction under lock contention. Postgres startup on an initialized database can now run alongside an append without deadlocking.
+- [Compaction](event-definitions-and-retention.md#estimate-and-compact-one-batch) removes a transaction marker when it deletes the last member. The receipt lists deleted event IDs and transaction marker IDs separately.
+- [Datastar streams](datastar.md#event-subscription-filters) can exclude event types, match any of several tag groups and refresh when a `:datastar/refresh-key` value changes. Nested input bindings tolerate removed rows. Disconnecting releases the stream’s subscriptions. **Breaking for custom pub/sub implementations.** Implement `unsub` to remove a channel from one topic while keeping its other subscriptions active.
+- Grain emits metrics for commands, queries, processors, event stores and read models. The [CloudWatch EMF publisher](../components/mulog-aws-cloudwatch-emf-publisher/README.md) supports metric registries, configurable buffering and a deadline for flushing on shutdown.
+- Fressian encoding and Datastar rendering allocate less memory. SQLite uses an indexed lookup for processor checkpoints, and Postgres does less work during compaction.
+- Added service implementation skills for commands, events, keyed projections, queries, background work and Datastar views.
+
+[Compare this release with the previous main revision](https://github.com/ObneyAI/grain/compare/dbf5b52...15b0d3e)
 
 ## August 2026
 

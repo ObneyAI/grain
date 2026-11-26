@@ -7,7 +7,7 @@ For example:
 ```clojure
 obneyai/grain-core-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :git/sha "0555370637af92daea24132859f53dc44cdba8a5"
+ :git/sha "15b0d3ef878c0e7aabbb929dcbc133401ce29ebf"
  :deps/root "projects/grain-core-v2"}
 ```
 
