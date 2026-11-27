@@ -1,6 +1,7 @@
 (ns ai.obney.grain.event-store-v3.core.in-memory
   (:refer-clojure :exclude [read])
   (:require [ai.obney.grain.event-store-v3.interface.protocol :as p]
+            [ai.obney.grain.event-store-v3.interface.exact-transfer :as transfer]
             [ai.obney.grain.event-store-v3.interface.compaction :as compaction]
             [ai.obney.grain.event-store-v3.interface.write-retry :as retry]
             [ai.obney.grain.event-store-v3.interface.backend :refer [prepare-append]]
@@ -257,6 +258,16 @@
 
   (read [this args]
     (read this args))
+
+  transfer/TenantSnapshot
+  (snapshot [this tenant-id]
+    (let [state @(:state this)]
+      (when-not (and (uuid? tenant-id) (contains? (:tenants state) tenant-id))
+        (throw (ex-info "Unknown tenant" {:tenant-id tenant-id})))
+      (transfer/validate! {:version 1 :tenant-id tenant-id
+                           :watermark (get-in state [:tenants tenant-id :tenant/last-event-id])
+                           :events (->> (:events state) (filter #(matches-tenant? tenant-id %))
+                                        (mapv strip-tenant-id))})))
 
   compaction/EventCompaction
 
